@@ -20,7 +20,7 @@ Compiling with clang is also possible - replace the `g++` package with `clang`.
 Graphics and audio need to be configured for them to work with WSL 2 backend.
 Please see the ubuntu [WSL documentation](https://wiki.ubuntu.com/WSL) on how to set up graphics and audio.
 
-## Fedora 33
+## Fedora
 
 ```bash
 sudo dnf install gcc-c++ libX11-devel alsa-lib-devel systemd-devel
@@ -103,3 +103,9 @@ mkShell {
 And enter it by just running `nix-shell`.
 
 You should be able compile bevy programms using `cargo` within this nix-shell.
+
+## Opensuse Tumbleweed
+
+```bash
+   sudo zypper install libudev-devel gcc-c++
+```
