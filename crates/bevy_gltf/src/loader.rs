@@ -232,6 +232,7 @@ async fn load_gltf<'a, 'b>(
         .into_iter()
         .map(|(label, node)| load_context.set_labeled_asset(&label, LoadedAsset::new(node)))
         .collect::<Vec<bevy_asset::Handle<GltfNode>>>();
+
     let named_nodes = named_nodes_intermediate
         .into_iter()
         .filter_map(|(name, index)| {
@@ -239,7 +240,7 @@ async fn load_gltf<'a, 'b>(
                 .get(index)
                 .map(|handle| (name.to_string(), handle.clone()))
         })
-        .collect();
+        .collect::<HashMap<String, bevy_asset::Handle<GltfNode>>>();
 
     // TODO: use the threaded impl on wasm once wasm thread pool doesn't deadlock on it
     #[cfg(target_arch = "wasm32")]
@@ -278,18 +279,20 @@ async fn load_gltf<'a, 'b>(
     for scene in gltf.scenes() {
         let mut err = None;
         let mut world = World::default();
+
         world
             .spawn()
             .insert_bundle((Transform::identity(), GlobalTransform::identity()))
             .with_children(|parent| {
                 for node in scene.nodes() {
-                    let result = load_node(&node, parent, load_context, &buffer_data);
+                    let result = load_node(&node, parent, load_context, &buffer_data, false);
                     if result.is_err() {
                         err = Some(result);
                         return;
                     }
                 }
             });
+
         if let Some(Err(err)) = err {
             return Err(err);
         }
@@ -300,6 +303,31 @@ async fn load_gltf<'a, 'b>(
             named_scenes.insert(name.to_string(), scene_handle.clone());
         }
         scenes.push(scene_handle);
+    }
+
+    // load named nodes as scene
+    for node in gltf.nodes() {
+        if let Some(name) = node.name() {
+            let mut err = None;
+            let mut world = World::default();
+
+
+            // TODO: How do we remove this second wrapper transform
+            world
+                .spawn()
+                .insert_bundle((Transform::identity(), GlobalTransform::identity()))
+                .with_children(|parent| {
+                    let result = load_node(&node, parent, load_context, &buffer_data, true);
+                    if result.is_err() {
+                        err = Some(result);
+                    }
+                });
+
+            if let Some(Err(err)) = err {
+                return Err(err);
+            }
+            load_context.set_labeled_asset(format!("Node-{}", name).as_str(), LoadedAsset::new(Scene::new(world)));
+        }
     }
 
     load_context.set_default_asset(LoadedAsset::new(Gltf {
@@ -447,11 +475,17 @@ fn load_node(
     world_builder: &mut WorldChildBuilder,
     load_context: &mut LoadContext,
     buffer_data: &[Vec<u8>],
+    use_identity: bool,
 ) -> Result<(), GltfError> {
     let transform = gltf_node.transform();
+    
+     
     let mut gltf_error = None;
     let mut node = world_builder.spawn_bundle((
-        Transform::from_matrix(Mat4::from_cols_array_2d(&transform.matrix())),
+        match use_identity {
+            true => Transform::identity(),
+            false => Transform::from_matrix(Mat4::from_cols_array_2d(&transform.matrix())),
+        },
         GlobalTransform::identity(),
     ));
 
@@ -538,7 +572,7 @@ fn load_node(
 
         // append other nodes
         for child in gltf_node.children() {
-            if let Err(err) = load_node(&child, parent, load_context, buffer_data) {
+            if let Err(err) = load_node(&child, parent, load_context, buffer_data, false) {
                 gltf_error = Some(err);
                 return;
             }

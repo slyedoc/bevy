@@ -13,7 +13,7 @@
 //! Here is a simple "Hello World" Bevy app:
 //! ```
 //! use bevy::prelude::*;
-//!
+//!gltf_names
 //! fn main() {
 //!    App::new()
 //!        .add_system(hello_world_system)
