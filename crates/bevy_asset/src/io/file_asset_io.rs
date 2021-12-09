@@ -84,6 +84,7 @@ impl AssetIo for FileAssetIo {
         )))
     }
 
+    #[allow(unused_variables)]
     fn watch_path_for_changes(&self, path: &Path) -> Result<(), AssetIoError> {
         #[cfg(feature = "filesystem_watcher")]
         {
