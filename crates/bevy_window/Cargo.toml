@@ -20,5 +20,5 @@ raw-window-handle = "0.4.2"
 
 # other
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-web-sys = "0.3"
+# [target.'cfg(target_arch = "wasm32")'.dependencies]
+# web-sys = "0.3"
