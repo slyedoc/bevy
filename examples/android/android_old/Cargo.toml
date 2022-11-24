@@ -1,0 +1,31 @@
+[package]
+name = "android_old"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+#name = "main"
+crate-type = ["cdylib"]
+
+[[bin]]
+path="src/lib.rs"
+name="android_old"
+required-features = [ "desktop" ]
+
+[dependencies]
+bevy = { path = "../../../", features = [
+  "bevy_asset",
+  #"bevy_audio",
+  #"bevy_gilrs",
+  "bevy_scene",
+  "bevy_winit",
+  "render",
+  #"png",
+  #"hdr",
+  #"vorbis",
+  #"x11",
+  #"filesystem_watcher",
+  "android-native-activity"
+],  default-features = false }
+android_logger = "0.11"
+log = "0.4"

@@ -12,6 +12,8 @@ keywords = ["bevy"]
 trace = []
 wayland = ["winit/wayland"]
 x11 = ["winit/x11"]
+android-native-activity = [ "winit/android-native-activity" ]
+android-game-activity = [ "winit/android-game-activity" ]
 
 [dependencies]
 # bevy
@@ -23,7 +25,9 @@ bevy_window = { path = "../bevy_window", version = "0.9.0" }
 bevy_utils = { path = "../bevy_utils", version = "0.9.0" }
 
 # other
-winit = { version = "0.27", default-features = false }
+#TODO: change to once winit 0.28 is released
+winit = { git = "https://github.com/rust-windowing/winit", default-features = false }
+
 approx = { version = "0.5", default-features = false }
 raw-window-handle = "0.5"
 
@@ -34,3 +38,4 @@ crossbeam-channel = "0.5"
 
 [package.metadata.docs.rs]
 features = ["x11"]
+

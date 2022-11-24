@@ -12,10 +12,14 @@ readme = "README.md"
 repository = "https://github.com/bevyengine/bevy"
 
 [workspace]
-exclude = ["benches", "crates/bevy_ecs_compile_fail_tests"]
+exclude = [
+  "benches",
+  "crates/bevy_ecs_compile_fail_tests",
+]
 members = [
   "crates/*",
   "examples/ios",
+  "examples/android/*",
   "tools/ci",
   "tools/spancmp",
   "tools/build-example-pages",
@@ -102,6 +106,9 @@ serialize = ["bevy_internal/serialize"]
 # Display server protocol support (X11 is enabled by default)
 wayland = ["bevy_internal/wayland"]
 x11 = ["bevy_internal/x11"]
+android-native-activity = ["bevy_internal/android-native-activity"]
+android-game-activity = ["bevy_internal/android-game-activity"]
+
 
 # Enable rendering of font glyphs using subpixel accuracy
 subpixel_glyph_atlas = ["bevy_internal/subpixel_glyph_atlas"]
@@ -1598,27 +1605,27 @@ category = "Window"
 wasm = true
 
 # Android
-[[example]]
-crate-type = ["cdylib"]
-name = "android_example"
-path = "examples/android/android.rs"
+#[[example]]
+#name = "android"
+#path = "examples/android/android.rs"
+#required-features = ["android-game-activity"]
 
-[package.metadata.example.android_example]
-hidden = true
+# [package.metadata.example.android]
+# hidden = true
 
-[package.metadata.android]
-package = "org.bevyengine.example"
-apk_name = "bevyexample"
-assets = "assets"
-resources = "assets/android-res"
-build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
+# [package.metadata.android]
+# package = "org.bevyengine.example"
+# apk_name = "bevyexample"
+# assets = "assets"
+# resources = "assets/android-res"
+# build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
 
-[package.metadata.android.sdk]
-target_sdk_version = 31
+# [package.metadata.android.sdk]
+# target_sdk_version = 31
 
-[package.metadata.android.application]
-icon = "@mipmap/ic_launcher"
-label = "Bevy Example"
+# [package.metadata.android.application]
+# icon = "@mipmap/ic_launcher"
+# label = "Bevy Example"
 
 [profile.wasm-release]
 inherits = "release"
