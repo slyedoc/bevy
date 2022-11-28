@@ -39,33 +39,13 @@ pub mod android {
     pub use winit::platform::android::*;
 }
 
-impl Default for WinitPlugin {
-    fn default() -> Self {
-        WinitPlugin {
-           // #[cfg(target_os = "android")] 
-           // android_app: None,
-        }
-    }
-}
-
-pub struct WinitPlugin {
-    // This doesn't work because android app is not copyable and plugin build 
-    // only receives a &self, so cant Option::take
-    //#[cfg(target_os = "android")] 
-    //pub android_app: Option<winit::platform::android::activity::AndroidApp>,
-}
-
-#[cfg(target_os = "android")]
-#[derive(Resource)]
-pub struct WinitAndroidApp( pub Option<winit::platform::android::activity::AndroidApp>);
+pub struct WinitPlugin;
 
 impl Plugin for WinitPlugin {
     fn build(&self, app: &mut App) {
         
-        #[cfg(target_os = "android")]
-        app.init_non_send_resource::<WinitWindows>();
-            
-            app.init_resource::<WinitSettings>()
+
+        app.init_resource::<WinitSettings>()
             .set_runner(winit_runner)
             .add_system_to_stage(CoreStage::PostUpdate, change_window.label(ModifiesWindows));
         #[cfg(target_arch = "wasm32")]
@@ -74,17 +54,13 @@ impl Plugin for WinitPlugin {
 
         #[cfg(not(target_os = "android"))]
         let event_loop = EventLoop::new();
+        
         #[cfg(target_os = "android")] {
-            
-            let mut winit_android_app = app.world.get_non_send_resource_mut::<WinitAndroidApp>().expect("Winit Android app not set");
-            
-            use winit::event_loop::EventLoopBuilder;
-            use winit::platform::android::EventLoopBuilderExtAndroid;
-            
-            let android_app = winit_android_app.0.take().expect("Android app not set");
-            let event_loop = EventLoopBuilder::with_user_event()
-                .with_android_app(android_app)
-                .build();
+
+            GLOBAL_ANDROID_APP.with(|global_android_app| {
+                
+            });
+
         }
             
        

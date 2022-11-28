@@ -11,33 +11,23 @@ pub fn bevy_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     TokenStream::from(quote! {
     
-        // TODO: Remove this
-        // use ndk-glue macro to create an activity: https://github.com/rust-windowing/android-ndk-rs/tree/master/ndk-macro
-        // #[cfg(target_os = "android")]
-        // #[cfg_attr(target_os = "android", bevy::ndk_glue::main(backtrace = "on", ndk_glue = "bevy::ndk_glue"))]
-        // fn android_main() {
-        //     main()
-        // }
+        #[cfg(target_os = "android")] {
+            use bevy::winit::android::activity::AndroidApp;
 
-        // Notes:
-        /// Global static maybe? 
-        /// https://www.sitepoint.com/rust-global-variables/
+            // TODO: I don't really like the idea of adding a global, but it keeps 
+            // the user code clean
+            thread_local!(static GLOBAL_ANDROID_APP: Option<AndroidApp> = None);
+            
+            #[no_mangle]
+            fn android_main(android_app: AndroidApp) {
+                
+                GLOBAL_ANDROID_APP.with(|global_android_app| {
+                    *global_android_app = Some(android_app);
+                });
+                main()
+            }
 
-        // #[cfg(target_os = "android")]        
-        // #[no_mangle]
-        // fn android_main(app: bevy::winit::android::activity::AndroidApp) {
-        //     use bevy::winit::android::EventLoopBuilderExtAndroid;
-
-        //     android_logger::init_once(android_logger::Config::default().with_min_level(log::Level::Trace));
-
-        //     let event_loop = EventLoopBuilder::with_user_event()
-        //         .with_android_app(app)
-        //         .build();
-        //     //main(event_loop);
-        //     // TODO: figure out how to pass the event loop to main
-        //     main()
-        // }
-
+        }
 
         #[no_mangle]
         #[cfg(target_os = "ios")]

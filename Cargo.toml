@@ -43,6 +43,23 @@ default = [
   "filesystem_watcher",
 ]
 
+android = [
+    # default android activity
+  "android-native-activity",
+  "animation",
+  "bevy_asset",
+  #"bevy_audio",
+  "bevy_gilrs",
+  "bevy_scene",
+  "bevy_winit",
+  "render",
+  "png",
+  "hdr",
+  "vorbis",
+
+  #"filesystem_watcher",
+]
+
 # Force dynamic linking, which improves iterative compile times
 dynamic = ["bevy_dylib"]
 
