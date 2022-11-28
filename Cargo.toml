@@ -18,6 +18,7 @@ exclude = [
 ]
 members = [
   "crates/*",
+  "examples/android",
   "examples/ios",
   "examples/android/*",
   "tools/ci",
@@ -1467,6 +1468,16 @@ category = "UI (User Interface)"
 wasm = true
 
 [[example]]
+name = "window_fallthrough"
+path = "examples/ui/window_fallthrough.rs"
+
+[package.metadata.example.window_fallthrough]
+name = "Window Fallthrough"
+description = "Illustrates how to access `winit::window::Window`'s `hittest` functionality."
+category = "UI (User Interface)"
+wasm = false
+
+[[example]]
 name = "font_atlas_debug"
 path = "examples/ui/font_atlas_debug.rs"
 
@@ -1621,6 +1632,7 @@ description = "Demonstrates resizing and responding to resizing a window"
 category = "Window"
 wasm = true
 
+<<<<<<< HEAD
 # Android
 #[[example]]
 #name = "android"
@@ -1644,6 +1656,8 @@ wasm = true
 # icon = "@mipmap/ic_launcher"
 # label = "Bevy Example"
 
+=======
+>>>>>>> upstream/main
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"
