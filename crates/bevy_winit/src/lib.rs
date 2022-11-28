@@ -39,13 +39,14 @@ pub mod android {
     pub use winit::platform::android::*;
 }
 
+#[derive(Default)]
 pub struct WinitPlugin;
 
 impl Plugin for WinitPlugin {
     fn build(&self, app: &mut App) {
         
-
-        app.init_resource::<WinitSettings>()
+        app.init_non_send_resource::<WinitWindows>()
+            .init_resource::<WinitSettings>()
             .set_runner(winit_runner)
             .add_system_to_stage(CoreStage::PostUpdate, change_window.label(ModifiesWindows));
         #[cfg(target_arch = "wasm32")]
@@ -56,11 +57,9 @@ impl Plugin for WinitPlugin {
         let event_loop = EventLoop::new();
         
         #[cfg(target_os = "android")] {
-
             GLOBAL_ANDROID_APP.with(|global_android_app| {
                 
             });
-
         }
             
        
@@ -255,9 +254,9 @@ fn change_window(
                         window.set_max_inner_size(Some(max_inner_size));
                     }
                 }
-                bevy_window::WindowCommand::SetAlwaysOnTop { always_on_top } => {
+                bevy_window::WindowCommand::SetWindowLevel { level } => {
                     let window = winit_windows.get_window(id).unwrap();
-                    window.set_always_on_top(always_on_top);
+                    window.set_window_level(converters::convert_window_level(level));
                 }
                 bevy_window::WindowCommand::SetCursorHitTest { hittest } => {
                     let window = winit_windows.get_window(id).unwrap();

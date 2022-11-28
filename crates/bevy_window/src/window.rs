@@ -295,7 +295,7 @@ pub struct Window {
     fit_canvas_to_parent: bool,
     command_queue: Vec<WindowCommand>,
     alpha_mode: CompositeAlphaMode,
-    always_on_top: bool,
+    level: WindowLevel,
 }
 /// A command to be sent to a window.
 ///
@@ -376,9 +376,9 @@ pub enum WindowCommand {
         resize_constraints: WindowResizeConstraints,
     },
     /// Set whether the window is always on top.
-    SetAlwaysOnTop {
-        always_on_top: bool,
-    },
+    SetWindowLevel {
+        level: WindowLevel,
+    },    
     Close,
 }
 
@@ -449,7 +449,7 @@ impl Window {
             fit_canvas_to_parent: window_descriptor.fit_canvas_to_parent,
             command_queue: Vec::new(),
             alpha_mode: window_descriptor.alpha_mode,
-            always_on_top: window_descriptor.always_on_top,
+            level: window_descriptor.level,
         }
     }
     /// Get the window's [`WindowId`].
@@ -829,15 +829,15 @@ impl Window {
     }
     /// Get whether or not the window is always on top.
     #[inline]
-    pub fn always_on_top(&self) -> bool {
-        self.always_on_top
+    pub fn level(&self) -> WindowLevel {
+        self.level
     }
 
-    /// Set whether of not the window is always on top.
-    pub fn set_always_on_top(&mut self, always_on_top: bool) {
-        self.always_on_top = always_on_top;
+    /// Set whether of not the window is always on top, bottom, or normal
+    pub fn set_level(&mut self, level: WindowLevel) {
+        self.level = level;
         self.command_queue
-            .push(WindowCommand::SetAlwaysOnTop { always_on_top });
+            .push(WindowCommand::SetWindowLevel { level });
     }
     /// Close the operating system window corresponding to this [`Window`].
     ///
@@ -914,6 +914,20 @@ pub enum WindowPosition {
     /// The monitor to position the window on can be selected with the `monitor` field in `WindowDescriptor`.
     At(Vec2),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+pub enum WindowLevel {
+    /// The window will always be below normal windows.
+    ///
+    /// This is useful for a widget-based app.
+    AlwaysOnBottom,
+    /// The default.
+    Normal,
+    /// The window will always be on top of normal windows.
+    AlwaysOnTop,
+}
+
 
 /// Defines which monitor to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1022,7 +1036,8 @@ pub struct WindowDescriptor {
     /// ## Platform-specific
     /// - iOS / Android / Web: Unsupported.
     /// - Linux (Wayland): Unsupported.
-    pub always_on_top: bool,
+    pub level: WindowLevel,
+    
 }
 
 impl Default for WindowDescriptor {
@@ -1046,7 +1061,7 @@ impl Default for WindowDescriptor {
             canvas: None,
             fit_canvas_to_parent: false,
             alpha_mode: CompositeAlphaMode::Auto,
-            always_on_top: false,
+            level: WindowLevel::Normal,
         }
     }
 }

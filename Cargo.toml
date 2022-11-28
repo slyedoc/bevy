@@ -18,9 +18,8 @@ exclude = [
 ]
 members = [
   "crates/*",
-  "examples/android",
-  "examples/ios",
   "examples/android/*",
+  "examples/ios",  
   "tools/ci",
   "tools/spancmp",
   "tools/build-example-pages",
@@ -1632,7 +1631,6 @@ description = "Demonstrates resizing and responding to resizing a window"
 category = "Window"
 wasm = true
 
-<<<<<<< HEAD
 # Android
 #[[example]]
 #name = "android"
@@ -1656,8 +1654,6 @@ wasm = true
 # icon = "@mipmap/ic_launcher"
 # label = "Bevy Example"
 
-=======
->>>>>>> upstream/main
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"

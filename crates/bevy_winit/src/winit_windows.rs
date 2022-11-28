@@ -72,9 +72,15 @@ impl WinitWindows {
             }
             .with_resizable(window_descriptor.resizable)
             .with_decorations(window_descriptor.decorations)
-            .with_transparent(window_descriptor.transparent)
-            .with_always_on_top(window_descriptor.always_on_top),
+            .with_transparent(window_descriptor.transparent),
         };
+
+        let window_level = match window_descriptor.level {
+            bevy_window::WindowLevel::AlwaysOnBottom => winit::window::WindowLevel::AlwaysOnBottom,
+            bevy_window::WindowLevel::Normal => winit::window::WindowLevel::Normal,
+            bevy_window::WindowLevel::AlwaysOnTop => winit::window::WindowLevel::AlwaysOnTop,
+        };
+        let winit_window_builder = winit_window_builder.with_window_level(window_level);
 
         let constraints = window_descriptor.resize_constraints.check_constraints();
         let min_inner_size = LogicalSize {
