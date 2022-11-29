@@ -1,4 +1,4 @@
-use crate::converters::convert_cursor_grab_mode;
+use crate::converters::{convert_cursor_grab_mode, convert_window_level};
 use bevy_math::{DVec2, IVec2};
 use bevy_utils::HashMap;
 use bevy_window::{
@@ -75,13 +75,6 @@ impl WinitWindows {
             .with_transparent(window_descriptor.transparent),
         };
 
-        let window_level = match window_descriptor.level {
-            bevy_window::WindowLevel::AlwaysOnBottom => winit::window::WindowLevel::AlwaysOnBottom,
-            bevy_window::WindowLevel::Normal => winit::window::WindowLevel::Normal,
-            bevy_window::WindowLevel::AlwaysOnTop => winit::window::WindowLevel::AlwaysOnTop,
-        };
-        let winit_window_builder = winit_window_builder.with_window_level(window_level);
-
         let constraints = window_descriptor.resize_constraints.check_constraints();
         let min_inner_size = LogicalSize {
             width: constraints.min_width,
@@ -102,7 +95,8 @@ impl WinitWindows {
             };
 
         #[allow(unused_mut)]
-        let mut winit_window_builder = winit_window_builder.with_title(&window_descriptor.title);
+        let mut winit_window_builder = winit_window_builder.with_title(&window_descriptor.title)
+            .with_window_level(convert_window_level(window_descriptor.level));
 
         #[cfg(target_arch = "wasm32")]
         {
@@ -122,7 +116,7 @@ impl WinitWindows {
                     panic!("Cannot find element: {}.", selector);
                 }
             }
-        }
+        }       
 
         let winit_window = winit_window_builder.build(event_loop).unwrap();
 

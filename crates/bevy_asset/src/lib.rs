@@ -80,28 +80,27 @@ impl Default for AssetPlugin {
     }
 }
 
-impl AssetPlugin {
-    /// Creates an instance of the platform's default `AssetIo`.
-    ///
-    /// This is useful when providing a custom `AssetIo` instance that needs to
-    /// delegate to the default `AssetIo` for the platform.
-    pub fn create_platform_default_asset_io(&self) -> Box<dyn AssetIo> {
-        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-        let source = FileAssetIo::new(&self.asset_folder, self.watch_for_changes);
-        #[cfg(target_arch = "wasm32")]
-        let source = WasmAssetIo::new(&self.asset_folder);
-        #[cfg(target_os = "android")]
-        let source = AndroidAssetIo::new(&self.asset_folder);
-
-        Box::new(source)
-    }
-}
-
 impl Plugin for AssetPlugin {
     fn build(&self, app: &mut App) {
+
         if !app.world.contains_resource::<AssetServer>() {
-            let source = self.create_platform_default_asset_io();
-            let asset_server = AssetServer::with_boxed_io(source);
+
+            #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+            let source = FileAssetIo::new(&self.asset_folder, self.watch_for_changes);
+            #[cfg(target_arch = "wasm32")]
+            let source = WasmAssetIo::new(&self.asset_folder);
+        
+            #[cfg(target_os = "android")]
+            let asset_manager = app.world.get_non_send_resource_mut::<bevy_android::AndroidResource>()
+                .expect("AndroidResource not found")
+                .android_app
+                .asset_manager();
+
+            #[cfg(target_os = "android")]
+            let source = AndroidAssetIo::new(&self.asset_folder, asset_manager);
+
+            
+            let asset_server = AssetServer::with_boxed_io(Box::new(source));
             app.insert_resource(asset_server);
         }
 

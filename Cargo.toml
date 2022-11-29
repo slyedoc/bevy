@@ -15,11 +15,13 @@ repository = "https://github.com/bevyengine/bevy"
 exclude = [
   "benches",
   "crates/bevy_ecs_compile_fail_tests",
+  "crates/bevy_audio", 
+  "examples/ios",  
 ]
 members = [
   "crates/*",
-  "examples/android/*",
-  "examples/ios",  
+  "examples/android/native_activity",
+  "examples/android/game_activity",
   "tools/ci",
   "tools/spancmp",
   "tools/build-example-pages",
@@ -31,23 +33,6 @@ members = [
 default = [
   "animation",
   "bevy_asset",
-  "bevy_audio",
-  "bevy_gilrs",
-  "bevy_scene",
-  "bevy_winit",
-  "render",
-  "png",
-  "hdr",
-  "vorbis",
-  "x11",
-  "filesystem_watcher",
-]
-
-android = [
-    # default android activity
-  "android-native-activity",
-  "animation",
-  "bevy_asset",
   #"bevy_audio",
   "bevy_gilrs",
   "bevy_scene",
@@ -55,9 +40,9 @@ android = [
   "render",
   "png",
   "hdr",
-  "vorbis",
-
-  #"filesystem_watcher",
+  #"vorbis",
+  "x11",
+  "filesystem_watcher",
 ]
 
 # Force dynamic linking, which improves iterative compile times
@@ -77,7 +62,7 @@ render = [
 # Optional bevy crates
 bevy_animation = ["bevy_internal/bevy_animation"]
 bevy_asset = ["bevy_internal/bevy_asset"]
-bevy_audio = ["bevy_internal/bevy_audio"]
+#bevy_audio = ["bevy_internal/bevy_audio"]
 bevy_core_pipeline = ["bevy_internal/bevy_core_pipeline"]
 bevy_dynamic_plugin = ["bevy_internal/bevy_dynamic_plugin"]
 bevy_gilrs = ["bevy_internal/bevy_gilrs"]
@@ -110,10 +95,10 @@ zlib = ["bevy_internal/zlib"]
 zstd = ["bevy_internal/zstd"]
 
 # Audio format support (vorbis is enabled by default)
-flac = ["bevy_internal/flac"]
-mp3 = ["bevy_internal/mp3"]
-vorbis = ["bevy_internal/vorbis"]
-wav = ["bevy_internal/wav"]
+#flac = ["bevy_internal/flac"]
+#mp3 = ["bevy_internal/mp3"]
+#vorbis = ["bevy_internal/vorbis"]
+#wav = ["bevy_internal/wav"]
 
 # Enable watching file system for asset hot reload
 filesystem_watcher = ["bevy_internal/filesystem_watcher"]
@@ -138,6 +123,11 @@ debug_asset_server = ["bevy_internal/debug_asset_server"]
 
 # Enable animation support, and glTF animation loading
 animation = ["bevy_internal/animation"]
+
+# TODO
+[patch.crates-io]
+winit = { git = "https://github.com/rust-windowing/winit", branch = "master" }
+
 
 [dependencies]
 bevy_dylib = { path = "crates/bevy_dylib", version = "0.9.0", default-features = false, optional = true }

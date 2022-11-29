@@ -40,7 +40,7 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 
 [target.'cfg(target_os = "android")'.dependencies]
-ndk-glue = { version = "0.7" }
+bevy_android = { path = "../bevy_android", version = "0.9.0" }
 
 [dev-dependencies]
 futures-lite = "1.4.0"

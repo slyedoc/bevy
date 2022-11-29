@@ -1,7 +1,56 @@
 [package]
-name = "native_activity"
+name = "android_native_activity"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+# Note: This works but cargo gives a warning, using main.rs instead with rlib
+#[[bin]]
+#path = "src/lib.rs"
+#name="android_native_activity"
+#required-features = [ "desktop" ]
+
+[features]
+default = ["bevy/android-native-activity"]
+desktop = ["bevy/x11"]
+
+[dependencies]
+bevy = { path = "../../../", features = [
+  "bevy_asset",
+  #"bevy_audio",
+  #"bevy_gilrs",
+  "bevy_scene",
+  "bevy_winit",
+  "render",
+  "png",
+  "hdr",
+  #"vorbis",
+  #"x11",
+  #"filesystem_watcher",
+],  default-features = false }
+
+[package.metadata.android]
+package = "org.bevyengine.nativeexample"
+apk_name = "bevynativeexample"
+# Path to your application's resources folder.
+# If not specified, resources will not be included in the APK.
+assets = "./assets"
+resources = "./android-res"
+#build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
+
+#[package.metadata.android.sdk]
+#target_sdk_version = 31
+
+[package.metadata.android.application]
+icon = "@mipmap/ic_launcher"
+label = "Bevy Native Example"
+
+# See https://developer.android.com/guide/topics/manifest/uses-feature-element
+#
+# Note: there can be multiple .uses_feature entries.
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.vulkan.level"
+required = true
+version = 1

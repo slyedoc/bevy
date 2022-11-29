@@ -38,10 +38,10 @@ zlib = ["bevy_render/zlib"]
 zstd = ["bevy_render/zstd"]
 
 # Audio format support (vorbis is enabled by default)
-flac = ["bevy_audio/flac"]
-mp3 = ["bevy_audio/mp3"]
-vorbis = ["bevy_audio/vorbis"]
-wav = ["bevy_audio/wav"]
+#flac = ["bevy_audio/flac"]
+#mp3 = ["bevy_audio/mp3"]
+#vorbis = ["bevy_audio/vorbis"]
+#wav = ["bevy_audio/wav"]
 
 # Enable watching file system for asset hot reload
 filesystem_watcher = ["bevy_asset/filesystem_watcher"]
@@ -87,7 +87,7 @@ bevy_tasks = { path = "../bevy_tasks", version = "0.9.0" }
 # bevy (optional)
 bevy_animation = { path = "../bevy_animation", optional = true, version = "0.9.0" }
 bevy_asset = { path = "../bevy_asset", optional = true, version = "0.9.0" }
-bevy_audio = { path = "../bevy_audio", optional = true, version = "0.9.0" }
+#bevy_audio = { path = "../bevy_audio", optional = true, version = "0.9.0" }
 bevy_core_pipeline = { path = "../bevy_core_pipeline", optional = true, version = "0.9.0" }
 bevy_gltf = { path = "../bevy_gltf", optional = true, version = "0.9.0" }
 bevy_pbr = { path = "../bevy_pbr", optional = true, version = "0.9.0" }
@@ -100,8 +100,5 @@ bevy_ui = { path = "../bevy_ui", optional = true, version = "0.9.0" }
 bevy_winit = { path = "../bevy_winit", optional = true, version = "0.9.0" }
 bevy_gilrs = { path = "../bevy_gilrs", optional = true, version = "0.9.0" }
 
-
 [target.'cfg(target_os = "android")'.dependencies]
-# This version *must* be the same as the version used by winit,
-# or Android will break: https://github.com/rust-windowing/winit#android
-# android_logger = "0.11.0"
+bevy_android = { path = "../bevy_android", version = "0.9.0" }

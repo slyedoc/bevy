@@ -167,6 +167,12 @@ pub mod winit {
     pub use bevy_winit::*;
 }
 
+#[cfg(target_os = "android")]
+pub mod android {
+    //! AndroidApp handle
+    pub use bevy_android::*;
+}
+
 #[cfg(feature = "bevy_dynamic_plugin")]
 pub mod dynamic_plugin {
     //! Dynamic linking of plugins

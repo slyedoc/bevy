@@ -33,47 +33,49 @@ use winit::{
     event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget},
 };
 
-#[cfg(target_os = "android")]
-pub mod android {
-    //! Android specific plugins
-    pub use winit::platform::android::*;
-}
-
 #[derive(Default)]
 pub struct WinitPlugin;
 
 impl Plugin for WinitPlugin {
     fn build(&self, app: &mut App) {
-        
         app.init_non_send_resource::<WinitWindows>()
             .init_resource::<WinitSettings>()
             .set_runner(winit_runner)
             .add_system_to_stage(CoreStage::PostUpdate, change_window.label(ModifiesWindows));
         #[cfg(target_arch = "wasm32")]
         app.add_plugin(web_resize::CanvasParentResizePlugin);
+
+        #[cfg(target_os = "android")]
+        use winit::platform::android::EventLoopBuilderExtAndroid;
+        #[cfg(target_os = "android")]
+        let android_resource = app
+            .world
+            .get_non_send_resource::<bevy_android::AndroidResource>()
+            .expect("AndroidResource not found");
         
+        // TODO: Hate that we got to clone the app here
+        #[cfg(target_os = "android")]
+        let event_loop = winit::event_loop::EventLoopBuilder::with_user_event()
+            .with_android_app(android_resource.android_app.to_owned())
+            .build();
 
         #[cfg(not(target_os = "android"))]
         let event_loop = EventLoop::new();
-        
-        #[cfg(target_os = "android")] {
-            GLOBAL_ANDROID_APP.with(|global_android_app| {
-                
-            });
-        }
-            
-       
-        
-        #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
+
         let mut create_window_reader = WinitCreateWindowReader::default();
-        #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
-        let create_window_reader = WinitCreateWindowReader::default();
+
         // Note that we create a window here "early" because WASM/WebGL requires the window to exist prior to initializing
         // the renderer.
-        // And for ios and macos, we should not create window early, all ui related code should be executed inside
+        // And for android, ios and macos, we should not create window early, all ui related code should be executed inside
         // UIApplicationMain/NSApplicationMain.
-        #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
-        handle_create_window_events(&mut app.world, &event_loop, &mut create_window_reader.0);
+        if cfg!(not(any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "macos"
+        ))) {
+            handle_create_window_events(&mut app.world, &event_loop, &mut create_window_reader.0);
+        }
+
         app.insert_resource(create_window_reader)
             .insert_non_send_resource(event_loop);
     }
@@ -357,7 +359,11 @@ struct WinitPersistentState {
 impl Default for WinitPersistentState {
     fn default() -> Self {
         Self {
-            active: true,
+            active: if cfg!(target_os = "android") {
+                false
+            } else {
+                true
+            },
             low_power_event: false,
             redraw_request_sent: false,
             timeout_reached: false,
@@ -599,18 +605,26 @@ pub fn winit_runner_with(mut app: App) {
             }
             event::Event::Suspended => {
                 winit_state.active = false;
+                //info!("Suspended");
             }
             event::Event::Resumed => {
                 winit_state.active = true;
+                //info!("Resumed");
+
+
             }
+            event::Event::RedrawRequested(_) => {}
             event::Event::MainEventsCleared => {
-                handle_create_window_events(
-                    &mut app.world,
-                    event_loop,
-                    &mut create_window_event_reader,
-                );
-                let winit_config = app.world.resource::<WinitSettings>();
+
                 let update = if winit_state.active {
+                    handle_create_window_events(
+                        &mut app.world,
+                        event_loop,
+                        &mut create_window_event_reader,
+                    );
+
+                    let winit_config = app.world.resource::<WinitSettings>();
+
                     let windows = app.world.resource::<Windows>();
                     let focused = windows.iter().any(|w| w.is_focused());
                     match winit_config.update_mode(focused) {

@@ -10,24 +10,17 @@ pub fn bevy_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     TokenStream::from(quote! {
-    
-        #[cfg(target_os = "android")] {
-            use bevy::winit::android::activity::AndroidApp;
+        
+        // #[cfg(target_os = "android")]
+        // #[no_mangle]
+        // fn android_main(android_app: bevy::android::AndroidApp) {
 
-            // TODO: I don't really like the idea of adding a global, but it keeps 
-            // the user code clean
-            thread_local!(static GLOBAL_ANDROID_APP: Option<AndroidApp> = None);
-            
-            #[no_mangle]
-            fn android_main(android_app: AndroidApp) {
-                
-                GLOBAL_ANDROID_APP.with(|global_android_app| {
-                    *global_android_app = Some(android_app);
-                });
-                main()
-            }
+        //     #[allow(unused)]
+        //     let _result = bevy::android::GLOBAL_ANDROID_APP.set(android_app).unwrap();
 
-        }
+        //     main(android_app)
+        // }
+
 
         #[no_mangle]
         #[cfg(target_os = "ios")]
