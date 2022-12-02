@@ -1,35 +1,28 @@
-use bevy_app::App;
-use bevy_ecs::prelude::*;
-use bevy_log::*;
 
-//use winit::{event_loop::EventLoopBuilder, platform::android::EventLoopBuilderExtAndroid};
-pub use winit::{
-    // Reexport of android-activity
-    platform::android::activity::*,
-};
+
+use bevy_ecs::system::Resource;
+
 pub use ndk::asset::AssetManager;
+pub use winit::platform::android::activity::*;
 
 /// A resource to store the Android App.
+
 #[derive(Resource)]
 pub struct AndroidResource {
-    pub android_app: AndroidApp,    
+    pub android_app: AndroidApp,
+    //saver: RwLock<Vec<Arc<dyn AndroidSaver>>>,
+}
+pub const RESUME: i32 = 1;
+pub const SUSPEND: i32 = 2;
+
+pub struct HackLoop {
+    pub status: BevyState,
 }
 
-pub fn hack_loop(android_app: AndroidApp, build_app: impl Fn(&mut App)) {
-
-    info!("Starting Hack Loop");
-    // build winit loop
-    //let event_loop = event_loop::EventLoop::new();
-    // let _event_loop = EventLoopBuilder::new()
-    //     .with_android_app(android_app.to_owned())
-    //     .build();
-
-    let mut app = App::new();
-    // Needed for Asset Server
-    app.insert_resource(AndroidResource { 
-        android_app
-    });
-    
-    build_app(&mut app);
-    app.run();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BevyState {
+    Resume,
+    Suspend,
 }
+
+//android_logger::init_once(android_logger::Config::default().with_min_level(log::Level::Info));

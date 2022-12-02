@@ -67,12 +67,13 @@ pub struct App {
     /// the application's event loop and advancing the [`Schedule`].
     /// Typically, it is not configured manually, but set by one of Bevy's built-in plugins.
     /// See `bevy::winit::WinitPlugin` and [`ScheduleRunnerPlugin`](crate::schedule_runner::ScheduleRunnerPlugin).
-    pub runner: Box<dyn Fn(App)>,
+    pub runner: Box<dyn Fn(App)>,    
     /// A container of [`Stage`]s set to be run in a linear order.
     pub schedule: Schedule,
     sub_apps: HashMap<AppLabelId, SubApp>,
     plugin_registry: Vec<Box<dyn Plugin>>,
     plugin_name_added: HashSet<String>,
+
 }
 
 impl Debug for App {
@@ -160,6 +161,19 @@ impl App {
     /// Finalizes the [`App`] configuration. For general usage, see the example on the item
     /// level documentation.
     pub fn run(&mut self) {
+        #[cfg(feature = "trace")]
+        let _bevy_app_run_span = info_span!("bevy_app").entered();
+
+        let mut app = std::mem::replace(self, App::empty());
+        let runner = std::mem::replace(&mut app.runner, Box::new(run_once));
+        (runner)(app);
+    }
+
+    /// Starts the application by calling the app's [runner function](Self::set_runner).
+    ///
+    /// Finalizes the [`App`] configuration. For general usage, see the example on the item
+    /// level documentation.
+    pub fn run_return(&mut self) {
         #[cfg(feature = "trace")]
         let _bevy_app_run_span = info_span!("bevy_app").entered();
 

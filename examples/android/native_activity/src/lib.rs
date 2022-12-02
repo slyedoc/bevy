@@ -6,7 +6,6 @@ use bevy::{
 
 #[cfg(target_os = "android")]
 use bevy::{
-
     render::settings::{WgpuLimits, WgpuSettings, WgpuSettingsPriority},
     winit::WinitSettings,
 };
@@ -19,20 +18,26 @@ use bevy::{
 #[no_mangle]
 fn android_main(android_app: bevy::android::AndroidApp) {
     //android_logger::init_once(android_logger::Config::default().with_min_level(log::Level::Info));
-    bevy::android::hack_loop(android_app, build_app)
+
+    use bevy::android::AndroidResource;
+    let mut app = App::new();
+    app.insert_resource(AndroidResource {
+        android_app: android_app.to_owned(),
+    });
+    build_app(&mut app);
+    
 }
 
-pub fn build_app(app: &mut App) {
+pub fn build_app(
+    #[cfg(target_os = "android")]
+    app: &mut App
+) {
     info!("Starting Build App");
-
 
     #[cfg(target_os = "android")]
     {
         // Android specific settings
-        app.insert_resource(WinitSettings {
-            return_from_run: false, // TODO
-            ..default()
-        })
+        app
         .insert_resource(WgpuSettings {
             priority: WgpuSettingsPriority::Compatibility,
             limits: WgpuLimits {
@@ -41,7 +46,7 @@ pub fn build_app(app: &mut App) {
                 ..default()
             },
             ..default()
-        });
+        });        
     }
 
     // Normal App Stuff
@@ -50,7 +55,8 @@ pub fn build_app(app: &mut App) {
         level: Level::INFO,
     }))
     .add_startup_system(setup)
-    .add_system(rotate_camera);
+    .add_system(rotate_camera)
+    .run();
 }
 
 /// set up a simple 3D scene

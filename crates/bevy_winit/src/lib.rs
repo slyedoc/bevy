@@ -296,12 +296,12 @@ fn change_window(
     target_os = "openbsd",
     target_os = "android"
 ))]
-fn run_return<F>(event_loop: &mut EventLoop<()>, event_handler: F)
+fn run_return<F>(event_loop: &mut EventLoop<()>, event_handler: F) -> i32
 where
     F: FnMut(Event<'_, ()>, &EventLoopWindowTarget<()>, &mut ControlFlow),
 {
     use winit::platform::run_return::EventLoopExtRunReturn;
-    event_loop.run_return(event_handler);
+    event_loop.run_return(event_handler)
 }
 
 #[cfg(not(any(
@@ -314,7 +314,7 @@ where
     target_os = "openbsd",
     target_os = "android"
 )))]
-fn run_return<F>(_event_loop: &mut EventLoop<()>, _event_handler: F)
+fn run_return<F>(_event_loop: &mut EventLoop<()>, _event_handler: F) -> i32
 where
     F: FnMut(Event<'_, ()>, &EventLoopWindowTarget<()>, &mut ControlFlow),
 {
@@ -322,7 +322,7 @@ where
 }
 
 pub fn winit_runner(app: App) {
-    winit_runner_with(app);
+    winit_runner_with(app)
 }
 
 // #[cfg(any(
@@ -596,11 +596,18 @@ pub fn winit_runner_with(mut app: App) {
             }
             event::Event::Suspended => {
                 winit_state.active = false; 
-                
                 #[cfg(target_os = "android")] {
-                    *control_flow = ControlFlow::ExitWithCode(1);
+                    // Exiting, as Bevy doesn't support resuming
+                    // Android will restart us on resume
+
+                    // Save before we next
+                    // let android_resource = app.world.resource_mut::<AndroidResource>();
+                    // android_resource.android_app.internal_data_path()
+                    
+                    info!("Suspended, exiting, as Bevy doesn't support resuming, main will get called again on resume");
+                    *control_flow = ControlFlow::ExitWithCode(bevy_android::SUSPEND);
                 }
-            }
+            }            
             event::Event::Resumed => {
                 winit_state.active = true;
             }
@@ -677,6 +684,7 @@ pub fn winit_runner_with(mut app: App) {
         event_loop.run(event_handler);
     }
 }
+
 
 fn handle_create_window_events(
     world: &mut World,
