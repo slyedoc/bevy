@@ -11,6 +11,7 @@ keywords = ["bevy"]
 [dependencies]
 bevy_app = { path = "../bevy_app", version = "0.9.0" }
 bevy_ecs = { path = "../bevy_ecs", version = "0.9.0" }
+bevy_log = { path = "../bevy_log", version = "0.9.0" }
+
 ndk = "0.7" # This version *must* be the same as the version used by android-activity
-android-activity = "0.4" # This verison much match winit
-#once_cell = "1.16" # TODO: replace once_cell with std equivalent if/when this lands: https://github.com/rust-lang/rfcs/pull/2788
+winit = { version = "0.27", features = ["android-native-activity"] }

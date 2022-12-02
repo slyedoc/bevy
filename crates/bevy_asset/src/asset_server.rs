@@ -699,7 +699,7 @@ mod test {
         }
     }
 
-    fn setup(asset_path: impl AsRef<Path>) -> AssetServer {
+    fn setup(asset_path: impl AsRef<Path>) -> AssetServer {        
         use crate::FileAssetIo;
         IoTaskPool::init(Default::default);
         AssetServer::new(FileAssetIo::new(asset_path, false))

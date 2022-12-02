@@ -1,22 +1,34 @@
-# Cargo APK Build
+# Notes
+
+Work in progress, testing for winit 0.8 that will replace ndk-glue with android-activity.
+
+All sound is disabled, will come back to that after resume suspend if working.
+
+# Test commands
+(Assuming from bevy root directory)
+
+Run on device or emulator
 ```
-export ANDROID_NDK_HOME="path/to/ndk"
-export ANDROID_SDK_HOME="path/to/sdk"
+cargo apk run -p android_native_activity
+```
 
-rustup target add aarch64-linux-android
-cargo install cargo-apk
-
-cargo apk run
+Run on desktop
+```
+cargo run -p android_native_activity --features desktop
 ```
 
 # Build Issues
 
-
-Also make sure NDK llvm tools are in your PATH, oboe requires it
+Make sure these are set
 
 ```
-$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+export ANDROID_HOME="path/to/sdk"
 ```
 
+For oboe build, also make sure NDK llvm tools are in your PATH
+
+```
+export PATH="$ANDROID_HOME/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH";
+```
 
 https://github.com/katyo/oboe-rs#build-issues

@@ -1,40 +1,56 @@
 use bevy::{
-    log::*,
-    prelude::*,
-    render::settings::{WgpuSettings, WgpuSettingsPriority},
+    app::AppExit, 
+    log::{Level, LogPlugin},
+    prelude::*
+};
+
+#[cfg(target_os = "android")]
+use bevy::{
+
+    render::settings::{WgpuLimits, WgpuSettings, WgpuSettingsPriority},
+    winit::WinitSettings,
 };
 
 // Notes: I can't figure out anyway to use `bevy_main` to generate the android_main function
 // without using global variable or using conditional parameters in main function which while it
-// works it is not ideal and gives warnings
-
+// works it is not ideal and gives warnings, for now I will just use the android_main function here
+// can see if i can move it too bevy_main later
 #[cfg(target_os = "android")]
 #[no_mangle]
 fn android_main(android_app: bevy::android::AndroidApp) {
-    let mut app = App::new();
-    #[cfg(target_os = "android")]
-    app.insert_non_send_resource(bevy::android::AndroidResource { android_app });
-
-    setup_app(&mut app);
+    //android_logger::init_once(android_logger::Config::default().with_min_level(log::Level::Info));
+    bevy::android::hack_loop(android_app, build_app)
 }
 
+pub fn build_app(app: &mut App) {
+    info!("Starting Build App");
 
-pub fn setup_app( app: &mut App ) {
 
-    // This configures the app to use the most compatible rendering settings.
-    // They help with compatibility with as many devices as possible.
-    app.insert_resource(WgpuSettings {
-        priority: WgpuSettingsPriority::Compatibility,
-        ..default()
-    })
-    .add_plugins(DefaultPlugins.set(LogPlugin {
-        //filter: "android_activity=warn,wgpu=error".to_string(),
-        filter: "android_activity=debug,wgpu=error".to_string(),
+    #[cfg(target_os = "android")]
+    {
+        // Android specific settings
+        app.insert_resource(WinitSettings {
+            return_from_run: false, // TODO
+            ..default()
+        })
+        .insert_resource(WgpuSettings {
+            priority: WgpuSettingsPriority::Compatibility,
+            limits: WgpuLimits {
+                // Was required for my device and emulator
+                max_storage_textures_per_shader_stage: 4,
+                ..default()
+            },
+            ..default()
+        });
+    }
+
+    // Normal App Stuff
+    app.add_plugins(DefaultPlugins.set(LogPlugin {
+        filter: "android_activity=warn,wgpu=warn".to_string(),
         level: Level::INFO,
     }))
     .add_startup_system(setup)
-    .add_system(rotate_camera)
-    .run();
+    .add_system(rotate_camera);
 }
 
 /// set up a simple 3D scene
@@ -68,7 +84,7 @@ fn setup(
         ..default()
     });
 
-    // asset test
+    // Image, test asset server
     commands.spawn(ImageBundle {
         style: Style {
             size: Size::new(Val::Px(50.0), Val::Px(50.0)),
@@ -89,5 +105,13 @@ fn rotate_camera(mut query: Query<&mut Transform, With<Camera>>, time: Res<Time>
     for mut transform in &mut query {
         transform.rotate_around(Vec3::ZERO, Quat::from_rotation_y(time.delta_seconds()));
         transform.look_at(Vec3::ZERO, Vec3::Y);
+    }
+}
+
+#[allow(dead_code)]
+fn exit_soon(mut exit: EventWriter<AppExit>, mut count: Local<usize>) {
+    *count += 1;
+    if *count > 5 {
+        exit.send(AppExit);
     }
 }

@@ -26,11 +26,10 @@ use bevy_window::{
     WindowClosed, WindowCreated, WindowFocused, WindowMoved, WindowResized,
     WindowScaleFactorChanged, Windows,
 };
-
 use winit::{
     dpi::{LogicalPosition, LogicalSize, PhysicalPosition},
     event::{self, DeviceEvent, Event, StartCause, WindowEvent},
-    event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget},
+    event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopWindowTarget},
 };
 
 #[derive(Default)]
@@ -45,22 +44,21 @@ impl Plugin for WinitPlugin {
         #[cfg(target_arch = "wasm32")]
         app.add_plugin(web_resize::CanvasParentResizePlugin);
 
-        #[cfg(target_os = "android")]
-        use winit::platform::android::EventLoopBuilderExtAndroid;
-        #[cfg(target_os = "android")]
-        let android_resource = app
-            .world
-            .get_non_send_resource::<bevy_android::AndroidResource>()
-            .expect("AndroidResource not found");
-        
-        // TODO: Hate that we got to clone the app here
-        #[cfg(target_os = "android")]
-        let event_loop = winit::event_loop::EventLoopBuilder::with_user_event()
-            .with_android_app(android_resource.android_app.to_owned())
-            .build();
+        #[allow(unused_mut)]
+        let mut event_loop_builder = EventLoopBuilder::new();
 
-        #[cfg(not(target_os = "android"))]
-        let event_loop = EventLoop::new();
+        #[cfg(target_os = "android")]
+        {
+            let android_resource = app
+                .world
+                .get_resource::<bevy_android::AndroidResource>()
+                .expect("AndroidResource not found");
+
+            use winit::platform::android::EventLoopBuilderExtAndroid;
+            // TODO: Hate that we got to clone the app here
+            event_loop_builder.with_android_app(android_resource.android_app.to_owned());
+        }
+        let event_loop = event_loop_builder.build();
 
         let mut create_window_reader = WinitCreateWindowReader::default();
 
@@ -285,13 +283,6 @@ fn change_window(
     }
 }
 
-fn run<F>(event_loop: EventLoop<()>, event_handler: F) -> !
-where
-    F: 'static + FnMut(Event<'_, ()>, &EventLoopWindowTarget<()>, &mut ControlFlow),
-{
-    event_loop.run(event_handler)
-}
-
 // TODO: It may be worth moving this cfg into a procedural macro so that it can be referenced by
 // a single name instead of being copied around.
 // https://gist.github.com/jakerr/231dee4a138f7a5f25148ea8f39b382e seems to work.
@@ -302,7 +293,8 @@ where
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    target_os = "android"
 ))]
 fn run_return<F>(event_loop: &mut EventLoop<()>, event_handler: F)
 where
@@ -319,7 +311,8 @@ where
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    target_os = "android"
 )))]
 fn run_return<F>(_event_loop: &mut EventLoop<()>, _event_handler: F)
 where
@@ -356,14 +349,11 @@ struct WinitPersistentState {
     timeout_reached: bool,
     last_update: Instant,
 }
+
 impl Default for WinitPersistentState {
     fn default() -> Self {
         Self {
-            active: if cfg!(target_os = "android") {
-                false
-            } else {
-                true
-            },
+            active: false,            
             low_power_event: false,
             redraw_request_sent: false,
             timeout_reached: false,
@@ -400,6 +390,7 @@ pub fn winit_runner_with(mut app: App) {
                               control_flow: &mut ControlFlow| {
         #[cfg(feature = "trace")]
         let _span = bevy_utils::tracing::info_span!("winit event_handler").entered();
+        info!("Received winit event: {:?}", event);
         match event {
             event::Event::NewEvents(start) => {
                 let winit_config = app.world.resource::<WinitSettings>();
@@ -604,14 +595,14 @@ pub fn winit_runner_with(mut app: App) {
                 });
             }
             event::Event::Suspended => {
-                winit_state.active = false;
-                //info!("Suspended");
+                winit_state.active = false; 
+                
+                #[cfg(target_os = "android")] {
+                    *control_flow = ControlFlow::ExitWithCode(1);
+                }
             }
             event::Event::Resumed => {
                 winit_state.active = true;
-                //info!("Resumed");
-
-
             }
             event::Event::RedrawRequested(_) => {}
             event::Event::MainEventsCleared => {
@@ -622,9 +613,7 @@ pub fn winit_runner_with(mut app: App) {
                         event_loop,
                         &mut create_window_event_reader,
                     );
-
                     let winit_config = app.world.resource::<WinitSettings>();
-
                     let windows = app.world.resource::<Windows>();
                     let focused = windows.iter().any(|w| w.is_focused());
                     match winit_config.update_mode(focused) {
@@ -685,7 +674,7 @@ pub fn winit_runner_with(mut app: App) {
     if return_from_run {
         run_return(&mut event_loop, event_handler);
     } else {
-        run(event_loop, event_handler);
+        event_loop.run(event_handler);
     }
 }
 

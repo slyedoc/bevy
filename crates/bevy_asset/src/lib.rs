@@ -91,7 +91,7 @@ impl Plugin for AssetPlugin {
             let source = WasmAssetIo::new(&self.asset_folder);
         
             #[cfg(target_os = "android")]
-            let asset_manager = app.world.get_non_send_resource_mut::<bevy_android::AndroidResource>()
+            let asset_manager = app.world.get_resource_mut::<bevy_android::AndroidResource>()
                 .expect("AndroidResource not found")
                 .android_app
                 .asset_manager();
