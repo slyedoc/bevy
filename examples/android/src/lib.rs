@@ -101,7 +101,7 @@ fn setup(
             },
             ..default()
         },
-        image: UiImage::new(asset_server.load("icon.png")),
+        image: UiImage::new(asset_server.load("branding/icon.png")),
         ..default()
     });
 }
