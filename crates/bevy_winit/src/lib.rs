@@ -389,8 +389,7 @@ pub fn winit_runner_with(mut app: App) {
                               event_loop: &EventLoopWindowTarget<()>,
                               control_flow: &mut ControlFlow| {
         #[cfg(feature = "trace")]
-        let _span = bevy_utils::tracing::info_span!("winit event_handler").entered();
-        info!("Received winit event: {:?}", event);
+        let _span = bevy_utils::tracing::info_span!("winit event_handler").entered();        
         match event {
             event::Event::NewEvents(start) => {
                 let winit_config = app.world.resource::<WinitSettings>();
