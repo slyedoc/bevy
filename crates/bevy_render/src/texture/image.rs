@@ -144,7 +144,7 @@ impl ImageSampler {
 /// The [`ImagePlugin`](super::ImagePlugin) can be set during app initialization to change the default
 /// image sampler.
 #[derive(Resource, Debug, Clone, Deref, DerefMut)]
-pub struct DefaultImageSampler(pub(crate) Sampler);
+pub struct DefaultImageSampler(pub Sampler);
 
 /// How edges should be handled in texture addressing.
 ///
