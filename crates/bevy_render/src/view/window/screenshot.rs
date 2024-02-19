@@ -179,7 +179,7 @@ pub(crate) fn get_aligned_size(width: u32, height: u32, pixel_size: u32) -> u32 
     height * align_byte_size(width * pixel_size)
 }
 
-pub(crate) fn layout_data(width: u32, height: u32, format: TextureFormat) -> ImageDataLayout {
+pub fn layout_data(width: u32, height: u32, format: TextureFormat) -> ImageDataLayout {
     ImageDataLayout {
         bytes_per_row: if height > 1 {
             // 1 = 1 row
