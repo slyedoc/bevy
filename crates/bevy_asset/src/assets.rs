@@ -273,7 +273,7 @@ pub struct Assets<A: Asset> {
     dense_storage: DenseAssetStorage<A>,
     hash_map: HashMap<Uuid, A>,
     handle_provider: AssetHandleProvider,
-    queued_events: Vec<AssetEvent<A>>,
+    pub queued_events: Vec<AssetEvent<A>>,
 }
 
 impl<A: Asset> Default for Assets<A> {
