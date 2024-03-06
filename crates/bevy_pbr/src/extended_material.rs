@@ -4,8 +4,7 @@ use bevy_render::{
     mesh::MeshVertexBufferLayout,
     render_asset::RenderAssets,
     render_resource::{
-        AsBindGroup, AsBindGroupError, BindGroupLayout, RenderPipelineDescriptor, Shader,
-        ShaderRef, SpecializedMeshPipelineError, UnpreparedBindGroup,
+        AsBindGroup, AsBindGroupError, BindGroupLayout, BufferSlice, RenderPipelineDescriptor, Shader, ShaderRef, SpecializedMeshPipelineError, StageBuffers, UnpreparedBindGroup
     },
     renderer::RenderDevice,
     texture::{FallbackImage, Image},
@@ -149,6 +148,22 @@ impl<B: Material, E: MaterialExtension> AsBindGroup for ExtendedMaterial<B, E> {
         let mut entries = B::bind_group_layout_entries(render_device);
         entries.extend(E::bind_group_layout_entries(render_device));
         entries
+    }
+
+    // TODO: make this optional
+    fn create_staging_buffers(
+        &self,
+        render_device: &RenderDevice,        
+    ) -> StageBuffers {
+        StageBuffers {
+            storage: vec![],
+        }
+    }
+
+    fn map_storage_mappings(
+        &mut self,
+        _staging_buffers: &Vec<(u32, BufferSlice<'_>)>,
+    ) {
     }
 }
 

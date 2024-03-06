@@ -6,11 +6,14 @@ use crate::{
     renderer::RenderDevice,
     texture::FallbackImage,
 };
+use bevy_asset::Handle;
 pub use bevy_render_macros::AsBindGroup;
 use bevy_utils::thiserror::Error;
 use encase::ShaderType;
 use std::ops::Deref;
 use wgpu::{BindGroupEntry, BindGroupLayoutEntry, BindingResource};
+
+use super::BufferSlice;
 
 define_atomic_id!(BindGroupId);
 render_resource_wrapper!(ErasedBindGroup, wgpu::BindGroup);
@@ -339,6 +342,23 @@ pub trait AsBindGroup {
     fn bind_group_layout_entries(render_device: &RenderDevice) -> Vec<BindGroupLayoutEntry>
     where
         Self: Sized;
+
+    /// Creates cpu staging buffers, should be used to read back data from the gpu.
+    fn create_staging_buffers(&self, render_device: &RenderDevice) -> StageBuffers
+    where
+        Self: Sized;
+
+    fn image_handles(&self) -> Vec<Handle<Image>>
+    where
+        Self: Sized,
+    {
+        vec![]
+    }
+
+    /// Maps the staging buffer slices to Self
+    fn map_storage_mappings(&mut self, staging_buffers: &Vec<(u32, BufferSlice<'_>)>)
+    where
+        Self: Sized;
 }
 
 /// An error that occurs during [`AsBindGroup::as_bind_group`] calls.
@@ -360,6 +380,11 @@ pub struct PreparedBindGroup<T> {
 pub struct UnpreparedBindGroup<T> {
     pub bindings: Vec<(u32, OwnedBindingResource)>,
     pub data: T,
+}
+
+/// a map of staging buffers, keyed by the target binding index, and a list of images that need staging buffers
+pub struct StageBuffers {
+    pub storage: Vec<(u32, Buffer)>,
 }
 
 /// An owned binding resource of any type (ex: a [`Buffer`], [`TextureView`], etc).

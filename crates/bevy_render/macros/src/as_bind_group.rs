@@ -3,10 +3,7 @@ use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::{quote, ToTokens};
 use syn::{
-    parse::{Parse, ParseStream},
-    punctuated::Punctuated,
-    token::Comma,
-    Data, DataStruct, Error, Fields, LitInt, LitStr, Meta, MetaList, Result,
+    parse::{Parse, ParseStream}, punctuated::Punctuated, token::Comma, Data, DataStruct, Error, Fields, GenericArgument, LitInt, LitStr, Meta, MetaList, PathArguments, Result, Type
 };
 
 const UNIFORM_ATTRIBUTE_NAME: Symbol = Symbol("uniform");
@@ -42,9 +39,13 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
     let manifest = BevyManifest::default();
     let render_path = manifest.get_path("bevy_render");
     let asset_path = manifest.get_path("bevy_asset");
+    let core_path = manifest.get_path("bevy_core");
 
     let mut binding_states: Vec<BindingState> = Vec::new();
     let mut binding_impls = Vec::new();
+    let mut staging_storage_impls = Vec::new();
+    let mut staging_mappings = Vec::new();
+    let mut staging_handles = Vec::new();
     let mut binding_layouts = Vec::new();
     let mut attr_prepared_data_ident = None;
 
@@ -206,6 +207,7 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                         visibility,
                         read_only,
                         buffer,
+                        staging,
                     } = get_storage_binding_attr(nested_meta_items)?;
                     let visibility =
                         visibility.hygienic_quote(&quote! { #render_path::render_resource });
@@ -229,6 +231,12 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                             )
                         });
                     } else {
+                        
+                        let usage = if staging {
+                            quote! { #render_path::render_resource::BufferUsages::COPY_SRC | #render_path::render_resource::BufferUsages::COPY_DST | #render_path::render_resource::BufferUsages::STORAGE }
+                        } else {
+                            quote! { #render_path::render_resource::BufferUsages::COPY_DST | #render_path::render_resource::BufferUsages::STORAGE }
+                        };
                         binding_impls.push(quote! {{
                             use #render_path::render_resource::AsBindGroupShaderType;
                             let mut buffer = #render_path::render_resource::encase::StorageBuffer::new(Vec::new());
@@ -238,12 +246,41 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                                 #render_path::render_resource::OwnedBindingResource::Buffer(render_device.create_buffer_with_data(
                                     &#render_path::render_resource::BufferInitDescriptor {
                                         label: None,
-                                        usage: #render_path::render_resource::BufferUsages::COPY_DST | #render_path::render_resource::BufferUsages::STORAGE,
+                                        usage: #usage,
                                         contents: buffer.as_ref(),
                                     },
                                 ))
                             )
                         }});
+
+                        // Add staging buffers for Storage
+                        if staging {
+                            // TODO: this is a bit of a mess
+                            let size = match is_vec_type(&field.ty) {
+                                Some(t) => quote! { self.#field_name.len() as u64 * <#t as #render_path::render_resource::ShaderType>::min_size().get() },
+                                None => quote! { <#field_ty as #render_path::render_resource::ShaderType>::min_size().get() },
+                            };
+
+                            staging_storage_impls.push(quote! {
+                                (
+                                    #binding_index,                                    
+                                    render_device.create_buffer(&#render_path::render_resource::BufferDescriptor {
+                                        label: None,
+                                        usage: #render_path::render_resource::BufferUsages::COPY_DST
+                                            | #render_path::render_resource::BufferUsages::MAP_READ,
+                                        size: #size,
+                                        mapped_at_creation: false,
+                                    })                                
+                                )                                
+                            });
+
+                            staging_mappings.push(quote! {{
+                                let buffer_slice = &buffer_slices.iter().find(|(i, _)| i == &#binding_index).unwrap().1;
+                                let data = buffer_slice.get_mapped_range();
+                                self.#field_name = #core_path::cast_slice(&data).to_vec();
+                                //drop(data);
+                            }});
+                        }
                     }
 
                     binding_layouts.push(quote! {
@@ -265,6 +302,7 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                         image_format,
                         access,
                         visibility,
+                        staging,
                     } = get_storage_texture_binding_attr(nested_meta_items)?;
 
                     let visibility =
@@ -297,6 +335,16 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                             count: None,
                         }
                     });
+
+                    // Add staging buffers for StorageTexture
+                    if staging {
+                        staging_handles.push(quote! {
+                            {                                    
+                                let handle: Option<&#asset_path::Handle<#render_path::texture::Image>> = (&self.#field_name).into();
+                                handle.unwrap().clone()
+                            }
+                        });
+                    }
                 }
                 BindingType::Texture => {
                     let TextureAttrs {
@@ -304,6 +352,7 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                         sample_type,
                         multisampled,
                         visibility,
+                        staging,
                     } = tex_attrs.as_ref().unwrap();
 
                     let visibility =
@@ -337,6 +386,17 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
                             count: None,
                         }
                     });
+
+                    // Add staging buffers for texture
+                    // think we can treat this same as storage texture, just render handle and all logic will be same
+                    if *staging {                        
+                        staging_handles.push(quote! {
+                            {                                    
+                                let handle: Option<&#asset_path::Handle<#render_path::texture::Image>> = (&self.#field_name).into();
+                                handle.unwrap().clone()
+                            }
+                        });
+                    }
                 }
                 BindingType::Sampler => {
                     let SamplerAttrs {
@@ -509,6 +569,32 @@ pub fn derive_as_bind_group(ast: syn::DeriveInput) -> Result<TokenStream> {
             fn bind_group_layout_entries(render_device: &#render_path::renderer::RenderDevice) -> Vec<#render_path::render_resource::BindGroupLayoutEntry> {
                 vec![#(#binding_layouts,)*]
             }
+            
+            fn create_staging_buffers(
+                &self,                
+                render_device: &#render_path::renderer::RenderDevice,                
+            ) -> #render_path::render_resource::StageBuffers
+            {
+                use #render_path::render_resource::AsBindGroupShaderType;                
+                                
+                #render_path::render_resource::StageBuffers {
+                    storage: vec![#(#staging_storage_impls,)*],
+                }
+            }
+
+            fn image_handles(
+                &self             
+            ) -> Vec<#asset_path::Handle<#render_path::texture::Image>>
+            {                
+                vec![#(#staging_handles,)*]                
+            }
+
+            fn map_storage_mappings(
+                &mut self,
+               buffer_slices: &Vec<(u32, #render_path::render_resource::BufferSlice<'_>)>,
+           ) {
+                #(#staging_mappings)*
+           }
         }
     }))
 }
@@ -776,6 +862,7 @@ struct TextureAttrs {
     sample_type: BindingTextureSampleType,
     multisampled: bool,
     visibility: ShaderStageVisibility,
+    staging: bool,
 }
 
 impl Default for BindingTextureSampleType {
@@ -791,6 +878,7 @@ impl Default for TextureAttrs {
             sample_type: Default::default(),
             multisampled: true,
             visibility: Default::default(),
+            staging: false,
         }
     }
 }
@@ -804,6 +892,7 @@ struct StorageTextureAttrs {
     // which will error if the access is not member of the StorageTextureAccess enum.
     access: proc_macro2::TokenStream,
     visibility: ShaderStageVisibility,
+    staging: bool,
 }
 
 impl Default for StorageTextureAttrs {
@@ -813,6 +902,7 @@ impl Default for StorageTextureAttrs {
             image_format: quote! { Rgba8Unorm },
             access: quote! { ReadWrite },
             visibility: ShaderStageVisibility::compute(),
+            staging: false,
         }
     }
 }
@@ -821,7 +911,7 @@ fn get_storage_texture_binding_attr(metas: Vec<Meta>) -> Result<StorageTextureAt
     let mut storage_texture_attrs = StorageTextureAttrs::default();
 
     for meta in metas {
-        use syn::Meta::{List, NameValue};
+        use syn::Meta::{List, NameValue, Path};
         match meta {
             // Parse #[storage_texture(0, dimension = "...")].
             NameValue(m) if m.path == DIMENSION => {
@@ -839,6 +929,10 @@ fn get_storage_texture_binding_attr(metas: Vec<Meta>) -> Result<StorageTextureAt
             // Parse #[storage_texture(0, visibility(...))].
             List(m) if m.path == VISIBILITY => {
                 storage_texture_attrs.visibility = get_visibility_flag_value(&m)?;
+            }
+            // Parse #[storage_texture(0, staging))].
+            Path(m) if m == STAGING => {
+                storage_texture_attrs.staging = true;
             }
             NameValue(m) => {
                 return Err(Error::new_spanned(
@@ -885,11 +979,12 @@ fn get_texture_attrs(metas: Vec<Meta>) -> Result<TextureAttrs> {
     let mut multisampled = Default::default();
     let mut filterable = None;
     let mut filterable_ident = None;
+    let mut staging = false;
 
     let mut visibility = ShaderStageVisibility::vertex_fragment();
 
     for meta in metas {
-        use syn::Meta::{List, NameValue};
+        use syn::Meta::{List, NameValue, Path};
         match meta {
             // Parse #[texture(0, dimension = "...")].
             NameValue(m) if m.path == DIMENSION => {
@@ -914,6 +1009,10 @@ fn get_texture_attrs(metas: Vec<Meta>) -> Result<TextureAttrs> {
             List(m) if m.path == VISIBILITY => {
                 visibility = get_visibility_flag_value(&m)?;
             }
+            Path(path) if path == STAGING => {
+                staging = true;
+            }
+
             NameValue(m) => {
                 return Err(Error::new_spanned(
                     m.path,
@@ -951,6 +1050,7 @@ fn get_texture_attrs(metas: Vec<Meta>) -> Result<TextureAttrs> {
         sample_type,
         multisampled,
         visibility,
+        staging,
     })
 }
 
@@ -1069,15 +1169,18 @@ struct StorageAttrs {
     visibility: ShaderStageVisibility,
     read_only: bool,
     buffer: bool,
+    staging: bool,
 }
 
 const READ_ONLY: Symbol = Symbol("read_only");
 const BUFFER: Symbol = Symbol("buffer");
+const STAGING: Symbol = Symbol("staging");
 
 fn get_storage_binding_attr(metas: Vec<Meta>) -> Result<StorageAttrs> {
     let mut visibility = ShaderStageVisibility::vertex_fragment();
     let mut read_only = false;
     let mut buffer = false;
+    let mut staging = false;
 
     for meta in metas {
         use syn::{Meta::List, Meta::Path};
@@ -1092,6 +1195,9 @@ fn get_storage_binding_attr(metas: Vec<Meta>) -> Result<StorageAttrs> {
             Path(path) if path == BUFFER => {
                 buffer = true;
             }
+            Path(path) if path == STAGING => {
+                staging = true;
+            }
             _ => {
                 return Err(Error::new_spanned(
                     meta,
@@ -1105,5 +1211,27 @@ fn get_storage_binding_attr(metas: Vec<Meta>) -> Result<StorageAttrs> {
         visibility,
         read_only,
         buffer,
+        staging,
     })
+}
+
+/// Checks if the given type is a `Vec<T>` and returns `Some(T)` if it is,
+/// or `None` otherwise.
+fn is_vec_type(ty: &Type) -> Option<syn::Type> {
+    if let Type::Path(type_path) = ty {
+        // Check if the path ends with "Vec"
+        if let Some(last_segment) = type_path.path.segments.last() {
+            if last_segment.ident == "Vec" {
+                // Check if there is exactly one generic argument, which should be `T`
+                if let PathArguments::AngleBracketed(angle_bracketed_param) = &last_segment.arguments {
+                    if angle_bracketed_param.args.len() == 1 {
+                        if let Some(GenericArgument::Type(ty)) = angle_bracketed_param.args.first() {
+                            return Some(ty.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }

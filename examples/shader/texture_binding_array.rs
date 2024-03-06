@@ -169,6 +169,22 @@ impl AsBindGroup for BindlessMaterial {
             },
         ]
     }
+
+    //TODO:  make this optional or new trait?
+    fn create_staging_buffers(
+        &self,
+        _: &RenderDevice,
+    ) -> StageBuffers {
+        StageBuffers {
+            storage: vec![],
+        }
+    }
+
+    fn map_storage_mappings(
+        &mut self,
+        _: &Vec<(u32, BufferSlice<'_>)>,
+    ) {
+    }
 }
 
 impl Material for BindlessMaterial {
