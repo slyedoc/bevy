@@ -179,6 +179,10 @@ impl Image {
                 ImageBuffer::from_raw(self.width(), self.height(), self.data)
                     .map(DynamicImage::ImageLumaA8)
             }
+            TextureFormat::Rgba8Unorm => {
+                ImageBuffer::from_raw(self.width(), self.height(), self.data)
+                    .map(DynamicImage::ImageRgba8)
+            }
             TextureFormat::Rgba8UnormSrgb => {
                 ImageBuffer::from_raw(self.width(), self.height(), self.data)
                     .map(DynamicImage::ImageRgba8)
