@@ -6,7 +6,7 @@ use bevy_render::{
     camera::Camera,
     color::Color,
     mesh::Mesh,
-    primitives::{CascadesFrusta, CubemapFrusta, Frustum},
+    primitives::{CascadesFrusta, CubemapFrusta, Frustum, HalfSpace},
     render_asset::RenderAssets,
     render_graph::{Node, NodeRunError, RenderGraphContext},
     render_phase::*,
@@ -29,30 +29,30 @@ use crate::*;
 
 #[derive(Component)]
 pub struct ExtractedPointLight {
-    color: Color,
+    pub color: Color,
     /// luminous intensity in lumens per steradian
-    intensity: f32,
-    range: f32,
-    radius: f32,
-    transform: GlobalTransform,
-    shadows_enabled: bool,
-    shadow_depth_bias: f32,
-    shadow_normal_bias: f32,
-    spot_light_angles: Option<(f32, f32)>,
+    pub intensity: f32,
+    pub range: f32,
+    pub radius: f32,
+    pub transform: GlobalTransform,
+    pub shadows_enabled: bool,
+    pub shadow_depth_bias: f32,
+    pub shadow_normal_bias: f32,
+    pub spot_light_angles: Option<(f32, f32)>,
 }
 
 #[derive(Component, Debug)]
 pub struct ExtractedDirectionalLight {
-    color: Color,
-    illuminance: f32,
-    transform: GlobalTransform,
-    shadows_enabled: bool,
-    shadow_depth_bias: f32,
-    shadow_normal_bias: f32,
-    cascade_shadow_config: CascadeShadowConfig,
-    cascades: EntityHashMap<Vec<Cascade>>,
-    frusta: EntityHashMap<Vec<Frustum>>,
-    render_layers: RenderLayers,
+    pub color: Color,
+    pub illuminance: f32,
+    pub transform: GlobalTransform,
+    pub shadows_enabled: bool,
+    pub shadow_depth_bias: f32,
+    pub shadow_normal_bias: f32,
+    pub cascade_shadow_config: CascadeShadowConfig,
+    pub cascades: EntityHashMap<Vec<Cascade>>,
+    pub frusta: EntityHashMap<Vec<Frustum>>,
+    pub render_layers: RenderLayers,
 }
 
 #[derive(Copy, Clone, ShaderType, Default, Debug)]
@@ -1145,7 +1145,7 @@ pub fn prepare_lights(
                 .unwrap()
                 .iter()
                 .take(MAX_CASCADES_PER_LIGHT);
-            for (cascade_index, ((cascade, frusta), bound)) in cascades
+            for (cascade_index, ((cascade, frustum), bound)) in cascades
                 .zip(frusta)
                 .zip(&light.cascade_shadow_config.bounds)
                 .enumerate()
@@ -1172,6 +1172,11 @@ pub fn prepare_lights(
                         });
                 directional_depth_texture_array_index += 1;
 
+                let mut frustum = *frustum;
+                // Push the near clip plane out to infinity for directional lights
+                frustum.half_spaces[4] =
+                    HalfSpace::new(frustum.half_spaces[4].normal().extend(f32::INFINITY));
+
                 let view_light_entity = commands
                     .spawn((
                         ShadowView {
@@ -1192,7 +1197,7 @@ pub fn prepare_lights(
                             hdr: false,
                             color_grading: Default::default(),
                         },
-                       *frusta,
+                        frustum,
                         RenderPhase::<Shadow>::default(),
                         LightEntity::Directional {
                             light_entity,
@@ -1210,16 +1215,20 @@ pub fn prepare_lights(
                 .create_view(&TextureViewDescriptor {
                     label: Some("point_light_shadow_map_array_texture_view"),
                     format: None,
-                    #[cfg(any(
-                        not(feature = "webgl"),
-                        not(target_arch = "wasm32"),
-                        feature = "webgpu"
+                    // NOTE: iOS Simulator is missing CubeArray support so we use Cube instead.
+                    // See https://github.com/bevyengine/bevy/pull/12052 - remove if support is added.
+                    #[cfg(all(
+                        not(ios_simulator),
+                        any(
+                            not(feature = "webgl"),
+                            not(target_arch = "wasm32"),
+                            feature = "webgpu"
+                        )
                     ))]
                     dimension: Some(TextureViewDimension::CubeArray),
-                    #[cfg(all(
-                        feature = "webgl",
-                        target_arch = "wasm32",
-                        not(feature = "webgpu")
+                    #[cfg(any(
+                        ios_simulator,
+                        all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu"))
                     ))]
                     dimension: Some(TextureViewDimension::Cube),
                     aspect: TextureAspect::DepthOnly,
