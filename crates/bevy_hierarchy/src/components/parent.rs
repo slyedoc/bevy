@@ -23,7 +23,7 @@ use std::ops::Deref;
 #[derive(Component, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 #[cfg_attr(feature = "reflect", reflect(Component, MapEntities, PartialEq))]
-pub struct Parent(pub(crate) Entity);
+pub struct Parent(pub Entity);
 
 impl Parent {
     /// Gets the [`Entity`] ID of the parent.
