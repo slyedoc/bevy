@@ -83,7 +83,8 @@ use crate::{
     },
     skybox::SkyboxPlugin,
     tonemapping::TonemappingNode,
-    upscaling::UpscalingNode,
+    upscaling::UpscalingNode, 
+    space_skybox::SpaceSkybox,
 };
 
 use self::graph::{Core3d, Node3d};
@@ -96,7 +97,11 @@ impl Plugin for Core3dPlugin {
             .register_type::<Camera3dDepthLoadOp>()
             .register_type::<Camera3dDepthTextureUsage>()
             .register_type::<ScreenSpaceTransmissionQuality>()
-            .add_plugins((SkyboxPlugin, ExtractComponentPlugin::<Camera3d>::default()))
+            .add_plugins((
+                SpaceSkyboxPlugin,
+                SkyboxPlugin,
+                 ExtractComponentPlugin::<Camera3d>::default()
+            ))
             .add_systems(PostUpdate, check_msaa);
 
         let Ok(render_app) = app.get_sub_app_mut(RenderApp) else {
