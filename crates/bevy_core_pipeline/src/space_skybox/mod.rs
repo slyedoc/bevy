@@ -1,20 +1,29 @@
-use bevy::{
-    asset::load_internal_asset,
-    ecs::query::QueryItem,
-    prelude::*,
-    reflect::TypePath,
-    render::{
-        camera::Exposure,
-        extract_component::*,
-        render_asset::RenderAssets,
-        render_resource::{binding_types::*, *},
-        renderer::RenderDevice,
-        texture::BevyDefault,
-        view::*,
-        Render, RenderApp, RenderSet,
+use bevy_app::{App, Plugin};
+use bevy_asset::{load_internal_asset, Handle};
+use bevy_ecs::{
+    prelude::{Component, Entity},
+    query::{QueryItem, With},
+    schedule::IntoSystemConfigs,
+    system::{Commands, Query, Res, ResMut, Resource},
+};
+use bevy_render::{
+    camera::Exposure,
+    extract_component::{
+        ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
+        UniformComponentPlugin,
     },
+    render_asset::RenderAssets,
+    render_resource::{
+        binding_types::{sampler, texture_cube, uniform_buffer},
+        *,
+    },
+    renderer::RenderDevice,
+    texture::{BevyDefault, Image},
+    view::{ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniforms},
+    Render, RenderApp, RenderSet,
 };
 
+use crate::core_3d::CORE_3D_DEPTH_FORMAT;
 
 const SKYBOX_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(5052371412819132759);
 
@@ -194,7 +203,7 @@ fn prepare_skybox_pipelines(
             SpaceSkyboxPipelineKey {
                 hdr: view.hdr,
                 samples: msaa.samples(),
-                depth_format: bevy::core_pipeline::core_3d::CORE_3D_DEPTH_FORMAT,
+                depth_format: CORE_3D_DEPTH_FORMAT,
             },
         );
 

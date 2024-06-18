@@ -84,7 +84,7 @@ use crate::{
     skybox::SkyboxPlugin,
     tonemapping::TonemappingNode,
     upscaling::UpscalingNode, 
-    space_skybox::SpaceSkybox,
+    space_skybox::SpaceSkyboxPlugin,
 };
 
 use self::graph::{Core3d, Node3d};
