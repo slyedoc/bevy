@@ -1,7 +1,6 @@
 use crate::{
     core_3d::Opaque3d,
     skybox::{SkyboxBindGroup, SkyboxPipelineId},
-    space_skybox::{self, SpaceSkyboxBindGroup, SpaceSkyboxPipelineId},
 };
 use bevy_ecs::{prelude::World, query::QueryItem};
 use bevy_render::{
@@ -29,8 +28,6 @@ impl ViewNode for MainOpaquePass3dNode {
         &'static ViewDepthTexture,
         Option<&'static SkyboxPipelineId>,
         Option<&'static SkyboxBindGroup>,
-        Option<&'static SpaceSkyboxPipelineId>,
-        Option<&'static SpaceSkyboxBindGroup>,
         &'static ViewUniformOffset,
     );
 
@@ -46,8 +43,8 @@ impl ViewNode for MainOpaquePass3dNode {
             depth,
             skybox_pipeline,
             skybox_bind_group,
-            space_skybox_pipeline,
-            space_skybox_bind_group,
+            // space_skybox_pipeline,
+            // space_skybox_bind_group,
             view_uniform_offset,
         ): QueryItem<'w, Self::ViewQuery>,
         world: &'w World,
@@ -110,20 +107,20 @@ impl ViewNode for MainOpaquePass3dNode {
             }
 
             // Skybox draw using a fullscreen triangle
-            if let (Some(space_skybox_pipeline), Some(SpaceSkyboxBindGroup(space_skybox_bind_group))) =
-                (space_skybox_pipeline, space_skybox_bind_group)
-            {
-                let pipeline_cache = world.resource::<PipelineCache>();
-                if let Some(pipeline) = pipeline_cache.get_render_pipeline(space_skybox_pipeline.0) {
-                    render_pass.set_render_pipeline(pipeline);
-                    render_pass.set_bind_group(
-                        0,
-                        &space_skybox_bind_group.0,
-                        &[view_uniform_offset.offset, space_skybox_bind_group.1],
-                    );
-                    render_pass.draw(0..3, 0..1);
-                }
-            }
+            // if let (Some(space_skybox_pipeline), Some(SpaceSkyboxBindGroup(space_skybox_bind_group))) =
+            //     (space_skybox_pipeline, space_skybox_bind_group)
+            // {
+            //     let pipeline_cache = world.resource::<PipelineCache>();
+            //     if let Some(pipeline) = pipeline_cache.get_render_pipeline(space_skybox_pipeline.0) {
+            //         render_pass.set_render_pipeline(pipeline);
+            //         render_pass.set_bind_group(
+            //             0,
+            //             &space_skybox_bind_group.0,
+            //             &[view_uniform_offset.offset, space_skybox_bind_group.1],
+            //         );
+            //         render_pass.draw(0..3, 0..1);
+            //     }
+            // }
 
             drop(render_pass);
             command_encoder.finish()

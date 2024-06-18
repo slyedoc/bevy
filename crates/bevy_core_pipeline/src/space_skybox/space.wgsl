@@ -2,13 +2,14 @@
 #import bevy_pbr::utils::coords_to_viewport_uv
 
 struct SkyboxUniforms {
+    background: vec4<f32>,
 	brightness: f32,
 }
 
-@group(0) @binding(0) var skybox: texture_cube<f32>;
-@group(0) @binding(1) var skybox_sampler: sampler;
-@group(0) @binding(2) var<uniform> view: View;
-@group(0) @binding(3) var<uniform> uniforms: SkyboxUniforms;
+//@group(0) @binding(0) var skybox: texture_cube<f32>;
+//@group(0) @binding(1) var skybox_sampler: sampler;
+@group(0) @binding(0) var<uniform> view: View;
+@group(0) @binding(1) var<uniform> uniforms: SkyboxUniforms;
 
 // struct View {
 //     view_proj: mat4x4<f32>,
@@ -120,11 +121,11 @@ fn skybox_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let ray_direction = coords_to_ray_direction(in.position.xy, view.viewport);
     
     //let uv = mesh.uv * 100.0; // Scale UV coordinates
-    //let distance = voronoi(ray_direction.xy * 10.0); // Generate a distance field
+    let distance = voronoi(ray_direction.xy * 10.0); // Generate a distance field
 
     // Color ramp: white if distance is low (star), black otherwise (space)
     let star_color = vec3<f32>(1.0, 1.0, 1.0);
-    let space_color = vec3<f32>(0.0, 0.0, 0.0);
+    let space_color = uniforms.background.xyz;
 
     // Generate a random value for the current UV coordinates
     let rand_value = random2(ray_direction.xz);

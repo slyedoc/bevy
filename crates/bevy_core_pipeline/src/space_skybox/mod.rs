@@ -8,22 +8,22 @@ use bevy_ecs::{
 };
 use bevy_render::{
     camera::Exposure,
+    color::Color,
     extract_component::{
         ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
         UniformComponentPlugin,
     },
-    render_asset::RenderAssets,
-    render_resource::{
-        binding_types::{sampler, texture_cube, uniform_buffer},
-        *,
-    },
+    render_resource::*,
     renderer::RenderDevice,
-    texture::{BevyDefault, Image},
+    texture::BevyDefault,
     view::{ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniforms},
     Render, RenderApp, RenderSet,
 };
 
-use crate::core_3d::CORE_3D_DEPTH_FORMAT;
+use crate::{
+    core_3d::CORE_3D_DEPTH_FORMAT,
+    skybox::{SkyboxBindGroup, SkyboxPipelineId, SkyboxPipelineKey},
+};
 
 const SKYBOX_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(5052371412819132759);
 
@@ -66,16 +66,26 @@ impl Plugin for SpaceSkyboxPlugin {
 
 #[derive(Component, Clone)]
 pub struct SpaceSkybox {
-    pub image: Handle<Image>,
+    pub background: Color,
     /// Scale factor applied to the skybox image.
     /// After applying this multiplier to the image samples, the resulting values should
     /// be in units of [cd/m^2](https://en.wikipedia.org/wiki/Candela_per_square_metre).
     pub brightness: f32,
 }
 
+impl Default for SpaceSkybox {
+    fn default() -> Self {
+        Self {
+            background: Color::rgb(0.5, 0.5, 0.5),
+            brightness: 1.0,
+        }
+    }
+}
+
 // TODO: Replace with a push constant once WebGPU gets support for that
 #[derive(Component, ShaderType, Clone)]
 pub struct SpaceSkyboxUniforms {
+    background: Color,
     brightness: f32,
 }
 
@@ -92,6 +102,7 @@ impl ExtractComponent for SpaceSkybox {
         Some((
             skybox.clone(),
             SpaceSkyboxUniforms {
+                background: skybox.background,
                 brightness: skybox.brightness * exposure,
             },
         ))
@@ -111,11 +122,11 @@ impl SpaceSkyboxPipeline {
                 &BindGroupLayoutEntries::sequential(
                     ShaderStages::FRAGMENT,
                     (
-                        texture_cube(TextureSampleType::Float { filterable: true }),
-                        sampler(SamplerBindingType::Filtering),
-                        uniform_buffer::<ViewUniform>(true)
+                        //binding_types::texture_cube(TextureSampleType::Float { filterable: true }),
+                        //binding_types::sampler(SamplerBindingType::Filtering),
+                        binding_types::uniform_buffer::<ViewUniform>(true)
                             .visibility(ShaderStages::VERTEX_FRAGMENT),
-                        uniform_buffer::<SpaceSkyboxUniforms>(true),
+                        binding_types::uniform_buffer::<SpaceSkyboxUniforms>(true),
                     ),
                 ),
             ),
@@ -123,15 +134,8 @@ impl SpaceSkyboxPipeline {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
-pub(super) struct SpaceSkyboxPipelineKey {
-    hdr: bool,
-    samples: u32,
-    depth_format: TextureFormat,
-}
-
 impl SpecializedRenderPipeline for SpaceSkyboxPipeline {
-    type Key = SpaceSkyboxPipelineKey;
+    type Key = SkyboxPipelineKey;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         RenderPipelineDescriptor {
@@ -185,9 +189,6 @@ impl SpecializedRenderPipeline for SpaceSkyboxPipeline {
     }
 }
 
-#[derive(Component)]
-pub struct SpaceSkyboxPipelineId(pub CachedRenderPipelineId);
-
 fn prepare_skybox_pipelines(
     mut commands: Commands,
     pipeline_cache: Res<PipelineCache>,
@@ -200,7 +201,7 @@ fn prepare_skybox_pipelines(
         let pipeline_id = pipelines.specialize(
             &pipeline_cache,
             &pipeline,
-            SpaceSkyboxPipelineKey {
+            SkyboxPipelineKey {
                 hdr: view.hdr,
                 samples: msaa.samples(),
                 depth_format: CORE_3D_DEPTH_FORMAT,
@@ -209,19 +210,16 @@ fn prepare_skybox_pipelines(
 
         commands
             .entity(entity)
-            .insert(SpaceSkyboxPipelineId(pipeline_id));
+            .insert(SkyboxPipelineId(pipeline_id));
     }
 }
-
-#[derive(Component)]
-pub struct SpaceSkyboxBindGroup(pub (BindGroup, u32));
 
 fn prepare_skybox_bind_groups(
     mut commands: Commands,
     pipeline: Res<SpaceSkyboxPipeline>,
     view_uniforms: Res<ViewUniforms>,
     skybox_uniforms: Res<ComponentUniforms<SpaceSkyboxUniforms>>,
-    images: Res<RenderAssets<Image>>,
+    //images: Res<RenderAssets<Image>>,
     render_device: Res<RenderDevice>,
     views: Query<(
         Entity,
@@ -229,9 +227,9 @@ fn prepare_skybox_bind_groups(
         &DynamicUniformIndex<SpaceSkyboxUniforms>,
     )>,
 ) {
-    for (entity, skybox, skybox_uniform_index) in &views {
-        if let (Some(skybox), Some(view_uniforms), Some(skybox_uniforms)) = (
-            images.get(&skybox.image),
+    for (entity, _skybox, skybox_uniform_index) in &views {
+        if let (Some(view_uniforms), Some(skybox_uniforms)) = (
+            //images.get(&skybox.image),
             view_uniforms.uniforms.binding(),
             skybox_uniforms.binding(),
         ) {
@@ -239,17 +237,16 @@ fn prepare_skybox_bind_groups(
                 "skybox_bind_group",
                 &pipeline.bind_group_layout,
                 &BindGroupEntries::sequential((
-                    &skybox.texture_view,
-                    &skybox.sampler,
+                    //&skybox.texture_view,
+                    //&skybox.sampler,
                     view_uniforms,
                     skybox_uniforms,
                 )),
             );
 
-            commands.entity(entity).insert(SpaceSkyboxBindGroup((
-                bind_group,
-                skybox_uniform_index.index(),
-            )));
+            commands
+                .entity(entity)
+                .insert(SkyboxBindGroup((bind_group, skybox_uniform_index.index())));
         }
     }
 }
