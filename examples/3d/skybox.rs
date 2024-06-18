@@ -5,8 +5,7 @@ mod camera_controller;
 
 use bevy::{
     asset::LoadState,
-    core_pipeline::{Skybox, SpaceSkybox},
-    input::keyboard,
+    core_pipeline::Skybox,    
     prelude::*,
     render::{
         render_resource::{TextureViewDescriptor, TextureViewDimension},
@@ -44,7 +43,6 @@ fn main() {
         .add_systems(
             Update,
             (
-                toggle_skybox,
                 cycle_cubemap_asset,
                 asset_loaded.after(cycle_cubemap_asset),
                 animate_light_direction,
@@ -101,34 +99,6 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     });
 }
 
-fn toggle_skybox(
-    mut commands: Commands,
-    keys: Res<ButtonInput<KeyCode>>,
-    query: Query<Entity, With<Camera>>,
-    mut local: Local<bool>,
-    cubemap: Res<Cubemap>,
-) {
-    if keys.just_pressed(KeyCode::Space) {
-        for entity in &mut query.iter() {
-            if *local {
-                commands
-                    .entity(entity)
-                    .insert(Skybox {
-                        image: cubemap.image_handle.clone(),
-                        brightness: 1.0,
-                    })
-                    .remove::<SpaceSkybox>();
-            } else {
-                commands
-                    .entity(entity)
-                    .remove::<Skybox>()
-                    .insert(SpaceSkybox::default());
-            }
-        }
-
-        *local = !*local;
-    }
-}
 const CUBEMAP_SWAP_DELAY: f32 = 3.0;
 
 fn cycle_cubemap_asset(

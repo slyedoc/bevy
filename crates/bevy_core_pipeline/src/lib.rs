@@ -17,8 +17,7 @@ mod space_skybox;
 pub mod tonemapping;
 pub mod upscaling;
 
-pub use skybox::Skybox;
-pub use space_skybox::SpaceSkybox;
+pub use skybox::{Skybox, SkyboxPipelineId, SkyboxPipelineKey};
 
 /// Experimental features that are not yet finished. Please report any issues you encounter!
 pub mod experimental {
