@@ -13,11 +13,10 @@ pub mod msaa_writeback;
 pub mod prepass;
 mod skybox;
 mod taa;
-mod space_skybox;
 pub mod tonemapping;
 pub mod upscaling;
 
-pub use skybox::{Skybox, SkyboxPipelineId, SkyboxPipelineKey};
+pub use skybox::{Skybox, SkyboxBindGroup, SkyboxPipelineId, SkyboxPipelineKey};
 
 /// Experimental features that are not yet finished. Please report any issues you encounter!
 pub mod experimental {

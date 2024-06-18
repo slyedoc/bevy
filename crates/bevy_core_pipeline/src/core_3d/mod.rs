@@ -83,8 +83,7 @@ use crate::{
     },
     skybox::SkyboxPlugin,
     tonemapping::TonemappingNode,
-    upscaling::UpscalingNode, 
-    space_skybox::SpaceSkyboxPlugin,
+    upscaling::UpscalingNode,
 };
 
 use self::graph::{Core3d, Node3d};
@@ -98,7 +97,6 @@ impl Plugin for Core3dPlugin {
             .register_type::<Camera3dDepthTextureUsage>()
             .register_type::<ScreenSpaceTransmissionQuality>()
             .add_plugins((
-                SpaceSkyboxPlugin,
                 SkyboxPlugin,
                  ExtractComponentPlugin::<Camera3d>::default()
             ))
