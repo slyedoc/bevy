@@ -146,6 +146,8 @@ pub struct SkyboxPipelineKey {
     pub hdr: bool,
     pub samples: u32,
     pub depth_format: TextureFormat,
+    // needed way to extend the key
+    pub unique: u8,
 }
 
 impl SpecializedRenderPipeline for SkyboxPipeline {
@@ -222,6 +224,7 @@ fn prepare_skybox_pipelines(
                 hdr: view.hdr,
                 samples: msaa.samples(),
                 depth_format: CORE_3D_DEPTH_FORMAT,
+                unique: 0,
             },
         );
 
