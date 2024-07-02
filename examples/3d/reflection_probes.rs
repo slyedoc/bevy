@@ -6,7 +6,7 @@
 //!
 //! Reflection probes don't work on WebGL 2 or WebGPU.
 
-use bevy::core_pipeline::Skybox;
+use bevy::core_pipeline::SkyboxImage;
 use bevy::prelude::*;
 
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -184,7 +184,7 @@ fn add_environment_map_to_camera(
         commands
             .entity(camera_entity)
             .insert(create_camera_environment_map_light(&cubemaps))
-            .insert(Skybox {
+            .insert(SkyboxImage {
                 image: cubemaps.skybox.clone(),
                 brightness: 5000.0,
             });

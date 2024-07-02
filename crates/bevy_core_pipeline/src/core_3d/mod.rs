@@ -81,7 +81,7 @@ use crate::{
         NormalPrepass, Opaque3dPrepass, ViewPrepassTextures, MOTION_VECTOR_PREPASS_FORMAT,
         NORMAL_PREPASS_FORMAT,
     },
-    skybox::SkyboxPlugin,
+    skybox::SkyboxImagePlugin,
     tonemapping::TonemappingNode,
     upscaling::UpscalingNode,
 };
@@ -97,7 +97,7 @@ impl Plugin for Core3dPlugin {
             .register_type::<Camera3dDepthTextureUsage>()
             .register_type::<ScreenSpaceTransmissionQuality>()
             .add_plugins((
-                SkyboxPlugin,
+                SkyboxImagePlugin,
                  ExtractComponentPlugin::<Camera3d>::default()
             ))
             .add_systems(PostUpdate, check_msaa);
