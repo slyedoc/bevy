@@ -28,7 +28,7 @@ use crate::{
         prepass_target_descriptors, MotionVectorPrepass, NormalPrepass, PreviousViewData,
         PreviousViewUniforms,
     },
-    Skybox,
+    SkyboxImage,
 };
 
 pub const SKYBOX_PREPASS_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(376510055324461154);
@@ -118,7 +118,7 @@ pub fn prepare_skybox_prepass_pipelines(
     mut pipelines: ResMut<SpecializedRenderPipelines<SkyboxPrepassPipeline>>,
     msaa: Res<Msaa>,
     pipeline: Res<SkyboxPrepassPipeline>,
-    views: Query<(Entity, Has<NormalPrepass>), (With<Skybox>, With<MotionVectorPrepass>)>,
+    views: Query<(Entity, Has<NormalPrepass>), (With<SkyboxImage>, With<MotionVectorPrepass>)>,
 ) {
     for (entity, normal_prepass) in &views {
         let pipeline_key = SkyboxPrepassPipelineKey {
@@ -143,7 +143,7 @@ pub fn prepare_skybox_prepass_bind_groups(
     view_uniforms: Res<ViewUniforms>,
     prev_view_uniforms: Res<PreviousViewUniforms>,
     render_device: Res<RenderDevice>,
-    views: Query<Entity, (With<Skybox>, With<MotionVectorPrepass>)>,
+    views: Query<Entity, (With<SkyboxImage>, With<MotionVectorPrepass>)>,
 ) {
     for entity in &views {
         let (Some(view_uniforms), Some(prev_view_uniforms)) = (

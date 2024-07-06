@@ -1,7 +1,7 @@
 //! Demonstrates anisotropy with the glTF sample barn lamp model.
 
 use bevy::{
-    color::palettes::css::WHITE, core_pipeline::Skybox, math::vec3, prelude::*, time::Stopwatch,
+    color::palettes::css::WHITE, core_pipeline::SkyboxImage, math::vec3, prelude::*, time::Stopwatch,
 };
 
 /// The initial position of the camera.
@@ -199,7 +199,7 @@ fn handle_input(
                 for camera in cameras.iter() {
                     commands
                         .entity(camera)
-                        .remove::<Skybox>()
+                        .remove::<SkyboxImage>()
                         .remove::<EnvironmentMapLight>();
                 }
                 spawn_directional_light(&mut commands);
@@ -241,7 +241,7 @@ fn add_skybox_and_environment_map(
 ) {
     commands
         .entity(entity)
-        .insert(Skybox {
+        .insert(SkyboxImage {
             brightness: 5000.0,
             image: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
         })

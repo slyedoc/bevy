@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use bevy::{
     color::palettes::css::{BLACK, WHITE},
-    core_pipeline::{fxaa::Fxaa, Skybox},
+    core_pipeline::{fxaa::Fxaa, SkyboxImage},
     input::mouse::MouseWheel,
     math::{vec3, vec4},
     pbr::{
@@ -240,7 +240,7 @@ fn spawn_camera(commands: &mut Commands, asset_server: &AssetServer) {
             specular_map: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
             intensity: 5000.0,
         })
-        .insert(Skybox {
+        .insert(SkyboxImage {
             image: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
             brightness: 5000.0,
         })

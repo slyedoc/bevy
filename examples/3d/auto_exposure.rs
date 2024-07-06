@@ -14,7 +14,7 @@
 use bevy::{
     core_pipeline::{
         auto_exposure::{AutoExposureCompensationCurve, AutoExposurePlugin, AutoExposureSettings},
-        Skybox,
+        SkyboxImage,
     },
     math::{cubic_splines::LinearSpline, primitives::Plane3d, vec2},
     prelude::*,
@@ -51,7 +51,7 @@ fn setup(
             metering_mask: metering_mask.clone(),
             ..default()
         },
-        Skybox {
+        SkyboxImage {
             image: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
             brightness: bevy::pbr::light_consts::lux::DIRECT_SUNLIGHT,
         },

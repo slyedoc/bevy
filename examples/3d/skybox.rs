@@ -5,7 +5,7 @@ mod camera_controller;
 
 use bevy::{
     asset::LoadState,
-    core_pipeline::Skybox,
+    core_pipeline::SkyboxImage,
     prelude::*,
     render::{
         render_resource::{TextureViewDescriptor, TextureViewDimension},
@@ -78,7 +78,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             ..default()
         },
         CameraController::default(),
-        Skybox {
+        SkyboxImage {
             image: skybox_handle.clone(),
             brightness: 1000.0,
         },
@@ -144,7 +144,7 @@ fn asset_loaded(
     asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
     mut cubemap: ResMut<Cubemap>,
-    mut skyboxes: Query<&mut Skybox>,
+    mut skyboxes: Query<&mut SkyboxImage>,
 ) {
     if !cubemap.is_loaded && asset_server.load_state(&cubemap.image_handle) == LoadState::Loaded {
         info!("Swapping to {}...", CUBEMAPS[cubemap.index].0);

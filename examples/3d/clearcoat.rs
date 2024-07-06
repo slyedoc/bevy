@@ -21,7 +21,7 @@ use std::f32::consts::PI;
 
 use bevy::{
     color::palettes::css::{BLUE, GOLD, WHITE},
-    core_pipeline::{tonemapping::Tonemapping::AcesFitted, Skybox},
+    core_pipeline::{tonemapping::Tonemapping::AcesFitted, SkyboxImage},
     math::vec3,
     pbr::{CascadeShadowConfig, Cascades, CascadesVisibleEntities},
     prelude::*,
@@ -221,7 +221,7 @@ fn spawn_camera(commands: &mut Commands, asset_server: &AssetServer) {
             tonemapping: AcesFitted,
             ..default()
         })
-        .insert(Skybox {
+        .insert(SkyboxImage {
             brightness: 5000.0,
             image: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
         })

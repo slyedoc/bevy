@@ -30,9 +30,9 @@ const SKYBOX_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(555947634232
 
 pub mod prepass;
 
-pub struct SkyboxPlugin;
+pub struct SkyboxImagePlugin;
 
-impl Plugin for SkyboxPlugin {
+impl Plugin for SkyboxImagePlugin {
     fn build(&self, app: &mut App) {
         load_internal_asset!(app, SKYBOX_SHADER_HANDLE, "skybox.wgsl", Shader::from_wgsl);
         load_internal_asset!(
@@ -43,8 +43,8 @@ impl Plugin for SkyboxPlugin {
         );
 
         app.add_plugins((
-            ExtractComponentPlugin::<Skybox>::default(),
-            UniformComponentPlugin::<SkyboxUniforms>::default(),
+            ExtractComponentPlugin::<SkyboxImage>::default(),
+            UniformComponentPlugin::<SkyboxImageUniforms>::default(),
         ));
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
@@ -84,7 +84,7 @@ impl Plugin for SkyboxPlugin {
 ///
 /// See also <https://en.wikipedia.org/wiki/Skybox_(video_games)>.
 #[derive(Component, Clone)]
-pub struct Skybox {
+pub struct SkyboxImage {
     pub image: Handle<Image>,
     /// Scale factor applied to the skybox image.
     /// After applying this multiplier to the image samples, the resulting values should
@@ -92,10 +92,10 @@ pub struct Skybox {
     pub brightness: f32,
 }
 
-impl ExtractComponent for Skybox {
+impl ExtractComponent for SkyboxImage {
     type QueryData = (&'static Self, Option<&'static Exposure>);
     type QueryFilter = ();
-    type Out = (Self, SkyboxUniforms);
+    type Out = (Self, SkyboxImageUniforms);
 
     fn extract_component((skybox, exposure): QueryItem<'_, Self::QueryData>) -> Option<Self::Out> {
         let exposure = exposure
@@ -104,7 +104,7 @@ impl ExtractComponent for Skybox {
 
         Some((
             skybox.clone(),
-            SkyboxUniforms {
+            SkyboxImageUniforms {
                 brightness: skybox.brightness * exposure,
                 #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
                 _wasm_padding_8b: 0,
@@ -119,7 +119,7 @@ impl ExtractComponent for Skybox {
 
 // TODO: Replace with a push constant once WebGPU gets support for that
 #[derive(Component, ShaderType, Clone)]
-pub struct SkyboxUniforms {
+pub struct SkyboxImageUniforms {
     brightness: f32,
     #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
     _wasm_padding_8b: u32,
@@ -146,7 +146,7 @@ impl SkyboxPipeline {
                         sampler(SamplerBindingType::Filtering),
                         uniform_buffer::<ViewUniform>(true)
                             .visibility(ShaderStages::VERTEX_FRAGMENT),
-                        uniform_buffer::<SkyboxUniforms>(true),
+                        uniform_buffer::<SkyboxImageUniforms>(true),
                     ),
                 ),
             ),
@@ -225,7 +225,7 @@ fn prepare_skybox_pipelines(
     mut pipelines: ResMut<SpecializedRenderPipelines<SkyboxPipeline>>,
     pipeline: Res<SkyboxPipeline>,
     msaa: Res<Msaa>,
-    views: Query<(Entity, &ExtractedView), With<Skybox>>,
+    views: Query<(Entity, &ExtractedView), With<SkyboxImage>>,
 ) {
     for (entity, view) in &views {
         let pipeline_id = pipelines.specialize(
@@ -251,10 +251,10 @@ fn prepare_skybox_bind_groups(
     mut commands: Commands,
     pipeline: Res<SkyboxPipeline>,
     view_uniforms: Res<ViewUniforms>,
-    skybox_uniforms: Res<ComponentUniforms<SkyboxUniforms>>,
+    skybox_uniforms: Res<ComponentUniforms<SkyboxImageUniforms>>,
     images: Res<RenderAssets<GpuImage>>,
     render_device: Res<RenderDevice>,
-    views: Query<(Entity, &Skybox, &DynamicUniformIndex<SkyboxUniforms>)>,
+    views: Query<(Entity, &SkyboxImage, &DynamicUniformIndex<SkyboxImageUniforms>)>,
 ) {
     for (entity, skybox, skybox_uniform_index) in &views {
         if let (Some(skybox), Some(view_uniforms), Some(skybox_uniforms)) = (
