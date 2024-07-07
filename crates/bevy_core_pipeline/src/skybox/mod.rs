@@ -156,9 +156,9 @@ impl SkyboxPipeline {
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub struct SkyboxPipelineKey {
-    hdr: bool,
-    samples: u32,
-    depth_format: TextureFormat,
+    pub hdr: bool,
+    pub samples: u32,
+    pub depth_format: TextureFormat,
 }
 
 impl SpecializedRenderPipeline for SkyboxPipeline {
