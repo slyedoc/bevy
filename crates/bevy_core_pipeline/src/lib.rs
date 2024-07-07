@@ -26,7 +26,7 @@ mod taa;
 pub mod tonemapping;
 pub mod upscaling;
 
-pub use skybox::SkyboxImage;
+pub use skybox::{SkyboxImage, SkyboxPipelineKey, SkyboxPipelineId, SkyboxBindGroup};
 
 /// Experimental features that are not yet finished. Please report any issues you encounter!
 ///

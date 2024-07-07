@@ -155,7 +155,7 @@ impl SkyboxPipeline {
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
-struct SkyboxPipelineKey {
+pub struct SkyboxPipelineKey {
     hdr: bool,
     samples: u32,
     depth_format: TextureFormat,
