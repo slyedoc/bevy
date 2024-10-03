@@ -1,11 +1,12 @@
 use bevy_app::{App, Plugin};
 use bevy_asset::{load_internal_asset, Handle};
 use bevy_ecs::{
-    prelude::{Component, Entity},
+    prelude::{Component, Entity, ReflectComponent},
     query::{QueryItem, With},
     schedule::IntoSystemConfigs,
     system::{Commands, Query, Res, ResMut, Resource},
 };
+use bevy_reflect::Reflect;
 use bevy_render::{
     camera::Exposure,
     extract_component::{
@@ -83,7 +84,8 @@ impl Plugin for SkyboxPlugin {
 /// To do so, use `EnvironmentMapLight` alongside this component.
 ///
 /// See also <https://en.wikipedia.org/wiki/Skybox_(video_games)>.
-#[derive(Component, Clone)]
+#[derive(Component, Default, Clone, Reflect)]
+#[reflect(Component)]
 pub struct Skybox {
     pub image: Handle<Image>,
     /// Scale factor applied to the skybox image.
