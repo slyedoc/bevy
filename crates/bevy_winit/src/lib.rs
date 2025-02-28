@@ -120,7 +120,8 @@ impl<T: Event> Plugin for WinitPlugin<T> {
 
         #[cfg(target_family = "wasm")]
         {                    
-            event_loop_builder.allow_event_loop_recreation();
+            // allow event loop recreation on wasm
+            EventLoop::<T>::allow_event_loop_recreation();
         }
 
 
