@@ -19,7 +19,7 @@ use bevy_reflect::prelude::ReflectDefault;
 use bevy_reflect::Reflect;
 use bevy_window::{RawHandleWrapperHolder, WindowEvent};
 use core::marker::PhantomData;
-use winit::event_loop::EventLoop;
+use winit::event_loop::{EventLoop, EventLoopBuilder};
 
 use bevy_a11y::AccessibilityRequested;
 use bevy_app::{App, Last, Plugin};
@@ -121,7 +121,7 @@ impl<T: Event> Plugin for WinitPlugin<T> {
         #[cfg(target_family = "wasm")]
         {                    
             // allow event loop recreation on wasm
-            EventLoop::<T>::allow_event_loop_recreation();
+            EventLoopBuilder::<T>::allow_event_loop_recreation();
         }
 
 
