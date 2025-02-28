@@ -118,13 +118,6 @@ impl<T: Event> Plugin for WinitPlugin<T> {
             event_loop_builder.with_android_app(bevy_window::ANDROID_APP.get().expect(msg).clone());
         }
 
-        #[cfg(target_arch = "wasm32")]
-        {                    
-            
-        }
-
-
-
         app.init_non_send_resource::<WinitWindows>()
             .init_resource::<WinitMonitors>()
             .init_resource::<WinitSettings>()
