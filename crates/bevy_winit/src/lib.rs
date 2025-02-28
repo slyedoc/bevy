@@ -118,11 +118,11 @@ impl<T: Event> Plugin for WinitPlugin<T> {
             event_loop_builder.with_android_app(bevy_window::ANDROID_APP.get().expect(msg).clone());
         }
 
-        #[cfg(target_family = "wasm")]
+        #[cfg(target_arch = "wasm32")]
         {                    
-            // allow event loop recreation on wasm
-            EventLoopBuilder::<T>::allow_event_loop_recreation();
+            
         }
+
 
 
         app.init_non_send_resource::<WinitWindows>()
