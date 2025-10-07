@@ -95,6 +95,10 @@ pub fn create_dark_theme() -> ThemeProps {
                 tokens::SWITCH_SLIDE_DISABLED,
                 palette::LIGHT_GRAY_2.with_alpha(0.3),
             ),
+            // Scroll
+            (tokens::SCROLL_BG, palette::GRAY_2),
+            (tokens::SCROLLBAR_TRACK, palette::GRAY_1.with_alpha(0.5)),
+            (tokens::SCROLLBAR_THUMB, palette::GRAY_3.with_alpha(0.7)),
         ]),
     }
 }

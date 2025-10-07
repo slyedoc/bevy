@@ -137,3 +137,12 @@ pub const SWITCH_SLIDE: ThemeToken = ThemeToken::new_static("feathers.switch.sli
 /// Switch slide (disabled)
 pub const SWITCH_SLIDE_DISABLED: ThemeToken =
     ThemeToken::new_static("feathers.switch.slide.disabled");
+
+// Scroll container
+
+/// Scroll container background
+pub const SCROLL_BG: ThemeToken = ThemeToken::new_static("feathers.scroll.bg");
+/// Scrollbar track background
+pub const SCROLLBAR_TRACK: ThemeToken = ThemeToken::new_static("feathers.scrollbar.track");
+/// Scrollbar thumb background
+pub const SCROLLBAR_THUMB: ThemeToken = ThemeToken::new_static("feathers.scrollbar.thumb");

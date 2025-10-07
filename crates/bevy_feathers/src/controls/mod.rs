@@ -6,6 +6,7 @@ mod checkbox;
 mod color_slider;
 mod color_swatch;
 mod radio;
+mod scroll;
 mod slider;
 mod toggle_switch;
 mod virtual_keyboard;
@@ -17,6 +18,7 @@ pub use color_slider::{
 };
 pub use color_swatch::{color_swatch, ColorSwatch, ColorSwatchFg};
 pub use radio::{radio, RadioPlugin};
+pub use scroll::{scroll, HScrollbar, ScrollbarPlugin, ScrollContainer, ScrollProps, VScrollbar};
 pub use slider::{slider, SliderPlugin, SliderProps};
 pub use toggle_switch::{toggle_switch, ToggleSwitchPlugin};
 pub use virtual_keyboard::{virtual_keyboard, VirtualKeyPressed};
@@ -34,6 +36,7 @@ impl Plugin for ControlsPlugin {
             CheckboxPlugin,
             ColorSliderPlugin,
             RadioPlugin,
+            ScrollbarPlugin,
             SliderPlugin,
             ToggleSwitchPlugin,
         ));
