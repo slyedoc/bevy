@@ -94,15 +94,15 @@ impl Default for ScrollProps {
 /// # Arguments
 /// * `props` - construction properties for the scroll container.
 /// * `overrides` - a bundle of components that are merged in with the normal scroll container components.
-/// * `children` - Either a [`SpawnableList`] (like SpawnIter) or the result of the `children!` macro.
+/// * `children` - Either `Children::spawn(SpawnIter(...))` for homogeneous lists or the result of the `children!` macro for heterogeneous content.
 ///
 /// # Examples
 /// ```ignore
-/// // Homogeneous list with SpawnIter
+/// // Homogeneous list with SpawnIter (must be wrapped in Children::spawn)
 /// scroll(
 ///     ScrollProps::vertical(px(400)),
 ///     (),
-///     SpawnIter((0..10).map(|i| (Node::default(), Text(format!("Item {}", i)))))
+///     Children::spawn(SpawnIter((0..10).map(|i| (Node::default(), Text(format!("Item {}", i))))))
 /// )
 ///
 /// // Heterogeneous list with children! macro
