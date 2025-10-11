@@ -94,8 +94,28 @@ impl Default for ScrollProps {
 /// # Arguments
 /// * `props` - construction properties for the scroll container.
 /// * `overrides` - a bundle of components that are merged in with the normal scroll container components.
-/// * `children` - a [`SpawnableList`] of child elements to be scrolled.
-pub fn scroll<C: SpawnableList<ChildOf> + Send + Sync + 'static, B: Bundle>(
+/// * `children` - Either a [`SpawnableList`] (like SpawnIter) or the result of the `children!` macro.
+///
+/// # Examples
+/// ```ignore
+/// // Homogeneous list with SpawnIter
+/// scroll(
+///     ScrollProps::vertical(px(400)),
+///     (),
+///     SpawnIter((0..10).map(|i| (Node::default(), Text(format!("Item {}", i)))))
+/// )
+///
+/// // Heterogeneous list with children! macro
+/// scroll(
+///     ScrollProps::vertical(px(400)),
+///     (),
+///     children![
+///         some_function_returning_impl_bundle(),
+///         another_function(),
+///     ]
+/// )
+/// ```
+pub fn scroll<C: Bundle, B: Bundle>(
     props: ScrollProps,
     overrides: B,
     children: C,
@@ -148,7 +168,7 @@ pub fn scroll<C: SpawnableList<ChildOf> + Send + Sync + 'static, B: Bundle>(
                 props.corners.to_border_radius(4.0),
                 ThemeBackgroundColor(props.bg_token),
                 observe(scroll_observer),
-                Children::spawn(children),
+                children,
                 overrides,
             ),
         ],
