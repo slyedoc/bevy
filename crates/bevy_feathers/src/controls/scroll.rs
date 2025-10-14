@@ -1,7 +1,7 @@
 use bevy_app::{Plugin, PostUpdate};
 use bevy_ecs::{
-    bundle::Bundle, children, component::Component, entity::Entity, hierarchy::{ChildOf, Children},
-    observer::On, prelude::ReflectComponent, spawn::SpawnableList, spawn::SpawnRelated,
+    bundle::Bundle, children, component::Component, entity::Entity, hierarchy::{ChildOf},
+    observer::On, prelude::ReflectComponent, spawn::SpawnRelated,
     query::{Added, With},
     system::{Commands, Query},
 };

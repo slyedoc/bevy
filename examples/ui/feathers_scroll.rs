@@ -1,25 +1,15 @@
 //! This example shows off the various Bevy Feathers widgets.
-#[path = "../helpers/screenshot.rs"]
-mod screenshot;
-
-use crate::screenshot::ScreenshotPlugin;
 use argh::FromArgs;
 use bevy::{
     color::palettes,
     ecs::spawn::SpawnIter,
     feathers::{
-        controls::{
-            button, checkbox, color_slider, color_swatch, radio, scroll, slider, toggle_switch,
-            ButtonProps, ButtonVariant, ColorChannel, ColorSlider, ColorSliderProps, ColorSwatch,
-            ScrollProps, SliderBaseColor, SliderProps,
-        },
-        dark_theme::create_dark_theme,
         rounded_corners::RoundedCorners,
-        theme::{ThemeBackgroundColor, ThemedText, UiTheme},
-        tokens, FeathersPlugins,
+        theme::{ThemeBackgroundColor, ThemedText},
+        tokens,
+        controls::*,
     },
     input_focus::tab_navigation::TabGroup,
-    picking::events::{Click, Pointer},
     prelude::*,
     ui::{Checked, InteractionDisabled},
     ui_widgets::{
@@ -59,8 +49,7 @@ fn main() {
     info!("Auto: {}", auto);
 
     App::new()
-        .add_plugins((DefaultPlugins, ScreenshotPlugin::new(auto), FeathersPlugins))
-        .insert_resource(UiTheme(create_dark_theme()))
+        .add_plugins(DefaultPlugins)
         .insert_resource(DemoWidgetStates {
             rgb_color: palettes::tailwind::EMERALD_800.with_alpha(0.7),
             hsl_color: palettes::tailwind::AMBER_800.into(),
@@ -87,7 +76,7 @@ fn demo_root() -> impl Bundle {
         ThemeBackgroundColor(tokens::WINDOW_BG),
         children![
             // main demo area
-            //demo_panel(),
+            demo_panel(),
 
             // before, with children overflow
             (
@@ -123,7 +112,7 @@ fn demo_root() -> impl Bundle {
                     ..Default::default()
                 },
                 (),
-                SpawnIter((0..30).map(|i| {
+                Children::spawn(SpawnIter((0..30).map(|i| {
                     (
                         Node {
                             min_height: px(40),
@@ -145,7 +134,7 @@ fn demo_root() -> impl Bundle {
                             )
                         ]
                     )
-                }))
+                })))
             ),
             // Scroll x-axis
             scroll(
@@ -157,7 +146,7 @@ fn demo_root() -> impl Bundle {
                     ..Default::default()
                 },
                 (),
-                SpawnIter((0..30).map(|i| {
+                Children::spawn(SpawnIter((0..30).map(|i| {
                     (
                         Node {
                             min_width: px(100),
@@ -170,25 +159,22 @@ fn demo_root() -> impl Bundle {
                             ..default()
                         },
                     )
-                }))
+                })))
             ),
         ],
     )
 }
 
 fn demo_panel() -> impl Bundle {
-    (
-        Node {
-            display: Display::Flex,
-            flex_direction: FlexDirection::Column,
-            align_items: AlignItems::Stretch,
-            justify_content: JustifyContent::Start,
-            row_gap: px(8),
+    scroll(
+        ScrollProps {
             width: px(300),
             height: percent(100),
             overflow: Overflow::scroll_y(),
-            ..default()
+            align_items: AlignItems::Stretch,
+            ..Default::default()
         },
+        (),
         children![
             (
                 Node {
@@ -515,7 +501,7 @@ fn demo_panel() -> impl Bundle {
                     },
                 )
             ),
-        ],
+        ]
     )
 }
 
