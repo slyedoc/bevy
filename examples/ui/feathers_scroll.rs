@@ -1,21 +1,23 @@
 //! This example shows off the various Bevy Feathers widgets.
-use argh::FromArgs;
+
 use bevy::{
-    color::palettes,
-    ecs::spawn::SpawnIter,
+    color::palettes, ecs::spawn::SpawnIter, 
     feathers::{
+        dark_theme::create_dark_theme,
+        controls::*, 
+        FeathersPlugins,
         rounded_corners::RoundedCorners,
-        theme::{ThemeBackgroundColor, ThemedText},
-        tokens,
-        controls::*,
-    },
+        theme::{ThemeBackgroundColor, ThemedText, UiTheme},
+        tokens        
+    }, 
     input_focus::tab_navigation::TabGroup,
-    prelude::*,
+    log::LogPlugin, 
+    prelude::*, 
     ui::{Checked, InteractionDisabled},
     ui_widgets::{
         checkbox_self_update, observe, slider_self_update, Activate, RadioButton, RadioGroup,
         SliderPrecision, SliderStep, SliderValue, ValueChange,
-    },
+    }
 };
 
 /// A struct to hold the state of various widgets shown in the demo.
@@ -34,22 +36,20 @@ enum SwatchType {
 #[derive(Component, Clone, Copy)]
 struct DemoDisabledButton;
 
-#[derive(FromArgs)]
-#[argh(description = "feathers")]
-struct Args {
-    /// will take a screenshot automatically after 2 seconds and exit
-    /// used for claude feedback
-    #[argh(switch)]
-    auto: Option<bool>,
-}
 
 fn main() {
-    let args: Args = argh::from_env();
-    let auto = args.auto.unwrap_or(false);
-    info!("Auto: {}", auto);
+
+
+            let mut log_plugin = LogPlugin::default();
+        // Filter out DLSS validation errors (known issue in NVIDIA DLSS SDK)
+        // https://forums.developer.nvidia.com/t/validation-errors-using-dlss-vulkan-sdk-due-to-vkcmdclearcolorimage/326493
+        log_plugin.filter += ",wgpu_hal::vulkan::instance=off";
 
     App::new()
-        .add_plugins(DefaultPlugins)
+        .add_plugins(DefaultPlugins.set(log_plugin))
+         .add_plugins(FeathersPlugins)
+        .insert_resource(UiTheme(create_dark_theme()))
+
         .insert_resource(DemoWidgetStates {
             rgb_color: palettes::tailwind::EMERALD_800.with_alpha(0.7),
             hsl_color: palettes::tailwind::AMBER_800.into(),

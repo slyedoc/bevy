@@ -4734,3 +4734,12 @@ name = "Render Depth to Texture"
 description = "Demonstrates how to use depth-only cameras"
 category = "Shaders"
 wasm = true
+
+
+[patch.crates-io]
+# 0c978d0d46c7eaf68f6d1ecf2ea1bd03a96b7c47  = wgpu 26.0.1
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "0c978d0d46c7eaf68f6d1ecf2ea1bd03a96b7c47" }
+wgpu-core = { git = "https://github.com/gfx-rs/wgpu", rev = "0c978d0d46c7eaf68f6d1ecf2ea1bd03a96b7c47" }
+wgpu-hal = { git = "https://github.com/gfx-rs/wgpu", rev = "0c978d0d46c7eaf68f6d1ecf2ea1bd03a96b7c47" }
+wgpu-types = { git = "https://github.com/gfx-rs/wgpu", rev = "0c978d0d46c7eaf68f6d1ecf2ea1bd03a96b7c47" }
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "0c978d0d46c7eaf68f6d1ecf2ea1bd03a96b7c47" }
