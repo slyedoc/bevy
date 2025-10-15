@@ -385,6 +385,26 @@ fn demo_panel() -> impl Bundle {
                 ),
                 observe(slider_self_update)
             ),
+            // Dropdown example
+            (
+                dropdown(
+                    DropdownProps {
+                        width: px(280),
+                        max_height: px(200),
+                        initial_value: Some("Apple".to_string()),
+                        ..default()
+                    },
+                    (),
+                    SpawnIter(
+                        ["Apple", "Banana", "Cherry", "Date", "Elderberry", "Fig", "Grape", "Honeydew"]
+                            .iter()
+                            .map(|fruit| dropdown_option(fruit))
+                    )
+                ),
+                observe(|change: On<ValueChange<String>>| {
+                    info!("Dropdown selected: {}", change.value);
+                })
+            ),
             (
                 Node {
                     display: Display::Flex,

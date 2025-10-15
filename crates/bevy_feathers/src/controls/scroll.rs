@@ -1,54 +1,18 @@
-use bevy_app::{Plugin, PostUpdate};
 use bevy_ecs::{
-    bundle::Bundle, children, component::Component, entity::Entity, hierarchy::{ChildOf},
-    observer::On, prelude::ReflectComponent, spawn::SpawnRelated,
-    query::{Added, With},
-    system::{Commands, Query},
+    bundle::Bundle, observer::On, relationship::RelatedSpawner,
+    spawn::{SpawnRelated, SpawnWith}, system::Query,
 };
 use bevy_math::Vec2;
 use bevy_picking::events::{Pointer, Scroll};
-use bevy_reflect::{prelude::ReflectDefault, Reflect};
-use bevy_ui::{AlignItems, ComputedNode, Display, JustifyContent, Node, Overflow, OverflowAxis, PositionType, ScrollPosition, UiRect, Val};
+use bevy_ui::{AlignItems, ComputedNode, JustifyContent, Node, Overflow, OverflowAxis, PositionType, ScrollPosition, UiRect, Val};
 use bevy_ui_widgets::{observe, Scrollbar, ControlOrientation, CoreScrollbarThumb};
 
 use crate::{rounded_corners::RoundedCorners, theme::{ThemeBackgroundColor, ThemeToken}, tokens};
 
 /// Scrollbar styling constants
 const SCROLLBAR_WIDTH: f32 = 8.0;
-const SCROLLBAR_MIN_THUMB_SIZE: f32 = 10.0; // Minimum thumb size as percentage
+const SCROLLBAR_MIN_THUMB_SIZE: f32 = 10.0;
 const LINE_HEIGHT: f32 = 21.0;
-
-/// Plugin that handles scrollbar creation and updates
-pub struct ScrollbarPlugin;
-
-impl Plugin for ScrollbarPlugin {
-    fn build(&self, app: &mut bevy_app::App) {
-        app.add_systems(PostUpdate, (spawn_scrollbars, update_scrollbars));
-    }
-}
-
-/// Marker component for scroll containers that stores props
-#[derive(Component, Debug, Clone, Reflect)]
-#[reflect(Component)]
-pub struct ScrollContainer {
-    /// Whether to show scrollbars for this container
-    pub show_scrollbars: bool,
-}
-
-/// Marker component for the scroll wrapper (parent of scroll container)
-#[derive(Component, Debug, Default, Clone, Copy, PartialEq, Eq, Reflect)]
-#[reflect(Component, Default, Debug, PartialEq, Clone)]
-pub struct ScrollWrapper;
-
-/// Marker component for vertical scrollbar (stores thumb entity)
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Reflect)]
-#[reflect(Component, Debug, PartialEq, Clone)]
-pub struct VScrollbar(pub Entity);
-
-/// Marker component for horizontal scrollbar (stores thumb entity)
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Reflect)]
-#[reflect(Component, Debug, PartialEq, Clone)]
-pub struct HScrollbar(pub Entity);
 
 
 /// Parameters for the scroll container template.
@@ -61,8 +25,6 @@ pub struct ScrollProps {
     pub overflow: Overflow,
     /// Flex direction for content layout
     pub flex_direction: bevy_ui::FlexDirection,
-    /// Show scrollbars
-    pub show_scrollbars: bool,
     /// Rounded corners options
     pub corners: RoundedCorners,
     /// Background color token
@@ -78,7 +40,6 @@ impl Default for ScrollProps {
             height: Val::Auto,
             overflow: Overflow::visible(),
             flex_direction: bevy_ui::FlexDirection::Column,
-            show_scrollbars: true,
             corners: RoundedCorners::default(),
             bg_token: tokens::SCROLL_BG,
             align_items: AlignItems::Stretch,
@@ -120,25 +81,15 @@ pub fn scroll<C: Bundle, B: Bundle>(
     overrides: B,
     children: C,
 ) -> impl Bundle {
-    // Calculate padding based on which scrollbars will be shown
     let base_padding = 4.0;
-    let padding = if props.show_scrollbars {
-        UiRect {
-            left: Val::Px(base_padding),
-            top: Val::Px(base_padding),
-            right: Val::Px(if props.overflow.y == OverflowAxis::Scroll {
-                base_padding + SCROLLBAR_WIDTH
-            } else {
-                base_padding
-            }),
-            bottom: Val::Px(if props.overflow.x == OverflowAxis::Scroll {
-                base_padding + SCROLLBAR_WIDTH
-            } else {
-                base_padding
-            }),
-        }
-    } else {
-        UiRect::all(Val::Px(base_padding))
+    let has_vscroll = props.overflow.y == OverflowAxis::Scroll;
+    let has_hscroll = props.overflow.x == OverflowAxis::Scroll;
+
+    let padding = UiRect {
+        left: Val::Px(base_padding),
+        top: Val::Px(base_padding),
+        right: Val::Px(if has_vscroll { base_padding + SCROLLBAR_WIDTH } else { base_padding }),
+        bottom: Val::Px(if has_hscroll { base_padding + SCROLLBAR_WIDTH } else { base_padding }),
     };
 
     (
@@ -148,30 +99,83 @@ pub fn scroll<C: Bundle, B: Bundle>(
             position_type: PositionType::Relative,
             ..Default::default()
         },
-        ScrollWrapper,
-        children![
-            (
-                Node {
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    flex_direction: props.flex_direction,
-                    justify_content: JustifyContent::Start,
-                    align_items: props.align_items,
-                    overflow: props.overflow,
-                    padding,
-                    ..Default::default()
-                },
-                ScrollContainer {
-                    show_scrollbars: props.show_scrollbars,
-                },
-                ScrollPosition::default(),
-                props.corners.to_border_radius(4.0),
-                ThemeBackgroundColor(props.bg_token),
-                observe(scroll_observer),
-                children,
-                overrides,
-            ),
-        ],
+        bevy_ecs::hierarchy::Children::spawn(
+            SpawnWith(move |parent: &mut RelatedSpawner<bevy_ecs::hierarchy::ChildOf>| {
+                // Spawn the scroll area first
+                let scroll_area_id = parent.spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Percent(100.0),
+                        flex_direction: props.flex_direction,
+                        justify_content: JustifyContent::Start,
+                        align_items: props.align_items,
+                        overflow: props.overflow,
+                        padding,
+                        ..Default::default()
+                    },
+                    ScrollPosition::default(),
+                    props.corners.to_border_radius(4.0),
+                    ThemeBackgroundColor(props.bg_token),
+                    observe(scroll_observer),
+                    children,
+                    overrides,
+                )).id();
+
+                // Spawn vertical scrollbar if needed
+                if has_vscroll {
+                    parent.spawn((
+                        Node {
+                            width: Val::Px(SCROLLBAR_WIDTH),
+                            height: Val::Percent(100.0),
+                            position_type: PositionType::Absolute,
+                            right: Val::Px(0.0),
+                            top: Val::Px(0.0),
+                            ..Default::default()
+                        },
+                        Scrollbar::new(scroll_area_id, ControlOrientation::Vertical, SCROLLBAR_MIN_THUMB_SIZE),
+                        ThemeBackgroundColor(tokens::SCROLLBAR_TRACK),
+                        bevy_ui::ZIndex(1),
+                        bevy_ecs::hierarchy::Children::spawn(bevy_ecs::spawn::Spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                position_type: PositionType::Absolute,
+                                ..Default::default()
+                            },
+                            CoreScrollbarThumb,
+                            props.corners.to_border_radius(2.0),
+                            ThemeBackgroundColor(tokens::SCROLLBAR_THUMB),
+                        ))),
+                    ));
+                }
+
+                // Spawn horizontal scrollbar if needed
+                if has_hscroll {
+                    parent.spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Px(SCROLLBAR_WIDTH),
+                            position_type: PositionType::Absolute,
+                            bottom: Val::Px(0.0),
+                            left: Val::Px(0.0),
+                            ..Default::default()
+                        },
+                        Scrollbar::new(scroll_area_id, ControlOrientation::Horizontal, SCROLLBAR_MIN_THUMB_SIZE),
+                        ThemeBackgroundColor(tokens::SCROLLBAR_TRACK),
+                        bevy_ui::ZIndex(1),
+                        bevy_ecs::hierarchy::Children::spawn(bevy_ecs::spawn::Spawn((
+                            Node {
+                                height: Val::Percent(100.0),
+                                position_type: PositionType::Absolute,
+                                ..Default::default()
+                            },
+                            CoreScrollbarThumb,
+                            props.corners.to_border_radius(2.0),
+                            ThemeBackgroundColor(tokens::SCROLLBAR_THUMB),
+                        ))),
+                    ));
+                }
+            })
+        ),
     )
 }
 
@@ -186,7 +190,6 @@ impl ScrollProps {
                 y: OverflowAxis::Scroll,
             },
             flex_direction: bevy_ui::FlexDirection::Column,
-            show_scrollbars: true,
             corners: RoundedCorners::default(),
             bg_token: tokens::SCROLL_BG,
             align_items: AlignItems::Stretch,
@@ -203,7 +206,6 @@ impl ScrollProps {
                 y: OverflowAxis::Visible,
             },
             flex_direction: bevy_ui::FlexDirection::Row,
-            show_scrollbars: true,
             corners: RoundedCorners::default(),
             bg_token: tokens::SCROLL_BG,
             align_items: AlignItems::Stretch,
@@ -220,160 +222,9 @@ impl ScrollProps {
                 y: OverflowAxis::Scroll,
             },
             flex_direction: bevy_ui::FlexDirection::Column,
-            show_scrollbars: true,
             corners: RoundedCorners::default(),
             bg_token: tokens::SCROLL_BG,
             align_items: AlignItems::Stretch,
-        }
-    }
-}
-
-/// System that spawns scrollbars for newly created scroll containers
-fn spawn_scrollbars(
-    mut commands: Commands,
-    scroll_containers: Query<(Entity, &Node, &ScrollContainer, &ChildOf), Added<ScrollContainer>>,
-) {
-    for (entity, node, container, child_of) in scroll_containers.iter() {
-        if !container.show_scrollbars {
-            continue;
-        }
-
-        let wrapper_entity = child_of.parent();
-
-        // Spawn vertical scrollbar
-        if node.overflow.y == OverflowAxis::Scroll {
-            let mut thumb_id = Entity::PLACEHOLDER;
-            let scrollbar = commands
-                .spawn((
-                    Node {
-                        width: Val::Px(SCROLLBAR_WIDTH),
-                        height: Val::Percent(100.0),
-                        position_type: PositionType::Absolute,
-                        right: Val::Px(0.0),
-                        top: Val::Px(0.0),
-                        bottom: Val::Px(0.0),
-                        display: Display::Flex,
-                        flex_direction: bevy_ui::FlexDirection::Column,
-                        ..Default::default()
-                    },
-                    Scrollbar {
-                        target: entity,
-                        orientation: ControlOrientation::Vertical,
-                        min_thumb_length: SCROLLBAR_MIN_THUMB_SIZE,
-                    },
-                    ThemeBackgroundColor(tokens::SCROLLBAR_TRACK),
-                    bevy_ui::ZIndex(1),
-                ))
-                .with_children(|parent| {
-                    thumb_id = parent.spawn((
-                        Node {
-                            width: Val::Percent(100.0),
-                            height: Val::Percent(20.0),
-                            ..Default::default()
-                        },
-                        CoreScrollbarThumb,
-                        ThemeBackgroundColor(tokens::SCROLLBAR_THUMB),
-                    )).id();
-                })
-                .id();
-            commands.entity(entity).insert(VScrollbar(thumb_id));
-            commands.entity(wrapper_entity).add_child(scrollbar);
-        }
-
-        // Spawn horizontal scrollbar
-        if node.overflow.x == OverflowAxis::Scroll {
-            let mut thumb_id = Entity::PLACEHOLDER;
-            let scrollbar = commands
-                .spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        height: Val::Px(SCROLLBAR_WIDTH),
-                        position_type: PositionType::Absolute,
-                        bottom: Val::Px(0.0),
-                        left: Val::Px(0.0),
-                        right: Val::Px(0.0),
-                        display: Display::Flex,
-                        flex_direction: bevy_ui::FlexDirection::Row,
-                        ..Default::default()
-                    },
-                    Scrollbar {
-                        target: entity,
-                        orientation: ControlOrientation::Horizontal,
-                        min_thumb_length: SCROLLBAR_MIN_THUMB_SIZE,
-                    },
-                    ThemeBackgroundColor(tokens::SCROLLBAR_TRACK),
-                    bevy_ui::ZIndex(1),
-                ))
-                .with_children(|parent| {
-                    thumb_id = parent.spawn((
-                        Node {
-                            width: Val::Percent(20.0),
-                            height: Val::Percent(100.0),
-                            ..Default::default()
-                        },
-                        CoreScrollbarThumb,
-                        ThemeBackgroundColor(tokens::SCROLLBAR_THUMB),
-                    )).id();
-                })
-                .id();
-            commands.entity(entity).insert(HScrollbar(thumb_id));
-            commands.entity(wrapper_entity).add_child(scrollbar);
-        }
-    }
-}
-
-/// System that updates scrollbar thumb position and size based on scroll position
-fn update_scrollbars(
-    scroll_containers: Query<(&ScrollPosition, &ComputedNode, Option<&VScrollbar>, Option<&HScrollbar>), With<ScrollContainer>>,
-    mut thumb_query: Query<&mut Node, With<CoreScrollbarThumb>>,
-) {
-    for (scroll_pos, computed, v_scrollbar, h_scrollbar) in scroll_containers.iter() {
-        let content_size = computed.content_size();
-        let container_size = computed.size();
-        let scale = computed.inverse_scale_factor();
-
-        // Update vertical scrollbar thumb
-        if let Some(v_scrollbar) = v_scrollbar {
-            if v_scrollbar.0 != Entity::PLACEHOLDER {
-                if let Ok(mut thumb_node) = thumb_query.get_mut(v_scrollbar.0) {
-                    let max_scroll = (content_size.y - container_size.y) * scale;
-                    if max_scroll > 0.0 {
-                        // Calculate thumb size as a percentage of visible area
-                        let visible_ratio = (container_size.y / content_size.y).clamp(0.0, 1.0);
-                        let thumb_height = (visible_ratio * 100.0).max(SCROLLBAR_MIN_THUMB_SIZE);
-
-                        // Calculate thumb position as percentage
-                        let scroll_ratio = (scroll_pos.y / max_scroll).clamp(0.0, 1.0);
-                        let max_thumb_offset = 100.0 - thumb_height;
-                        let thumb_top = scroll_ratio * max_thumb_offset;
-
-                        thumb_node.height = Val::Percent(thumb_height);
-                        thumb_node.top = Val::Percent(thumb_top);
-                    }
-                }
-            }
-        }
-
-        // Update horizontal scrollbar thumb
-        if let Some(h_scrollbar) = h_scrollbar {
-            if h_scrollbar.0 != Entity::PLACEHOLDER {
-                if let Ok(mut thumb_node) = thumb_query.get_mut(h_scrollbar.0) {
-                    let max_scroll = (content_size.x - container_size.x) * scale;
-                    if max_scroll > 0.0 {
-                        // Calculate thumb size as a percentage of visible area
-                        let visible_ratio = (container_size.x / content_size.x).clamp(0.0, 1.0);
-                        let thumb_width = (visible_ratio * 100.0).max(SCROLLBAR_MIN_THUMB_SIZE);
-
-                        // Calculate thumb position as percentage
-                        let scroll_ratio = (scroll_pos.x / max_scroll).clamp(0.0, 1.0);
-                        let max_thumb_offset = 100.0 - thumb_width;
-                        let thumb_left = scroll_ratio * max_thumb_offset;
-
-                        thumb_node.width = Val::Percent(thumb_width);
-                        thumb_node.left = Val::Percent(thumb_left);
-                    }
-                }
-            }
         }
     }
 }
