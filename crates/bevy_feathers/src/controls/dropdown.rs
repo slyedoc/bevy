@@ -184,18 +184,18 @@ pub fn dropdown<C: SpawnableList<ChildOf> + Send + Sync + 'static, B: Bundle>(
 }
 
 /// Helper function to create a dropdown option
-pub fn dropdown_option(value: &str) -> impl Bundle {
+pub fn dropdown_option(value: impl Into<String>) -> impl Bundle {
     use crate::controls::button::{button, ButtonProps};
     use crate::theme::ThemedText;
-
+    let value = value.into();
     (
         button(
             ButtonProps::default(),
             (),
-            Spawn((Text::new(value), ThemedText)),
+            Spawn((Text::new(value.clone()), ThemedText)),
         ),
         DropdownOption {
-            value: value.to_string(),
+            value: value,
         },
         observe(on_option_click),
     )

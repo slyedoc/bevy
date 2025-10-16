@@ -398,7 +398,7 @@ fn demo_panel() -> impl Bundle {
                     SpawnIter(
                         ["Apple", "Banana", "Cherry", "Date", "Elderberry", "Fig", "Grape", "Honeydew"]
                             .iter()
-                            .map(|fruit| dropdown_option(fruit))
+                            .map(|fruit| dropdown_option(*fruit))
                     )
                 ),
                 observe(|change: On<ValueChange<String>>| {
