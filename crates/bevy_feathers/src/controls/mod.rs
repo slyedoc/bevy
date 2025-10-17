@@ -18,7 +18,7 @@ pub use color_slider::{
     color_slider, ColorChannel, ColorSlider, ColorSliderPlugin, ColorSliderProps, SliderBaseColor,
 };
 pub use color_swatch::{color_swatch, ColorSwatch, ColorSwatchFg};
-pub use dropdown::{dropdown, dropdown_option, Dropdown, DropdownOption, DropdownPlugin, DropdownProps};
+pub use dropdown::{dropdown, dropdown_option, Dropdown, DropdownOption, DropdownPlugin, DropdownProps, DropdownTrigger, DropdownTriggerText};
 pub use radio::{radio, RadioPlugin};
 pub use scroll::{scroll, ScrollProps};
 pub use slider::{slider, SliderPlugin, SliderProps};
