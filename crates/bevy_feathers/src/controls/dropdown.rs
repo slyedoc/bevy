@@ -203,12 +203,12 @@ pub fn dropdown_option(value: impl Into<String>) -> impl Bundle {
 
 /// Observer that handles trigger button clicks to toggle dropdown
 fn on_trigger_click(
-    _trigger: On<Activate>,
+    trigger: On<Activate>,
     trigger_query: Query<&ChildOf, With<DropdownTrigger>>,
     mut dropdown_query: Query<&mut Dropdown>,
 ) {
-    // Find parent dropdown
-    for child_of in trigger_query.iter() {
+    // Find parent dropdown for THIS specific trigger
+    if let Ok(child_of) = trigger_query.get(trigger.entity) {
         if let Ok(mut dropdown) = dropdown_query.get_mut(child_of.parent()) {
             dropdown.is_open = !dropdown.is_open;
         }
@@ -219,8 +219,9 @@ fn on_trigger_click(
 fn on_option_click(
     trigger: On<Activate>,
     option_query: Query<(&DropdownOption, &ChildOf)>,
-    mut dropdown_query: Query<&mut Dropdown>,
+    mut dropdown_query: Query<(&mut Dropdown, &Children)>,
     child_of_query: Query<&ChildOf>,
+    trigger_query: Query<&Children, With<DropdownTrigger>>,
     mut text_query: Query<&mut Text, With<DropdownTriggerText>>,
     mut commands: Commands,
 ) {
@@ -231,16 +232,23 @@ fn on_option_click(
     // Walk up the hierarchy to find the dropdown
     let mut current = current_parent.parent();
     loop {
-        if let Ok(mut dropdown) = dropdown_query.get_mut(current) {
+        if let Ok((mut dropdown, dropdown_children)) = dropdown_query.get_mut(current) {
             // Update selected value
             dropdown.selected = option.value.clone();
 
             // Close dropdown
             dropdown.is_open = false;
 
-            // Update the trigger button text (there should only be one DropdownTriggerText)
-            for mut text in text_query.iter_mut() {
-                text.0 = option.value.clone();
+            // Find the trigger button in this specific dropdown's children
+            for &child in dropdown_children {
+                if let Ok(trigger_children) = trigger_query.get(child) {
+                    // Find the text inside this trigger
+                    for &text_child in trigger_children {
+                        if let Ok(mut text) = text_query.get_mut(text_child) {
+                            text.0 = option.value.clone();
+                        }
+                    }
+                }
             }
 
             // Emit ValueChange event on the dropdown entity

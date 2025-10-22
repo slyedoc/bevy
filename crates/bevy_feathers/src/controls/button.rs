@@ -47,6 +47,8 @@ pub struct ButtonProps {
     pub variant: ButtonVariant,
     /// Rounded corners options
     pub corners: RoundedCorners,
+    /// Optional width override
+    pub width: Option<Val>,
 }
 
 /// Template function to spawn a button.
@@ -62,6 +64,7 @@ pub fn button<C: SpawnableList<ChildOf> + Send + Sync + 'static, B: Bundle>(
 ) -> impl Bundle {
     (
         Node {
+            width: props.width.unwrap_or_default(),
             height: size::ROW_HEIGHT,
             justify_content: JustifyContent::Center,
             align_items: AlignItems::Center,
