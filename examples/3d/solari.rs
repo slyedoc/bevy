@@ -8,13 +8,18 @@ use bevy::{
     gltf::GltfMaterialName,
     image::{ImageAddressMode, ImageLoaderSettings},
     mesh::VertexAttributeValues,
+    pbr::{ExtendedMaterial, MaterialExtension},
     post_process::bloom::Bloom,
     prelude::*,
-    render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
+    render::{
+        diagnostic::RenderDiagnosticsPlugin,
+        render_resource::{AsBindGroup, TextureUsages},
+    },
+    shader::ShaderRef,
     scene::SceneInstanceReady,
     solari::{
         pathtracer::{Pathtracer, PathtracingPlugin},
-        prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
+        prelude::{RaytracingMesh3d, SolariLighting, SolariMaterialPlugin, SolariPlugins},
     },
 };
 use rand::{Rng, SeedableRng};
@@ -25,6 +30,29 @@ use std::f32::consts::PI;
 use bevy::anti_alias::dlss::{
     Dlss, DlssProjectId, DlssRayReconstructionFeature, DlssRayReconstructionSupported,
 };
+
+/// A simple material extension that adds a pulsing glow effect.
+/// Demonstrates using ExtendedMaterial with Solari raytracing.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+struct PulsingGlowExtension {
+    /// Base hue for the glow color (0-360 degrees)
+    #[uniform(100)]
+    base_hue: f32,
+}
+
+impl MaterialExtension for PulsingGlowExtension {
+    fn fragment_shader() -> ShaderRef {
+        // Use default fragment shader - animation is done CPU-side on the base material
+        ShaderRef::Default
+    }
+}
+
+/// Marker component for animated torus entities
+#[derive(Component)]
+struct AnimatedTorus;
+
+/// Type alias for the extended material
+type PulsingGlowMaterial = ExtendedMaterial<StandardMaterial, PulsingGlowExtension>;
 
 /// `bevy_solari` demo.
 #[derive(FromArgs, Resource, Clone, Copy)]
@@ -52,11 +80,14 @@ fn main() {
         SolariPlugins,
         FreeCameraPlugin,
         RenderDiagnosticsPlugin,
+        // Register the ExtendedMaterial for both rasterization and Solari raytracing
+        SolariMaterialPlugin::<PulsingGlowExtension>::default(),
     ))
     .insert_resource(args);
 
     if args.many_lights == Some(true) {
-        app.add_systems(Startup, setup_many_lights);
+        app.add_systems(Startup, setup_many_lights)
+            .add_systems(Update, animate_pulsing_glow);
     } else {
         app.add_systems(Startup, setup_pica_pica);
     }
@@ -202,6 +233,7 @@ fn setup_many_lights(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut extended_materials: ResMut<Assets<PulsingGlowMaterial>>,
     args: Res<Args>,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_rr_supported: Option<
         Res<DlssRayReconstructionSupported>,
@@ -231,6 +263,14 @@ fn setup_many_lights(
     );
     let sphere_mesh = meshes.add(
         Sphere::default()
+            .mesh()
+            .build()
+            .with_generated_tangents()
+            .unwrap(),
+    );
+    // Torus mesh for ExtendedMaterial demo
+    let torus_mesh = meshes.add(
+        Torus::new(0.3, 0.6)
             .mesh()
             .build()
             .with_generated_tangents()
@@ -304,6 +344,37 @@ fn setup_many_lights(
                 )),
             ))
             .insert_if(Mesh3d(sphere_mesh.clone()), || {
+                args.pathtracer != Some(true)
+            });
+    }
+
+    // Spawn torus shapes using ExtendedMaterial - demonstrates Solari support for custom materials
+    for i in 0..10 {
+        let angle = (i as f32 / 10.0) * std::f32::consts::TAU;
+        let hue = angle.to_degrees();
+        let radius = 8.0;
+        commands
+            .spawn((
+                AnimatedTorus,
+                RaytracingMesh3d(torus_mesh.clone()),
+                MeshMaterial3d(extended_materials.add(PulsingGlowMaterial {
+                    base: StandardMaterial {
+                        base_color: Color::hsl(hue, 0.8, 0.5),
+                        metallic: 0.9,
+                        perceptual_roughness: 0.1,
+                        ..default()
+                    },
+                    extension: PulsingGlowExtension { base_hue: hue },
+                })),
+                Transform::default()
+                    .with_translation(Vec3::new(
+                        angle.cos() * radius,
+                        1.5,
+                        angle.sin() * radius,
+                    ))
+                    .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+            ))
+            .insert_if(Mesh3d(torus_mesh.clone()), || {
                 args.pathtracer != Some(true)
             });
     }
@@ -615,5 +686,34 @@ fn update_performance_text(
             world_cache_active_cells_count as u32,
             (world_cache_active_cells_count * 100.0) / (2u64.pow(20) as f64)
         ));
+    }
+}
+
+/// Animates the PulsingGlowMaterial tori with a pulsing emissive effect.
+/// The emissive color pulses based on time, creating a breathing glow effect.
+fn animate_pulsing_glow(
+    time: Res<Time>,
+    torus_query: Query<&MeshMaterial3d<PulsingGlowMaterial>, With<AnimatedTorus>>,
+    mut materials: ResMut<Assets<PulsingGlowMaterial>>,
+) {
+    let t = time.elapsed_secs();
+
+    for material_handle in &torus_query {
+        if let Some(material) = materials.get_mut(material_handle) {
+            let base_hue = material.extension.base_hue;
+
+            // Pulsing intensity based on time and hue offset for wave effect
+            let phase = base_hue.to_radians() + t * 2.0;
+            let pulse = (phase.sin() * 0.5 + 0.5).powi(2); // 0 to 1, squared for sharper pulse
+
+            // Animate emissive - glow brighter and dimmer
+            let emissive_strength = pulse * 5000.0;
+            material.base.emissive = Color::hsl(base_hue, 1.0, 0.5).into();
+            material.base.emissive *= emissive_strength;
+
+            // Subtle color shift in base color
+            let shifted_hue = (base_hue + t * 20.0) % 360.0;
+            material.base.base_color = Color::hsl(shifted_hue, 0.8, 0.4 + pulse * 0.2);
+        }
     }
 }

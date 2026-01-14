@@ -1,5 +1,9 @@
-use super::{blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d};
-use bevy_asset::{AssetId, Handle};
+use super::{
+    blas::BlasManager,
+    extract::{ExtractedRaytracingMaterial, RaytracingMaterialAssets},
+    RaytracingMesh3d,
+};
+use bevy_asset::{Handle, UntypedAssetId};
 use bevy_color::{ColorToComponents, LinearRgba};
 use bevy_ecs::{
     entity::{Entity, EntityHashMap},
@@ -7,7 +11,7 @@ use bevy_ecs::{
     system::{Query, Res, ResMut},
 };
 use bevy_math::{ops::cos, Mat4, Vec3};
-use bevy_pbr::{ExtractedDirectionalLight, MeshMaterial3d, StandardMaterial};
+use bevy_pbr::ExtractedDirectionalLight;
 use bevy_platform::{collections::HashMap, hash::FixedHasher};
 use bevy_render::{
     mesh::allocator::MeshAllocator,
@@ -36,13 +40,13 @@ pub fn prepare_raytracing_scene_bindings(
     instances_query: Query<(
         Entity,
         &RaytracingMesh3d,
-        &MeshMaterial3d<StandardMaterial>,
+        &ExtractedRaytracingMaterial,
         &GlobalTransform,
     )>,
     directional_lights_query: Query<(Entity, &ExtractedDirectionalLight)>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
-    material_assets: Res<StandardMaterialAssets>,
+    material_assets: Res<RaytracingMaterialAssets>,
     texture_assets: Res<RenderAssets<GpuImage>>,
     fallback_texture: Res<FallbackImage>,
     render_device: Res<RenderDevice>,
@@ -82,8 +86,7 @@ pub fn prepare_raytracing_scene_bindings(
     let mut directional_lights = StorageBufferList::<GpuDirectionalLight>::default();
     let mut previous_frame_light_id_translations = StorageBufferList::<u32>::default();
 
-    let mut material_id_map: HashMap<AssetId<StandardMaterial>, u32, FixedHasher> =
-        HashMap::default();
+    let mut material_id_map: HashMap<UntypedAssetId, u32, FixedHasher> = HashMap::default();
     let mut material_id = 0;
     let mut process_texture = |texture_handle: &Option<Handle<_>>| -> Option<u32> {
         match texture_handle {
@@ -155,10 +158,10 @@ pub fn prepare_raytracing_scene_bindings(
         let Some(index_slice) = mesh_allocator.mesh_index_slice(&mesh.id()) else {
             continue;
         };
-        let Some(material_id) = material_id_map.get(&material.id()).copied() else {
+        let Some(material_id) = material_id_map.get(&material.0).copied() else {
             continue;
         };
-        let Some(material) = materials.get().get(material_id as usize) else {
+        let Some(mat) = materials.get().get(material_id as usize) else {
             continue;
         };
 
@@ -191,7 +194,7 @@ pub fn prepare_raytracing_scene_bindings(
 
         material_ids.get_mut().push(material_id);
 
-        if material.emissive != Vec3::ZERO {
+        if mat.emissive != Vec3::ZERO {
             light_sources
                 .get_mut()
                 .push(GpuLightSource::new_emissive_mesh_light(

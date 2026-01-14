@@ -18,7 +18,7 @@ pub mod scene;
 pub mod prelude {
     pub use super::SolariPlugins;
     pub use crate::realtime::SolariLighting;
-    pub use crate::scene::RaytracingMesh3d;
+    pub use crate::scene::{RaytracingMesh3d, SolariMaterialApp, SolariMaterialPlugin};
 }
 
 use crate::realtime::SolariLightingPlugin;
@@ -36,6 +36,8 @@ use bevy_render::settings::WgpuFeatures;
 /// * [`pathtracer::PathtracingPlugin`] - A non-realtime pathtracer for validation purposes (not added by default).
 ///
 /// To get started, add this plugin to your app, and then add `RaytracingMesh3d` and `MeshMaterial3d::<StandardMaterial>` to your entities.
+///
+/// For [`ExtendedMaterial<StandardMaterial, E>`](bevy_pbr::ExtendedMaterial), register your extension type with [`SolariMaterialApp::add_solari_material`].
 pub struct SolariPlugins;
 
 impl PluginGroup for SolariPlugins {
