@@ -1307,7 +1307,7 @@ impl FromWorld for PreprocessPipelines {
                 storage_buffer::<PreprocessWorkItem>(/*has_dynamic_offset=*/ false),
             ),));
         let gpu_late_occlusion_culling_bind_group_layout_entries =
-            gpu_occlusion_culling_bind_group_layout_entries();
+            gpu_late_occlusion_culling_bind_group_layout_entries();
 
         let reset_indirect_batch_sets_bind_group_layout_entries =
             DynamicBindGroupLayoutEntries::sequential(
@@ -1498,6 +1498,31 @@ fn gpu_occlusion_culling_bind_group_layout_entries() -> DynamicBindGroupLayoutEn
         (
             12,
             storage_buffer::<LatePreprocessWorkItemIndirectParameters>(
+                /*has_dynamic_offset=*/ false,
+            ),
+        ),
+    ))
+}
+
+/// Returns the bind group layout entries for the late phase of GPU occlusion culling.
+///
+/// This is similar to [`gpu_occlusion_culling_bind_group_layout_entries`], but uses
+/// `storage_buffer_read_only` for binding 12 since the late phase only reads from
+/// the indirect parameters buffer. This avoids a wgpu validation error where
+/// STORAGE_READ_WRITE conflicts with INDIRECT usage in the same dispatch scope.
+fn gpu_late_occlusion_culling_bind_group_layout_entries() -> DynamicBindGroupLayoutEntries {
+    gpu_culling_bind_group_layout_entries().extend_with_indices((
+        (
+            2,
+            uniform_buffer::<PreviousViewData>(/*has_dynamic_offset=*/ false),
+        ),
+        (
+            10,
+            texture_2d(TextureSampleType::Float { filterable: true }),
+        ),
+        (
+            12,
+            storage_buffer_read_only::<LatePreprocessWorkItemIndirectParameters>(
                 /*has_dynamic_offset=*/ false,
             ),
         ),
