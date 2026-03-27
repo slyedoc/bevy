@@ -1,5 +1,5 @@
 mod binder;
-mod blas;
+pub mod blas;
 mod extract;
 mod types;
 
