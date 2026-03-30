@@ -518,6 +518,8 @@ pub mod macro_utils;
 
 extern crate alloc;
 
+mod dynamic_bsn;
+mod dynamic_bsn_lexer;
 mod resolved_scene;
 mod scene;
 mod scene_list;
@@ -525,6 +527,8 @@ mod scene_patch;
 mod spawn;
 
 pub use bevy_scene_macros::*;
+
+use lalrpop_util::lalrpop_mod;
 pub use resolved_scene::*;
 pub use scene::*;
 pub use scene_list::*;
@@ -534,6 +538,13 @@ pub use spawn::*;
 use bevy_app::{App, Plugin, SceneSpawnerSystems, SpawnScene};
 use bevy_asset::AssetApp;
 use bevy_ecs::prelude::*;
+
+use crate::dynamic_bsn::DynamicBsnLoader;
+
+lalrpop_mod!(
+    #[allow(unused_qualifications)]
+    dynamic_bsn_grammar
+);
 
 /// Adds support for spawning Bevy Scenes. See [`Scene`], [`SceneList`], [`ScenePatch`], and the [`bsn!`] macro for more information.
 #[derive(Default)]
@@ -545,6 +556,7 @@ impl Plugin for ScenePlugin {
             .init_resource::<WaitingScenes>()
             .init_asset::<ScenePatch>()
             .init_asset::<SceneListPatch>()
+            .init_asset_loader::<DynamicBsnLoader>()
             .add_systems(
                 SpawnScene,
                 (resolve_scene_patches, spawn_queued)

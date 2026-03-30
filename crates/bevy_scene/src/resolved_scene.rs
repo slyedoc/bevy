@@ -10,6 +10,7 @@ use bevy_ecs::{
     world::{EntityWorldMut, World},
 };
 use bevy_platform::collections::HashSet;
+use bevy_reflect::PartialReflect;
 use bevy_utils::TypeIdMap;
 use core::any::{Any, TypeId};
 use thiserror::Error;
@@ -140,7 +141,7 @@ pub struct ResolvedScene {
     ///
     /// [`Children`]: bevy_ecs::hierarchy::Children
     // PERF: special casing Children might make sense here to avoid hashing
-    related: TypeIdMap<RelatedResolvedScenes>,
+    pub related: TypeIdMap<RelatedResolvedScenes>,
     /// The inherited [`ScenePatch`] to apply _first_ before applying this [`ResolvedScene`].
     inherited: Option<InheritedSceneInfo>,
     /// A [`TypeId`] to `templates` index mapping. If a [`Template`] is intended to be shared / patched across scenes, it should be registered
@@ -394,14 +395,6 @@ impl ResolvedScene {
         Ok(())
     }
 
-    /// This will get the [`Template`], if it already exists in this [`ResolvedScene`]. If it doesn't exist,
-    /// it will use [`Default`] to create a new [`Template`].
-    ///
-    /// This uses "copy-on-write" behavior for inherited scenes. If a [`Template`] that the inherited scene has is requested, it will be
-    /// cloned (using [`Template::clone_template`]), added to the current [`ResolvedScene`], and returned.
-    ///
-    /// This will ignore [`Template`]s added to this scene using [`ResolvedScene::push_template`], as these are not registered as the "canonical"
-    /// [`Template`] for a given [`TypeId`].
     pub fn get_or_insert_template<
         'a,
         T: Template<Output: Component> + Default + Send + Sync + 'static,
@@ -426,12 +419,15 @@ impl ResolvedScene {
     ///
     /// This will ignore [`Template`]s added to this scene using [`ResolvedScene::push_template`], as these are not registered as the "canonical"
     /// [`Template`] for a given [`TypeId`].
-    pub fn get_or_insert_erased_template<'a>(
+    pub fn get_or_insert_erased_template<'a, F>(
         &'a mut self,
         context: &mut ResolveContext,
         type_id: TypeId,
-        default: fn() -> Box<dyn ErasedComponentTemplate>,
-    ) -> &'a mut dyn ErasedComponentTemplate {
+        default: F,
+    ) -> &'a mut dyn ErasedComponentTemplate
+    where
+        F: FnOnce() -> Box<dyn ErasedComponentTemplate>,
+    {
         let mut is_inherited = false;
         let index = self.template_indices.entry(type_id).or_insert_with(|| {
             let index = self.component_templates.len();
@@ -675,6 +671,15 @@ pub trait ErasedComponentTemplate: Any + Send + Sync {
 
     /// Clones this template. See [`Clone`].
     fn clone_template(&self) -> Box<dyn ErasedComponentTemplate>;
+
+    /// Returns a mutable [`Any`] reference to this template, if it can be downcast.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Returns a mutable [`PartialReflect`] reference to this template, if it can be
+    /// reflected. Returns [`None`] otherwise.
+    fn try_as_partial_reflect_mut(&mut self) -> Option<&mut dyn PartialReflect> {
+        None
+    }
 }
 
 impl<T: Template<Output: Component> + Send + Sync + 'static> ErasedComponentTemplate for T {
@@ -694,6 +699,10 @@ impl<T: Template<Output: Component> + Send + Sync + 'static> ErasedComponentTemp
 
     fn clone_template(&self) -> Box<dyn ErasedComponentTemplate> {
         Box::new(Template::clone_template(self))
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
