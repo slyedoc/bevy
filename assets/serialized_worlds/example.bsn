@@ -1,6 +1,4 @@
 // Example BSN file.
-//
-// Demonstrates loading a scene at runtime via the dynamic BSN asset loader.
 
 #Root
 bevy_transform::components::transform::Transform
@@ -8,10 +6,26 @@ bevy_camera::visibility::Visibility::Visible
 bevy_ecs::hierarchy::Children [
     bevy_camera::components::Camera3d
     bevy_transform::components::transform::Transform {
-        translation: glam::Vec3 { x: 2.0, y: 2.0, z: 3.0 },
-        rotation: glam::Quat { x: -0.19134, y: 0.33141, z: 0.06943, w: 0.9215 },
+        translation: glam::Vec3 { x: 0.7, y: 0.7, z: 1.0 },
+        rotation: glam::Quat { x: -0.15037778, y: 0.2968788, z: 0.04740241, w: 0.941808 },
     }
+    bevy_camera::visibility::Visibility::Visible
+    bevy_light::probe::EnvironmentMapLight {
+        diffuse_map: "environment_maps/pisa_diffuse_rgb9e5_zstd.ktx2",
+        specular_map: "environment_maps/pisa_specular_rgb9e5_zstd.ktx2",
+        intensity: 250.0,
+    },
 
     bevy_transform::components::transform::Transform
-    bevy_light::directional_light::DirectionalLight
+    // Embed an asset as a handle:
+    bevy_world_serialization::components::WorldAssetRoot("models/FlightHelmet/FlightHelmet.gltf#Scene0"),
+
+    bevy_light::directional_light::DirectionalLight {
+        shadow_maps_enabled: true,
+    }
+    // A template:
+    @bevy_light::cascade::CascadeShadowConfigBuilder {
+        num_cascades: 1,
+        maximum_distance: 1.6,
+    }
 ]

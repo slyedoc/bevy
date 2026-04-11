@@ -633,12 +633,14 @@ impl BsnAst {
                     .starts_with("bevy_asset::handle::HandleTemplate<")
                 {
                     let asset_path: AssetPath<'static> = AssetPath::parse(string).into_owned();
+                    let mut dynamic_tuple = DynamicTuple::default();
+                    dynamic_tuple.insert(asset_path);
+                    let dynamic_enum =
+                        DynamicEnum::new("Path", DynamicVariant::Tuple(dynamic_tuple));
                     let ReflectMut::Enum(reflect_enum) = reflect.reflect_mut() else {
                         panic!("`HandleTemplate` wasn't an enum")
                     };
-                    // `HandleTemplate::Path` is the default, so we don't have
-                    // to set it.
-                    reflect_enum.field_at_mut(0).unwrap().apply(&asset_path);
+                    reflect_enum.apply(&dynamic_enum);
                     return Ok(reflect.into_partial_reflect());
                 }
 

@@ -12,24 +12,9 @@ fn main() {
         .run();
 }
 
-fn setup(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    asset_server: Res<AssetServer>,
-) {
-    // Load the camera + directional light hierarchy at runtime from BSN.
+fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     let scene_patch = asset_server.load("serialized_worlds/example.bsn");
     commands.spawn(ScenePatchInstance(scene_patch));
-
-    // Spawn a mesh so there's something visible for the BSN camera to look at.
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::from_length(0.5))),
-        MeshMaterial3d(materials.add(StandardMaterial::from_color(Color::srgb(
-            0.4, 0.6, 0.9,
-        )))),
-        Transform::from_xyz(0.0, 0.0, 0.0),
-    ));
 }
 
 fn animate_light_direction(
