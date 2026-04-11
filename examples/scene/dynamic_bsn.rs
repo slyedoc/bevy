@@ -2,10 +2,7 @@
 
 use std::f32::consts::{FRAC_PI_4, PI};
 
-use bevy::ecs::reflect::{ReflectFromTemplate, ReflectTemplate};
-use bevy::light::CascadeShadowConfig;
 use bevy::prelude::*;
-use bevy_scene2::ScenePatchInstance;
 
 fn main() {
     App::new()
@@ -15,30 +12,8 @@ fn main() {
         .run();
 }
 
-#[derive(Clone, Copy, Default, Component, Debug, Reflect)]
-#[reflect(Clone, Default, Component)]
-enum TestEnum {
-    #[default]
-    Foo,
-    Bar,
-    Baz,
-}
-
-#[derive(Clone, Default, Component, Debug, Reflect)]
-#[reflect(Default, Component)]
-struct TestStruct {
-    the_enum: TestEnum,
-}
-
-#[derive(Clone, Component, Debug, Reflect, FromTemplate)]
-#[reflect(Clone, Component, FromTemplate)]
-#[template(reflect)]
-struct HandleContainer {
-    field: Handle<Scene>,
-}
-
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
-    let scene_patch = asset_server.load("scenes/example.bsn");
+    let scene_patch = asset_server.load("serialized_worlds/example.bsn");
     commands.spawn(ScenePatchInstance(scene_patch));
 }
 
