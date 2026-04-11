@@ -8,8 +8,8 @@ bevy_camera::visibility::Visibility::Visible
 bevy_ecs::hierarchy::Children [
     bevy_camera::components::Camera3d
     bevy_transform::components::transform::Transform {
-        translation: glam::Vec3 { x: 0.7, y: 0.7, z: 1.0 },
-        rotation: glam::Quat { x: -0.15037778, y: 0.2968788, z: 0.04740241, w: 0.941808 },
+        translation: glam::Vec3 { x: 2.0, y: 2.0, z: 3.0 },
+        rotation: glam::Quat { x: -0.19134, y: 0.33141, z: 0.06943, w: 0.9215 },
     }
 
     bevy_transform::components::transform::Transform
