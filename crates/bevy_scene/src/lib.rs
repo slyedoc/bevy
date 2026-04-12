@@ -518,8 +518,8 @@ pub mod macro_utils;
 
 extern crate alloc;
 
-mod dynamic_bsn;
-mod dynamic_bsn_lexer;
+pub mod dynamic_bsn;
+pub mod dynamic_bsn_lexer;
 mod resolved_scene;
 mod scene;
 mod scene_list;
@@ -543,7 +543,7 @@ use crate::dynamic_bsn::DynamicBsnLoader;
 
 lalrpop_mod!(
     #[allow(unused_qualifications)]
-    dynamic_bsn_grammar
+    pub dynamic_bsn_grammar
 );
 
 /// Adds support for spawning Bevy Scenes. See [`Scene`], [`SceneList`], [`ScenePatch`], and the [`bsn!`] macro for more information.
