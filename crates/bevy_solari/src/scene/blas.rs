@@ -153,7 +153,10 @@ fn allocate_blas(
         vertex_count: vertex_slice.range.len() as u32,
         index_format: Some(IndexFormat::Uint32),
         index_count: Some(index_slice.range.len() as u32),
-        flags: AccelerationStructureGeometryFlags::OPAQUE,
+        // Non-opaque: ray queries will return candidate intersections so the
+        // shader can alpha-test (see trace_ray in raytracing_scene_bindings.wgsl).
+        // Opaque materials take a fast-path and confirm immediately.
+        flags: AccelerationStructureGeometryFlags::empty(),
     };
 
     let blas = render_device.wgpu_device().create_blas(

@@ -106,8 +106,51 @@ fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ra
     let ray = RayDesc(ray_flag, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
     var rq: ray_query;
     rayQueryInitialize(&rq, tlas, ray);
-    rayQueryProceed(&rq);
+    // BLAS is non-opaque, so ray queries walk candidate intersections and we
+    // alpha-test each one. Opaque materials take a fast path.
+    while rayQueryProceed(&rq) {
+        let candidate = rayQueryGetCandidateIntersection(&rq);
+        if candidate_passes_alpha_test(candidate) {
+            rayQueryConfirmIntersection(&rq);
+        }
+    }
     return rayQueryGetCommittedIntersection(&rq);
+}
+
+fn candidate_passes_alpha_test(candidate: RayIntersection) -> bool {
+    let material_id = material_ids[candidate.instance_index];
+    let material = materials[material_id];
+
+    // Opaque → accept immediately.
+    if material.alpha_mode == ALPHA_MODE_OPAQUE {
+        return true;
+    }
+
+    // No base-color texture → nothing to sample; use the material's implicit
+    // 1.0 alpha (StandardMaterial.base_color is vec3 here), so accept.
+    if material.base_color_texture_id == TEXTURE_MAP_NONE {
+        return true;
+    }
+
+    // Compute hit UV from candidate barycentrics.
+    let instance_geo = geometry_ids[candidate.instance_index];
+    let vertices = load_vertices(instance_geo, candidate.primitive_index);
+    let bary = vec3(1.0 - candidate.barycentrics.x - candidate.barycentrics.y, candidate.barycentrics);
+    let uv = mat3x2(vertices[0].uv, vertices[1].uv, vertices[2].uv) * bary;
+
+    let alpha = textureSampleLevel(
+        textures[material.base_color_texture_id],
+        samplers[material.base_color_texture_id],
+        uv,
+        0.0,
+    ).a;
+
+    if material.alpha_mode == ALPHA_MODE_MASK {
+        return alpha >= material.alpha_cutoff;
+    }
+
+    // Blend: treat as occluder only for sufficiently opaque texels.
+    return alpha > 0.01;
 }
 
 fn sample_texture(id: u32, uv: vec2<f32>) -> vec3<f32> {
