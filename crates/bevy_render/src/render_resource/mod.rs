@@ -62,7 +62,9 @@ pub use wgpu::{
     TextureFormatFeatures, TextureSampleType, TextureUsages, TextureView as WgpuTextureView,
     TextureViewDescriptor, TextureViewDimension, Tlas, TlasInstance, VertexAttribute,
     VertexBufferLayout as RawVertexBufferLayout, VertexFormat, VertexState as RawVertexState,
-    VertexStepMode, COPY_BUFFER_ALIGNMENT,
+    VertexStepMode, COPY_BUFFER_ALIGNMENT, RayTracingPipeline, RayTracingPipelineDescriptor,
+    RayTracingPipelineStageDescriptor, RayTracingShaderGroupDescriptor,
+    RayTracingShaderGroupType, ShaderBindingTableRegion,
 };
 
 pub mod encase {

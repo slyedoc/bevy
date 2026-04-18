@@ -49,9 +49,15 @@ struct Material {
     perceptual_roughness: f32,
     emissive: vec3<f32>,
     metallic: f32,
+    reflectance: vec3<f32>,
+    alpha_cutoff: f32,
+    alpha_mode: u32,
     _padding: vec3<f32>,
-    reflectance: f32,
 }
+
+const ALPHA_MODE_OPAQUE: u32 = 0u;
+const ALPHA_MODE_MASK: u32 = 1u;
+const ALPHA_MODE_BLEND: u32 = 2u;
 
 const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
 
@@ -96,7 +102,9 @@ const RAY_T_MAX = 100000.0f;
 const RAY_NO_CULL = 0xFFu;
 
 fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
-    let ray = RayDesc(ray_flag, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
+    // FORCE_OPAQUE ensures ray queries get committed intersections for non-opaque BLAS geometry.
+    // The RT pipeline any-hit shader handles transparency separately via RAY_FLAG_NONE.
+    let ray = RayDesc(ray_flag | RAY_FLAG_FORCE_OPAQUE, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
     var rq: ray_query;
     rayQueryInitialize(&rq, tlas, ray);
     rayQueryProceed(&rq);
@@ -110,7 +118,7 @@ fn sample_texture(id: u32, uv: vec2<f32>) -> vec3<f32> {
 struct ResolvedMaterial {
     base_color: vec3<f32>,
     emissive: vec3<f32>,
-    reflectance: f32,
+    reflectance: vec3<f32>,
     perceptual_roughness: f32,
     roughness: f32,
     metallic: f32,

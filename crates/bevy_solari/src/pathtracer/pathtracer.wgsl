@@ -97,7 +97,7 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 fn brdf_pdf(wo: vec3<f32>, wi: vec3<f32>, ray_hit: ResolvedRayHitFull) -> f32 {
     let NdotV = max(dot(ray_hit.world_normal, wo), 0.0001);
-    let F0 = calculate_F0(ray_hit.material.base_color, ray_hit.material.metallic, vec3(ray_hit.material.reflectance));
+    let F0 = calculate_F0(ray_hit.material.base_color, ray_hit.material.metallic, ray_hit.material.reflectance);
     let df = 1.0 - luminance(fresnel(F0, NdotV));
 
     let diffuse_weight = mix(df, 0.0, ray_hit.material.metallic);

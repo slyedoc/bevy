@@ -5498,3 +5498,11 @@ name = "Light Probe Blending"
 description = "Demonstrates blending between multiple reflection probes"
 category = "3D Rendering"
 wasm = false
+
+[patch.crates-io]
+wgpu = { path = "/mnt/code/f/wgpu/wgpu" }
+wgpu-core = { path = "/mnt/code/f/wgpu/wgpu-core" }
+wgpu-hal = { path = "/mnt/code/f/wgpu/wgpu-hal" }
+wgpu-types = { path = "/mnt/code/f/wgpu/wgpu-types" }
+wgpu-naga-bridge = { path = "/mnt/code/f/wgpu/wgpu-naga-bridge" }
+naga = { path = "/mnt/code/f/wgpu/naga" }

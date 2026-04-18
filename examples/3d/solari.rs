@@ -10,7 +10,7 @@ use bevy::{
     mesh::{Indices, VertexAttributeValues},
     post_process::bloom::Bloom,
     prelude::*,
-    render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
+    render::render_resource::TextureUsages,
     solari::{
         pathtracer::{Pathtracer, PathtracingPlugin},
         prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
@@ -43,7 +43,7 @@ fn main() {
     let mut app = App::new();
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    app.insert_resource(DlssProjectId(bevy_asset::uuid::uuid!(
+    app.insert_resource(DlssProjectId(bevy::asset::uuid::uuid!(
         "5417916c-0291-4e3f-8f65-326c1858ab96" // Don't copy paste this - generate your own UUID!
     )));
 
@@ -51,7 +51,7 @@ fn main() {
         DefaultPlugins,
         SolariPlugins,
         FreeCameraPlugin,
-        RenderDiagnosticsPlugin,
+        //RenderDiagnosticsPlugin,
     ))
     .insert_resource(args);
 

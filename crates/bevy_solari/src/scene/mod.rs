@@ -1,15 +1,17 @@
 mod binder;
-mod blas;
+pub mod blas;
 mod extract;
+mod rt_pipeline;
 mod types;
 
 use bevy_shader::load_shader_library;
 pub use binder::RaytracingSceneBindings;
+pub use rt_pipeline::ShadowRtPipeline;
 pub use types::RaytracingMesh3d;
 
 use crate::SolariPlugins;
 use bevy_app::{App, Plugin};
-use bevy_ecs::schedule::IntoScheduleConfigs;
+use bevy_ecs::{schedule::IntoScheduleConfigs, system::Commands};
 use bevy_render::{
     extract_resource::ExtractResourcePlugin,
     mesh::{
@@ -17,14 +19,15 @@ use bevy_render::{
         RenderMesh,
     },
     render_asset::prepare_assets,
-    render_resource::BufferUsages,
+    render_resource::{BufferUsages, PipelineCache},
     renderer::RenderDevice,
-    ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
+    ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
+use bevy_ecs::system::Res;
 use binder::prepare_raytracing_scene_bindings;
 use blas::{compact_raytracing_blas, prepare_raytracing_blas, BlasManager};
 use extract::{extract_raytracing_scene, StandardMaterialAssets};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Creates acceleration structures and binding arrays of resources for raytracing.
 pub struct RaytracingScenePlugin;
@@ -61,6 +64,7 @@ impl Plugin for RaytracingScenePlugin {
             .init_gpu_resource::<BlasManager>()
             .init_gpu_resource::<StandardMaterialAssets>()
             .insert_resource(RaytracingSceneBindings::new())
+            .add_systems(RenderStartup, init_shadow_rt_pipeline)
             .add_systems(ExtractSchedule, extract_raytracing_scene)
             .add_systems(
                 Render,
@@ -76,4 +80,21 @@ impl Plugin for RaytracingScenePlugin {
                 ),
             );
     }
+}
+
+fn init_shadow_rt_pipeline(
+    mut commands: Commands,
+    render_device: Res<RenderDevice>,
+    pipeline_cache: Res<PipelineCache>,
+    scene_bindings: Res<RaytracingSceneBindings>,
+) {
+    let shader_source = include_str!("shadow_rt.wgsl");
+    let pipeline = ShadowRtPipeline::new(
+        &render_device,
+        &pipeline_cache,
+        &scene_bindings,
+        shader_source,
+    );
+    info!("Shadow RT pipeline created successfully");
+    commands.insert_resource(pipeline);
 }

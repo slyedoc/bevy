@@ -57,9 +57,10 @@ pub fn prepare_raytracing_blas(
         .extracted
         .iter()
         .filter(|(_, mesh)| is_mesh_raytracing_compatible(mesh))
-        .map(|(asset_id, _)| {
+        .map(|(asset_id, mesh)| {
             let vertex_slice = mesh_allocator.mesh_vertex_slice(asset_id).unwrap();
             let index_slice = mesh_allocator.mesh_index_slice(asset_id).unwrap();
+            let vertex_size = mesh.get_vertex_size();
 
             let (blas, blas_size) =
                 allocate_blas(&vertex_slice, &index_slice, asset_id, &render_device);
@@ -69,19 +70,19 @@ pub fn prepare_raytracing_blas(
                 .compaction_queue
                 .push_back((*asset_id, blas_size.vertex_count, false));
 
-            (*asset_id, vertex_slice, index_slice, blas_size)
+            (*asset_id, vertex_slice, index_slice, blas_size, vertex_size)
         })
         .collect::<Vec<_>>();
 
     // Build geometry into each BLAS
     let build_entries = blas_resources
         .iter()
-        .map(|(asset_id, vertex_slice, index_slice, blas_size)| {
+        .map(|(asset_id, vertex_slice, index_slice, blas_size, vertex_size)| {
             let geometry = BlasTriangleGeometry {
                 size: blas_size,
                 vertex_buffer: vertex_slice.buffer,
                 first_vertex: vertex_slice.range.start,
-                vertex_stride: 48,
+                vertex_stride: *vertex_size as u64,
                 index_buffer: Some(index_slice.buffer),
                 first_index: Some(index_slice.range.start),
                 transform_buffer: None,
@@ -152,7 +153,9 @@ fn allocate_blas(
         vertex_count: vertex_slice.range.len() as u32,
         index_format: Some(IndexFormat::Uint32),
         index_count: Some(index_slice.range.len() as u32),
-        flags: AccelerationStructureGeometryFlags::OPAQUE,
+        // Non-opaque allows any-hit shader invocation for alpha testing.
+        // The any-hit shader accepts immediately for opaque materials.
+        flags: AccelerationStructureGeometryFlags::NO_DUPLICATE_ANY_HIT_INVOCATION,
     };
 
     let blas = render_device.wgpu_device().create_blas(

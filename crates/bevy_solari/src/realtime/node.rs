@@ -2,7 +2,7 @@ use super::{
     prepare::{SolariLightingResources, LIGHT_TILE_BLOCKS, WORLD_CACHE_SIZE},
     SolariLighting,
 };
-use crate::scene::RaytracingSceneBindings;
+use crate::scene::{RaytracingSceneBindings, ShadowRtPipeline};
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy_anti_alias::dlss::ViewDlssRayReconstructionTextures;
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
@@ -78,6 +78,7 @@ type SolariLightingViewQuery = (
 pub fn solari_lighting(
     view: ViewQuery<SolariLightingViewQuery>,
     solari_pipelines: Option<Res<SolariLightingPipelines>>,
+    shadow_rt_pipeline: Option<Res<ShadowRtPipeline>>,
     pipeline_cache: Res<PipelineCache>,
     scene_bindings: Res<RaytracingSceneBindings>,
     view_uniforms: Res<ViewUniforms>,
@@ -250,6 +251,19 @@ pub fn solari_lighting(
             occlusion_query_set: None,
             multiview_mask: None,
         });
+    }
+
+    // Dispatch shadow RT pipeline test (traces a single ray to verify the pipeline works)
+    if let Some(ref shadow_rt) = shadow_rt_pipeline {
+        command_encoder.trace_rays(
+            &shadow_rt.pipeline,
+            &[(&**scene_bind_group, &[])],
+            &shadow_rt.raygen_region,
+            &shadow_rt.miss_region,
+            &shadow_rt.hit_region,
+            &shadow_rt.callable_region,
+            1, 1, 1, // 1x1x1 dispatch — single ray for testing
+        );
     }
 
     let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -505,7 +519,7 @@ pub fn init_solari_lighting_pipelines(
             "compact_world_cache_blocks",
             load_embedded_asset!(asset_server.as_ref(), "world_cache_compact.wgsl"),
             Some(&bind_group_layout_world_cache_active_cells_dispatch),
-            vec![],
+            vec!["WORLD_CACHE_NON_ATOMIC_LIFE_BUFFER".into()],
         ),
         compact_world_cache_write_active_cells_pipeline: create_pipeline(
             "solari_lighting_compact_world_cache_write_active_cells_pipeline",

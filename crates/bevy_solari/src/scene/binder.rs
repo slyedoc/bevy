@@ -7,6 +7,7 @@ use bevy_ecs::{
     system::{Query, Res, ResMut},
 };
 use bevy_math::{ops::cos, Mat4, Vec3};
+use bevy_material::AlphaMode;
 use bevy_pbr::{
     DfgLut, ExtractedDirectionalLight, MeshMaterial3d, PreviousGlobalTransform, StandardMaterial,
 };
@@ -132,7 +133,16 @@ pub fn prepare_raytracing_scene_bindings(
             perceptual_roughness: material.perceptual_roughness,
             emissive: material.emissive.to_vec3(),
             metallic: material.metallic,
-            reflectance: material.reflectance,
+            reflectance: LinearRgba::from(material.specular_tint).to_vec3() * material.reflectance,
+            alpha_cutoff: match material.alpha_mode {
+                AlphaMode::Mask(cutoff) => cutoff,
+                _ => 0.5,
+            },
+            alpha_mode: match material.alpha_mode {
+                AlphaMode::Opaque => 0,
+                AlphaMode::Mask(_) => 1,
+                _ => 2,
+            },
             _padding: Default::default(),
         });
 
@@ -305,7 +315,11 @@ impl RaytracingSceneBindings {
             bind_group_layout: BindGroupLayoutDescriptor::new(
                 "raytracing_scene_bind_group_layout",
                 &BindGroupLayoutEntries::sequential(
-                    ShaderStages::COMPUTE,
+                    ShaderStages::COMPUTE
+                        | ShaderStages::RAY_GENERATION
+                        | ShaderStages::ANY_HIT
+                        | ShaderStages::CLOSEST_HIT
+                        | ShaderStages::MISS,
                     (
                         storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
                         storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
@@ -392,8 +406,11 @@ struct GpuMaterial {
     perceptual_roughness: f32,
     emissive: Vec3,
     metallic: f32,
-    _padding: Vec3,
-    reflectance: f32,
+    reflectance: Vec3,
+    alpha_cutoff: f32,
+    /// 0 = Opaque, 1 = Mask, 2 = Blend
+    alpha_mode: u32,
+    _padding: [f32; 3],
 }
 
 #[derive(ShaderType)]

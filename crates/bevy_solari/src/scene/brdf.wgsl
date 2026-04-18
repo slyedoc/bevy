@@ -25,7 +25,7 @@ fn evaluate_and_sample_brdf(
 ) -> EvaluateAndSampleBrdfResult {
     let NdotV = dot(world_normal, wo);
     if NdotV < 0.0001 { return EvaluateAndSampleBrdfResult(vec3(0.0), vec3(0.0), 0.0); }
-    let F0 = calculate_F0(material.base_color, material.metallic, vec3(material.reflectance));
+    let F0 = calculate_F0(material.base_color, material.metallic, material.reflectance);
     let df = 1.0 - luminance(fresnel(F0, NdotV));
 
     let diffuse_weight = mix(df, 0.0, material.metallic);
@@ -81,7 +81,7 @@ fn evaluate_diffuse_brdf(wo: vec3<f32>, wi: vec3<f32>, world_normal: vec3<f32>, 
     let NdotL = dot(world_normal, wi);
     let NdotV = dot(world_normal, wo);
     if NdotL < 0.0001 || NdotV < 0.0001 { return vec3(0.0); }
-    let F0 = calculate_F0(material.base_color, material.metallic, vec3(material.reflectance));
+    let F0 = calculate_F0(material.base_color, material.metallic, material.reflectance);
     let layering = (1.0 - fresnel(F0, NdotL)) * (1.0 - fresnel(F0, NdotV));
 
     return diffuse_color * layering * NdotL;
@@ -95,7 +95,7 @@ fn evaluate_specular_brdf(wo: vec3<f32>, wi: vec3<f32>, world_normal: vec3<f32>,
     let NdotV = dot(world_normal, wo);
     if NdotL < 0.0001 || NdotH < 0.0001 || LdotH < 0.0001 || NdotV < 0.0001 { return vec3(0.0); }
 
-    let F0 = calculate_F0(material.base_color, material.metallic, vec3(material.reflectance));
+    let F0 = calculate_F0(material.base_color, material.metallic, material.reflectance);
     let F = fresnel(F0, LdotH);
 
     if material.roughness <= MIRROR_ROUGHNESS_THRESHOLD {
