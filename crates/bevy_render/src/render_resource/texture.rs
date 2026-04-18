@@ -74,8 +74,8 @@ pub struct SurfaceTexture {
 }
 
 impl SurfaceTexture {
-    pub fn present(self) {
-        self.value.into_inner().present();
+    pub fn present(self, queue: &wgpu::Queue) {
+        queue.present(self.value.into_inner());
     }
 }
 

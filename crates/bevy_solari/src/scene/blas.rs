@@ -153,9 +153,7 @@ fn allocate_blas(
         vertex_count: vertex_slice.range.len() as u32,
         index_format: Some(IndexFormat::Uint32),
         index_count: Some(index_slice.range.len() as u32),
-        // Non-opaque allows any-hit shader invocation for alpha testing.
-        // The any-hit shader accepts immediately for opaque materials.
-        flags: AccelerationStructureGeometryFlags::NO_DUPLICATE_ANY_HIT_INVOCATION,
+        flags: AccelerationStructureGeometryFlags::OPAQUE,
     };
 
     let blas = render_device.wgpu_device().create_blas(

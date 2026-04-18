@@ -518,10 +518,12 @@ impl PipelineCache {
                     .vertex
                     .buffers
                     .iter()
-                    .map(|layout| RawVertexBufferLayout {
-                        array_stride: layout.array_stride,
-                        attributes: &layout.attributes,
-                        step_mode: layout.step_mode,
+                    .map(|layout| {
+                        Some(RawVertexBufferLayout {
+                            array_stride: layout.array_stride,
+                            attributes: &layout.attributes,
+                            step_mode: layout.step_mode,
+                        })
                     })
                     .collect::<Vec<_>>();
 

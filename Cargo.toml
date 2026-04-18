@@ -5500,9 +5500,9 @@ category = "3D Rendering"
 wasm = false
 
 [patch.crates-io]
-wgpu = { path = "/mnt/code/f/wgpu/wgpu" }
-wgpu-core = { path = "/mnt/code/f/wgpu/wgpu-core" }
-wgpu-hal = { path = "/mnt/code/f/wgpu/wgpu-hal" }
-wgpu-types = { path = "/mnt/code/f/wgpu/wgpu-types" }
-wgpu-naga-bridge = { path = "/mnt/code/f/wgpu/wgpu-naga-bridge" }
-naga = { path = "/mnt/code/f/wgpu/naga" }
+wgpu = { git = "https://github.com/slyedoc/wgpu", branch = "any-hit-support" }
+wgpu-core = { git = "https://github.com/slyedoc/wgpu", branch = "any-hit-support" }
+wgpu-hal = { git = "https://github.com/slyedoc/wgpu", branch = "any-hit-support" }
+wgpu-types = { git = "https://github.com/slyedoc/wgpu", branch = "any-hit-support" }
+wgpu-naga-bridge = { git = "https://github.com/slyedoc/wgpu", branch = "any-hit-support" }
+naga = { git = "https://github.com/slyedoc/wgpu", branch = "any-hit-support" }

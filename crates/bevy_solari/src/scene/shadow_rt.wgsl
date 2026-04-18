@@ -1,5 +1,6 @@
 enable wgpu_ray_tracing_pipeline;
 enable primitive_index;
+enable wgpu_binding_array;
 
 // --- Types matching raytracing_scene_bindings.wgsl ---
 

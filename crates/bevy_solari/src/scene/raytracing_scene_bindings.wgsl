@@ -1,4 +1,5 @@
 enable wgpu_ray_query;
+enable wgpu_binding_array;
 
 #define_import_path bevy_solari::scene_bindings
 
@@ -102,9 +103,7 @@ const RAY_T_MAX = 100000.0f;
 const RAY_NO_CULL = 0xFFu;
 
 fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
-    // FORCE_OPAQUE ensures ray queries get committed intersections for non-opaque BLAS geometry.
-    // The RT pipeline any-hit shader handles transparency separately via RAY_FLAG_NONE.
-    let ray = RayDesc(ray_flag | RAY_FLAG_FORCE_OPAQUE, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
+    let ray = RayDesc(ray_flag, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
     var rq: ray_query;
     rayQueryInitialize(&rq, tlas, ray);
     rayQueryProceed(&rq);

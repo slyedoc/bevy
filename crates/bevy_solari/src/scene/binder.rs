@@ -410,7 +410,7 @@ struct GpuMaterial {
     alpha_cutoff: f32,
     /// 0 = Opaque, 1 = Mask, 2 = Blend
     alpha_mode: u32,
-    _padding: [f32; 3],
+    _padding: Vec3,
 }
 
 #[derive(ShaderType)]

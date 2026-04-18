@@ -253,18 +253,8 @@ pub fn solari_lighting(
         });
     }
 
-    // Dispatch shadow RT pipeline test (traces a single ray to verify the pipeline works)
-    if let Some(ref shadow_rt) = shadow_rt_pipeline {
-        command_encoder.trace_rays(
-            &shadow_rt.pipeline,
-            &[(&**scene_bind_group, &[])],
-            &shadow_rt.raygen_region,
-            &shadow_rt.miss_region,
-            &shadow_rt.hit_region,
-            &shadow_rt.callable_region,
-            1, 1, 1, // 1x1x1 dispatch — single ray for testing
-        );
-    }
+    // Disabled: shadow RT pipeline test dispatch (suspect for breaking rendering)
+    let _ = &shadow_rt_pipeline;
 
     let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
         label: Some("solari_lighting"),
