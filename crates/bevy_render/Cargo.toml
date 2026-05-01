@@ -37,6 +37,13 @@ statically-linked-dxc = ["wgpu/static-dxc"]
 # Forces the wgpu instance to be initialized using the raw Vulkan HAL, enabling additional configuration
 raw_vulkan_init = ["wgpu/vulkan"]
 
+# Forwards `wgpu/experimental-cluster-acceleration-structure`. Vulkan-only NVIDIA
+# extension exposing `VK_NV_cluster_acceleration_structure` (the bottom layer of
+# RTX MegaGeometry). See the `cluster_acceleration_structure` example for usage.
+experimental_cluster_acceleration_structure = [
+    "wgpu/experimental-cluster-acceleration-structure",
+]
+
 trace = ["profiling"]
 tracing-tracy = ["dep:tracy-client"]
 ci_limits = []

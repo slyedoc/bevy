@@ -92,6 +92,7 @@ pub fn render_system(
         #[cfg(feature = "trace")]
         let _span = info_span!("present_frames").entered();
 
+        let render_queue = world.resource::<RenderQueue>().clone();
         world.resource_scope(|world, mut windows: Mut<ExtractedWindows>| {
             let views = state.get(world).unwrap();
             for window in windows.values_mut() {
@@ -103,7 +104,7 @@ pub fn render_system(
                 });
 
                 if view_needs_present || window.needs_initial_present {
-                    window.present();
+                    window.present(&render_queue.0);
                     window.needs_initial_present = false;
                 }
             }
@@ -204,7 +205,12 @@ pub async fn initialize_renderer(
                 force_shader_model: ForceShaderModelToken::default(),
                 agility_sdk: None,
             },
-            noop: wgpu::NoopBackendOptions { enable: false },
+            // wgpu trunk added several fields to `NoopBackendOptions` post-29.0.1; use
+            // `Default::default` and override only what we set.
+            noop: wgpu::NoopBackendOptions {
+                enable: false,
+                ..Default::default()
+            },
         },
     };
 
@@ -250,6 +256,9 @@ pub async fn initialize_renderer(
         power_preference: options.power_preference,
         compatible_surface: surface.as_ref(),
         force_fallback_adapter,
+        // Added on wgpu trunk post-29.0.1. We don't constrain by limit bucket; let the
+        // adapter pick whatever's available.
+        apply_limit_buckets: Default::default(),
     };
 
     #[cfg(not(target_family = "wasm"))]

@@ -66,6 +66,12 @@ statically-linked-dxc = ["bevy_render/statically-linked-dxc"]
 # Forces the wgpu instance to be initialized using the raw Vulkan HAL, enabling additional configuration
 raw_vulkan_init = ["bevy_render/raw_vulkan_init"]
 
+# Vulkan-only NVIDIA extension `VK_NV_cluster_acceleration_structure` (RTX MegaGeometry).
+# See `examples/3d/cluster_acceleration_structure.rs`.
+experimental_cluster_acceleration_structure = [
+    "bevy_render/experimental_cluster_acceleration_structure",
+]
+
 # Pre-populate buffer labels with buffer types for debugging.
 type_label_buffers = ["bevy_render/type_label_buffers"]
 

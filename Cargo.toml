@@ -418,6 +418,12 @@ statically-linked-dxc = ["bevy_internal/statically-linked-dxc"]
 # Forces the wgpu instance to be initialized using the raw Vulkan HAL, enabling additional configuration
 raw_vulkan_init = ["bevy_internal/raw_vulkan_init"]
 
+# Vulkan-only NVIDIA extension `VK_NV_cluster_acceleration_structure` (RTX MegaGeometry).
+# See `examples/3d/cluster_acceleration_structure.rs`.
+experimental_cluster_acceleration_structure = [
+    "bevy_internal/experimental_cluster_acceleration_structure",
+]
+
 # Pre-populate buffer labels with buffer types for debugging.
 type_label_buffers = ["bevy_internal/type_label_buffers"]
 
@@ -759,6 +765,9 @@ futures-timer = { version = "3", features = ["wasm-bindgen", "gloo-timers"] }
 crossbeam-channel = "0.5.0"
 argh = "0.1.12"
 thiserror = "2.0"
+# Direct deps for the cluster_acceleration_structure smoke test example only.
+wgpu = { version = "29.0.1", default-features = false }
+ash = { version = "0.38" }
 event-listener = "5.3.0"
 anyhow = "1"
 accesskit = "0.24"
@@ -1536,6 +1545,18 @@ name = "Solari"
 description = "Demonstrates realtime dynamic raytraced lighting using Bevy Solari."
 category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "cluster_acceleration_structure"
+path = "examples/3d/cluster_acceleration_structure.rs"
+doc-scrape-examples = true
+required-features = ["experimental_cluster_acceleration_structure"]
+
+[package.metadata.example.cluster_acceleration_structure]
+name = "Cluster Acceleration Structure (NV)"
+description = "Smoke test for VK_NV_cluster_acceleration_structure. Requests the wgpu feature, escapes via as_hal, and queries cluster build sizes."
+category = "3D Rendering"
+wasm = false
 
 [[example]]
 name = "spherical_area_lights"
@@ -5522,3 +5543,17 @@ name = "Light Probe Blending"
 description = "Demonstrates blending between multiple reflection probes"
 category = "3D Rendering"
 wasm = false
+
+# Local fork of wgpu with `experimental-cluster-acceleration-structure` enabled,
+# pulling `VK_NV_cluster_acceleration_structure` bindings from a fork of ash that
+# tracks current Vulkan headers (PR ash-rs/ash#1028). This is what the
+# `cluster_acceleration_structure` example below tests.
+[patch.crates-io]
+wgpu = { path = "../wgpu/wgpu" }
+wgpu-core = { path = "../wgpu/wgpu-core" }
+wgpu-hal = { path = "../wgpu/wgpu-hal" }
+wgpu-types = { path = "../wgpu/wgpu-types" }
+wgpu-naga-bridge = { path = "../wgpu/wgpu-naga-bridge" }
+naga = { path = "../wgpu/naga" }
+ash = { git = "https://github.com/slyedoc/ash.git", branch = "cluster-acceleration-structure" }
+gpu-allocator = { git = "https://github.com/slyedoc/gpu-allocator.git", branch = "ash-push-rename" }
