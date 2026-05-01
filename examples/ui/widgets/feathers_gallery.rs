@@ -174,7 +174,7 @@ fn demo_column_1() -> impl Scene {
                             flex_grow: 1.0,
                         }
                         on(|_activate: On<Activate>| {
-                            info!("Disabled button clicked!");
+                            info!("Primary button clicked!");
                         })
                     ),
                     (
