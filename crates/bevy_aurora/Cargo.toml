@@ -1,0 +1,54 @@
+[package]
+name = "bevy_aurora"
+version = "0.19.0-dev"
+edition = "2024"
+description = "Pure ray-traced rendering for clustered (meshlet) geometry: cluster_AS + ReSTIR + DLSS Ray Reconstruction"
+homepage = "https://bevy.org"
+repository = "https://github.com/bevyengine/bevy"
+license = "MIT OR Apache-2.0"
+keywords = ["bevy"]
+
+[dependencies]
+# bevy
+bevy_app = { path = "../bevy_app", version = "0.19.0-dev" }
+bevy_asset = { path = "../bevy_asset", version = "0.19.0-dev" }
+bevy_camera = { path = "../bevy_camera", version = "0.19.0-dev" }
+bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.19.0-dev" }
+bevy_ecs = { path = "../bevy_ecs", version = "0.19.0-dev" }
+bevy_math = { path = "../bevy_math", version = "0.19.0-dev" }
+bevy_pbr = { path = "../bevy_pbr", version = "0.19.0-dev" }
+bevy_platform = { path = "../bevy_platform", version = "0.19.0-dev", default-features = false, features = [
+  "std",
+] }
+bevy_reflect = { path = "../bevy_reflect", version = "0.19.0-dev" }
+bevy_render = { path = "../bevy_render", version = "0.19.0-dev", features = [
+  # Aurora reaches into wgpu-hal's Vulkan backend via as_hal/as_hal_mut.
+  # The cluster_AS extension lives under this Cargo feature on wgpu-hal,
+  # forwarded via bevy_render and the wgpu/wgpu-core/wgpu-hal feature chain.
+  "experimental_cluster_acceleration_structure",
+] }
+bevy_transform = { path = "../bevy_transform", version = "0.19.0-dev" }
+bevy_utils = { path = "../bevy_utils", version = "0.19.0-dev" }
+
+# raw vk + wgpu hal access -- aurora drives cluster_AS through as_hal escapes
+ash = { version = "0.38" }
+wgpu = { version = "29.0.1", default-features = false }
+
+# other
+bytemuck = { version = "1", features = ["derive"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[features]
+# DLSS Ray Reconstruction final upscale.
+dlss = []
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args = [
+  "-Zunstable-options",
+  "--generate-link-to-definition",
+  "--generate-macro-expansion",
+]
+all-features = true
