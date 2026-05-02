@@ -19,6 +19,7 @@
 //! module proper as `cluster_as.rs`, `blas.rs`, `tlas.rs`, and `meshlet_loader.rs`
 //! during M-A implementation.
 
+pub mod cluster_as;
 pub mod meshlet_loader;
 pub mod raw_vk;
 
