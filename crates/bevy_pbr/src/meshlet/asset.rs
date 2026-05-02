@@ -60,6 +60,51 @@ pub struct MeshletMesh {
     pub(crate) bvh_depth: u32,
 }
 
+/// Read-only accessors for [`MeshletMesh`]'s underlying data. Used by external
+/// crates (e.g. `bevy_aurora`) that consume the meshlet format for ray-tracing.
+impl MeshletMesh {
+    /// The full bitstream-packed vertex-position array shared across all meshlets.
+    /// See [`Meshlet`] for per-meshlet decoding parameters.
+    #[inline]
+    pub fn vertex_positions(&self) -> &[u32] {
+        &self.vertex_positions
+    }
+
+    /// Octahedral-encoded, 2×16-snorm packed vertex normals shared across all
+    /// meshlets. Indexed by `Meshlet::start_vertex_attribute_id + local_vertex`.
+    #[inline]
+    pub fn vertex_normals(&self) -> &[u32] {
+        &self.vertex_normals
+    }
+
+    /// Uncompressed vertex UVs shared across all meshlets. Indexed by
+    /// `Meshlet::start_vertex_attribute_id + local_vertex`.
+    #[inline]
+    pub fn vertex_uvs(&self) -> &[Vec2] {
+        &self.vertex_uvs
+    }
+
+    /// Per-triangle vertex indices, packed as `u8` values local to each
+    /// meshlet's vertex range. A meshlet's indices live at
+    /// `[start_index_id .. start_index_id + 3 * triangle_count]`.
+    #[inline]
+    pub fn indices(&self) -> &[u8] {
+        &self.indices
+    }
+
+    /// The list of meshlets making up this mesh.
+    #[inline]
+    pub fn meshlets(&self) -> &[Meshlet] {
+        &self.meshlets
+    }
+
+    /// Tight world-space AABB of this mesh.
+    #[inline]
+    pub fn aabb(&self) -> &MeshletAabb {
+        &self.aabb
+    }
+}
+
 /// A single BVH8 node in the BVH used for culling and LOD selection of a [`MeshletMesh`].
 #[derive(Copy, Clone, Default, Pod, Zeroable)]
 #[repr(C)]

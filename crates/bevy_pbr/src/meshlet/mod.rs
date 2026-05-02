@@ -21,7 +21,8 @@ pub(crate) use self::{
 };
 
 pub use self::asset::{
-    MeshletMesh, MeshletMeshLoader, MeshletMeshSaver, MESHLET_MESH_ASSET_VERSION,
+    Meshlet, MeshletAabb, MeshletMesh, MeshletMeshLoader, MeshletMeshSaver,
+    MESHLET_MESH_ASSET_VERSION,
 };
 #[cfg(feature = "meshlet_processor")]
 pub use self::from_mesh::{
