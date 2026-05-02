@@ -728,4 +728,5 @@ Forks involved (all on slyedoc):
 - `slyedoc/wgpu#cluster-acceleration-structure` (M-B.prereq landed)
 - `slyedoc/ash#cluster-acceleration-structure`
 - `slyedoc/gpu-allocator#ash-push-rename`
-- `slyedoc/bevy#restir_primary` (this branch — resumes M-B sub-2)
+- `slyedoc/bevy#primary_ray` (this branch — primary visibility is M-B's
+  whole purpose; renamed from `restir_primary` to reflect that)
