@@ -289,7 +289,19 @@ Deliverables:
 - `examples/m_b_pgbuffer_vis.rs` — visualize PGBuffer normals as colors
 
 **Risks**:
-- Material lookup is novel — no solari precedent.
+- Material lookup chain is well-trodden in Nanite (Unreal `Engine/Shaders/Private/Nanite/RayTracing/`
+  + `Engine/Shaders/Private/Nanite/NaniteAttributeDecode.ush`) but not in solari.
+  The canonical chain is `(InstanceID, ClusterId, PrimitiveIndex) → FCluster →
+  GetRelativeMaterialIndex → DecodeSegmentMapping LUT → MaterialSlot`. Nanite
+  bakes the per-triangle material index into the AS itself by writing
+  `DecodeGeometryIndexBuffer` during CLAS decode, so the AS reports it as
+  `GeometryIndex` at hit time. Notably Nanite does *not* use
+  `instance_custom_index` for materials — that's free for Aurora to use
+  however it wants. For the M-B bunny test (single material per mesh) the
+  whole cluster-level chain is unnecessary: a per-instance LUT indexed by
+  `intersection.instance_index → AuroraInstanceData.material_id` is enough
+  (~50 LOC WGSL + a storage buffer). The full chain comes online only when
+  Aurora wants multi-material meshes (post-M-C).
 - Motion vectors from RT primary need camera-jitter awareness (TAA / DLSS).
 - Hybrid scenes (meshlet + raster entities) need a write strategy: aurora-priority
   inside meshlet pixels, raster fallback elsewhere. Defer to M-D's compose.
@@ -544,9 +556,16 @@ These are unresolved and will surface during M-A or M-B:
 
 ## 10. Risks I'm tracking
 
-- **Material lookup novelty.** Cluster-id → meshlet-id → material slot is new
-  ground; solari's per-instance-id model doesn't translate. M-B is the riskiest
-  milestone for this reason.
+- **Material lookup chain.** Solari's per-instance-id model is too shallow —
+  cluster geometry needs `(instance, cluster, primitive) → cluster header →
+  material index → material slot`. The canonical recipe is fully documented in
+  Unreal's Nanite RT shaders: per-triangle material index is baked into the AS
+  via `GeometryIndex` during CLAS decode; per-cluster multi-material is
+  encoded with a fast path (≤3 ranges in the cluster header) and a slow path
+  (linear search through a per-cluster `MaterialTable`). Aurora cribs the
+  structure when it needs multi-material per cluster — single-material-per-mesh
+  prototype scope (M-B / bunny) gets away with a flat per-instance LUT and
+  defers the cluster-level chain to post-M-C.
 - **PGBuffer ↔ DLSS-RR fit.** DLSS-RR has tight expectations on guide-buffer
   shape. Verify against solari's working DLSS-RR call site before committing
   PGBuffer formats.
@@ -590,13 +609,22 @@ place; compute pipeline not yet wired.
 `create_texture_from_hal`, plus `Tlas::instance_buffer` becoming `Option`
 and a `BuildAccelerationStructureError::CannotRebuildForeignTlas` guard. No
 hal-level changes required; the fork already exposes the hal-level build
-APIs Aurora needs. ~140 LOC across wgpu-core + wgpu. Validation deferred to
-M-B sub-2 (Aurora's `scene/tlas.rs` rewrite against hal).
+APIs Aurora needs. ~140 LOC across wgpu-core + wgpu.
 
-**Active: M-B sub-2 on `slyedoc/bevy#restir_primary`.** Rewrite
-`scene/tlas.rs` to build the TLAS through `wgpu-hal` (instead of raw ash),
-wrap via `Device::create_tlas_from_hal`, then wire `primary/visibility.rs`
-as a plain wgpu compute pipeline with an `acceleration_structure` binding.
+**M-B sub-2 landed.** `scene/tlas.rs` rewritten to build through wgpu-hal +
+wrap via `create_tlas_from_hal` (`add2668f30`); `primary/visibility.{rs,wgsl}`
+wires a compute pipeline that binds the wrapped TLAS as
+`acceleration_structure` and traces a camera ray per pixel into the camera's
+view target. Validated end-to-end on bunny: 2416 CLASes → cluster-built
+BLAS → wrapped TLAS → ray-queried + dispatched, zero validation errors.
+
+Visual output is debug-shaded (world-position fractional bits → R/G/B on hit,
+dim sky on miss). Real PGBuffer fill (proper world_position / normal /
+motion / material_id / depth) lands in M-B sub-3.
+
+**Active: M-B sub-3.** Replace the debug shading with proper PGBuffer fill
+into the existing [`PgbufferTextures`] resource so downstream passes (M-C
+ReSTIR DI) can read it.
 
 Forks involved (all on slyedoc):
 - `slyedoc/wgpu#cluster-acceleration-structure` (M-B.prereq landed)

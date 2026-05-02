@@ -1,19 +1,14 @@
 //! Aurora's RT primary visibility pass — the layer that replaces
 //! [`DeferredPrepass`] / [`DepthPrepass`] for meshlet-rendered entities.
 //!
-//! Traces a camera ray per pixel against the TLAS managed by
-//! [`crate::scene::TlasManager`] and writes a "primary G-buffer" (`PGBuffer`) of
-//! world position / world normal / screen motion / material id / linear depth.
-//! Downstream Aurora passes (lighting, compose) read `PGBuffer` the same way
-//! they would read raster G-buffer in solari.
-//!
-//! # Milestone state
-//!
-//! M-B sub-1 (this commit): allocate `PGBuffer` textures + plugin scaffolding.
-//! No compute shader, no ray query, no dispatch yet — those land in
-//! M-B sub-2 (compute pipeline) and M-B sub-3 (visibility WGSL).
+//! M-B sub-1 scaffolded the [`PgbufferTextures`] resource. M-B sub-2 (this
+//! module) adds the actual compute pass: a camera ray per pixel against
+//! Aurora's wrapped TLAS, written straight into the camera's view target as
+//! a debug shading. M-B sub-3 will swap that simple write for a proper
+//! PGBuffer fill (world_position / normal / motion / material_id / depth).
 
 pub mod pgbuffer;
+pub mod visibility;
 
 use bevy_app::{App, Plugin};
 use bevy_ecs::schedule::IntoScheduleConfigs;
@@ -23,12 +18,14 @@ use bevy_render::{
 };
 
 pub use pgbuffer::{PgbufferExtent, PgbufferTextures};
+pub use visibility::{AuroraCamera, AuroraPrimaryVisibilityPlugin};
 
-/// Allocates [`PgbufferTextures`] at render startup and (later) drives the RT
-/// primary visibility compute pass.
-pub struct AuroraPrimaryVisibilityPlugin;
+/// Allocates [`PgbufferTextures`] at render startup. Per-camera sizing comes
+/// when [`AuroraCamera`] gains a viewport tracker; for now the fixed
+/// [`PgbufferExtent`] is used.
+pub struct AuroraPgbufferPlugin;
 
-impl Plugin for AuroraPrimaryVisibilityPlugin {
+impl Plugin for AuroraPgbufferPlugin {
     fn build(&self, app: &mut App) {
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -43,9 +40,6 @@ impl Plugin for AuroraPrimaryVisibilityPlugin {
     }
 }
 
-/// Allocate `PGBuffer` textures at render startup, sized to the default extent.
-/// Real per-camera sizing comes when [`crate::scene::components::AuroraCamera`]
-/// lands in the next sub-milestone.
 fn init_pgbuffer(
     mut commands: bevy_ecs::system::Commands,
     device: bevy_ecs::system::Res<RenderDevice>,
@@ -67,9 +61,6 @@ fn init_pgbuffer(
     commands.insert_resource(textures);
 }
 
-/// React to changes in [`PgbufferExtent`] by reallocating the `PGBuffer`
-/// textures. M-B sub-1 only fires when an external system mutates the extent;
-/// the auto-resize-on-camera-viewport-change path comes with `AuroraCamera`.
 fn resize_pgbuffer(
     mut commands: bevy_ecs::system::Commands,
     device: bevy_ecs::system::Res<RenderDevice>,
@@ -78,7 +69,7 @@ fn resize_pgbuffer(
 ) {
     let needs_resize = match pgbuffer.as_deref() {
         Some(pg) => pg.extent != extent.0,
-        None => false, // init_pgbuffer handles first allocation
+        None => false,
     };
     if !needs_resize {
         return;

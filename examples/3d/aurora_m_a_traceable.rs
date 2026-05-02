@@ -27,6 +27,7 @@ use bevy::{
 };
 use bevy::aurora::{
     prelude::*,
+    primary::AuroraCamera,
     scene::{AuroraMeshlet3d, ClusterAsManager, TlasManager, UploadedMeshes},
 };
 use bevy::ecs::schedule::IntoScheduleConfigs;
@@ -53,9 +54,21 @@ fn main() {
             AuroraDumpPlugin,
         ))
         .insert_resource(BunnyAsset(Handle::default()))
-        .add_systems(Startup, load_bunny)
+        .add_systems(Startup, (load_bunny, setup_camera))
         .add_systems(Update, spawn_when_ready)
         .run();
+}
+
+fn setup_camera(mut commands: Commands) {
+    use bevy::render::render_resource::TextureUsages;
+    commands.spawn((
+        Camera3d::default(),
+        bevy::camera::Hdr,
+        Msaa::Off,
+        bevy::camera::CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
+        Transform::from_xyz(0.5, 0.7, 1.5).looking_at(Vec3::new(0.0, 0.4, 0.0), Vec3::Y),
+        AuroraCamera,
+    ));
 }
 
 #[derive(Resource)]

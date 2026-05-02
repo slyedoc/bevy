@@ -56,6 +56,7 @@ impl PluginGroup for AuroraPlugins {
     fn build(self) -> PluginGroupBuilder {
         PluginGroupBuilder::start::<Self>()
             .add(scene::AuroraScenePlugin)
+            .add(primary::AuroraPgbufferPlugin)
             .add(primary::AuroraPrimaryVisibilityPlugin)
     }
 }
