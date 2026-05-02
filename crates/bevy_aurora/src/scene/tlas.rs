@@ -203,8 +203,13 @@ impl TlasManager {
                     instance_id: inst.instance_custom_index & 0x00FF_FFFF,
                     instance_mask: u32::from(inst.mask),
                     instance_contribution_to_hit_group_index: 0,
+                    // FORCE_OPAQUE at the instance level matches the
+                    // OPAQUE flag set at the cluster geometry level (see
+                    // `cluster_as.rs::OPAQUE_GEOMETRY_FLAGS`). Without it,
+                    // candidate triangles need any-hit confirmation, which
+                    // Aurora's WGSL ray-query path doesn't do.
                     instance_flags:
-                        vk::PartitionedAccelerationStructureInstanceFlagsNV::default(),
+                        vk::PartitionedAccelerationStructureInstanceFlagsNV::FLAG_FORCE_OPAQUE,
                     instance_index: idx as u32,
                     // Single global partition for now -- multi-partition
                     // build-time support comes once Aurora has a meaningful

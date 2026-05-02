@@ -611,7 +611,65 @@ and a `BuildAccelerationStructureError::CannotRebuildForeignTlas` guard. No
 hal-level changes required; the fork already exposes the hal-level build
 APIs Aurora needs. ~140 LOC across wgpu-core + wgpu.
 
-**M-B sub-2 partial — bunny invisible (cluster-BLAS-in-TLAS suspect).**
+**M-B sub-2 LANDED — bunny visible end-to-end.**
+
+The Zorah-shape pipeline is fully working through Aurora: meshlet →
+CLAS → cluster BLAS → partitioned TLAS → wrapped as `wgpu::Tlas` →
+bound in a plain wgpu compute shader → ray-queried → bunny silhouette
+on screen. Both `NV_RAYTRACING_CLUSTER_OPS` (= Vulkan
+`VK_NV_cluster_acceleration_structure`) and `NV_RAYTRACING_PARTITIONED_TLAS`
+(= Vulkan `VK_NV_partitioned_acceleration_structure`) are required and
+both are now wired through the wgpu fork.
+
+**The hard-won bug fix:** Aurora was setting
+`base_geometry_index_and_geometry_flags = 1 << 29` thinking it meant
+OPAQUE. It actually meant `CULL_DISABLE`. The 3-bit `geometryFlags`
+subfield occupies bits 29-31 and holds the *enum value* (not a
+pre-positioned bit), per `ash::vk::ClusterAccelerationStructureGeometryFlagsNV`:
+
+  CULL_DISABLE   = 0b001  → bit 29 set
+  NO_DUPLICATE_AH = 0b010 → bit 30 set
+  OPAQUE         = 0b100  → bit 31 set
+
+Without OPAQUE, NV's driver treats every cluster triangle as a candidate
+requiring any-hit confirmation. Aurora's WGSL ray query does
+`rayQueryProceed` + `rayQueryGetCommittedIntersection` but never
+`rayQueryConfirmIntersection`, so candidates never become committed
+hits. Result: every ray returned `RAY_QUERY_INTERSECTION_NONE`. Fix:
+`OPAQUE_GEOMETRY_FLAGS = 0b100 << 29` (= `1 << 31`) in
+`scene/cluster_as.rs`, plus `FLAG_FORCE_OPAQUE` on the partitioned-TLAS
+`PartitionedAccelerationStructureWriteInstanceDataNV` for symmetry.
+
+**Diagnostic infrastructure that earned its keep:**
+
+- `scene/test_triangle_blas.rs` (`AURORA_TEST_TRIANGLE_BLAS=1`): builds a
+  standard KHR triangle BLAS, runs it through Aurora's TLAS wrap path.
+  Decisive when the bunny was missing -- triangle visible meant
+  wrap+bind+trace was correct, isolating the bug to BLAS contents.
+- `scene/blas.rs::wrap_built_blas`: created a `VkAccelerationStructureKHR`
+  handle aliasing the cluster_AS BLAS storage and compared
+  `vkGetAccelerationStructureDeviceAddressKHR` against the
+  cluster_AS-reported `dst_addresses[0]`. Equal -- proved the address
+  read was correct.
+- Vulkan validation layers (`InstanceFlags::VALIDATION`) on the example
+  to surface AS / build / sync diagnostics. Notably *no* AS-specific
+  diagnostics ever appeared -- Aurora's API usage was technically
+  correct; the bug was purely a flag-value misread.
+
+**Earlier fully unrelated detour, kept for the record:** First attempt
+to fix the missing bunny was to add `VK_NV_partitioned_acceleration_structure`
+to wgpu (multi-day, ~330 LOC). That detour was *also* needed (per the
+Zorah workflow notes pairing CLUSTER_OPS + PARTITIONED_TLAS) but it
+wasn't sufficient on its own -- the OPAQUE flag bug had to be fixed
+*after* the partitioned TLAS was in place. Both pieces are now load-bearing.
+
+**(Original M-B sub-2 partial block below kept as historical context.)**
+
+---
+
+(Earlier text — the wrong-hypothesis wall before the OPAQUE fix:)
+
+
 `scene/tlas.rs` rewritten to build through wgpu-hal + wrap via
 `create_tlas_from_hal` (`add2668f30`); `primary/visibility.{rs,wgsl}` wires
 a compute pipeline that binds the wrapped TLAS as `acceleration_structure`

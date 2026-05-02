@@ -222,8 +222,22 @@ impl ClusterAsManager {
         // NaniteRayTracingDecodePageClusters.usf also uses IndexFormat=4.
         const INDEX_TYPE_32BIT: u32 = 4;
         // Geometry-flags layout: bits 0..24 geometryIndex, 24..29 reserved,
-        // 29..32 geometryFlags. Bit 29 = OPAQUE.
-        const OPAQUE_GEOMETRY_FLAGS: u32 = 1 << 29;
+        // 29..32 geometryFlags (3-bit subfield).
+        //
+        // **The 3-bit geometryFlags subfield holds the enum VALUE, not a
+        // pre-positioned bit.** Per ash / Vulkan / NVAPI:
+        //   CULL_DISABLE                  = 0b001  → bit 29 set
+        //   NO_DUPLICATE_ANYHIT_INVOCATION = 0b010 → bit 30 set
+        //   OPAQUE                         = 0b100 → bit 31 set
+        //
+        // Without OPAQUE set, NV's driver treats every cluster triangle as a
+        // any-hit-shader candidate. Aurora's ray-query path does
+        // rayQueryProceed + rayQueryGetCommittedIntersection but never
+        // rayQueryConfirmIntersection, so candidate triangles never get
+        // committed and ray queries return NONE -- which is exactly what we
+        // saw with the bunny invisible. (Aurora was previously setting
+        // `1 << 29` thinking it meant OPAQUE; that's actually CULL_DISABLE.)
+        const OPAQUE_GEOMETRY_FLAGS: u32 = 0b100 << 29;
 
         let mut max_tris = 0u32;
         let mut max_verts = 0u32;
