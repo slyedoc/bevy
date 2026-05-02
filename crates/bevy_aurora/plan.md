@@ -235,6 +235,37 @@ Deliverables:
 - Quarter-res introduces aliasing on high-frequency GI — may need a small
   variance-aware filter before DLSS-RR
 
+### M-A.streaming — "Sparse CLAS array + meshlet page lifecycle" *(2-3 weeks)*
+
+End state: CLAS array lives in a sparse-residency `VkBuffer` whose pages are
+bound on demand as meshlet streamer adds/evicts geometry. No reallocation +
+copy when the array grows. Hooks into `bevy_pbr::meshlet`'s page lifecycle.
+
+Mirrors what NVIDIA gets from D3D12 Reserved Resources in Zorah. Required
+before Aurora can render scenes that don't fit in a fixed CLAS budget at
+build time.
+
+Deliverables:
+- `scene/raw_vk.rs::SparseBuffer` wrapper with `bind_pages` / `unbind_pages`
+- Sparse-binding queue selection at adapter init
+- CLAS allocator that hands out offset ranges as meshlet pages stream in
+- Eviction path that frees ranges when meshlet pages stream out
+- Defrag pass (Adam's "move ops" from Zorah) — periodic compaction so the
+  bound range stays contiguous
+
+**Risks**:
+- Sparse-binding queue ordering vs the regular graphics queue — bind ops are
+  asynchronous; need fences to keep CLAS reads ordered after binds.
+- Page granularity (typically 64 KiB on NVIDIA, larger on some IHVs) — wastes
+  memory if individual CLASes are small.
+- Defrag is intrusive; needs to coordinate with in-flight ray traces.
+
+This is a separate milestone, **not a prerequisite** for M-B/M-C/M-D — those
+all work with base M-A's committed buffers as long as the scene fits in the
+fixed CLAS budget. M-A.streaming becomes a prerequisite for "render scenes
+larger than 1 GB of clusters" and for matching Zorah's stutter-free
+streaming behaviour.
+
 ### M-F — "ReSTIR PT (Lin 2022)" *(4-8 weeks, separate project)*
 
 End state: ReSTIR GI replaced with full ReSTIR PT. Multi-bounce reuse via
@@ -348,6 +379,21 @@ These are unresolved and will surface during M-A or M-B:
 - **CLAS lifetime / streaming.** Production Nanite has CLAS array eviction +
   defrag. Prototype scope: static meshes only, build once, never evict.
   Production scope: integrate with `bevy_pbr::meshlet`'s page lifecycle.
+- **Sparse-residency buffers for streaming (D3D12 "Reserved Resources" equivalent).**
+  Zorah uses D3D12 Reserved Resources extensively to avoid CPU-side stutter
+  from CLAS-array resizes — every meshlet page streamed in extends the array,
+  and reallocating + copying multi-MB buffers on a frame-hot path stalls.
+  Vulkan equivalent: `VkBufferCreateInfo::flags = SPARSE_BINDING_BIT |
+  SPARSE_RESIDENCY_BIT` + `vkQueueBindSparse` to wire pages into virtual ranges.
+  Needs `sparseBinding` + `sparseResidencyBuffer` device features (universal on
+  discrete GPUs) plus a sparse-binding queue. wgpu has zero coverage for
+  sparse buffers — this is more raw-vk territory.
+
+  **Scope**: deferred to a separate milestone "M-A.streaming". Base M-A uses
+  committed (`vkAllocateMemory + vkBindBufferMemory`) buffers since it's
+  static-only. Migrating committed → sparse later means swapping `RawBuffer`'s
+  allocation backend; the device-address API is unchanged so call sites don't
+  move.
 - **Material model.** Per-mesh material (one StandardMaterial per AuroraMeshlet3d
   entity, applied to all clusters of that mesh). Per-cluster material slots
   (Nanite-style multi-material meshlets) deferred — not required for prototype.
