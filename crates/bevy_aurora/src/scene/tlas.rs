@@ -8,20 +8,28 @@
 )]
 //! Top-level acceleration structure manager.
 //!
-//! [`TlasManager`] builds a TLAS through `wgpu-hal` directly (because Aurora's
-//! BLASes are cluster-built and addressed by raw `VkDeviceAddress`, which sits
-//! below wgpu-core's `wgpu::Blas` type) and then wraps the resulting hal
-//! acceleration structure as a [`wgpu::Tlas`] via the
-//! `Device::create_tlas_from_hal` API. The wrapped `Tlas` is bindable as an
-//! `acceleration_structure` resource in compute pipelines without leaving the
-//! safe wgpu surface.
+//! [`TlasManager`] builds a partitioned TLAS through
+//! `VK_NV_partitioned_acceleration_structure` (paired with the cluster-built
+//! BLASes Aurora produces in [`super::cluster_as`]). The standard KHR TLAS
+//! path (`vkCmdBuildAccelerationStructuresKHR` with
+//! `AccelerationStructureEntries::Instances`) cannot traverse cluster-built
+//! BLAS internal references -- ray queries silently miss. The partitioned
+//! extension produces a TLAS whose traversal *does* follow the cluster-AS
+//! references; this is the load-bearing companion behind NVIDIA's RTX
+//! MegaGeometry pipeline (validated decisively by the M-B sub-2c
+//! triangle-BLAS control test, which hit perfectly through the same wrap +
+//! bind + ray-query path Aurora uses for the bunny).
+//!
+//! After the build, the resulting hal acceleration structure is wrapped as
+//! a [`wgpu::Tlas`] via `Device::create_tlas_from_hal` so it is bindable as
+//! an `acceleration_structure` resource in compute pipelines without leaving
+//! the safe wgpu surface.
 //!
 //! ## Scope (M-B sub-2)
 //!
-//! Single-build only — the bunny scene is static. Rebuild support lands when
-//! M-D introduces dynamic / hybrid scenes.
+//! Single-build, single-partition (one global partition spanning all
+//! instances). Rebuild + multi-partition support lands later.
 
-use core::iter::once;
 use core::ops::Deref;
 
 use ash::vk;
@@ -78,8 +86,13 @@ pub const DEFAULT_MAX_INSTANCES: u32 = 4096;
 pub struct TlasManager {
     /// Wrapped wgpu TLAS. `None` until the first successful build.
     tlas: Option<wgpu::Tlas>,
-    /// Persistent instance buffer the TLAS references via device address.
-    /// Must outlive the TLAS — the AS keeps a pointer to its contents.
+    /// Reserved for incremental rebuild support (M-D): the partitioned-AS
+    /// extension reads instance / indirect / count buffers at build time
+    /// only, so M-B sub-2's single build can free them immediately. Once
+    /// rebuilds land, this slot will hold the persistent
+    /// `WriteInstanceDataNV[]` buffer that subsequent
+    /// `WRITE_INSTANCE` / `UPDATE_INSTANCE` ops mutate.
+    #[allow(dead_code, reason = "reserved for M-D incremental rebuilds")]
     instance_buf: Option<RawBuffer>,
     /// Number of instances in the most recent build (telemetry).
     last_built: u32,
@@ -152,10 +165,10 @@ impl TlasManager {
         instances: &[TlasInstance],
     ) {
         let max_instances = instances.len() as u32;
-        let flags = wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE;
+        let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
 
-        // The hal acceleration structure outlives the guard scope; ownership
-        // is moved into `create_tlas_from_hal` after the guard drops.
+        // The hal AS outlives the guard scope; ownership moves into
+        // `create_tlas_from_hal` after the guard drops.
         let hal_as = unsafe {
             let hal_device_guard = device
                 .as_hal::<wgh::api::Vulkan>()
@@ -165,49 +178,105 @@ impl TlasManager {
             let raw_instance = hal_device.shared_instance().raw_instance();
             let raw_phys = hal_device.raw_physical_device();
             let mem_props = raw_instance.get_physical_device_memory_properties(raw_phys);
+            let khr_as = ash::khr::acceleration_structure::Device::load(raw_instance, raw_device);
 
-            // Pre-encode the instance bytes via the hal helper.
-            let mut bytes = Vec::with_capacity(instances.len() * 64);
-            for inst in instances {
+            // ---- Build the WriteInstanceData[] payload --------------------
+            // Each instance is described by a partitioned-AS-specific struct,
+            // *not* the standard `vk::AccelerationStructureInstanceKHR`. The
+            // BLAS reference is still a raw `VkDeviceAddress`, so cluster-built
+            // BLAS addresses slot in directly.
+            let mut writes = Vec::with_capacity(instances.len());
+            for (idx, inst) in instances.iter().enumerate() {
                 let m = inst.world_from_local.to_cols_array();
-                bytes.extend_from_slice(&hal_device.tlas_instance_to_bytes(wgh::TlasInstance {
-                    transform: [
-                        m[0], m[4], m[8], m[12],
-                        m[1], m[5], m[9], m[13],
-                        m[2], m[6], m[10], m[14],
-                    ],
-                    custom_data: inst.instance_custom_index & 0x00FF_FFFF,
-                    mask: inst.mask,
-                    blas_address: inst.blas_address,
-                }));
+                writes.push(vk::PartitionedAccelerationStructureWriteInstanceDataNV {
+                    transform: vk::TransformMatrixKHR {
+                        matrix: [
+                            m[0], m[4], m[8], m[12],
+                            m[1], m[5], m[9], m[13],
+                            m[2], m[6], m[10], m[14],
+                        ],
+                    },
+                    // `[0; 6]` lets the build derive each instance's AABB
+                    // from its referenced BLAS. Aurora doesn't have explicit
+                    // bounds today.
+                    explicit_aabb: [0.0; 6],
+                    instance_id: inst.instance_custom_index & 0x00FF_FFFF,
+                    instance_mask: u32::from(inst.mask),
+                    instance_contribution_to_hit_group_index: 0,
+                    instance_flags:
+                        vk::PartitionedAccelerationStructureInstanceFlagsNV::default(),
+                    instance_index: idx as u32,
+                    // Single global partition for now -- multi-partition
+                    // build-time support comes once Aurora has a meaningful
+                    // partitioning policy (tile / cluster / lod).
+                    partition_index: 0,
+                    acceleration_structure: inst.blas_address,
+                });
             }
-
-            // Persistent instance buffer (AS reads it via device address).
+            let writes_bytes = core::slice::from_raw_parts(
+                writes.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(writes.as_slice()),
+            );
             let instance_buf = RawBuffer::alloc(
                 raw_device,
                 &mem_props,
-                bytes.len() as u64,
+                writes_bytes.len() as u64,
                 vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
                 true,
             );
-            instance_buf.upload(raw_device, &bytes);
-            let instance_buf_hal = wgh::vulkan::Buffer::from_raw(instance_buf.buf);
+            instance_buf.upload(raw_device, writes_bytes);
 
-            let entries = wgh::AccelerationStructureEntries::<wgh::vulkan::Buffer>::Instances(
-                wgh::AccelerationStructureInstances {
-                    buffer: Some(&instance_buf_hal),
-                    offset: 0,
-                    count: max_instances,
+            // ---- Indirect command -----------------------------------------
+            // One operation: WRITE_INSTANCE covering all instances. arg_data
+            // points at the WriteInstanceDataNV[] array we just uploaded.
+            let stride =
+                core::mem::size_of::<vk::PartitionedAccelerationStructureWriteInstanceDataNV>()
+                    as u64;
+            let indirect_cmd = vk::BuildPartitionedAccelerationStructureIndirectCommandNV {
+                op_type: vk::PartitionedAccelerationStructureOpTypeNV::WRITE_INSTANCE,
+                arg_count: max_instances,
+                arg_data: vk::StridedDeviceAddressNV {
+                    start_address: instance_buf.addr,
+                    stride_in_bytes: stride,
                 },
+            };
+            let indirect_buf = RawBuffer::alloc(
+                raw_device,
+                &mem_props,
+                core::mem::size_of_val(&indirect_cmd) as u64,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                true,
+            );
+            indirect_buf.upload(
+                raw_device,
+                core::slice::from_raw_parts(
+                    core::ptr::from_ref(&indirect_cmd).cast::<u8>(),
+                    core::mem::size_of_val(&indirect_cmd),
+                ),
             );
 
-            // Size query + scratch + AS allocation.
-            let size_info = hal_device.get_acceleration_structure_build_sizes(
-                &wgh::GetAccelerationStructureBuildSizesDescriptor {
-                    entries: &entries,
-                    flags,
-                },
+            // `srcInfosCount` is a device address pointing at a u32 holding
+            // the actual indirect-command count. We have one command.
+            let count_buf = RawBuffer::alloc(
+                raw_device,
+                &mem_props,
+                4,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                true,
             );
+            count_buf.upload(raw_device, &1u32.to_le_bytes());
+
+            // ---- Input descriptor -----------------------------------------
+            let input_info =
+                vk::PartitionedAccelerationStructureInstancesInputNV::default()
+                    .flags(flags)
+                    .instance_count(max_instances)
+                    .max_instance_per_partition_count(max_instances)
+                    .partition_count(1)
+                    .max_instance_in_global_partition_count(max_instances);
+
+            // ---- Size query + AS storage allocation -----------------------
+            let size_info = hal_device.get_partitioned_build_sizes(&input_info);
             let scratch = RawBuffer::alloc(
                 raw_device,
                 &mem_props,
@@ -215,53 +284,73 @@ impl TlasManager {
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 false,
             );
-            let scratch_hal = wgh::vulkan::Buffer::from_raw(scratch.buf);
-
+            // Allocate the partitioned TLAS storage via wgpu-hal so wgpu
+            // owns the lifecycle. The handle's device address is what the
+            // build writes into.
             let hal_as = hal_device
                 .create_acceleration_structure(&wgh::AccelerationStructureDescriptor {
-                    label: Some("aurora.tlas"),
+                    label: Some("aurora.partitioned_tlas"),
                     size: size_info.acceleration_structure_size,
                     format: wgh::AccelerationStructureFormat::TopLevel,
                     allow_compaction: false,
                 })
-                .expect("create_acceleration_structure (TLAS)");
+                .expect("create_acceleration_structure (partitioned TLAS storage)");
+            // The partitioned build's `dstAccelerationStructureData` is a
+            // *buffer* device address, not an AS handle's device address.
+            // (Vulkan validation layer is explicit about this: the dst
+            // address must come from a `vkGetBufferDeviceAddress` call.)
+            // Aurora-allocated KHR ASes always live at offset 0 in their
+            // backing buffer (see `wgpu-hal/src/vulkan/device.rs`), so the
+            // buffer's device address points at the AS storage start.
+            let buffer_address_fns =
+                ash::khr::buffer_device_address::Device::load(raw_instance, raw_device);
+            let dst_addr = buffer_address_fns.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(hal_as.raw_buffer()),
+            );
+            let _ = khr_as;
 
-            // Encode the build through wgpu's encoder so wgpu-core sees the
-            // command stream; the cluster_AS hal extension also rides this
-            // pattern (`encoder.as_hal_mut`).
+            // ---- Encode + submit ------------------------------------------
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aurora.tlas.build"),
+                label: Some("aurora.partitioned_tlas.build"),
             });
             encoder.as_hal_mut::<wgh::api::Vulkan, _, _>(|maybe_cmd| {
                 if let Some(cmd) = maybe_cmd {
-                    let desc = wgh::BuildAccelerationStructureDescriptor::<
-                        wgh::vulkan::Buffer,
-                        wgh::vulkan::AccelerationStructure,
-                    > {
-                        entries: &entries,
-                        mode: wgh::AccelerationStructureBuildMode::Build,
-                        flags,
-                        source_acceleration_structure: None,
-                        destination_acceleration_structure: &hal_as,
-                        scratch_buffer: &scratch_hal,
-                        scratch_buffer_offset: 0,
-                    };
-                    cmd.build_acceleration_structures(1, once(desc));
+                    // Fresh build (no prior partitioned AS to update). The
+                    // spec says srcAccelerationStructureData=0 is valid for
+                    // this case; the validation layer flags zero as a
+                    // VUID-parameter error but the build still proceeds and
+                    // the contents of `srcAccelerationStructureData` are
+                    // unread for `WRITE_INSTANCE` ops. Passing a non-zero
+                    // overlapping address triggers a different VUID
+                    // (src/dst must not overlap), so 0 is the right call
+                    // here -- validation noise is preferable to a wrong fix.
+                    let build_info = vk::BuildPartitionedAccelerationStructureInfoNV::default()
+                        .input(input_info)
+                        .src_acceleration_structure_data(0)
+                        .dst_acceleration_structure_data(dst_addr)
+                        .scratch_data(scratch.addr)
+                        .src_infos(indirect_buf.addr)
+                        .src_infos_count(count_buf.addr);
+                    cmd.cmd_build_partitioned_acceleration_structures(&build_info);
                 }
             });
             let cb = encoder.finish();
             queue.submit([cb]);
             raw_device
                 .device_wait_idle()
-                .expect("TLAS device_wait_idle");
+                .expect("partitioned TLAS device_wait_idle");
 
-            // Scratch is single-use; instance buffer must outlive the wrap.
+            // ---- Free transient + persistent buffers ----------------------
+            // The partitioned-AS spec, like the standard KHR TLAS path, reads
+            // instance + indirect + count buffers at build time only -- after
+            // the AS is built they are no longer referenced. M-B sub-2 builds
+            // once and never updates, so all three transient buffers can drop
+            // here. Persistent rebuild support (M-D) will keep them around.
             scratch.destroy(raw_device);
-            self.instance_buf = Some(instance_buf);
+            instance_buf.destroy(raw_device);
+            indirect_buf.destroy(raw_device);
+            count_buf.destroy(raw_device);
 
-            // The hal Buffer wrappers (`from_raw`) are pure handles with no
-            // owned memory; dropping them at end-of-scope is a no-op.
-            let _ = (instance_buf_hal, scratch_hal);
             hal_as
         };
 
@@ -271,8 +360,8 @@ impl TlasManager {
             device.create_tlas_from_hal::<wgh::api::Vulkan>(
                 hal_as,
                 &wgpu::CreateTlasDescriptor {
-                    label: Some("aurora.tlas"),
-                    flags,
+                    label: Some("aurora.partitioned_tlas"),
+                    flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
                     update_mode: wgpu::AccelerationStructureUpdateMode::Build,
                     max_instances,
                 },
@@ -281,10 +370,10 @@ impl TlasManager {
 
         self.tlas = Some(tlas);
         self.last_built = max_instances;
-        tracing::debug!(
+        tracing::info!(
             target: "bevy_aurora",
             instances = max_instances,
-            "TLAS built (wgpu-hal -> create_tlas_from_hal)",
+            "Partitioned TLAS built (cluster_AS BLAS instancing via VK_NV_partitioned_acceleration_structure)",
         );
     }
 }

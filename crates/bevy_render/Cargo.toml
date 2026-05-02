@@ -44,6 +44,13 @@ experimental_cluster_acceleration_structure = [
     "wgpu/experimental-cluster-acceleration-structure",
 ]
 
+# Forwards `wgpu/experimental-partitioned-acceleration-structure`. Vulkan-only
+# NVIDIA extension exposing `VK_NV_partitioned_acceleration_structure`. Pairs
+# with `experimental_cluster_acceleration_structure`.
+experimental_partitioned_acceleration_structure = [
+    "wgpu/experimental-partitioned-acceleration-structure",
+]
+
 trace = ["profiling"]
 tracing-tracy = ["dep:tracy-client"]
 ci_limits = []

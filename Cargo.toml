@@ -427,6 +427,14 @@ experimental_cluster_acceleration_structure = [
     "bevy_internal/experimental_cluster_acceleration_structure",
 ]
 
+# Vulkan-only NVIDIA extension `VK_NV_partitioned_acceleration_structure` --
+# the load-bearing companion to `experimental_cluster_acceleration_structure`
+# for the Nanite-style pipeline. Required to ray-query against cluster-built
+# BLASes (the standard KHR TLAS path doesn't traverse them).
+experimental_partitioned_acceleration_structure = [
+    "bevy_internal/experimental_partitioned_acceleration_structure",
+]
+
 # Pre-populate buffer labels with buffer types for debugging.
 type_label_buffers = ["bevy_internal/type_label_buffers"]
 

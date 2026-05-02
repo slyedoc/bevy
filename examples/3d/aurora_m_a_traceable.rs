@@ -45,7 +45,8 @@ fn main() {
             DefaultPlugins.set(RenderPlugin {
                 render_creation: WgpuSettings {
                     features: WgpuFeatures::EXPERIMENTAL_RAY_QUERY
-                        | WgpuFeatures::EXPERIMENTAL_CLUSTER_ACCELERATION_STRUCTURE,
+                        | WgpuFeatures::EXPERIMENTAL_CLUSTER_ACCELERATION_STRUCTURE
+                        | WgpuFeatures::EXPERIMENTAL_PARTITIONED_ACCELERATION_STRUCTURE,
                     // Force-enable Vulkan validation in release so the layer
                     // surfaces "BLAS device address X is not a recognized AS"
                     // / wrong-flag / barrier-missing diagnostics. Requires the
