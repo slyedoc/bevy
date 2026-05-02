@@ -30,13 +30,15 @@
 
 use std::ops::Deref;
 
-use ash::vk;
+use ash::vk::{self, Handle as _, TaggedStructure as _};
 use bevy::{
     app::AppExit,
     prelude::*,
     render::{
-        render_resource::WgpuFeatures, renderer::RenderDevice, settings::WgpuSettings, RenderApp,
-        RenderPlugin, RenderStartup,
+        render_resource::WgpuFeatures,
+        renderer::{RenderDevice, RenderQueue},
+        settings::WgpuSettings,
+        RenderApp, RenderPlugin, RenderStartup,
     },
 };
 use wgpu::hal::api::Vulkan;
@@ -73,8 +75,106 @@ impl Plugin for ClusterAccelerationStructureSmokeTestPlugin {
             warn!("RenderApp not present; cluster_AS smoke test skipped.");
             return;
         };
-        render_app.add_systems(RenderStartup, smoke_test);
+        render_app.add_systems(RenderStartup, smoke_test.before(m2_build_clas));
+        render_app.add_systems(RenderStartup, m2_build_clas);
     }
+}
+
+/// Mirror of `bevy_pbr::meshlet::asset::Meshlet`. The upstream struct is `pub`
+/// but its containing `MeshletMesh` keeps fields `pub(crate)`, so we re-declare
+/// the position-related fields locally and feed them to a dequant routine that
+/// matches the WGSL `get_meshlet_vertex_position` exactly.
+#[derive(Copy, Clone, Debug)]
+struct Meshlet {
+    /// Bit offset within the parent mesh's `vertex_positions` bitstream.
+    start_vertex_position_bit: u32,
+    /// Vertex count minus one (a meshlet has at most 256 verts → fits in u8).
+    vertex_count_minus_one: u8,
+    /// Triangle count for this meshlet.
+    triangle_count: u8,
+    /// Bits used per X channel of vertex positions in this meshlet's bitstream.
+    bits_per_vertex_position_channel_x: u8,
+    bits_per_vertex_position_channel_y: u8,
+    bits_per_vertex_position_channel_z: u8,
+    /// Power-of-2 quantization factor: encoded position = round(world_pos * (1 << f) * 100).
+    vertex_position_quantization_factor: u8,
+    /// Per-channel min of the quantized integer values, stored as f32 by the encoder.
+    min_vertex_position_channel_x: f32,
+    min_vertex_position_channel_y: f32,
+    min_vertex_position_channel_z: f32,
+}
+
+/// CPU port of `bevy_pbr::meshlet::meshlet_bindings::get_meshlet_vertex_position`.
+///
+/// Walks the bitstream `vertex_positions[..]` from `meshlet.start_vertex_position_bit`
+/// for `vertex_count_minus_one + 1` vertices, extracting `bits_per_channel_*` per
+/// X/Y/Z, then dequantizes into world-space `f32x3` using the meshlet's stored
+/// quantization params.
+fn dequantize_meshlet_vertices(meshlet: &Meshlet, vertex_positions: &[u32]) -> Vec<[f32; 3]> {
+    let vertex_count = u32::from(meshlet.vertex_count_minus_one) + 1;
+    let bits = [
+        u32::from(meshlet.bits_per_vertex_position_channel_x),
+        u32::from(meshlet.bits_per_vertex_position_channel_y),
+        u32::from(meshlet.bits_per_vertex_position_channel_z),
+    ];
+    let bits_per_vertex = bits[0] + bits[1] + bits[2];
+    // `(1 << f) * CENTIMETERS_PER_METER` -- matches `from_mesh.rs` and the WGSL.
+    let inv_quant = 1.0 / ((1u32 << meshlet.vertex_position_quantization_factor) as f32 * 100.0);
+    let mins = [
+        meshlet.min_vertex_position_channel_x,
+        meshlet.min_vertex_position_channel_y,
+        meshlet.min_vertex_position_channel_z,
+    ];
+
+    let mut out = Vec::with_capacity(vertex_count as usize);
+    for v in 0..vertex_count {
+        let mut start_bit = meshlet.start_vertex_position_bit + v * bits_per_vertex;
+        let mut packed = [0u32; 3];
+        for (i, &b) in bits.iter().enumerate() {
+            let lower_word = (start_bit / 32) as usize;
+            let bit_offset = start_bit & 31;
+            let mut next_32 = vertex_positions[lower_word] >> bit_offset;
+            // Spans a u32 boundary. `bit_offset` is in 1..32 here so the left
+            // shift is well-defined.
+            if bit_offset + b > 32 {
+                next_32 |= vertex_positions[lower_word + 1] << (32 - bit_offset);
+            }
+            let mask = if b == 32 { u32::MAX } else { (1u32 << b) - 1 };
+            packed[i] = next_32 & mask;
+            start_bit += b;
+        }
+        out.push([
+            (packed[0] as f32 + mins[0]) * inv_quant,
+            (packed[1] as f32 + mins[1]) * inv_quant,
+            (packed[2] as f32 + mins[2]) * inv_quant,
+        ]);
+    }
+    out
+}
+
+/// Hand-built single-triangle meshlet with verts at (0,0,0), (1,0,0), (0,1,0).
+/// 8 bits/channel, factor=0 → packed `100 = 0x64` represents one world-space
+/// meter. Avoids needing the bunny.meshlet_mesh asset.
+fn synthetic_triangle_meshlet() -> (Meshlet, Vec<u32>, Vec<u8>) {
+    // 24 bits/vertex × 3 verts = 72 bits ≤ 3 × 32-bit words.
+    //   word 0 = vert0(xyz=000) | vert1.x(0x64)        = 0x64000000
+    //   word 1 = vert1(yz=00)   | vert2(x=0, y=0x64)   = 0x64000000
+    //   word 2 = vert2.z(0)                            = 0x00000000
+    let vertex_positions = vec![0x64000000u32, 0x64000000u32, 0x00000000u32];
+    let indices = vec![0u8, 1, 2];
+    let meshlet = Meshlet {
+        start_vertex_position_bit: 0,
+        vertex_count_minus_one: 2,
+        triangle_count: 1,
+        bits_per_vertex_position_channel_x: 8,
+        bits_per_vertex_position_channel_y: 8,
+        bits_per_vertex_position_channel_z: 8,
+        vertex_position_quantization_factor: 0,
+        min_vertex_position_channel_x: 0.0,
+        min_vertex_position_channel_y: 0.0,
+        min_vertex_position_channel_z: 0.0,
+    };
+    (meshlet, vertex_positions, indices)
 }
 
 fn smoke_test(device: Res<RenderDevice>) {
@@ -89,6 +189,29 @@ fn smoke_test(device: Res<RenderDevice>) {
         return;
     }
     info!("EXPERIMENTAL_CLUSTER_ACCELERATION_STRUCTURE: supported");
+
+    // ---- M1: meshlet position dequantization (CPU, no GPU calls) ------------
+    let (meshlet, vertex_positions_packed, indices) = synthetic_triangle_meshlet();
+    let dequantized = dequantize_meshlet_vertices(&meshlet, &vertex_positions_packed);
+    info!(
+        "M1 dequant: {} verts {:?}, {} indices {:?}",
+        dequantized.len(),
+        dequantized,
+        indices.len(),
+        indices,
+    );
+    // Expected exactly the input world-space triangle.
+    let expected: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    for (got, exp) in dequantized.iter().zip(expected.iter()) {
+        for axis in 0..3 {
+            assert!(
+                (got[axis] - exp[axis]).abs() < 1e-5,
+                "M1 dequant mismatch: got {got:?} expected {exp:?}"
+            );
+        }
+    }
+    info!("M1 dequant: round-trip OK");
+    let _ = meshlet.triangle_count;
 
     // SAFETY:
     // - Adapter advertised the wgpu feature; therefore the device was created with
@@ -142,5 +265,334 @@ fn smoke_test(device: Res<RenderDevice>) {
             sizes.update_scratch_size,
             sizes.build_scratch_size,
         );
+    }
+}
+
+// ---- M2: actual indirect cluster_AS build on real GPU memory ----------------
+
+/// Wraps a raw `vk::Buffer` + its backing `vk::DeviceMemory` so we can free
+/// both at the end of the smoke test.
+struct RawBuffer {
+    buf: vk::Buffer,
+    mem: vk::DeviceMemory,
+    size: u64,
+    addr: u64,
+}
+
+unsafe fn alloc_buffer(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    host_visible: bool,
+) -> RawBuffer {
+    let info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buf = unsafe { device.create_buffer(&info, None).expect("create_buffer") };
+
+    let req = unsafe { device.get_buffer_memory_requirements(buf) };
+    let need = if host_visible {
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+    } else {
+        vk::MemoryPropertyFlags::DEVICE_LOCAL
+    };
+    let mt = (0..mem_props.memory_type_count)
+        .find(|&i| {
+            (req.memory_type_bits & (1 << i)) != 0
+                && mem_props.memory_types[i as usize]
+                    .property_flags
+                    .contains(need)
+        })
+        .expect("compatible memory type");
+
+    let mut alloc_flags =
+        vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(req.size)
+        .memory_type_index(mt)
+        .push(&mut alloc_flags);
+    let mem = unsafe { device.allocate_memory(&alloc_info, None).expect("alloc_memory") };
+    unsafe { device.bind_buffer_memory(buf, mem, 0).expect("bind_memory") };
+
+    let addr = unsafe {
+        device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf))
+    };
+
+    RawBuffer {
+        buf,
+        mem,
+        size: req.size,
+        addr,
+    }
+}
+
+unsafe fn upload_bytes(device: &ash::Device, buf: &RawBuffer, bytes: &[u8]) {
+    assert!((bytes.len() as u64) <= buf.size);
+    let ptr = unsafe {
+        device
+            .map_memory(buf.mem, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
+            .expect("map_memory")
+    } as *mut u8;
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+        device.unmap_memory(buf.mem);
+    }
+}
+
+unsafe fn destroy(device: &ash::Device, buf: RawBuffer) {
+    unsafe {
+        device.destroy_buffer(buf.buf, None);
+        device.free_memory(buf.mem, None);
+    }
+}
+
+fn m2_build_clas(device: Res<RenderDevice>, queue: Res<RenderQueue>) {
+    if !device
+        .features()
+        .contains(WgpuFeatures::EXPERIMENTAL_CLUSTER_ACCELERATION_STRUCTURE)
+    {
+        return;
+    }
+
+    // Reuse the same synthetic input as M1 so we know the geometry round-trips.
+    let (meshlet, vertex_positions_packed, indices) = synthetic_triangle_meshlet();
+    let positions = dequantize_meshlet_vertices(&meshlet, &vertex_positions_packed);
+    let triangle_count = u32::from(meshlet.triangle_count);
+    let vertex_count = u32::from(meshlet.vertex_count_minus_one) + 1;
+
+    // SAFETY: gating on the wgpu feature bit guarantees the Vulkan device, the
+    // VK_NV_cluster_acceleration_structure extension, and shaderDeviceAddress
+    // are all enabled. Everything below is bounded to RenderStartup with no
+    // other GPU work in flight; we vkDeviceWaitIdle before touching outputs.
+    unsafe {
+        let wgpu_device = device.wgpu_device();
+        let Some(hal_device): Option<_> = wgpu_device.as_hal::<Vulkan>() else {
+            warn!("Device is not a Vulkan device; skipping M2.");
+            return;
+        };
+        let hal_device: &wgpu::hal::vulkan::Device = hal_device.deref();
+        let raw_device = hal_device.raw_device();
+        let raw_phys = hal_device.raw_physical_device();
+        let raw_instance = hal_device.shared_instance().raw_instance();
+        let mem_props = raw_instance.get_physical_device_memory_properties(raw_phys);
+
+        // ---- Allocate input buffers: positions, indices ---------------------
+        // BLAS_INPUT_RO is the right Vulkan flag for AS-build inputs; we share
+        // it across vertex/index/descriptor buffers since they're all consumed
+        // by the cluster build.
+        let pos_bytes = bytemuck::cast_slice::<[f32; 3], u8>(&positions);
+        let pos = alloc_buffer(
+            raw_device,
+            &mem_props,
+            pos_bytes.len() as u64,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            true,
+        );
+        upload_bytes(raw_device, &pos, pos_bytes);
+
+        let idx = alloc_buffer(
+            raw_device,
+            &mem_props,
+            indices.len() as u64,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            true,
+        );
+        upload_bytes(raw_device, &idx, &indices);
+
+        // ---- Build the per-cluster descriptor (one entry, one cluster) ------
+        // The bitfield is packed manually because ash represents it as a single
+        // u32. Layout per the spec, LSB-first:
+        //   bits  0..9  triangleCount
+        //   bits  9..18 vertexCount
+        //   bits 18..24 positionTruncateBitCount (0 = no truncation)
+        //   bits 24..28 indexType  (1 = 8-bit, 2 = 16-bit, 4 = 32-bit)
+        //   bits 28..32 opacityMicromapIndexType (0 = none)
+        let index_type_8bit: u32 = 1;
+        let packed_bitfield: u32 = (triangle_count & 0x1FF)
+            | ((vertex_count & 0x1FF) << 9)
+            | (0u32 << 18) // positionTruncateBitCount
+            | ((index_type_8bit & 0xF) << 24)
+            | (0u32 << 28); // opacityMicromapIndexType
+
+        let desc = vk::ClusterAccelerationStructureBuildTriangleClusterInfoNV {
+            cluster_id: 0,
+            cluster_flags: vk::ClusterAccelerationStructureClusterFlagsNV::default(),
+            packed_bitfield,
+            // Bitfield: bits 0..24 geometryIndex, 24..29 reserved, 29..32 geometryFlags.
+            // Set OPAQUE (bit 0 of geometryFlags) -> bit 29.
+            base_geometry_index_and_geometry_flags:
+                vk::ClusterAccelerationStructureGeometryIndexAndGeometryFlagsNV(1u32 << 29),
+            index_buffer_stride: 0,
+            vertex_buffer_stride: 12, // f32x3 = 12 bytes
+            geometry_index_and_flags_buffer_stride: 0,
+            opacity_micromap_index_buffer_stride: 0,
+            index_buffer: idx.addr,
+            vertex_buffer: pos.addr,
+            geometry_index_and_flags_buffer: 0,
+            opacity_micromap_array: 0,
+            opacity_micromap_index_buffer: 0,
+        };
+        let desc_bytes = std::slice::from_raw_parts(
+            (&desc as *const _) as *const u8,
+            std::mem::size_of_val(&desc),
+        );
+
+        let src_infos = alloc_buffer(
+            raw_device,
+            &mem_props,
+            desc_bytes.len() as u64,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            true,
+        );
+        upload_bytes(raw_device, &src_infos, desc_bytes);
+
+        // ---- Size query, then allocate dst_implicit + scratch ---------------
+        let triangle_input = vk::ClusterAccelerationStructureTriangleClusterInputNV::default()
+            .vertex_format(vk::Format::R32G32B32_SFLOAT)
+            .max_geometry_index_value(0)
+            .max_cluster_unique_geometry_count(1)
+            .max_cluster_triangle_count(triangle_count)
+            .max_cluster_vertex_count(vertex_count)
+            .max_total_triangle_count(triangle_count)
+            .max_total_vertex_count(vertex_count);
+        let op_input = vk::ClusterAccelerationStructureOpInputNV {
+            p_triangle_clusters: &triangle_input as *const _ as *mut _,
+        };
+        let input_info = vk::ClusterAccelerationStructureInputInfoNV::default()
+            .max_acceleration_structure_count(1)
+            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+            .op_type(vk::ClusterAccelerationStructureOpTypeNV::BUILD_TRIANGLE_CLUSTER)
+            .op_mode(vk::ClusterAccelerationStructureOpModeNV::IMPLICIT_DESTINATIONS)
+            .op_input(op_input);
+
+        let sizes = hal_device.get_cluster_build_sizes(&input_info);
+        info!(
+            "M2 sizes: dst_implicit={} scratch={} bytes (1 CLAS, 1 tri)",
+            sizes.acceleration_structure_size, sizes.build_scratch_size,
+        );
+
+        let dst_implicit = alloc_buffer(
+            raw_device,
+            &mem_props,
+            sizes.acceleration_structure_size,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
+            false,
+        );
+        let scratch = alloc_buffer(
+            raw_device,
+            &mem_props,
+            sizes.build_scratch_size.max(1),
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            false,
+        );
+
+        // dst_addresses receives one VkDeviceAddress per built CLAS. HOST_VISIBLE
+        // so we can read it back without a copy. Stride must be at least
+        // sizeof(VkDeviceAddress) = 8 bytes per the spec. Per VUID-10459 the
+        // backing buffer must carry the AS_STORAGE_KHR usage even though the
+        // payload is just an array of u64 device addresses.
+        let dst_addresses = alloc_buffer(
+            raw_device,
+            &mem_props,
+            8,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                | vk::BufferUsageFlags::STORAGE_BUFFER,
+            true,
+        );
+        // Pre-fill with sentinel so we can tell if the driver wrote anything.
+        upload_bytes(raw_device, &dst_addresses, &0xCDu64.to_le_bytes());
+
+        // `srcInfosCount` is, for IMPLICIT/EXPLICIT_DESTINATIONS modes, a
+        // VkDeviceAddress pointing at a 4-byte-aligned u32 holding the actual
+        // count (see VUID-VkClusterAccelerationStructureCommandsInfoNV-srcInfosCount-*).
+        // Allocate that count buffer and fill with 1 (we have one cluster).
+        let count_buf = alloc_buffer(
+            raw_device,
+            &mem_props,
+            4,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            true,
+        );
+        upload_bytes(raw_device, &count_buf, &1u32.to_le_bytes());
+
+        // ---- Record + submit -------------------------------------------------
+        let commands_info = vk::ClusterAccelerationStructureCommandsInfoNV {
+            s_type: vk::ClusterAccelerationStructureCommandsInfoNV::STRUCTURE_TYPE,
+            p_next: std::ptr::null_mut(),
+            input: input_info,
+            dst_implicit_data: dst_implicit.addr,
+            scratch_data: scratch.addr,
+            dst_addresses_array: vk::StridedDeviceAddressRegionKHR {
+                device_address: dst_addresses.addr,
+                stride: 8,
+                size: 8,
+            },
+            dst_sizes_array: vk::StridedDeviceAddressRegionKHR::default(),
+            src_infos_array: vk::StridedDeviceAddressRegionKHR {
+                device_address: src_infos.addr,
+                stride: std::mem::size_of_val(&desc) as u64,
+                size: desc_bytes.len() as u64,
+            },
+            // For IMPLICIT/EXPLICIT_DESTINATIONS this is a device address to a
+            // u32 count, not a literal count. See VUID-...-srcInfosCount-*.
+            src_infos_count: count_buf.addr,
+            address_resolution_flags: vk::ClusterAccelerationStructureAddressResolutionFlagsNV::default(),
+            _marker: std::marker::PhantomData,
+        };
+
+        // Use a wgpu CommandEncoder + as_hal_mut to escape into vulkan::CommandEncoder
+        // and call our inherent helper. Submit via the wgpu queue. This avoids
+        // hand-rolling a vk command pool / fence.
+        let mut encoder = wgpu_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cluster_AS_build"),
+        });
+        encoder.as_hal_mut::<Vulkan, _, _>(|maybe_cmd| {
+            if let Some(cmd) = maybe_cmd {
+                cmd.cmd_build_cluster_acceleration_structures_indirect(&commands_info);
+            }
+        });
+        let cb = encoder.finish();
+        queue.submit([cb]);
+
+        // Block on completion before reading back. RenderStartup is single-threaded
+        // and there's no other GPU work this early, so this is benign.
+        raw_device.device_wait_idle().expect("device_wait_idle");
+
+        // ---- Read back the device address of the built CLAS -----------------
+        let ptr = raw_device
+            .map_memory(dst_addresses.mem, 0, 8, vk::MemoryMapFlags::empty())
+            .expect("map dst_addresses") as *const u64;
+        let clas_address = std::ptr::read_unaligned(ptr);
+        raw_device.unmap_memory(dst_addresses.mem);
+
+        if clas_address == 0xCD || clas_address == 0 {
+            warn!(
+                "M2 build appears to have failed: dst_addresses[0] = 0x{:016x} \
+                 (sentinel still present)",
+                clas_address,
+            );
+        } else {
+            info!(
+                "M2 build OK: 1 CLAS @ device address 0x{:016x} ({} bytes implicit data)",
+                clas_address, sizes.acceleration_structure_size,
+            );
+        }
+
+        // ---- Cleanup --------------------------------------------------------
+        // dst_implicit is the only allocation the CLAS itself lives in; after
+        // we read its device address we'd normally hand it off. Here we tear
+        // everything down because the smoke test exits.
+        destroy(raw_device, pos);
+        destroy(raw_device, idx);
+        destroy(raw_device, src_infos);
+        destroy(raw_device, dst_implicit);
+        destroy(raw_device, scratch);
+        destroy(raw_device, dst_addresses);
+        destroy(raw_device, count_buf);
+
+        // Suppress "unused" on the queue handle we just returned to bevy.
+        let _ = queue;
     }
 }
