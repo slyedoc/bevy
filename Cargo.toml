@@ -328,6 +328,9 @@ bevy_scene = ["bevy_internal/bevy_scene"]
 # Provides raytraced lighting (experimental)
 bevy_solari = ["bevy_internal/bevy_solari"]
 
+# Provides pure ray-traced rendering for clustered (meshlet) geometry.
+bevy_aurora = ["bevy_internal/bevy_aurora"]
+
 # Provides sprite functionality
 bevy_sprite = ["bevy_internal/bevy_sprite"]
 
@@ -1555,6 +1558,18 @@ required-features = ["experimental_cluster_acceleration_structure"]
 [package.metadata.example.cluster_acceleration_structure]
 name = "Cluster Acceleration Structure (NV)"
 description = "Smoke test for VK_NV_cluster_acceleration_structure. Requests the wgpu feature, escapes via as_hal, and queries cluster build sizes."
+category = "3D Rendering"
+wasm = false
+
+[[example]]
+name = "aurora_m_a_traceable"
+path = "examples/3d/aurora_m_a_traceable.rs"
+doc-scrape-examples = true
+required-features = ["bevy_aurora", "experimental_cluster_acceleration_structure", "https"]
+
+[package.metadata.example.aurora_m_a_traceable]
+name = "Aurora M-A: Traceable Bunny"
+description = "bevy_aurora milestone A -- builds CLAS + BLAS + TLAS for a real meshlet asset (the Stanford bunny). No rendering yet; logs AS device addresses."
 category = "3D Rendering"
 wasm = false
 

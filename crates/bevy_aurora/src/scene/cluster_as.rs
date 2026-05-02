@@ -34,6 +34,7 @@ use core::ops::Range;
 use ash::vk::{self, TaggedStructure as _};
 use bevy_ecs::resource::Resource;
 
+use super::blas::build_blas_for_clusters;
 use super::meshlet_loader::{DequantizedMeshlet, DequantizedMeshletMesh};
 use super::raw_vk::{PersistentBuffer, RangeAllocator, RawBuffer};
 
@@ -41,6 +42,11 @@ use super::raw_vk::{PersistentBuffer, RangeAllocator, RawBuffer};
 /// enough for ~660k 384-byte CLASes (a 1-triangle CLAS occupies 384 bytes
 /// on Blackwell). M-A.streaming will lift this via sparse residency.
 pub const DEFAULT_CLAS_STORAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Default size of the persistent BLAS storage buffer in M-A: 32 MiB.
+/// Cluster BLASes are small (a 1-CLAS BLAS is ~1.5 KiB on Blackwell)
+/// because they only carry CLAS-reference indices, not triangles.
+pub const DEFAULT_BLAS_STORAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// CLAS storage requires this alignment on NVIDIA hardware (matches the
 /// `accelerationStructure*` minimum in `VkPhysicalDeviceAccelerationStructurePropertiesKHR`).
@@ -51,18 +57,23 @@ pub const CLAS_STORAGE_ALIGNMENT: u64 = 256;
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct MeshClusterHandle(u32);
 
-/// Per-mesh metadata after a successful CLAS upload.
+/// Per-mesh metadata after a successful CLAS + BLAS upload.
 #[derive(Debug)]
 pub struct MeshClusters {
     /// Byte range within [`ClusterAsManager::clas_storage`] that holds this
-    /// mesh's CLAS payloads. `dst_implicit_data` for the build was set to the
-    /// start of this range.
-    pub storage_range: Range<u64>,
+    /// mesh's CLAS payloads.
+    pub clas_storage_range: Range<u64>,
     /// One entry per meshlet (in source order). Each is the
-    /// `VkDeviceAddress` of the corresponding CLAS within `clas_storage`,
-    /// suitable to use as a `clusterReferences` entry when building a BLAS
-    /// via `BUILD_CLUSTERS_BOTTOM_LEVEL`.
+    /// `VkDeviceAddress` of the corresponding CLAS, suitable as a
+    /// `clusterReferences` entry in a `BUILD_CLUSTERS_BOTTOM_LEVEL` build.
     pub clas_addresses: Vec<u64>,
+    /// Byte range within [`ClusterAsManager::blas_storage`] that holds this
+    /// mesh's BLAS payload.
+    pub blas_storage_range: Range<u64>,
+    /// Device address of the cluster-bottom-level BLAS that references all
+    /// of [`Self::clas_addresses`]. This is what a TLAS instance's
+    /// `accelerationStructureReference` points at.
+    pub blas_address: u64,
 }
 
 impl MeshClusters {
@@ -81,16 +92,10 @@ impl MeshClusters {
 #[derive(Resource)]
 pub struct ClusterAsManager {
     clas_storage: PersistentBuffer,
-    free_ranges: RangeAllocator,
+    clas_free_ranges: RangeAllocator,
+    blas_storage: PersistentBuffer,
+    blas_free_ranges: RangeAllocator,
     meshes: Vec<MeshClusters>,
-    /// Lazy-loaded once, when the first BLAS / TLAS build needs it.
-    /// Held by value -- ash's extension Device structs are just function
-    /// pointer tables wrapping a raw `vk::Device` handle, no borrow.
-    #[expect(
-        dead_code,
-        reason = "consumed by scene::blas::build / scene::tlas::build in subsequent commits"
-    )]
-    khr_as: Option<ash::khr::acceleration_structure::Device>,
 }
 
 impl ClusterAsManager {
@@ -104,6 +109,7 @@ impl ClusterAsManager {
         device: &ash::Device,
         mem_props: &vk::PhysicalDeviceMemoryProperties,
         clas_storage_size: u64,
+        blas_storage_size: u64,
     ) -> Self {
         let clas_storage = unsafe {
             PersistentBuffer::alloc(
@@ -112,14 +118,25 @@ impl ClusterAsManager {
                 mem_props,
                 clas_storage_size,
                 vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
-                /* host_visible = */ false,
+                false,
+            )
+        };
+        let blas_storage = unsafe {
+            PersistentBuffer::alloc(
+                "aurora.blas_storage",
+                device,
+                mem_props,
+                blas_storage_size,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
+                false,
             )
         };
         Self {
             clas_storage,
-            free_ranges: RangeAllocator::new(clas_storage_size),
+            clas_free_ranges: RangeAllocator::new(clas_storage_size),
+            blas_storage,
+            blas_free_ranges: RangeAllocator::new(blas_storage_size),
             meshes: Vec::new(),
-            khr_as: None,
         }
     }
 
@@ -157,8 +174,10 @@ impl ClusterAsManager {
         if meshlet_count == 0 {
             // Empty mesh: still register a handle so callers can index uniformly.
             self.meshes.push(MeshClusters {
-                storage_range: 0..0,
+                clas_storage_range: 0..0,
                 clas_addresses: Vec::new(),
+                blas_storage_range: 0..0,
+                blas_address: 0,
             });
             return MeshClusterHandle((self.meshes.len() - 1) as u32);
         }
@@ -292,20 +311,20 @@ impl ClusterAsManager {
         let sizes = unsafe { hal_device.get_cluster_build_sizes(&input_info) };
 
         // ---- Allocate range in clas_storage + transient outputs --------------
-        let storage_range = self
-            .free_ranges
+        let clas_storage_range = self
+            .clas_free_ranges
             .alloc(sizes.acceleration_structure_size, CLAS_STORAGE_ALIGNMENT)
             .unwrap_or_else(|| {
                 panic!(
                     "ClusterAsManager out of CLAS storage: requested {} bytes, used {} / {}",
                     sizes.acceleration_structure_size,
-                    self.free_ranges.used(),
-                    self.free_ranges.capacity(),
+                    self.clas_free_ranges.used(),
+                    self.clas_free_ranges.capacity(),
                 )
             });
         unsafe {
             self.clas_storage
-                .ensure_resident(storage_range.clone());
+                .ensure_resident(clas_storage_range.clone());
         }
 
         let scratch = unsafe {
@@ -350,7 +369,7 @@ impl ClusterAsManager {
             s_type: vk::ClusterAccelerationStructureCommandsInfoNV::STRUCTURE_TYPE,
             p_next: core::ptr::null_mut(),
             input: input_info,
-            dst_implicit_data: self.clas_storage.device_address(storage_range.start),
+            dst_implicit_data: self.clas_storage.device_address(clas_storage_range.start),
             scratch_data: scratch.addr,
             dst_addresses_array: vk::StridedDeviceAddressRegionKHR {
                 device_address: dst_addresses.addr,
@@ -422,13 +441,29 @@ impl ClusterAsManager {
             scratch_bytes = sizes.build_scratch_size,
             "uploaded mesh: {} CLASes built into [{:#x}, {:#x})",
             meshlet_count,
-            self.clas_storage.device_address(storage_range.start),
-            self.clas_storage.device_address(storage_range.end),
+            self.clas_storage.device_address(clas_storage_range.start),
+            self.clas_storage.device_address(clas_storage_range.end),
         );
 
+        // ---- Build the BLAS that references those CLASes -------------------
+        let blas = unsafe {
+            build_blas_for_clusters(
+                device,
+                mem_props,
+                hal_device,
+                wgpu_device,
+                queue,
+                &mut self.blas_storage,
+                &mut self.blas_free_ranges,
+                &clas_addresses,
+            )
+        };
+
         let entry = MeshClusters {
-            storage_range,
+            clas_storage_range,
             clas_addresses,
+            blas_storage_range: blas.storage_range,
+            blas_address: blas.address,
         };
         let handle = MeshClusterHandle(self.meshes.len() as u32);
         self.meshes.push(entry);
@@ -442,7 +477,9 @@ impl ClusterAsManager {
     /// No in-flight GPU work may reference any CLAS / BLAS / TLAS produced
     /// through this manager.
     pub unsafe fn destroy(self, device: &ash::Device) {
-        unsafe { self.clas_storage.destroy(device) };
-        // BLAS / TLAS handles will be destroyed here in their own milestones.
+        unsafe {
+            self.clas_storage.destroy(device);
+            self.blas_storage.destroy(device);
+        }
     }
 }
