@@ -19,6 +19,12 @@
 
 use std::f32::consts::PI;
 
+use bevy::{aurora::{
+    prelude::*,
+    primary::AuroraCamera,
+    scene::{AuroraMeshlet3d, ClusterAsManager, TlasManager, UploadedMeshes},
+}, log::LogPlugin};
+use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::{
     light::{light_consts, DirectionalLight},
     pbr::experimental::meshlet::{MeshletMesh, MeshletMesh3d, MeshletPlugin},
@@ -29,12 +35,6 @@ use bevy::{
         Render, RenderApp, RenderPlugin, RenderSystems,
     },
 };
-use bevy::aurora::{
-    prelude::*,
-    primary::AuroraCamera,
-    scene::{AuroraMeshlet3d, ClusterAsManager, TlasManager, UploadedMeshes},
-};
-use bevy::ecs::schedule::IntoScheduleConfigs;
 
 const ASSET_URL: &str =
     "https://github.com/bevyengine/bevy_asset_files/raw/6dccaef517bde74d1969734703709aead7211dbc/meshlet/bunny.meshlet_mesh";
@@ -42,24 +42,21 @@ const ASSET_URL: &str =
 fn main() {
     App::new()
         .add_plugins((
-            DefaultPlugins.set(RenderPlugin {
-                render_creation: WgpuSettings {
-                    features: WgpuFeatures::EXPERIMENTAL_RAY_QUERY
-                        | WgpuFeatures::EXPERIMENTAL_CLUSTER_ACCELERATION_STRUCTURE
-                        | WgpuFeatures::EXPERIMENTAL_PARTITIONED_ACCELERATION_STRUCTURE,
-                    // Force-enable Vulkan validation in release so the layer
-                    // surfaces "BLAS device address X is not a recognized AS"
-                    // / wrong-flag / barrier-missing diagnostics. Requires the
-                    // Vulkan SDK validation layers to be installed
-                    // (`libvulkan-validation-layers` on Linux).
-                    instance_flags: InstanceFlags::VALIDATION
-                        | InstanceFlags::DEBUG
-                        | InstanceFlags::GPU_BASED_VALIDATION,
+            DefaultPlugins
+                .set(RenderPlugin {
+                    render_creation: WgpuSettings {
+                        features: WgpuFeatures::EXPERIMENTAL_RAY_QUERY
+                            | WgpuFeatures::EXPERIMENTAL_CLUSTER_ACCELERATION_STRUCTURE
+                            | WgpuFeatures::EXPERIMENTAL_PARTITIONED_ACCELERATION_STRUCTURE,
+                        ..default()
+                    }
+                    .into(),
                     ..default()
-                }
-                .into(),
-                ..default()
-            }),
+                })
+                .set(LogPlugin {
+                    filter: "bevy_aurora=trace,info".into(),
+                    ..default()
+                }),
             MeshletPlugin {
                 cluster_buffer_slots: 1 << 14,
             },
@@ -145,10 +142,7 @@ impl Plugin for AuroraDumpPlugin {
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
-        render_app.add_systems(
-            Render,
-            dump_state.in_set(RenderSystems::Cleanup),
-        );
+        render_app.add_systems(Render, dump_state.in_set(RenderSystems::Cleanup));
     }
 }
 

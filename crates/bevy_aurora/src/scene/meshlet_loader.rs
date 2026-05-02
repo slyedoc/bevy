@@ -30,8 +30,9 @@ pub struct DequantizedMeshlet {
     pub vertex_offset: u32,
     /// Number of vertices in this meshlet (= `Meshlet::vertex_count_minus_one + 1`).
     pub vertex_count: u32,
-    /// Offset, in `u8`s, into [`DequantizedMeshletMesh::indices`]. Each
-    /// triangle is 3 consecutive `u8`s; total = `3 * triangle_count` bytes.
+    /// Offset, in `u32`s, into [`DequantizedMeshletMesh::indices`]. Each
+    /// triangle is 3 consecutive `u32`s; total = `3 * triangle_count` u32s
+    /// (= `12 * triangle_count` bytes).
     pub index_offset: u32,
     /// Number of triangles in this meshlet.
     pub triangle_count: u32,
@@ -53,9 +54,13 @@ pub struct DequantizedMeshletMesh {
     /// given meshlet's positions live at
     /// `[meshlet.vertex_offset .. meshlet.vertex_offset + meshlet.vertex_count]`.
     pub positions: Vec<[f32; 3]>,
-    /// Per-meshlet `u8` index streams concatenated. Each index is local to its
-    /// owning meshlet's vertex range (i.e. in `0 .. meshlet.vertex_count`).
-    pub indices: Vec<u8>,
+    /// Per-meshlet index streams concatenated, widened from the meshlet
+    /// asset's u8 storage to u32 because the cluster_AS extension's NVIDIA
+    /// driver implementation does not appear to handle 8-bit indices
+    /// correctly (Unreal's NaniteRayTracingDecodePageClusters.usf also uses
+    /// `IndexFormat = 4` = 32-bit). Each index is local to its owning
+    /// meshlet's vertex range (i.e. in `0 .. meshlet.vertex_count`).
+    pub indices: Vec<u32>,
     /// One entry per meshlet, in source order.
     pub meshlets: Vec<DequantizedMeshlet>,
 }
@@ -108,11 +113,12 @@ pub fn dequantize_meshlet_mesh(mesh: &MeshletMesh) -> DequantizedMeshletMesh {
         // Dequant this meshlet's vertices into the running tail of `positions`.
         dequantize_meshlet_into(m, positions_src, &mut positions);
 
-        // Indices are already in the right shape (u8 local to vertex range);
-        // just copy the slice verbatim.
+        // Widen the meshlet's u8 indices to u32 (cluster_AS NV driver path
+        // requires 32-bit indices despite the spec listing 8-bit as a
+        // supported format).
         let idx_start = m.start_index_id as usize;
         let idx_end = idx_start + (triangle_count as usize) * 3;
-        indices.extend_from_slice(&indices_src[idx_start..idx_end]);
+        indices.extend(indices_src[idx_start..idx_end].iter().map(|&i| u32::from(i)));
 
         meshlets.push(DequantizedMeshlet {
             vertex_offset,

@@ -195,16 +195,19 @@ impl ClusterAsManager {
         };
         unsafe { pos_buf.upload(device, pos_bytes) };
 
+        // Indices are now u32 (widened from the meshlet asset's u8 storage
+        // because the cluster_AS NV path requires 32-bit indices).
+        let idx_bytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
         let idx_buf = unsafe {
             RawBuffer::alloc(
                 device,
                 mem_props,
-                mesh.indices.len().max(1) as u64,
+                (idx_bytes.len() as u64).max(1),
                 vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
                 true,
             )
         };
-        unsafe { idx_buf.upload(device, &mesh.indices) };
+        unsafe { idx_buf.upload(device, idx_bytes) };
 
         // ---- Build per-cluster descriptors -----------------------------------
         // VkClusterAccelerationStructureBuildTriangleClusterInfoNV layout:
@@ -213,7 +216,11 @@ impl ClusterAsManager {
         //   bits 18..24 positionTruncateBitCount (0 = no truncation)
         //   bits 24..28 indexType  (1 = 8-bit, 2 = 16-bit, 4 = 32-bit)
         //   bits 28..32 opacityMicromapIndexType (0 = none)
-        const INDEX_TYPE_8BIT: u32 = 1;
+        //
+        // NV driver path appears to require 32-bit indices despite the
+        // spec listing 8-bit as a supported format -- Unreal's
+        // NaniteRayTracingDecodePageClusters.usf also uses IndexFormat=4.
+        const INDEX_TYPE_32BIT: u32 = 4;
         // Geometry-flags layout: bits 0..24 geometryIndex, 24..29 reserved,
         // 29..32 geometryFlags. Bit 29 = OPAQUE.
         const OPAQUE_GEOMETRY_FLAGS: u32 = 1 << 29;
@@ -243,9 +250,14 @@ impl ClusterAsManager {
             let packed_bitfield: u32 = (triangle_count & 0x1FF)
                 | ((vertex_count & 0x1FF) << 9)
                 | (0u32 << 18)
-                | ((INDEX_TYPE_8BIT & 0xF) << 24)
+                | ((INDEX_TYPE_32BIT & 0xF) << 24)
                 | (0u32 << 28);
 
+            // Strides are *per-index* (not per-triangle). For 32-bit
+            // indices, consecutive indices are 4 bytes apart. Unreal's
+            // NaniteRayTracingDecodePageClusters.usf is explicit about
+            // this: `IndexBuffer = base + IndexBufferOffset *
+            // IndexStrideInBytes`.
             descriptors.push(vk::ClusterAccelerationStructureBuildTriangleClusterInfoNV {
                 cluster_id: cluster_id as u32,
                 cluster_flags: vk::ClusterAccelerationStructureClusterFlagsNV::default(),
@@ -254,11 +266,13 @@ impl ClusterAsManager {
                     vk::ClusterAccelerationStructureGeometryIndexAndGeometryFlagsNV(
                         OPAQUE_GEOMETRY_FLAGS,
                     ),
-                index_buffer_stride: 0,
+                index_buffer_stride: 4, // 4 bytes per 32-bit index
                 vertex_buffer_stride: 12, // f32x3
                 geometry_index_and_flags_buffer_stride: 0,
                 opacity_micromap_index_buffer_stride: 0,
-                index_buffer: idx_buf.addr + u64::from(index_offset),
+                // index_offset is now a u32-count; multiply by 4 for the
+                // byte-address into the index buffer.
+                index_buffer: idx_buf.addr + u64::from(index_offset) * 4,
                 vertex_buffer: pos_buf.addr + u64::from(vertex_offset) * 12,
                 geometry_index_and_flags_buffer: 0,
                 opacity_micromap_array: 0,
