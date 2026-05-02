@@ -18,6 +18,7 @@ pub mod blas;
 pub mod cluster_as;
 pub mod meshlet_loader;
 pub mod raw_vk;
+pub mod test_triangle_blas;
 pub mod tlas;
 
 use core::ops::Deref;
@@ -244,6 +245,12 @@ fn process_uploads(
 /// Build the TLAS once the extracted instance set + uploaded BLASes are
 /// available. Idempotent: [`TlasManager::build`] returns immediately on
 /// subsequent calls (M-B sub-2 scope is single-build; M-D adds rebuilds).
+///
+/// Diagnostic: if the env var `AURORA_TEST_TRIANGLE_BLAS=1` is set, the TLAS
+/// is built with a single regular KHR-AS triangle BLAS instead of any
+/// Aurora cluster-built BLAS. This is the M-B sub-2c control test --
+/// confirms whether the wrap+bind+ray-query path works at all (rays hit
+/// the triangle), or whether something is broken regardless of BLAS source.
 fn rebuild_tlas(
     instances: Query<&ExtractedAuroraInstance>,
     manager: Option<Res<ClusterAsManager>>,
@@ -251,13 +258,52 @@ fn rebuild_tlas(
     tlas: Option<ResMut<TlasManager>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
+    mut test_blas: bevy_ecs::system::Local<Option<test_triangle_blas::TestTriangleBlas>>,
 ) {
-    let (Some(manager), Some(mut tlas)) = (manager, tlas) else {
+    let Some(mut tlas) = tlas else {
         return;
     };
     if tlas.is_built() {
         return;
     }
+
+    let triangle_diag = std::env::var("AURORA_TEST_TRIANGLE_BLAS")
+        .ok()
+        .is_some_and(|v| v != "0" && !v.is_empty());
+
+    if triangle_diag {
+        // Build the triangle BLAS once and cache it in this system's Local.
+        if test_blas.is_none() {
+            unsafe {
+                let wgpu_device = device.wgpu_device();
+                let Some(hal_device) = wgpu_device.as_hal::<wgpu::hal::api::Vulkan>() else {
+                    return;
+                };
+                let hal_device: &wgpu::hal::vulkan::Device = hal_device.deref();
+                let raw_device = hal_device.raw_device();
+                let raw_instance = hal_device.shared_instance().raw_instance();
+                let raw_phys = hal_device.raw_physical_device();
+                let mem_props = raw_instance.get_physical_device_memory_properties(raw_phys);
+                *test_blas = Some(test_triangle_blas::build(
+                    raw_device,
+                    &mem_props,
+                    raw_instance,
+                    wgpu_device,
+                    queue.0.as_ref(),
+                ));
+            }
+        }
+        let triangle = test_blas.as_ref().unwrap();
+        let inst = TlasInstance::opaque(bevy_math::Mat4::IDENTITY, triangle.address);
+        unsafe {
+            tlas.build(device.wgpu_device(), queue.0.as_ref(), &[inst]);
+        }
+        return;
+    }
+
+    let Some(manager) = manager else {
+        return;
+    };
     let mut tlas_instances = Vec::new();
     for inst in &instances {
         let Some(handle) = uploaded.0.get(&inst.mesh) else {

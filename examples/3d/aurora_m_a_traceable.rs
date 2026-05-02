@@ -24,8 +24,9 @@ use bevy::{
     pbr::experimental::meshlet::{MeshletMesh, MeshletMesh3d, MeshletPlugin},
     prelude::*,
     render::{
-        render_resource::WgpuFeatures, settings::WgpuSettings, Render, RenderApp, RenderPlugin,
-        RenderSystems,
+        render_resource::WgpuFeatures,
+        settings::{InstanceFlags, WgpuSettings},
+        Render, RenderApp, RenderPlugin, RenderSystems,
     },
 };
 use bevy::aurora::{
@@ -45,6 +46,14 @@ fn main() {
                 render_creation: WgpuSettings {
                     features: WgpuFeatures::EXPERIMENTAL_RAY_QUERY
                         | WgpuFeatures::EXPERIMENTAL_CLUSTER_ACCELERATION_STRUCTURE,
+                    // Force-enable Vulkan validation in release so the layer
+                    // surfaces "BLAS device address X is not a recognized AS"
+                    // / wrong-flag / barrier-missing diagnostics. Requires the
+                    // Vulkan SDK validation layers to be installed
+                    // (`libvulkan-validation-layers` on Linux).
+                    instance_flags: InstanceFlags::VALIDATION
+                        | InstanceFlags::DEBUG
+                        | InstanceFlags::GPU_BASED_VALIDATION,
                     ..default()
                 }
                 .into(),

@@ -646,18 +646,39 @@ Highest-likelihood causes (in order):
    path also had. Both versions only validated `device_address ≠ 0`, never
    traced rays, so neither is a known-good baseline.
 
-**Decisive next test:** build a regular triangle BLAS via raw KHR-AS calls
-(no cluster_AS), put its device address into the existing TLAS instance,
-see if rays hit. Outcomes:
-  - Rays hit → cause #1 or #2 (cluster path is the bug). Then either the
-    cluster-BLAS-as-TLAS-instance assumption is wrong (architectural
-    revision: maybe a wrapper BLAS, or `VK_NV_partitioned_acceleration_structure`),
-    or the address read needs fixing.
-  - Rays miss → cause #3 (our TLAS build is broken). Compare against
-    `bevy_solari/src/scene/binder.rs` which has a working KHR TLAS build.
+**Decisive control test landed.** `scene/test_triangle_blas.rs` builds a
+single-triangle BLAS via standard `vkCmdBuildAccelerationStructuresKHR`
+(no cluster_AS), gets the AS handle's device address via
+`vkGetAccelerationStructureDeviceAddressKHR`, and feeds it into the same
+TLAS wrap + bind + ray-query path Aurora's bunny goes through. Toggled by
+the env var `AURORA_TEST_TRIANGLE_BLAS=1` -- when set, `rebuild_tlas`
+substitutes the triangle BLAS for the cluster-built one with an identity
+transform; the rest of the pipeline is unchanged.
 
-This test sits as a one-shot example, ~150 LOC of triangle-BLAS code +
-the existing TLAS wrap path. Tracked as task #15 next session.
+Outcomes:
+  - **Triangle visible** (world-pos fractional shading on the warm side
+    of the sky background): the wrap + bind + ray-query path is correct.
+    The bug is upstream of the TLAS, in either the cluster_AS BLAS
+    construction (causes #1) or the address read in `scene/blas.rs`
+    (cause #2). Plan §10's load-bearing claim ("cluster-built BLAS device
+    address is consumable as `accelerationStructureReference`") may need
+    revisiting.
+  - **Still all sky-colour**: the wrap + bind + ray-query path is
+    broken regardless of BLAS source (cause #3). Compare against
+    `bevy_solari/src/scene/binder.rs` which has a working KHR TLAS build,
+    and against `wgpu/tests/tests/wgpu-gpu/ray_tracing/` for upstream
+    test coverage.
+
+Vulkan validation layers were enabled to look for AS-specific diagnostics
+(`InstanceFlags::VALIDATION | DEBUG | GPU_BASED_VALIDATION`) -- they
+surfaced `VUID-RuntimeSpirv-vulkanMemoryModel-06265` (unrelated, from
+bevy compute shaders) and a handful of buffer/memory leak warnings from
+Aurora's `RawBuffer`s not being explicitly destroyed at shutdown
+(unrelated -- cleanup-on-exit is fine for the prototype). Notably *no*
+diagnostics about the cluster_AS path, the TLAS instance reference, or
+the BLAS device address -- either the API usage is correct, or the
+`VK_NV_cluster_acceleration_structure` extension isn't yet covered by
+the Khronos validation layers (the extension is recent).
 
 **Bevy SST regression patch (incidental).** The base bevy branch had a
 binding-layout mismatch in the screen-space-transmission path:
