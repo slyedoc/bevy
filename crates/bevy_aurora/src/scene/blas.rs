@@ -31,6 +31,18 @@ pub(super) struct BuiltBlas {
     /// Device address of the built BLAS, suitable to use as
     /// `accelerationStructureReference` in a TLAS instance.
     pub address: u64,
+    /// `VkAccelerationStructureKHR` handle aliasing [`Self::storage_range`].
+    /// Created via `vkCreateAccelerationStructureKHR` (not via the cluster_AS
+    /// extension); the cluster_AS build writes the AS payload into the
+    /// storage range, and this handle gives that region a "real" KHR-AS
+    /// identity so the TLAS path recognises it.
+    ///
+    /// Diagnostic toggle: if Aurora was reading the cluster_AS
+    /// `dst_addresses[0]` directly (the "load-bearing claim" path) and that
+    /// wasn't producing a valid TLAS reference, calling
+    /// `vkGetAccelerationStructureDeviceAddressKHR(handle)` instead returns
+    /// the address every KHR-AS-driven path expects.
+    pub handle: ash::vk::AccelerationStructureKHR,
 }
 
 /// Build a single cluster-bottom-level BLAS that references `clas_addresses`.
@@ -203,8 +215,8 @@ pub(super) unsafe fn build_blas_for_clusters(
     queue.submit([cb]);
     unsafe { device.device_wait_idle().expect("BLAS device_wait_idle") };
 
-    // ---- Read BLAS device address -------------------------------------------
-    let blas_addr = unsafe {
+    // ---- Read BLAS device address (cluster_AS-reported) ---------------------
+    let cluster_reported_addr = unsafe {
         let ptr = device
             .map_memory(dst_addresses.mem, 0, 8, vk::MemoryMapFlags::empty())
             .expect("map BLAS dst_addresses")
@@ -214,10 +226,12 @@ pub(super) unsafe fn build_blas_for_clusters(
         addr
     };
     assert!(
-        blas_addr != 0,
+        cluster_reported_addr != 0,
         "BLAS build returned a zero device address -- driver did not write the output"
     );
 
+    // KHR-AS wrap is performed by the caller (cluster_as.rs::upload_mesh)
+    // because that path has the `ash::Instance` reference handy.
     unsafe {
         cluster_refs.destroy(device);
         src_infos.destroy(device);
@@ -231,12 +245,59 @@ pub(super) unsafe fn build_blas_for_clusters(
         clusters = cluster_count,
         blas_storage_bytes = sizes.acceleration_structure_size,
         scratch_bytes = sizes.build_scratch_size,
-        addr = format!("{blas_addr:#018x}"),
-        "BLAS built",
+        addr_cluster_reported = format!("{cluster_reported_addr:#018x}"),
+        "BLAS built (cluster_AS); KHR-AS wrap deferred to caller",
     );
 
     BuiltBlas {
         storage_range,
-        address: blas_addr,
+        address: cluster_reported_addr,
+        // Set to NULL by build; the caller wraps via `wrap_built_blas` once
+        // it has an `ash::Instance` reference handy.
+        handle: vk::AccelerationStructureKHR::null(),
     }
+}
+
+/// Wrap the BLAS storage range in a `VkAccelerationStructureKHR` handle and
+/// rewrite [`BuiltBlas::address`] / [`BuiltBlas::handle`] to use that
+/// KHR-AS path instead of the cluster_AS-reported address.
+///
+/// # Safety
+///
+/// - `device`/`raw_instance` must come from the same physical device that
+///   built the BLAS.
+/// - `blas_storage` must outlive the returned handle.
+/// - The build phase must have completed (i.e., `vkDeviceWaitIdle` has run).
+pub(super) unsafe fn wrap_built_blas(
+    device: &ash::Device,
+    raw_instance: &ash::Instance,
+    blas_storage: &PersistentBuffer,
+    built: &mut BuiltBlas,
+    blas_size: u64,
+) {
+    let khr_as = ash::khr::acceleration_structure::Device::load(raw_instance, device);
+    let create = vk::AccelerationStructureCreateInfoKHR::default()
+        .buffer(blas_storage.raw())
+        .offset(built.storage_range.start)
+        .size(blas_size)
+        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
+    let handle = unsafe {
+        khr_as
+            .create_acceleration_structure(&create, None)
+            .expect("create_acceleration_structure (cluster_AS BLAS wrap)")
+    };
+    let khr_addr = unsafe {
+        khr_as.get_acceleration_structure_device_address(
+            &vk::AccelerationStructureDeviceAddressInfoKHR::default().acceleration_structure(handle),
+        )
+    };
+    tracing::info!(
+        target: "bevy_aurora",
+        cluster_reported = format!("0x{:016x}", built.address),
+        khr_wrapped     = format!("0x{khr_addr:016x}"),
+        equal = (built.address == khr_addr),
+        "BLAS device address comparison (cluster_AS vs KHR-AS wrap)"
+    );
+    built.handle = handle;
+    built.address = khr_addr;
 }

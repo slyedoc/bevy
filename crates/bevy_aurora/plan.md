@@ -647,38 +647,69 @@ Highest-likelihood causes (in order):
    traced rays, so neither is a known-good baseline.
 
 **Decisive control test landed.** `scene/test_triangle_blas.rs` builds a
-single-triangle BLAS via standard `vkCmdBuildAccelerationStructuresKHR`
-(no cluster_AS), gets the AS handle's device address via
-`vkGetAccelerationStructureDeviceAddressKHR`, and feeds it into the same
+single-triangle BLAS via standard `vkCmdBuildAccelerationStructuresKHR`,
+gets the AS handle's device address, and feeds it into the same
 TLAS wrap + bind + ray-query path Aurora's bunny goes through. Toggled by
-the env var `AURORA_TEST_TRIANGLE_BLAS=1` -- when set, `rebuild_tlas`
-substitutes the triangle BLAS for the cluster-built one with an identity
-transform; the rest of the pipeline is unchanged.
+`AURORA_TEST_TRIANGLE_BLAS=1`. **Triangle is visible.** That decisively
+rules out the wrap + bind + ray-query stack as a suspect; the bug is
+upstream of the TLAS.
 
-Outcomes:
-  - **Triangle visible** (world-pos fractional shading on the warm side
-    of the sky background): the wrap + bind + ray-query path is correct.
-    The bug is upstream of the TLAS, in either the cluster_AS BLAS
-    construction (causes #1) or the address read in `scene/blas.rs`
-    (cause #2). Plan §10's load-bearing claim ("cluster-built BLAS device
-    address is consumable as `accelerationStructureReference`") may need
-    revisiting.
-  - **Still all sky-colour**: the wrap + bind + ray-query path is
-    broken regardless of BLAS source (cause #3). Compare against
-    `bevy_solari/src/scene/binder.rs` which has a working KHR TLAS build,
-    and against `wgpu/tests/tests/wgpu-gpu/ray_tracing/` for upstream
-    test coverage.
+**KHR-AS-handle-wrap diagnostic.** Rebuilt cluster_AS BLAS storage region
+gets wrapped via `vkCreateAccelerationStructureKHR(buffer, offset, size,
+BOTTOM_LEVEL)` and the resulting handle's device address compared
+against the cluster_AS-reported `dst_addresses[0]`. **They match exactly
+(0x000000002ad00000)**. Two facts pop out:
+  1. The cluster_AS storage region is recognised by the KHR-AS layer as
+     a valid AS at the API level (`vkCreateAccelerationStructureKHR`
+     succeeds on it).
+  2. `dst_addresses[0]` is exactly what
+     `vkGetAccelerationStructureDeviceAddressKHR` returns -- so the
+     address-read path in `scene/blas.rs` is correct.
 
-Vulkan validation layers were enabled to look for AS-specific diagnostics
-(`InstanceFlags::VALIDATION | DEBUG | GPU_BASED_VALIDATION`) -- they
-surfaced `VUID-RuntimeSpirv-vulkanMemoryModel-06265` (unrelated, from
-bevy compute shaders) and a handful of buffer/memory leak warnings from
-Aurora's `RawBuffer`s not being explicitly destroyed at shutdown
-(unrelated -- cleanup-on-exit is fine for the prototype). Notably *no*
-diagnostics about the cluster_AS path, the TLAS instance reference, or
-the BLAS device address -- either the API usage is correct, or the
-`VK_NV_cluster_acceleration_structure` extension isn't yet covered by
-the Khronos validation layers (the extension is recent).
+**Then why no hits.** Hypothesis -- and this is the one that fits every
+symptom: **the standard KHR TLAS cannot traverse cluster-built BLASes.**
+The cluster_AS extension produces BLASes in an internal format that
+references CLASes by device address; a regular KHR TLAS instance traversal
+expects flat triangle BLASes and silently doesn't follow the cluster
+references. The `wgpu-hal/src/vulkan/cluster_acceleration_structure.rs`
+header comment explicitly says:
+
+> Combined with `VK_NV_partitioned_acceleration_structure`, it's the basis of
+> the Nanite-style traced-geometry pipeline NVIDIA showed in Zorah.
+
+Aurora is using only half the pair -- cluster_AS for the BLAS, but a
+plain KHR TLAS instead of a partitioned TLAS for instancing. That likely
+explains everything: API-level wrap succeeds, addresses match, but ray
+queries through the standard KHR TLAS don't traverse the cluster BLAS's
+internal references.
+
+**What this means architecturally.** Aurora's plan.md §3 / §M-A treated
+the standard KHR TLAS as the "load-bearing claim of NVIDIA's MegaGeometry
+design". It looks like that load-bearing claim was actually about the
+cluster_AS + partitioned_AS pair, not cluster_AS alone. To progress, Aurora
+either has to:
+
+  A. **Add `VK_NV_partitioned_acceleration_structure`** support to
+     wgpu-hal and use a partitioned TLAS in `scene/tlas.rs` instead of
+     the standard KHR TLAS. Multi-day extension work + Aurora rewrites.
+  B. **Drop cluster_AS for the prototype** and switch Aurora's BLASes to
+     standard KHR triangle BLASes (one per mesh, no clusters). Loses the
+     Nanite-shaped pipeline goal but unblocks ReSTIR DI/GI work on real
+     RT primary visibility.
+  C. **Validate the hypothesis first** before either pivot. Cheapest way:
+     enable `VK_NV_partitioned_acceleration_structure` on the device,
+     build a partitioned-TLAS that instances the cluster-built BLAS,
+     ray-query against it. ~300-500 LOC of raw vk + an ash binding pass
+     (similar to what wgpu-hal did for cluster_AS).
+
+Vulkan validation layers were enabled (`InstanceFlags::VALIDATION |
+DEBUG | GPU_BASED_VALIDATION`); they surface unrelated noise
+(`VUID-RuntimeSpirv-vulkanMemoryModel-06265` from bevy compute shaders,
+`VUID-vkDestroyDevice-device-05137` from Aurora `RawBuffer`s not being
+explicitly destroyed at shutdown). Notably *no* AS-specific diagnostics
+-- consistent with "the API surface is being used correctly per the
+KHR spec, but the underlying primitives don't compose the way we
+assumed".
 
 **Bevy SST regression patch (incidental).** The base bevy branch had a
 binding-layout mismatch in the screen-space-transmission path:

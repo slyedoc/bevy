@@ -288,10 +288,17 @@ impl ClusterAsManager {
         unsafe { src_infos.upload(device, desc_bytes) };
 
         // ---- Size query ------------------------------------------------------
+        // Match Unreal's NaniteRayTracing constants (NaniteRayTracingDefinitions.h):
+        //   MaxGeometryIndex     = 15
+        //   MaxUniqueGeometries  = 10
+        // Aurora's data is single-geometry (geometryIndex == 0), so tighter
+        // caps would be valid per spec, but matching the known-working
+        // production config eliminates "driver implicitly requires
+        // headroom" as a suspect.
         let triangle_input = vk::ClusterAccelerationStructureTriangleClusterInputNV::default()
             .vertex_format(vk::Format::R32G32B32_SFLOAT)
-            .max_geometry_index_value(0)
-            .max_cluster_unique_geometry_count(1)
+            .max_geometry_index_value(15)
+            .max_cluster_unique_geometry_count(10)
             .max_cluster_triangle_count(max_tris)
             .max_cluster_vertex_count(max_verts)
             .max_total_triangle_count(total_tris)
@@ -446,7 +453,7 @@ impl ClusterAsManager {
         );
 
         // ---- Build the BLAS that references those CLASes -------------------
-        let blas = unsafe {
+        let mut blas = unsafe {
             build_blas_for_clusters(
                 device,
                 mem_props,
@@ -458,6 +465,27 @@ impl ClusterAsManager {
                 &clas_addresses,
             )
         };
+
+        // Diagnostic / fix for M-B sub-2c: wrap the cluster-built BLAS in a
+        // regular KHR-AS handle and use its device address in TLAS instances
+        // instead of the cluster_AS-reported `dst_addresses[0]`. The triangle
+        // BLAS control test confirmed the KHR-AS-wrapped path produces ray
+        // hits; if `dst_addresses[0]` returns a different address (or a
+        // non-`accelerationStructureReference`-compatible value), this wrap
+        // is the load-bearing fix. Logs both addresses so we can see whether
+        // they match.
+        let blas_size = blas.storage_range.end - blas.storage_range.start;
+        let raw_instance =
+            unsafe { hal_device.shared_instance() }.raw_instance();
+        unsafe {
+            super::blas::wrap_built_blas(
+                device,
+                raw_instance,
+                &self.blas_storage,
+                &mut blas,
+                blas_size,
+            );
+        }
 
         let entry = MeshClusters {
             clas_storage_range,
