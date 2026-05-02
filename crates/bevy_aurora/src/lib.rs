@@ -6,10 +6,10 @@
 //!    composes them into BLASes, and instances those into a TLAS via the standard
 //!    `VK_KHR_acceleration_structure` path.
 //! 2. [`primary`] traces camera rays against that TLAS and writes a "primary
-//!    G-buffer" (PGBuffer) of world position / normal / motion / material id —
+//!    G-buffer" (`PGBuffer`) of world position / normal / motion / material id —
 //!    replacing the raster G-buffer that [`bevy_solari`] reads from.
-//! 3. [`lighting`] runs ReSTIR DI / GI (cribbed from `bevy_solari` and rebound to
-//!    the PGBuffer) to compute direct + indirect lighting.
+//! 3. [`lighting`] runs `ReSTIR` DI / GI (cribbed from `bevy_solari` and rebound to
+//!    the `PGBuffer`) to compute direct + indirect lighting.
 //! 4. [`compose`] combines DI + GI, optionally upsamples a quarter-res GI buffer,
 //!    and writes the camera's `view_target` so the rest of bevy's render graph
 //!    (transparent, sky, post-process, UI) composites on top.
@@ -21,8 +21,16 @@
 //!
 //! [`bevy_solari`]: https://docs.rs/bevy_solari/latest/bevy_solari/
 
-// Aurora is a research crate; doc completeness comes after API settles.
-#![allow(missing_docs)]
+#![allow(
+    missing_docs,
+    reason = "Aurora is a research crate; doc completeness comes after API settles."
+)]
+#![allow(
+    unsafe_code,
+    reason = "Aurora drives Vulkan directly via as_hal escapes for the cluster_AS \
+              pipeline (see crates/bevy_aurora/plan.md §2). The whole crate is \
+              intrinsically unsafe; the workspace's -D unsafe-code lint doesn't apply."
+)]
 
 extern crate alloc;
 
@@ -54,7 +62,7 @@ impl AuroraPlugins {
     ///
     /// `EXPERIMENTAL_RAY_QUERY` is needed for the standard KHR-AS dependencies
     /// (`VK_KHR_acceleration_structure` + `VK_KHR_buffer_device_address`); the
-    /// cluster_AS extension itself sits on top of those.
+    /// `cluster_AS` extension itself sits on top of those.
     pub fn required_wgpu_features() -> WgpuFeatures {
         WgpuFeatures::EXPERIMENTAL_RAY_QUERY
             | WgpuFeatures::EXPERIMENTAL_CLUSTER_ACCELERATION_STRUCTURE
