@@ -123,25 +123,57 @@ progress is observable.
 
 ### M-A — "Cluster AS pipeline produces a traceable TLAS" *(2-3 weeks)*
 
-End state: `bunny.meshlet_mesh` loaded, every meshlet's positions dequantized
-(CPU side initially, GPU compute later), one big indirect cluster_AS build
-produces all CLAS, one BLAS contains all CLAS via `BUILD_CLUSTERS_BOTTOM_LEVEL`,
-one TLAS instances the BLAS. Raw vk compute shader traces fixed rays, writes
-hit/miss to a storage texture, blit to swapchain.
+End state: `bunny.meshlet_mesh` loaded, every meshlet's positions dequantized,
+one indirect cluster_AS build produces all CLAS, one BLAS contains all CLAS
+via `BUILD_CLUSTERS_BOTTOM_LEVEL`, one TLAS instances the BLAS. Raw vk compute
+shader traces fixed rays, writes hit/miss to a storage texture, blit to
+swapchain.
 
 **No lighting yet.** Just proves the geometry pipeline.
 
+Architecture: a single `ClusterAsManager` bevy `Resource` owns the persistent
+CLAS storage buffer, the BLAS handles, and the TLAS handle for the entire
+lifetime of the app. Per-frame systems mutate them via change detection on
+`AuroraMeshlet3d` components. No buffer recreation on the hot path.
+
+This mirrors `bevy_pbr::meshlet::meshlet_mesh_manager`'s design exactly --
+the rasterizer side already has the persistent-buffer + per-frame-update
+pattern; Aurora is the same shape for the RT side. The committed-vs-sparse
+backing decision (M-A vs M-A.streaming) is hidden inside `PersistentBuffer`
+behind a `device_address(offset)` API, so callers don't change.
+
+```rust
+// Sketch:
+#[derive(Resource)]
+struct ClusterAsManager {
+    clas_storage: PersistentBuffer,            // CLAS payload, fixed virtual addr
+    clas_index: HashMap<MeshletId, u64>,       // meshlet → device addr in clas_storage
+    free_ranges: RangeAllocator,               // M-A: bump allocator; later: real free-list
+    blases: HashMap<MeshHandle, ClusterBlas>,
+    tlas: Option<KhrTlas>,
+}
+
+fn process_meshlet_uploads(
+    mut mgr: ResMut<ClusterAsManager>,
+    new: Query<&AuroraMeshlet3d, Added<AuroraMeshlet3d>>,
+    /* device, queue, etc. */
+) { /* allocate + cmd_build_indirect */ }
+
+fn update_tlas(/* ... */) { /* rebuild instance array, update TLAS */ }
+```
+
 Deliverables:
-- `scene/cluster_as.rs` — CLAS array + indirect build dispatch
-- `scene/blas.rs` — cluster-bottom-level BLAS build
-- `scene/tlas.rs` — KHR TLAS build
-- `scene/meshlet_loader.rs` — `MeshletMesh` → CLAS-ready data
+- `scene/raw_vk.rs` — `RawBuffer`, `PersistentBuffer`, `RangeAllocator` allocator primitives
+- `scene/cluster_as.rs` — `ClusterAsManager` resource + per-frame systems
+- `scene/blas.rs` — cluster-bottom-level BLAS build helper
+- `scene/tlas.rs` — KHR TLAS build helper
+- `scene/meshlet_loader.rs` — `MeshletMesh` dequant + descriptor preparation
 - `examples/m_a_traceable.rs` — render hit/miss image of bunny
 
 **Risks**:
-- CLAS array sizing — start with a fixed cap, no streaming
+- CLAS array sizing — committed 256 MiB cap initially; M-A.streaming lifts this
 - Material binding deferred (M-A traces only — no shading)
-- Per-mesh static build only (no LOD, no eviction)
+- Per-mesh static build only (no LOD, no eviction in M-A; M-A.streaming adds them)
 
 ### M-B — "RT primary visibility writes PGBuffer" *(2-3 weeks)*
 
