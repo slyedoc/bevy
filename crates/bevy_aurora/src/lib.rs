@@ -37,6 +37,7 @@ extern crate alloc;
 use bevy_app::{PluginGroup, PluginGroupBuilder};
 use bevy_render::settings::WgpuFeatures;
 
+pub mod primary;
 pub mod scene;
 
 /// Re-exports of the most common Aurora types.
@@ -53,7 +54,9 @@ pub struct AuroraPlugins;
 
 impl PluginGroup for AuroraPlugins {
     fn build(self) -> PluginGroupBuilder {
-        PluginGroupBuilder::start::<Self>().add(scene::AuroraScenePlugin)
+        PluginGroupBuilder::start::<Self>()
+            .add(scene::AuroraScenePlugin)
+            .add(primary::AuroraPrimaryVisibilityPlugin)
     }
 }
 
