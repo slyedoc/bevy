@@ -175,6 +175,95 @@ Deliverables:
 - Material binding deferred (M-A traces only — no shading)
 - Per-mesh static build only (no LOD, no eviction in M-A; M-A.streaming adds them)
 
+### M-B.prereq — "wgpu: wrap a hal-built acceleration structure as `wgpu::Tlas`" *(landed)*
+
+**Why this exists:** M-B sub-2 needs a compute pipeline that binds the TLAS
+for ray queries. WGSL `acceleration_structure` bindings require
+`BindingResource::AccelerationStructure(&wgpu::Tlas)`, and `wgpu::Tlas` could
+previously only be obtained via `Device::create_tlas`, which both allocates
+*and* builds the AS through wgpu's own pipeline. Aurora's TLAS is built via
+`wgpu-hal` directly so it can interleave with cluster-BLAS construction (which
+uses `VK_NV_cluster_acceleration_structure` — exposed at the hal layer in this
+fork but not surfaced through wgpu-core). There was no path from "I have a
+hal-built AS" to "I have a `wgpu::Tlas` I can bind".
+
+**What landed (`slyedoc/wgpu#cluster-acceleration-structure`):**
+A `Device::create_tlas_from_hal<A>` API mirroring the existing
+`create_buffer_from_hal` / `create_texture_from_hal` precedents. Three layers,
+~140 LOC total:
+
+- `wgpu-core/src/resource.rs` — `Tlas::instance_buffer` is now `Option<...>`.
+  `None` flags a wrapped, foreign-built AS that wgpu does not own an instance
+  buffer for. `Drop` guards on the option.
+- `wgpu-core/src/device/ray_tracing.rs` — `Device::create_tlas_from_hal`
+  constructs a `Tlas` around a `Box<dyn DynAccelerationStructure>` produced by
+  the hal layer. `built_index` is set to a sentinel non-zero value at
+  construction so the bind-time `UsedUnbuiltTlas` guard passes naturally; no
+  BLAS dependency tracking; no instance buffer.
+- `wgpu-core/src/command/ray_tracing.rs` + `wgpu-core/src/ray_tracing.rs` —
+  added `BuildAccelerationStructureError::CannotRebuildForeignTlas` and an
+  early guard at the top of the build loop that rejects any TLAS missing an
+  instance buffer. Foreign-wrapped tlases cannot be rebuilt through wgpu's
+  build path.
+- `wgpu/src/backend/wgpu_core.rs` — `ContextWgpuCore::create_tlas_from_hal<A>`.
+- `wgpu/src/api/device.rs` — public
+  `unsafe fn Device::create_tlas_from_hal<A: hal::Api>(hal_as, desc) -> Tlas`,
+  documented unsafe contract (handle valid for this device, AS fully built,
+  desc reflects the actual build, returned `Tlas` owns the hal AS).
+
+**Notably *not* changed:** `wgpu-hal/src/vulkan/AccelerationStructure` itself.
+An earlier attempt at a hal-level `from_raw` wrapping a bare
+`VkAccelerationStructureKHR` was rolled back once it was clear that the fork
+already exposes everything Aurora needs to *build* an AS through wgpu-hal:
+`Device::create_acceleration_structure`,
+`CommandEncoder::build_acceleration_structures` (with
+`AccelerationStructureEntries::Instances` taking a buffer of
+`hal::TlasInstance { blas_address: u64, ... }` — i.e. raw BLAS device
+addresses, exactly what Aurora has on hand from cluster-BLAS construction).
+The actual gap was only at the wgpu-core layer, and is covered by
+`create_tlas_from_hal`.
+
+**Aurora-side change after this lands (M-B sub-2 work):**
+- `scene/tlas.rs` rewrites against `wgpu-hal` instead of raw `ash`: grab the
+  hal device through `as_hal::<Vulkan>`, call
+  `hal_device.create_acceleration_structure(...)` for the TLAS, build it via
+  the hal command encoder using `AccelerationStructureEntries::Instances` with
+  a buffer of `tlas_instance_to_bytes(TlasInstance { blas_address, ... })`,
+  then wrap the resulting hal AS via `Device::create_tlas_from_hal` and stash
+  the `wgpu::Tlas` on `ClusterAsManager`. Cluster-BLAS build stays on the
+  hal-level `cluster_acceleration_structure::Functions::cmd_build_indirect`.
+- `primary/visibility.rs` — plain wgpu compute pipeline, normal bind groups,
+  WGSL `acceleration_structure` binding works against the wrapped TLAS.
+
+**Validation:** smoke test deferred. Aurora's M-B sub-2 is the real consumer;
+if cluster-built BLAS device addresses survive the round-trip into a
+hal-built TLAS that's then ray-queried via the wrapped `wgpu::Tlas`, the API
+is validated end-to-end. A standalone `tests/tests/wgpu-gpu/ray_tracing/`
+test goes in if/when this is upstreamed.
+
+**Risks:**
+- TLAS rebuild semantics — a foreign-wrapped TLAS marks itself "built" with a
+  sentinel index. If the underlying hal AS is rebuilt out from under the
+  wrapper (legal at the hal layer), wgpu's view of "built state" goes stale
+  but the rebuild itself is fine — the next dispatch sees the new contents.
+  Caller-side discipline; not enforced in core.
+- The wgpu-core `Tlas::raw` is still `Snatchable<Box<dyn ...>>` — surface
+  loss can take it. Foreign hal AS gets dropped through normal
+  `destroy_acceleration_structure` so no special handling needed.
+- Trace replay intentionally skipped for foreign-built tlases — they cannot
+  be reproduced from a recorded trace.
+
+**Why not the earlier-considered alternatives:**
+- *Hal-level `AccelerationStructure::from_raw`*: would have let callers wrap
+  bare `VkAccelerationStructureKHR` handles, but Aurora doesn't need to —
+  building through hal directly produces a fully-owned hal AS. Considered and
+  rolled back.
+- *Fully raw vk pipeline + descriptor set in Aurora*: ~500-700 LOC of unsafe
+  per-frame plumbing; adds a second descriptor-management surface
+  inconsistent with the rest of Aurora going forward.
+- *Hybrid wgpu pipeline + raw vk descriptor patch*: fragile bind group layout
+  dance; not meaningfully smaller than the raw-vk path.
+
 ### M-B — "RT primary visibility writes PGBuffer" *(2-3 weeks)*
 
 End state: replace M-A's "hit/miss image" with a compute shader that traces
@@ -405,9 +494,14 @@ asset). No `Mesh3d`, no raster pipeline for those entities — pure RT.
 
 These are unresolved and will surface during M-A or M-B:
 
-- **wgpu integration scope.** Currently raw vk via `as_hal` for cluster_AS.
-  Long-term: extend `wgpu-hal` with cluster-AS resource types + builder methods.
-  Multi-week wgpu work; deferred until the API surface is settled.
+- **wgpu integration scope.** Aurora builds acceleration structures through
+  `wgpu-hal` directly (the fork already exposes `create_acceleration_structure`,
+  `build_acceleration_structures`, and the `VK_NV_cluster_acceleration_structure`
+  hal wrapper). Bind/dispatch goes through wgpu-core via the
+  `Device::create_tlas_from_hal` API landed in M-B.prereq. Long-term: lift
+  cluster-AS into first-class wgpu-core resource types so Aurora can drop the
+  `as_hal` reach entirely — multi-week, deferred until cluster_AS API stabilises
+  across IHVs.
 - **CLAS lifetime / streaming.** Production Nanite has CLAS array eviction +
   defrag. Prototype scope: static meshes only, build once, never evict.
   Production scope: integrate with `bevy_pbr::meshlet`'s page lifecycle.
@@ -483,12 +577,29 @@ To consult during implementation:
 
 ## 12. Status
 
-**Pre-M-A.** Cluster_AS bottom-of-the-stack proven on a synthetic 1-triangle test
-in `examples/3d/cluster_acceleration_structure.rs` (M-A scratch / smoke test).
-Real implementation begins when `bevy_aurora/src/lib.rs` exists.
+**M-A complete.** End-to-end meshlet → CLAS → BLAS → TLAS landed (`77744a5b4a`,
+`30f0a4e6cc`). `ClusterAsManager` resource + per-mesh CLAS upload + BLAS/TLAS
+build all working on bunny scene through raw vk + `as_hal`.
+
+**M-B sub-1 complete.** Primary visibility module + PGBuffer scaffolding
+landed (`2f16ed1fe1`). Texture allocation, lifecycle, and module skeleton in
+place; compute pipeline not yet wired.
+
+**M-B.prereq landed** on `slyedoc/wgpu#cluster-acceleration-structure`:
+`Device::create_tlas_from_hal<A>` mirroring `create_buffer_from_hal` /
+`create_texture_from_hal`, plus `Tlas::instance_buffer` becoming `Option`
+and a `BuildAccelerationStructureError::CannotRebuildForeignTlas` guard. No
+hal-level changes required; the fork already exposes the hal-level build
+APIs Aurora needs. ~140 LOC across wgpu-core + wgpu. Validation deferred to
+M-B sub-2 (Aurora's `scene/tlas.rs` rewrite against hal).
+
+**Active: M-B sub-2 on `slyedoc/bevy#restir_primary`.** Rewrite
+`scene/tlas.rs` to build the TLAS through `wgpu-hal` (instead of raw ash),
+wrap via `Device::create_tlas_from_hal`, then wire `primary/visibility.rs`
+as a plain wgpu compute pipeline with an `acceleration_structure` binding.
 
 Forks involved (all on slyedoc):
-- `slyedoc/wgpu#cluster-acceleration-structure`
+- `slyedoc/wgpu#cluster-acceleration-structure` (M-B.prereq landed)
 - `slyedoc/ash#cluster-acceleration-structure`
 - `slyedoc/gpu-allocator#ash-push-rename`
-- `slyedoc/bevy#restir_primary` (this branch)
+- `slyedoc/bevy#restir_primary` (this branch — resumes M-B sub-2)

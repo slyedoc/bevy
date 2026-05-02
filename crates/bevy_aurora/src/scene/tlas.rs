@@ -8,35 +8,45 @@
 )]
 //! Top-level acceleration structure manager.
 //!
-//! [`TlasManager`] owns one shared [`vk::AccelerationStructureKHR`] containing
-//! one instance per uploaded `(transform, BLAS device address)` pair. Aurora
-//! rebuilds the TLAS in-place each frame the instance set changes — the
-//! underlying AS handle survives so any descriptor-set reference to it stays
-//! valid; only the contents update.
+//! [`TlasManager`] builds a TLAS through `wgpu-hal` directly (because Aurora's
+//! BLASes are cluster-built and addressed by raw `VkDeviceAddress`, which sits
+//! below wgpu-core's `wgpu::Blas` type) and then wraps the resulting hal
+//! acceleration structure as a [`wgpu::Tlas`] via the
+//! `Device::create_tlas_from_hal` API. The wrapped `Tlas` is bindable as an
+//! `acceleration_structure` resource in compute pipelines without leaving the
+//! safe wgpu surface.
 //!
-//! Uses the standard `VK_KHR_acceleration_structure` build path
-//! (`vkCmdBuildAccelerationStructuresKHR`), not the cluster_AS path. The KHR
-//! ecosystem accepts a cluster-built BLAS device address as a valid
-//! `accelerationStructureReference` — that's the load-bearing claim of
-//! NVIDIA's MegaGeometry design.
+//! ## Scope (M-B sub-2)
+//!
+//! Single-build only — the bunny scene is static. Rebuild support lands when
+//! M-D introduces dynamic / hybrid scenes.
+
+use core::iter::once;
+use core::ops::Deref;
 
 use ash::vk;
 use bevy_ecs::resource::Resource;
 use bevy_math::Mat4;
+use wgpu::hal as wgh;
+// Bring the hal trait methods (`tlas_instance_to_bytes`,
+// `create_acceleration_structure`, `build_acceleration_structures`, ...) into
+// scope. They are trait items, not inherent methods on the concrete vulkan
+// types.
+use wgpu::hal::CommandEncoder as _;
+use wgpu::hal::Device as _;
 
-use super::raw_vk::{PersistentBuffer, RangeAllocator, RawBuffer};
+use super::raw_vk::RawBuffer;
 
 /// One instance Aurora wants in the TLAS this frame.
 #[derive(Debug, Clone, Copy)]
 pub struct TlasInstance {
-    /// World-from-local transform. Vulkan stores 3×4 row-major; we accept a
-    /// `bevy_math::Mat4` and drop the bottom row at upload time.
+    /// World-from-local transform. Vulkan's `TransformMatrixKHR` is row-major
+    /// 3×4 (12 floats); we accept a `bevy_math::Mat4` and convert at upload.
     pub world_from_local: Mat4,
     /// Cluster-built BLAS device address (from
     /// [`crate::scene::cluster_as::MeshClusters::blas_address`]).
     pub blas_address: u64,
-    /// Hit-shader instance index (24 bits). Aurora doesn't use shader
-    /// binding tables yet; pass 0.
+    /// Hit-shader instance index (24 bits).
     pub instance_custom_index: u32,
     /// Visibility mask (8 bits). 0xFF = visible to all rays.
     pub mask: u8,
@@ -53,376 +63,228 @@ impl TlasInstance {
     }
 }
 
-/// Default starting capacity for the TLAS storage / scratch / instance
-/// buffers. Aurora reallocates only when the actual instance count exceeds
-/// these caps; for prototype scenes the defaults fit comfortably.
+/// Soft cap on the number of instances per build. Just a sanity guard for the
+/// prototype — Aurora bails out before allocating an instance buffer larger
+/// than this.
 pub const DEFAULT_MAX_INSTANCES: u32 = 4096;
 
-/// Owns the persistent TLAS handle + backing buffer. Inserted into the render
-/// world as a [`Resource`] alongside [`super::cluster_as::ClusterAsManager`].
-#[derive(Resource)]
+/// Builds + holds the wrapped [`wgpu::Tlas`].
+///
+/// Inserted into the render world as a [`Resource`] alongside
+/// [`super::cluster_as::ClusterAsManager`]. Once [`Self::build`] succeeds,
+/// [`Self::tlas`] returns a stable `wgpu::Tlas` reference suitable for
+/// descriptor binding.
+#[derive(Resource, Default)]
 pub struct TlasManager {
-    /// Storage backing the [`Self::handle`] AS. Sized for `max_instances`.
-    storage: Option<PersistentBuffer>,
-    /// Scratch buffer reused across frame builds (sized for max_instances).
-    scratch: Option<RawBuffer>,
-    /// Persistent instance buffer (host-visible, AS_BUILD_INPUT_RO).
-    /// Aurora rewrites its contents each frame the instance list changes.
+    /// Wrapped wgpu TLAS. `None` until the first successful build.
+    tlas: Option<wgpu::Tlas>,
+    /// Persistent instance buffer the TLAS references via device address.
+    /// Must outlive the TLAS — the AS keeps a pointer to its contents.
     instance_buf: Option<RawBuffer>,
-    /// The actual TLAS handle. Stable across rebuilds — only the payload
-    /// changes — so descriptor sets bound to it stay valid.
-    handle: vk::AccelerationStructureKHR,
-    /// Cached KHR-AS device-level fn pointer table.
-    khr_as: Option<ash::khr::acceleration_structure::Device>,
-    /// Total instance capacity. Realloc trigger.
-    max_instances: u32,
-    /// Number of valid instances in the most recent build (for telemetry).
+    /// Number of instances in the most recent build (telemetry).
     last_built: u32,
-    /// Free-list over the storage buffer. Single-allocation in M-A; the
-    /// allocator is here for symmetry with the CLAS / BLAS managers and so
-    /// reallocation has a place to grow into.
-    storage_free_ranges: RangeAllocator,
-}
-
-impl Default for TlasManager {
-    fn default() -> Self {
-        Self {
-            storage: None,
-            scratch: None,
-            instance_buf: None,
-            handle: vk::AccelerationStructureKHR::null(),
-            khr_as: None,
-            max_instances: 0,
-            last_built: 0,
-            storage_free_ranges: RangeAllocator::new(0),
-        }
-    }
 }
 
 impl TlasManager {
-    /// The TLAS device address Aurora's lighting / primary-visibility shaders
-    /// trace against. Returns 0 if no build has happened yet.
-    pub fn device_address(&self) -> u64 {
-        if self.handle == vk::AccelerationStructureKHR::null() {
-            return 0;
-        }
-        let khr = self
-            .khr_as
-            .as_ref()
-            .expect("TlasManager::device_address called before build");
-        unsafe {
-            khr.get_acceleration_structure_device_address(
-                &vk::AccelerationStructureDeviceAddressInfoKHR::default()
-                    .acceleration_structure(self.handle),
-            )
-        }
+    /// Returns the wrapped TLAS, or `None` if no build has succeeded yet.
+    pub fn tlas(&self) -> Option<&wgpu::Tlas> {
+        self.tlas.as_ref()
     }
 
-    /// Raw VK handle for descriptor-set binding.
-    pub fn handle(&self) -> vk::AccelerationStructureKHR {
-        self.handle
+    /// `true` once a TLAS has been built.
+    pub fn is_built(&self) -> bool {
+        self.tlas.is_some()
     }
 
+    /// Number of instances in the most recent build.
     pub fn last_built_instance_count(&self) -> u32 {
         self.last_built
     }
 
-    /// Rebuild the TLAS for `instances`. The first call lazily allocates the
-    /// storage / scratch / instance buffers; subsequent calls reuse them.
-    /// If `instances.len()` exceeds the current capacity we reallocate and
-    /// double the cap. The TLAS handle survives -- callers' descriptor sets
-    /// stay valid.
+    /// Build the TLAS once for `instances`. Idempotent: subsequent calls with
+    /// any instance set return immediately.
     ///
     /// # Safety
     ///
     /// - All `blas_address` values must point at AS payloads in still-resident
     ///   storage.
-    /// - No in-flight GPU work may reference the TLAS handle when this is
-    ///   called -- we synchronously `vkDeviceWaitIdle` before mutating it.
-    pub unsafe fn rebuild(
+    /// - `device` must have been created with the Vulkan backend; this method
+    ///   panics on any other backend.
+    /// - No in-flight GPU work may race with the build's `vkDeviceWaitIdle`.
+    pub unsafe fn build(
         &mut self,
-        device: &ash::Device,
-        mem_props: &vk::PhysicalDeviceMemoryProperties,
-        raw_instance: &ash::Instance,
-        wgpu_device: &wgpu::Device,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         instances: &[TlasInstance],
     ) {
-        // Lazy KHR-AS load.
-        if self.khr_as.is_none() {
-            self.khr_as = Some(ash::khr::acceleration_structure::Device::load(
-                raw_instance,
-                device,
-            ));
+        if self.tlas.is_some() || instances.is_empty() {
+            return;
         }
-        // Grow / first-time alloc. Realloc may take `&mut self`, so clone the
-        // KHR-AS fns first (cheap -- ash extension Device structs are just
-        // function pointer tables wrapping a u64 device handle).
-        let khr = self.khr_as.clone().expect("just loaded");
-        let needed = instances.len().max(1) as u32;
-        if needed > self.max_instances {
-            unsafe { self.realloc_for(device, mem_props, &khr, needed.max(DEFAULT_MAX_INSTANCES)) };
-        }
-
-        // ---- Upload instance payload ----------------------------------------
-        let instance_buf = self
-            .instance_buf
-            .as_ref()
-            .expect("instance_buf allocated by realloc_for");
-        if !instances.is_empty() {
-            let mut instance_bytes =
-                Vec::with_capacity(instances.len() * size_of::<vk::AccelerationStructureInstanceKHR>());
-            for inst in instances {
-                let m = inst.world_from_local.to_cols_array();
-                // Vulkan TransformMatrixKHR is row-major 3×4 (12 floats).
-                // bevy Mat4::to_cols_array is column-major 4×4 (16). Convert.
-                let transform = vk::TransformMatrixKHR {
-                    matrix: [
-                        m[0], m[4], m[8], m[12], // row 0
-                        m[1], m[5], m[9], m[13], // row 1
-                        m[2], m[6], m[10], m[14], // row 2
-                    ],
-                };
-                let raw = vk::AccelerationStructureInstanceKHR {
-                    transform,
-                    instance_custom_index_and_mask: vk::Packed24_8::new(
-                        inst.instance_custom_index & 0x00FF_FFFF,
-                        inst.mask,
-                    ),
-                    instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
-                        0, 0,
-                    ),
-                    acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
-                        device_handle: inst.blas_address,
-                    },
-                };
-                instance_bytes.extend_from_slice(unsafe {
-                    core::slice::from_raw_parts(
-                        core::ptr::from_ref(&raw).cast::<u8>(),
-                        size_of::<vk::AccelerationStructureInstanceKHR>(),
-                    )
-                });
-            }
-            unsafe { instance_buf.upload(device, &instance_bytes) };
-        }
-
-        // ---- Build geometry ---------------------------------------------------
-        let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::default()
-            .data(vk::DeviceOrHostAddressConstKHR {
-                device_address: instance_buf.addr,
-            });
-        let geometry = vk::AccelerationStructureGeometryKHR::default()
-            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-            .geometry(vk::AccelerationStructureGeometryDataKHR {
-                instances: instances_data,
-            });
-        let geometries = [geometry];
-
-        let scratch = self.scratch.as_ref().expect("scratch allocated by realloc_for");
-        let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .geometries(&geometries)
-            .dst_acceleration_structure(self.handle)
-            .scratch_data(vk::DeviceOrHostAddressKHR {
-                device_address: scratch.addr,
-            });
-        let range = vk::AccelerationStructureBuildRangeInfoKHR::default()
-            .primitive_count(instances.len() as u32);
-
-        // ---- Submit via raw vk command pool (wgpu's encoder doesn't expose
-        // the active VkCommandBuffer for raw KHR-AS calls) ---------------------
-        let pool = unsafe {
-            device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default()
-                        .queue_family_index(0)
-                        .flags(vk::CommandPoolCreateFlags::TRANSIENT),
-                    None,
-                )
-                .expect("TLAS create_command_pool")
-        };
-        let cmd_alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cb = unsafe {
-            device
-                .allocate_command_buffers(&cmd_alloc)
-                .expect("TLAS alloc_command_buffers")[0]
-        };
-        unsafe {
-            device
-                .begin_command_buffer(
-                    cb,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .expect("TLAS begin_command_buffer");
-            khr.cmd_build_acceleration_structures(cb, &[build_info], &[&[range]]);
-            device.end_command_buffer(cb).expect("TLAS end_command_buffer");
-        }
-
-        let raw_queue = unsafe {
-            queue
-                .as_hal::<wgpu::hal::api::Vulkan>()
-                .expect("TLAS queue as_hal")
-                .as_raw()
-        };
-        let cbs = [cb];
-        let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-        unsafe {
-            device
-                .queue_submit(raw_queue, &[submit], vk::Fence::null())
-                .expect("TLAS queue_submit");
-            device.device_wait_idle().expect("TLAS device_wait_idle");
-            device.destroy_command_pool(pool, None);
-        }
-
-        let _ = wgpu_device; // currently unused; reserved if we move to wgpu encoder later
-        self.last_built = instances.len() as u32;
-        tracing::debug!(
-            target: "bevy_aurora",
-            instances = instances.len(),
-            cap = self.max_instances,
-            "TLAS built",
+        assert!(
+            instances.len() as u32 <= DEFAULT_MAX_INSTANCES,
+            "aurora TLAS instance count {} exceeds DEFAULT_MAX_INSTANCES {}",
+            instances.len(),
+            DEFAULT_MAX_INSTANCES,
         );
+        unsafe { self.build_inner(device, queue, instances) };
     }
 
-    /// (Re)allocate storage / scratch / instance buffers + recreate the TLAS
-    /// handle to fit `new_max_instances`. Destroys the previous handle.
+    /// Free Aurora-owned resources backing this TLAS.
+    ///
+    /// The wrapped `wgpu::Tlas` cleans up its own AS handle + storage on
+    /// drop; only the persistent instance buffer is on us.
     ///
     /// # Safety
     ///
-    /// No in-flight GPU work may reference the existing TLAS handle or its
-    /// backing buffers. Inherits all of [`Self::rebuild`]'s safety contract.
-    unsafe fn realloc_for(
+    /// No in-flight GPU work may reference the TLAS or its instance buffer.
+    pub unsafe fn destroy(self, device: &ash::Device) {
+        if let Some(buf) = self.instance_buf {
+            unsafe { buf.destroy(device) };
+        }
+        // `self.tlas` drops here; wgpu's destroy_acceleration_structure runs
+        // through wgpu-hal cleanup paths.
+    }
+
+    unsafe fn build_inner(
         &mut self,
-        device: &ash::Device,
-        mem_props: &vk::PhysicalDeviceMemoryProperties,
-        khr: &ash::khr::acceleration_structure::Device,
-        new_max_instances: u32,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        instances: &[TlasInstance],
     ) {
-        // Tear down previous (no-op on first call).
-        unsafe {
-            if self.handle != vk::AccelerationStructureKHR::null() {
-                khr.destroy_acceleration_structure(self.handle, None);
-                self.handle = vk::AccelerationStructureKHR::null();
-            }
-            if let Some(s) = self.storage.take() {
-                s.destroy(device);
-            }
-            if let Some(s) = self.scratch.take() {
-                s.destroy(device);
-            }
-            if let Some(s) = self.instance_buf.take() {
-                s.destroy(device);
-            }
-        }
+        let max_instances = instances.len() as u32;
+        let flags = wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE;
 
-        // Size query.
-        let dummy_data = vk::AccelerationStructureGeometryInstancesDataKHR::default();
-        let geometry = vk::AccelerationStructureGeometryKHR::default()
-            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-            .geometry(vk::AccelerationStructureGeometryDataKHR {
-                instances: dummy_data,
-            });
-        let geometries = [geometry];
-        let probe = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .geometries(&geometries);
-        let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
-        unsafe {
-            khr.get_acceleration_structure_build_sizes(
-                vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                &probe,
-                &[new_max_instances],
-                &mut size_info,
+        // The hal acceleration structure outlives the guard scope; ownership
+        // is moved into `create_tlas_from_hal` after the guard drops.
+        let hal_as = unsafe {
+            let hal_device_guard = device
+                .as_hal::<wgh::api::Vulkan>()
+                .expect("aurora requires the Vulkan backend");
+            let hal_device: &wgh::vulkan::Device = hal_device_guard.deref();
+            let raw_device = hal_device.raw_device();
+            let raw_instance = hal_device.shared_instance().raw_instance();
+            let raw_phys = hal_device.raw_physical_device();
+            let mem_props = raw_instance.get_physical_device_memory_properties(raw_phys);
+
+            // Pre-encode the instance bytes via the hal helper.
+            let mut bytes = Vec::with_capacity(instances.len() * 64);
+            for inst in instances {
+                let m = inst.world_from_local.to_cols_array();
+                bytes.extend_from_slice(&hal_device.tlas_instance_to_bytes(wgh::TlasInstance {
+                    transform: [
+                        m[0], m[4], m[8], m[12],
+                        m[1], m[5], m[9], m[13],
+                        m[2], m[6], m[10], m[14],
+                    ],
+                    custom_data: inst.instance_custom_index & 0x00FF_FFFF,
+                    mask: inst.mask,
+                    blas_address: inst.blas_address,
+                }));
+            }
+
+            // Persistent instance buffer (AS reads it via device address).
+            let instance_buf = RawBuffer::alloc(
+                raw_device,
+                &mem_props,
+                bytes.len() as u64,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                true,
             );
-        }
+            instance_buf.upload(raw_device, &bytes);
+            let instance_buf_hal = wgh::vulkan::Buffer::from_raw(instance_buf.buf);
 
-        // Storage buffer + AS handle.
-        let storage = unsafe {
-            PersistentBuffer::alloc(
-                "aurora.tlas_storage",
-                device,
-                mem_props,
-                size_info.acceleration_structure_size,
-                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
-                false,
-            )
-        };
-        let create = vk::AccelerationStructureCreateInfoKHR::default()
-            .buffer(storage.raw())
-            .offset(0)
-            .size(size_info.acceleration_structure_size)
-            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL);
-        let handle = unsafe {
-            khr.create_acceleration_structure(&create, None)
-                .expect("create_acceleration_structure (TLAS)")
-        };
+            let entries = wgh::AccelerationStructureEntries::<wgh::vulkan::Buffer>::Instances(
+                wgh::AccelerationStructureInstances {
+                    buffer: Some(&instance_buf_hal),
+                    offset: 0,
+                    count: max_instances,
+                },
+            );
 
-        let scratch = unsafe {
-            RawBuffer::alloc(
-                device,
-                mem_props,
+            // Size query + scratch + AS allocation.
+            let size_info = hal_device.get_acceleration_structure_build_sizes(
+                &wgh::GetAccelerationStructureBuildSizesDescriptor {
+                    entries: &entries,
+                    flags,
+                },
+            );
+            let scratch = RawBuffer::alloc(
+                raw_device,
+                &mem_props,
                 size_info.build_scratch_size.max(1),
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 false,
+            );
+            let scratch_hal = wgh::vulkan::Buffer::from_raw(scratch.buf);
+
+            let hal_as = hal_device
+                .create_acceleration_structure(&wgh::AccelerationStructureDescriptor {
+                    label: Some("aurora.tlas"),
+                    size: size_info.acceleration_structure_size,
+                    format: wgh::AccelerationStructureFormat::TopLevel,
+                    allow_compaction: false,
+                })
+                .expect("create_acceleration_structure (TLAS)");
+
+            // Encode the build through wgpu's encoder so wgpu-core sees the
+            // command stream; the cluster_AS hal extension also rides this
+            // pattern (`encoder.as_hal_mut`).
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("aurora.tlas.build"),
+            });
+            encoder.as_hal_mut::<wgh::api::Vulkan, _, _>(|maybe_cmd| {
+                if let Some(cmd) = maybe_cmd {
+                    let desc = wgh::BuildAccelerationStructureDescriptor::<
+                        wgh::vulkan::Buffer,
+                        wgh::vulkan::AccelerationStructure,
+                    > {
+                        entries: &entries,
+                        mode: wgh::AccelerationStructureBuildMode::Build,
+                        flags,
+                        source_acceleration_structure: None,
+                        destination_acceleration_structure: &hal_as,
+                        scratch_buffer: &scratch_hal,
+                        scratch_buffer_offset: 0,
+                    };
+                    cmd.build_acceleration_structures(1, once(desc));
+                }
+            });
+            let cb = encoder.finish();
+            queue.submit([cb]);
+            raw_device
+                .device_wait_idle()
+                .expect("TLAS device_wait_idle");
+
+            // Scratch is single-use; instance buffer must outlive the wrap.
+            scratch.destroy(raw_device);
+            self.instance_buf = Some(instance_buf);
+
+            // The hal Buffer wrappers (`from_raw`) are pure handles with no
+            // owned memory; dropping them at end-of-scope is a no-op.
+            let _ = (instance_buf_hal, scratch_hal);
+            hal_as
+        };
+
+        // Hand the hal AS to wgpu-core. From this point on, lifecycle of the
+        // underlying VkAccelerationStructureKHR is wgpu-managed.
+        let tlas = unsafe {
+            device.create_tlas_from_hal::<wgh::api::Vulkan>(
+                hal_as,
+                &wgpu::CreateTlasDescriptor {
+                    label: Some("aurora.tlas"),
+                    flags,
+                    update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                    max_instances,
+                },
             )
         };
 
-        let instance_buf = unsafe {
-            RawBuffer::alloc(
-                device,
-                mem_props,
-                u64::from(new_max_instances)
-                    * size_of::<vk::AccelerationStructureInstanceKHR>() as u64,
-                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-                true,
-            )
-        };
-
-        self.storage_free_ranges = RangeAllocator::new(size_info.acceleration_structure_size);
-        self.storage = Some(storage);
-        self.scratch = Some(scratch);
-        self.instance_buf = Some(instance_buf);
-        self.handle = handle;
-        self.max_instances = new_max_instances;
-
+        self.tlas = Some(tlas);
+        self.last_built = max_instances;
         tracing::debug!(
             target: "bevy_aurora",
-            cap = new_max_instances,
-            storage_bytes = size_info.acceleration_structure_size,
-            scratch_bytes = size_info.build_scratch_size,
-            "TLAS reallocated",
+            instances = max_instances,
+            "TLAS built (wgpu-hal -> create_tlas_from_hal)",
         );
-    }
-
-    /// Free all GPU memory + destroy the TLAS handle. Must be called before
-    /// `device` is destroyed.
-    ///
-    /// # Safety
-    ///
-    /// No in-flight GPU work may reference the TLAS handle.
-    pub unsafe fn destroy(self, device: &ash::Device) {
-        unsafe {
-            if let Some(khr) = &self.khr_as
-                && self.handle != vk::AccelerationStructureKHR::null() {
-                    khr.destroy_acceleration_structure(self.handle, None);
-                }
-            if let Some(s) = self.storage {
-                s.destroy(device);
-            }
-            if let Some(s) = self.scratch {
-                s.destroy(device);
-            }
-            if let Some(s) = self.instance_buf {
-                s.destroy(device);
-            }
-        }
     }
 }

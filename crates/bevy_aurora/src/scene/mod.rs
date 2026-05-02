@@ -241,9 +241,9 @@ fn process_uploads(
     }
 }
 
-/// Rebuild the TLAS to contain one instance per extracted Aurora entity that
-/// has had its mesh uploaded. Runs every frame; the TLAS handle is stable
-/// across rebuilds.
+/// Build the TLAS once the extracted instance set + uploaded BLASes are
+/// available. Idempotent: [`TlasManager::build`] returns immediately on
+/// subsequent calls (M-B sub-2 scope is single-build; M-D adds rebuilds).
 fn rebuild_tlas(
     instances: Query<&ExtractedAuroraInstance>,
     manager: Option<Res<ClusterAsManager>>,
@@ -255,6 +255,9 @@ fn rebuild_tlas(
     let (Some(manager), Some(mut tlas)) = (manager, tlas) else {
         return;
     };
+    if tlas.is_built() {
+        return;
+    }
     let mut tlas_instances = Vec::new();
     for inst in &instances {
         let Some(handle) = uploaded.0.get(&inst.mesh) else {
@@ -266,27 +269,15 @@ fn rebuild_tlas(
         }
         tlas_instances.push(TlasInstance::opaque(inst.world_from_local, mc.blas_address));
     }
+    if tlas_instances.is_empty() {
+        return;
+    }
 
-    // SAFETY: same as init_managers -- as_hal escape for the build call only.
+    // SAFETY: blas_addresses come from ClusterAsManager which retains the
+    // backing storage; init_managers + this system run on the same render
+    // thread, so no concurrent GPU work races our `vkDeviceWaitIdle`.
     unsafe {
-        let wgpu_device = device.wgpu_device();
-        let Some(hal_device) = wgpu_device.as_hal::<wgpu::hal::api::Vulkan>() else {
-            return;
-        };
-        let hal_device: &wgpu::hal::vulkan::Device = hal_device.deref();
-        let raw_device = hal_device.raw_device();
-        let raw_instance = hal_device.shared_instance().raw_instance();
-        let raw_phys = hal_device.raw_physical_device();
-        let mem_props = raw_instance.get_physical_device_memory_properties(raw_phys);
-
-        tlas.rebuild(
-            raw_device,
-            &mem_props,
-            raw_instance,
-            wgpu_device,
-            queue.0.as_ref(),
-            &tlas_instances,
-        );
+        tlas.build(device.wgpu_device(), queue.0.as_ref(), &tlas_instances);
     }
 }
 

@@ -114,8 +114,7 @@ fn dump_state(
         return;
     };
     let n_meshes = uploaded.0.len();
-    let tlas_addr = tlas.device_address();
-    if n_meshes == 0 || tlas_addr == 0 {
+    if n_meshes == 0 || !tlas.is_built() {
         return;
     }
     // Print once per uploaded mesh (skip the no-op subsequent frames).
@@ -137,8 +136,7 @@ fn dump_state(
         );
     }
     info!(
-        "  TLAS: {} instances @ {:#018x}",
+        "  TLAS: {} instances (wrapped as wgpu::Tlas)",
         tlas.last_built_instance_count(),
-        tlas_addr
     );
 }
