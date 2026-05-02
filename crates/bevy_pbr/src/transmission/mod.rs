@@ -31,8 +31,18 @@ impl Plugin for ScreenSpaceTransmissionPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "transmission.wgsl");
 
-        app.add_plugins(ExtractComponentPlugin::<ScreenSpaceTransmission>::default())
-            .register_required_components::<Camera3d, ScreenSpaceTransmission>();
+        // NOTE: do not auto-require ScreenSpaceTransmission on every Camera3d.
+        // The mesh-view bind group includes the SST texture/sampler bindings
+        // whenever the component is *present* (`Has<ScreenSpaceTransmission>`),
+        // but the opaque pipeline layout only includes them when the
+        // `MeshPipelineKey::SCREEN_SPACE_SPECULAR_TRANSMISSION_RESERVED_BITS`
+        // are set (i.e. when an actual transmissive material is being drawn).
+        // Auto-requiring the component caused the bind-group / pipeline layouts
+        // to disagree on bindings 25/26 the moment any opaque mesh was drawn
+        // without an env map (see e.g. running `examples/3d/meshlet.rs` after
+        // PR #22763). Treat SST as opt-in until upstream realigns the two
+        // layout paths.
+        app.add_plugins(ExtractComponentPlugin::<ScreenSpaceTransmission>::default());
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;

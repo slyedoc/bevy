@@ -17,8 +17,11 @@
 //! Requires an NVIDIA GPU (Turing+) with a driver implementing
 //! `VK_NV_cluster_acceleration_structure`.
 
+use std::f32::consts::PI;
+
 use bevy::{
-    pbr::experimental::meshlet::{MeshletMesh, MeshletPlugin},
+    light::{light_consts, DirectionalLight},
+    pbr::experimental::meshlet::{MeshletMesh, MeshletMesh3d, MeshletPlugin},
     prelude::*,
     render::{
         render_resource::WgpuFeatures, settings::WgpuSettings, Render, RenderApp, RenderPlugin,
@@ -54,11 +57,25 @@ fn main() {
             AuroraDumpPlugin,
         ))
         .insert_resource(BunnyAsset(Handle::default()))
-        .add_systems(Startup, (load_bunny, setup_camera))
+        .add_systems(Startup, (load_bunny, setup_camera, setup_light))
         .add_systems(Update, spawn_when_ready)
         .run();
 }
 
+fn setup_light(mut commands: Commands) {
+    commands.spawn((
+        DirectionalLight {
+            illuminance: light_consts::lux::FULL_DAYLIGHT,
+            shadow_maps_enabled: false,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::ZYX, 0.0, PI * -0.15, PI * -0.15)),
+    ));
+}
+
+/// Camera mirroring bevy's `examples/3d/meshlet.rs` exactly so we can
+/// confirm the raster bunny renders at scale 0.2 from this viewpoint, then
+/// re-attach `AuroraCamera` once we have a known-good visual baseline.
 fn setup_camera(mut commands: Commands) {
     use bevy::render::render_resource::TextureUsages;
     commands.spawn((
@@ -66,7 +83,7 @@ fn setup_camera(mut commands: Commands) {
         bevy::camera::Hdr,
         Msaa::Off,
         bevy::camera::CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
-        Transform::from_xyz(0.5, 0.7, 1.5).looking_at(Vec3::new(0.0, 0.4, 0.0), Vec3::Y),
+        Transform::from_translation(Vec3::new(1.8, 0.4, -0.1)).looking_at(Vec3::ZERO, Vec3::Y),
         AuroraCamera,
     ));
 }
@@ -86,6 +103,7 @@ fn spawn_when_ready(
     mut commands: Commands,
     bunny: Res<BunnyAsset>,
     meshes: Res<Assets<MeshletMesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     spawned: Query<&BunnySpawned>,
 ) {
     if !spawned.is_empty() {
@@ -95,12 +113,18 @@ fn spawn_when_ready(
         return;
     }
     info!("Bunny asset ready -- spawning AuroraMeshlet3d");
+    // Aurora-traced bunny. Scale matches bevy's `examples/3d/meshlet.rs` so
+    // the AuroraCamera at (1.8, 0.4, -0.1) frames the bunny from outside its
+    // bounding box (at scale 1.0 the bunny is ~5 units tall and the camera
+    // would sit inside it -- every ray starts in the interior and "escapes"
+    // through a backface that we then can't see lit).
     commands.spawn((
         AuroraMeshlet3d(bunny.0.clone()),
-        Transform::default(),
+        Transform::default().with_scale(Vec3::splat(0.2)),
         GlobalTransform::default(),
         BunnySpawned,
     ));
+    let _ = materials; // raster sibling intentionally removed for this checkpoint
 }
 
 /// Inline plugin that logs Aurora's AS state every frame after `rebuild_tlas`.

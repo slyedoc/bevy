@@ -611,20 +611,66 @@ and a `BuildAccelerationStructureError::CannotRebuildForeignTlas` guard. No
 hal-level changes required; the fork already exposes the hal-level build
 APIs Aurora needs. ~140 LOC across wgpu-core + wgpu.
 
-**M-B sub-2 landed.** `scene/tlas.rs` rewritten to build through wgpu-hal +
-wrap via `create_tlas_from_hal` (`add2668f30`); `primary/visibility.{rs,wgsl}`
-wires a compute pipeline that binds the wrapped TLAS as
-`acceleration_structure` and traces a camera ray per pixel into the camera's
-view target. Validated end-to-end on bunny: 2416 CLASes → cluster-built
-BLAS → wrapped TLAS → ray-queried + dispatched, zero validation errors.
+**M-B sub-2 partial — bunny invisible (cluster-BLAS-in-TLAS suspect).**
+`scene/tlas.rs` rewritten to build through wgpu-hal + wrap via
+`create_tlas_from_hal` (`add2668f30`); `primary/visibility.{rs,wgsl}` wires
+a compute pipeline that binds the wrapped TLAS as `acceleration_structure`
+and traces a camera ray per pixel into the camera's view target. Pipeline
+runs cleanly:
+  - 2416 CLASes built (NV cluster_AS)
+  - cluster-built BLAS @ a non-zero device address
+  - TLAS instance written + wrapped via `create_tlas_from_hal`
+  - bind group accepted; compute dispatches; zero validation errors
+  - **but every ray misses** -- the screen is uniform miss-colour
 
-Visual output is debug-shaded (world-position fractional bits → R/G/B on hit,
-dim sky on miss). Real PGBuffer fill (proper world_position / normal /
-motion / material_id / depth) lands in M-B sub-3.
+Verified the camera/transform are correct by spawning a sibling
+`MeshletMesh3d` at the same `Transform::default().with_scale(0.2)`; the
+raster bunny renders correctly from `(1.8, 0.4, -0.1)` looking at origin.
+So Aurora's compute pipeline, the wrapped TLAS bind, and the camera all
+work in isolation -- the failure is somewhere between "TLAS built" and
+"ray query returns hits".
 
-**Active: M-B sub-3.** Replace the debug shading with proper PGBuffer fill
-into the existing [`PgbufferTextures`] resource so downstream passes (M-C
-ReSTIR DI) can read it.
+Highest-likelihood causes (in order):
+
+1. **The cluster-built BLAS isn't directly consumable as a TLAS instance
+   reference.** The "load-bearing claim of NVIDIA's MegaGeometry design"
+   (see `tlas.rs` header comment) was *never* empirically validated -- the
+   pre-Aurora smoke test (`examples/3d/cluster_acceleration_structure.rs`)
+   only checks that the TLAS device address is non-zero, never traces a
+   ray. We're the first to actually test this.
+2. **The BLAS device address read in `scene/blas.rs` is racy or wrong.**
+   The address comes from a host-mapped buffer the GPU writes during the
+   indirect cluster build; if synchronization or memory-coherence is off,
+   we're stamping garbage into the TLAS instance.
+3. **Our TLAS build via wgpu-hal has a subtle bug** that the prior raw-vk
+   path also had. Both versions only validated `device_address ≠ 0`, never
+   traced rays, so neither is a known-good baseline.
+
+**Decisive next test:** build a regular triangle BLAS via raw KHR-AS calls
+(no cluster_AS), put its device address into the existing TLAS instance,
+see if rays hit. Outcomes:
+  - Rays hit → cause #1 or #2 (cluster path is the bug). Then either the
+    cluster-BLAS-as-TLAS-instance assumption is wrong (architectural
+    revision: maybe a wrapper BLAS, or `VK_NV_partitioned_acceleration_structure`),
+    or the address read needs fixing.
+  - Rays miss → cause #3 (our TLAS build is broken). Compare against
+    `bevy_solari/src/scene/binder.rs` which has a working KHR TLAS build.
+
+This test sits as a one-shot example, ~150 LOC of triangle-BLAS code +
+the existing TLAS wrap path. Tracked as task #15 next session.
+
+**Bevy SST regression patch (incidental).** The base bevy branch had a
+binding-layout mismatch in the screen-space-transmission path:
+`register_required_components::<Camera3d, ScreenSpaceTransmission>()`
+made every Camera3d auto-include the SST component; the mesh-view bind
+group then unconditionally added bindings 25/26 (driven by
+`Has<ScreenSpaceTransmission>`), but the opaque pipeline layout only
+includes those bindings when a transmissive material is being drawn. Running
+`examples/3d/meshlet.rs` reproduced the validation error. Patched in
+`crates/bevy_pbr/src/transmission/mod.rs` to make SST opt-in until upstream
+realigns the two layout paths.
+
+**Active: M-B sub-2c.** Triangle-BLAS control test (task #15).
 
 Forks involved (all on slyedoc):
 - `slyedoc/wgpu#cluster-acceleration-structure` (M-B.prereq landed)
