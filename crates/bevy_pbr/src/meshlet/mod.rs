@@ -21,13 +21,22 @@ pub(crate) use self::{
 };
 
 pub use self::asset::{
-    Meshlet, MeshletAabb, MeshletMesh, MeshletMeshLoader, MeshletMeshSaver,
-    MESHLET_MESH_ASSET_VERSION,
+    BvhNode, Meshlet, MeshletAabb, MeshletCullData, MeshletMesh, MeshletMeshLoader,
+    MeshletMeshSaver, MESHLET_MESH_ASSET_VERSION,
 };
 #[cfg(feature = "meshlet_processor")]
 pub use self::from_mesh::{
     MeshToMeshletMeshConversionError, MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR,
 };
+// Aurora-adjacent: external crates (bevy_aurora) reuse the meshlet upload
+// infrastructure to bind shading attributes (positions, normals, UVs,
+// indices, meshlet metadata) for ray-traced hit resolve. Exposing the
+// manager + persistent buffer trait gives aurora the same lazy-upload,
+// slice-allocation, and offset-folding behaviour the raster path uses.
+pub use self::meshlet_mesh_manager::{
+    init_meshlet_mesh_manager, perform_pending_meshlet_mesh_writes, MeshletMeshManager,
+};
+pub use self::persistent_buffer::{PersistentGpuBuffer, PersistentGpuBufferable};
 use self::{
     instance_manager::extract_meshlet_mesh_entities,
     material_pipeline_prepare::{
@@ -37,7 +46,6 @@ use self::{
     material_shade_nodes::{
         meshlet_deferred_gbuffer_prepass, meshlet_main_opaque_pass, meshlet_prepass,
     },
-    meshlet_mesh_manager::perform_pending_meshlet_mesh_writes,
     pipelines::*,
     resource_manager::{
         prepare_meshlet_per_frame_resources, prepare_meshlet_view_bind_groups, ResourceManager,
@@ -45,7 +53,7 @@ use self::{
     visibility_buffer_raster_node::meshlet_visibility_buffer_raster,
 };
 use crate::render::{per_view_shadow_pass, EARLY_SHADOW_PASS};
-use crate::{meshlet::meshlet_mesh_manager::init_meshlet_mesh_manager, PreviousGlobalTransform};
+use crate::PreviousGlobalTransform;
 use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, AssetApp, AssetId, Handle};
 use bevy_camera::visibility::{self, Visibility, VisibilityClass};
