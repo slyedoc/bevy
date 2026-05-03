@@ -111,6 +111,22 @@ impl MeshletMeshManager {
         )
     }
 
+    /// Returns the absolute index of the first [`Meshlet`] entry for `asset_id`
+    /// within the global [`MeshletMeshManager::meshlets`] buffer, if the asset
+    /// has been uploaded. External consumers (e.g. `bevy_aurora`'s ray-traced
+    /// hit resolve) need this to convert a per-mesh meshlet index into a global
+    /// slot lookup; bevy's own raster path consumes this internally via the
+    /// BVH-root index returned from [`queue_upload_if_needed`].
+    pub fn meshlet_base_index(&self, asset_id: &AssetId<MeshletMesh>) -> Option<u32> {
+        // slice array layout matches `queue_upload_if_needed`:
+        //   [0] vertex_positions, [1] vertex_normals, [2] vertex_uvs,
+        //   [3] indices,          [4] bvh_nodes,     [5] meshlets,
+        //   [6] meshlet_cull_data
+        self.meshlet_mesh_slices.get(asset_id).map(|(slices, _, _)| {
+            (slices[5].start / size_of::<Meshlet>() as u64) as u32
+        })
+    }
+
     pub fn remove(&mut self, asset_id: &AssetId<MeshletMesh>) {
         if let Some((
             [vertex_positions_slice, vertex_normals_slice, vertex_uvs_slice, indices_slice, bvh_node_slice, meshlets_slice, meshlet_cull_data_slice],
