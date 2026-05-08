@@ -520,7 +520,13 @@ pub fn init_solari_lighting_pipelines(
             "compact_world_cache_blocks",
             load_embedded_asset!(asset_server.as_ref(), "world_cache_compact.wgsl"),
             Some(&bind_group_layout_world_cache_active_cells_dispatch),
-            vec![],
+            // The shader as a whole accesses `world_cache_life` directly
+            // (decay, compact_single_block, write_active_cells). Stricter
+            // naga validation refuses to parse the module as
+            // `array<atomic<u32>>` while any function does direct access,
+            // so all four pipelines compiling this file must agree on
+            // the non-atomic typing.
+            vec!["WORLD_CACHE_NON_ATOMIC_LIFE_BUFFER".into()],
         ),
         compact_world_cache_write_active_cells_pipeline: create_pipeline(
             "solari_lighting_compact_world_cache_write_active_cells_pipeline",
