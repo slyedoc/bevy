@@ -52,6 +52,7 @@ pub struct SolariLightingPipelines {
     specular_gi_with_psr_pipeline: CachedComputePipelineId,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     resolve_dlss_rr_textures_pipeline: CachedComputePipelineId,
+    debug_view_pipeline: CachedComputePipelineId,
 }
 
 #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
@@ -134,6 +135,7 @@ pub fn solari_lighting(
         Some(gi_initial_and_temporal_pipeline),
         Some(gi_spatial_and_shade_pipeline),
         Some(specular_gi_pipeline),
+        Some(debug_view_pipeline),
         Some(scene_bind_group),
         Some(gbuffer),
         Some(depth_buffer),
@@ -157,6 +159,7 @@ pub fn solari_lighting(
         pipeline_cache.get_compute_pipeline(pipelines.gi_initial_and_temporal_pipeline),
         pipeline_cache.get_compute_pipeline(pipelines.gi_spatial_and_shade_pipeline),
         pipeline_cache.get_compute_pipeline(specular_gi_pipeline),
+        pipeline_cache.get_compute_pipeline(pipelines.debug_view_pipeline),
         &scene_bindings.bind_group,
         view_prepass_textures.deferred_view(),
         view_prepass_textures.depth_view(),
@@ -381,6 +384,18 @@ pub fn solari_lighting(
     pass.dispatch_workgroups(dx, dy, 1);
     d.end(&mut pass);
 
+    // Optional debug-channel overwrite. Runs last so it stomps the lit
+    // composite. Reuses the main solari bind group (gbuffer + depth +
+    // motion + view + view_output already bound) and brings its own
+    // 4-byte immediate carrying the view-mode discriminant.
+    if let Some(debug_view) = solari_lighting.debug_view {
+        let d = diagnostics.time_span(&mut pass, "solari_lighting/debug_view");
+        pass.set_pipeline(debug_view_pipeline);
+        pass.set_immediates(0, bytemuck::cast_slice(&[debug_view as u32]));
+        pass.dispatch_workgroups(dx, dy, 1);
+        d.end(&mut pass);
+    }
+
     drop(pass);
 
     diagnostics.record_u32(
@@ -593,5 +608,25 @@ pub fn init_solari_lighting_pipelines(
             Some(&bind_group_layout_resolve_dlss_rr_textures),
             vec!["DLSS_RR_GUIDE_BUFFERS".into()],
         ),
+        // The debug-view pass shares the main solari bind group but uses a
+        // 4-byte immediate (just the view-mode discriminant), distinct
+        // from the 8-byte `PushConstants` the rest of the pipelines use.
+        // Inlined here so we can override `immediate_size` from the
+        // `create_pipeline` lambda's hardcoded 8.
+        debug_view_pipeline: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("solari_lighting_debug_view_pipeline".into()),
+            layout: vec![
+                scene_bindings.bind_group_layout.clone(),
+                bind_group_layout.clone(),
+            ],
+            immediate_size: 4,
+            shader: load_embedded_asset!(asset_server.as_ref(), "debug_view.wgsl"),
+            shader_defs: vec![ShaderDefVal::UInt(
+                "WORLD_CACHE_SIZE".into(),
+                WORLD_CACHE_SIZE as u32,
+            )],
+            entry_point: Some("debug_view".into()),
+            ..default()
+        }),
     });
 }

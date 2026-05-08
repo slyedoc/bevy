@@ -13,7 +13,7 @@ use bevy::{
     render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
     solari::{
         pathtracer::{Pathtracer, PathtracingPlugin},
-        prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
+        prelude::{RaytracingMesh3d, SolariDebugView, SolariLighting, SolariPlugins},
     },
     world_serialization::WorldInstanceReady,
 };
@@ -65,8 +65,13 @@ fn main() {
         app.add_plugins(PathtracingPlugin);
     } else {
         if args.many_lights != Some(true) {
-            app.add_systems(Update, (pause_scene, toggle_lights, patrol_path))
-                .add_systems(PostUpdate, update_control_text);
+            app.add_systems(
+                Update,
+                (pause_scene, toggle_lights, patrol_path, cycle_debug_view),
+            )
+            .add_systems(PostUpdate, update_control_text);
+        } else {
+            app.add_systems(Update, cycle_debug_view);
         }
         app.add_systems(PostUpdate, update_performance_text);
     }
@@ -449,6 +454,33 @@ fn pause_scene(mut time: ResMut<Time<Virtual>>, key_input: Res<ButtonInput<KeyCo
     }
 }
 
+// Tab cycles through SolariLighting::debug_view for cross-renderer A/B
+// inspection of the gbuffer channels. None = lit composite (default).
+fn cycle_debug_view(
+    key_input: Res<ButtonInput<KeyCode>>,
+    mut solari_lighting: Query<&mut SolariLighting>,
+) {
+    if !key_input.just_pressed(KeyCode::Tab) {
+        return;
+    }
+    const CYCLE: [Option<SolariDebugView>; 10] = [
+        None,
+        Some(SolariDebugView::WorldNormal),
+        Some(SolariDebugView::WorldPosition),
+        Some(SolariDebugView::BaseColor),
+        Some(SolariDebugView::Material),
+        Some(SolariDebugView::Depth),
+        Some(SolariDebugView::Roughness),
+        Some(SolariDebugView::Metallic),
+        Some(SolariDebugView::Emissive),
+        Some(SolariDebugView::MotionVector),
+    ];
+    for mut lighting in &mut solari_lighting {
+        let current = CYCLE.iter().position(|v| *v == lighting.debug_view).unwrap_or(0);
+        lighting.debug_view = CYCLE[(current + 1) % CYCLE.len()];
+    }
+}
+
 #[derive(Resource)]
 struct RobotLightMaterial(Handle<StandardMaterial>);
 
@@ -531,6 +563,7 @@ fn update_control_text(
     materials: Res<Assets<StandardMaterial>>,
     directional_light: Query<Entity, With<DirectionalLight>>,
     time: Res<Time<Virtual>>,
+    solari_lighting: Query<&SolariLighting>,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_rr_supported: Option<
         Res<DlssRayReconstructionSupported>,
     >,
@@ -570,6 +603,21 @@ fn update_control_text(
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
     text.0
         .push_str("\nDenoising: App not compiled with DLSS support");
+
+    let debug_label = match solari_lighting.single().ok().and_then(|l| l.debug_view) {
+        None => "lit",
+        Some(SolariDebugView::WorldNormal) => "world_normal",
+        Some(SolariDebugView::WorldPosition) => "world_position",
+        Some(SolariDebugView::BaseColor) => "base_color",
+        Some(SolariDebugView::Material) => "material",
+        Some(SolariDebugView::Depth) => "depth",
+        Some(SolariDebugView::Roughness) => "roughness",
+        Some(SolariDebugView::Metallic) => "metallic",
+        Some(SolariDebugView::Emissive) => "emissive",
+        Some(SolariDebugView::MotionVector) => "motion",
+    };
+    text.0
+        .push_str(&format!("\n(Tab): Debug view -- {debug_label}"));
 }
 
 #[derive(Component)]
