@@ -463,8 +463,10 @@ fn cycle_debug_view(
     if !key_input.just_pressed(KeyCode::Tab) {
         return;
     }
-    const CYCLE: [Option<SolariDebugView>; 10] = [
+    const CYCLE: [Option<SolariDebugView>; 12] = [
         None,
+        Some(SolariDebugView::Direct),
+        Some(SolariDebugView::Indirect),
         Some(SolariDebugView::WorldNormal),
         Some(SolariDebugView::WorldPosition),
         Some(SolariDebugView::BaseColor),
@@ -606,6 +608,8 @@ fn update_control_text(
 
     let debug_label = match solari_lighting.single().ok().and_then(|l| l.debug_view) {
         None => "lit",
+        Some(SolariDebugView::Direct) => "direct",
+        Some(SolariDebugView::Indirect) => "indirect",
         Some(SolariDebugView::WorldNormal) => "world_normal",
         Some(SolariDebugView::WorldPosition) => "world_position",
         Some(SolariDebugView::BaseColor) => "base_color",

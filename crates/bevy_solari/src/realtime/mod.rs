@@ -156,6 +156,25 @@ pub enum SolariDebugView {
     /// Per-pixel screen-space motion (`prev_uv - curr_uv`), biased around
     /// mid-grey, scaled 50x so per-frame motion is legible.
     MotionVector = 9,
+    /// Direct lighting only. Skips the GI + specular GI dispatches; the
+    /// view-target retains just the ReSTIR DI shade-pass write.
+    /// Discriminant 0xFFFF_FFF0+ are reserved for these "skip-pass"
+    /// variants -- they go through the existing pipeline rather than
+    /// the gbuffer-overwrite `debug_view.wgsl`, so the value isn't read
+    /// by the shader.
+    Direct = 0xFFFFFFF0,
+    /// Diffuse + specular GI only (skips the ReSTIR DI shade-pass
+    /// write). The view-target starts at the load-op clear and only the
+    /// indirect dispatches add to it.
+    Indirect = 0xFFFFFFF1,
+}
+
+impl SolariDebugView {
+    /// Whether this variant routes through `debug_view.wgsl` (gbuffer
+    /// channel overwrite) vs. through pass-skipping in `node.rs`.
+    pub(crate) fn is_gbuffer_overwrite(self) -> bool {
+        !matches!(self, Self::Direct | Self::Indirect)
+    }
 }
 
 impl Default for SolariDebugView {

@@ -1,6 +1,6 @@
 use super::{
     prepare::{SolariLightingResources, LIGHT_TILE_BLOCKS, WORLD_CACHE_SIZE},
-    SolariLighting,
+    SolariDebugView, SolariLighting,
 };
 use crate::scene::RaytracingSceneBindings;
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -335,6 +335,14 @@ pub fn solari_lighting(
 
     d.end(&mut pass);
 
+    // `Direct` debug view skips GI + specular dispatches (view_output
+    // keeps just the DI shade-pass write). `Indirect` skips the DI
+    // shade pass (and view_output starts at the clear, so GI/specular
+    // accumulate on top of zero). Reservoir update passes still run for
+    // both so temporal history stays consistent across mode toggles.
+    let run_direct = !matches!(solari_lighting.debug_view, Some(SolariDebugView::Indirect));
+    let run_indirect = !matches!(solari_lighting.debug_view, Some(SolariDebugView::Direct));
+
     let d = diagnostics.time_span(&mut pass, "solari_lighting/direct_lighting");
 
     pass.set_pipeline(di_initial_and_temporal_pipeline);
@@ -344,51 +352,57 @@ pub fn solari_lighting(
     );
     pass.dispatch_workgroups(dx, dy, 1);
 
-    pass.set_pipeline(di_spatial_and_shade_pipeline);
-    pass.set_immediates(
-        0,
-        bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
-    );
-    pass.dispatch_workgroups(dx, dy, 1);
-
-    d.end(&mut pass);
-
-    let d = diagnostics.time_span(&mut pass, "solari_lighting/diffuse_indirect_lighting");
-
-    pass.set_pipeline(gi_initial_and_temporal_pipeline);
-    pass.set_immediates(
-        0,
-        bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
-    );
-    pass.dispatch_workgroups(dx, dy, 1);
-
-    pass.set_pipeline(gi_spatial_and_shade_pipeline);
-    pass.set_immediates(
-        0,
-        bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
-    );
-    pass.dispatch_workgroups(dx, dy, 1);
-
-    d.end(&mut pass);
-
-    let d = diagnostics.time_span(&mut pass, "solari_lighting/specular_indirect_lighting");
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    if let Some(bind_group_resolve_dlss_rr_textures) = &bind_group_resolve_dlss_rr_textures {
-        pass.set_bind_group(2, bind_group_resolve_dlss_rr_textures, &[]);
+    if run_direct {
+        pass.set_pipeline(di_spatial_and_shade_pipeline);
+        pass.set_immediates(
+            0,
+            bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
+        );
+        pass.dispatch_workgroups(dx, dy, 1);
     }
-    pass.set_pipeline(specular_gi_pipeline);
-    pass.set_immediates(
-        0,
-        bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
-    );
-    pass.dispatch_workgroups(dx, dy, 1);
+
     d.end(&mut pass);
 
-    // Optional debug-channel overwrite. Runs last so it stomps the lit
-    // composite. Reuses the main solari bind group (gbuffer + depth +
-    // motion + view + view_output already bound) and brings its own
-    // 4-byte immediate carrying the view-mode discriminant.
-    if let Some(debug_view) = solari_lighting.debug_view {
+    if run_indirect {
+        let d = diagnostics.time_span(&mut pass, "solari_lighting/diffuse_indirect_lighting");
+
+        pass.set_pipeline(gi_initial_and_temporal_pipeline);
+        pass.set_immediates(
+            0,
+            bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
+        );
+        pass.dispatch_workgroups(dx, dy, 1);
+
+        pass.set_pipeline(gi_spatial_and_shade_pipeline);
+        pass.set_immediates(
+            0,
+            bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
+        );
+        pass.dispatch_workgroups(dx, dy, 1);
+
+        d.end(&mut pass);
+
+        let d = diagnostics.time_span(&mut pass, "solari_lighting/specular_indirect_lighting");
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        if let Some(bind_group_resolve_dlss_rr_textures) = &bind_group_resolve_dlss_rr_textures {
+            pass.set_bind_group(2, bind_group_resolve_dlss_rr_textures, &[]);
+        }
+        pass.set_pipeline(specular_gi_pipeline);
+        pass.set_immediates(
+            0,
+            bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
+        );
+        pass.dispatch_workgroups(dx, dy, 1);
+        d.end(&mut pass);
+    }
+
+    // gbuffer-channel debug overwrite. Skipped for `Direct` / `Indirect`
+    // -- those produce their output by selectively running the lighting
+    // dispatches above, not by stomping `view_output` from the gbuffer.
+    if let Some(debug_view) = solari_lighting
+        .debug_view
+        .filter(|d| d.is_gbuffer_overwrite())
+    {
         let d = diagnostics.time_span(&mut pass, "solari_lighting/debug_view");
         pass.set_pipeline(debug_view_pipeline);
         pass.set_immediates(0, bytemuck::cast_slice(&[debug_view as u32]));
