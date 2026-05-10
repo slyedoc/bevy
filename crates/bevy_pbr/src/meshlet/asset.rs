@@ -114,6 +114,25 @@ impl MeshletMesh {
     pub fn aabb(&self) -> &MeshletAabb {
         &self.aabb
     }
+
+    /// BVH8 nodes used for cluster culling + LOD selection.
+    #[inline]
+    pub fn bvh(&self) -> &[BvhNode] {
+        &self.bvh
+    }
+
+    /// Per-meshlet culling data (AABB + LOD bounding sphere).
+    #[inline]
+    pub fn meshlet_cull_data(&self) -> &[MeshletCullData] {
+        &self.meshlet_cull_data
+    }
+
+    /// Depth of the culling BVH; sized so callers can allocate the right
+    /// number of dispatches at runtime.
+    #[inline]
+    pub fn bvh_depth(&self) -> u32 {
+        self.bvh_depth
+    }
 }
 
 /// A single BVH8 node in the BVH used for culling and LOD selection of a [`MeshletMesh`].
