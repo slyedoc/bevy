@@ -5,7 +5,7 @@ use alloc::borrow::Cow;
 use bevy_math::{
     bounding::{Aabb3d, BoundingSphere, BoundingVolume},
     ops::log2,
-    IVec3, Isometry3d, Vec2, Vec3, Vec3A, Vec3Swizzles,
+    IVec3, Isometry3d, Vec2, Vec3, Vec3A, Vec3Swizzles, Vec4,
 };
 use bevy_mesh::{Indices, Mesh};
 use bevy_platform::collections::HashMap;
@@ -48,7 +48,7 @@ impl MeshletMesh {
     /// The input mesh must:
     /// 1. Use [`PrimitiveTopology::TriangleList`]
     /// 2. Use indices
-    /// 3. Have the exact following set of vertex attributes: `{POSITION, NORMAL, UV_0}` (tangents can be used in material shaders, but are calculated at runtime and are not stored in the mesh)
+    /// 3. Have the exact following set of vertex attributes: `{POSITION, NORMAL, UV_0, TANGENT}`. If TANGENT is missing, call [`Mesh::generate_tangents`] first.
     ///
     /// # Vertex precision
     ///
@@ -209,6 +209,7 @@ impl MeshletMesh {
         // Copy vertex attributes per meshlet and compress
         let mut vertex_positions = BitVec::<u32, Lsb0>::new();
         let mut vertex_normals = Vec::new();
+        let mut vertex_tangents = Vec::new();
         let mut vertex_uvs = Vec::new();
         let mut bevy_meshlets = Vec::with_capacity(meshlets.len());
         for (i, meshlet) in meshlets.meshlets.iter().enumerate() {
@@ -219,6 +220,7 @@ impl MeshletMesh {
                 vertex_stride,
                 &mut vertex_positions,
                 &mut vertex_normals,
+                &mut vertex_tangents,
                 &mut vertex_uvs,
                 &mut bevy_meshlets,
                 vertex_position_quantization_factor,
@@ -229,6 +231,7 @@ impl MeshletMesh {
         Ok(Self {
             vertex_positions: vertex_positions.into_vec().into(),
             vertex_normals: vertex_normals.into(),
+            vertex_tangents: vertex_tangents.into(),
             vertex_uvs: vertex_uvs.into(),
             indices: meshlets.triangles.into(),
             bvh: bvh.into(),
@@ -255,6 +258,7 @@ fn validate_input_mesh(mesh: &Mesh) -> Result<Cow<'_, [u32]>, MeshToMeshletMeshC
         Mesh::ATTRIBUTE_POSITION.id,
         Mesh::ATTRIBUTE_NORMAL.id,
         Mesh::ATTRIBUTE_UV_0.id,
+        Mesh::ATTRIBUTE_TANGENT.id,
     ]) {
         return Err(MeshToMeshletMeshConversionError::WrongMeshVertexAttributes(
             mesh.attributes()
@@ -585,6 +589,7 @@ fn build_and_compress_per_meshlet_vertex_data(
     vertex_stride: usize,
     vertex_positions: &mut BitVec<u32, Lsb0>,
     vertex_normals: &mut Vec<u32>,
+    vertex_tangents: &mut Vec<u32>,
     vertex_uvs: &mut Vec<Vec2>,
     meshlets: &mut Vec<Meshlet>,
     vertex_position_quantization_factor: u8,
@@ -607,12 +612,19 @@ fn build_and_compress_per_meshlet_vertex_data(
         let position = Vec3::from_slice(bytemuck::cast_slice(&vertex_data[0..12]));
         let normal = Vec3::from_slice(bytemuck::cast_slice(&vertex_data[12..24]));
         let uv = Vec2::from_slice(bytemuck::cast_slice(&vertex_data[24..32]));
+        let tangent = Vec4::from_slice(bytemuck::cast_slice(&vertex_data[32..48]));
 
         // Copy uncompressed UV
         vertex_uvs.push(uv);
 
         // Compress normal
         vertex_normals.push(pack2x16snorm(octahedral_encode(normal)));
+
+        // Compress tangent: octahedral XYZ in upper 30 bits, mikktspace
+        // bitangent sign in the LSB.
+        let packed_xyz = pack2x16snorm(octahedral_encode(tangent.truncate())) & 0xFFFFFFFE;
+        let sign_bit = if tangent.w >= 0.0 { 1 } else { 0 };
+        vertex_tangents.push(packed_xyz | sign_bit);
 
         // Quantize position to a fixed-point IVec3
         let quantized_position = (position * quantization_factor + 0.5).as_ivec3();

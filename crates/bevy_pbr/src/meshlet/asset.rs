@@ -17,7 +17,7 @@ use thiserror::Error;
 const MESHLET_MESH_ASSET_MAGIC: u64 = 1717551717668;
 
 /// The current version of the [`MeshletMesh`] asset format.
-pub const MESHLET_MESH_ASSET_VERSION: u64 = 3;
+pub const MESHLET_MESH_ASSET_VERSION: u64 = 4;
 
 /// A mesh that has been pre-processed into multiple small clusters of triangles called meshlets.
 ///
@@ -43,6 +43,9 @@ pub struct MeshletMesh {
     pub(crate) vertex_positions: Arc<[u32]>,
     /// Octahedral-encoded and 2x16snorm packed normals for meshlet vertices.
     pub(crate) vertex_normals: Arc<[u32]>,
+    /// Octahedral-encoded tangents (2x15snorm in the upper 30 bits) +
+    /// mikktspace bitangent sign in the LSB. One u32 per vertex.
+    pub(crate) vertex_tangents: Arc<[u32]>,
     /// Uncompressed vertex texture coordinates for meshlet vertices.
     pub(crate) vertex_uvs: Arc<[Vec2]>,
     /// Triangle indices for meshlets.
@@ -75,6 +78,14 @@ impl MeshletMesh {
     #[inline]
     pub fn vertex_normals(&self) -> &[u32] {
         &self.vertex_normals
+    }
+
+    /// Octahedral-encoded vertex tangents (XYZ in the upper 30 bits) +
+    /// mikktspace bitangent sign in the LSB. One u32 per vertex; same
+    /// indexing as `vertex_normals`.
+    #[inline]
+    pub fn vertex_tangents(&self) -> &[u32] {
+        &self.vertex_tangents
     }
 
     /// Uncompressed vertex UVs shared across all meshlets. Indexed by
@@ -225,6 +236,7 @@ impl AssetSaver for MeshletMeshSaver {
         let mut writer = FrameEncoder::new(AsyncWriteSyncAdapter(writer));
         write_slice(&asset.vertex_positions, &mut writer)?;
         write_slice(&asset.vertex_normals, &mut writer)?;
+        write_slice(&asset.vertex_tangents, &mut writer)?;
         write_slice(&asset.vertex_uvs, &mut writer)?;
         write_slice(&asset.indices, &mut writer)?;
         write_slice(&asset.bvh, &mut writer)?;
@@ -274,6 +286,7 @@ impl AssetLoader for MeshletMeshLoader {
         let reader = &mut FrameDecoder::new(AsyncReadSyncAdapter(reader));
         let vertex_positions = read_slice(reader)?;
         let vertex_normals = read_slice(reader)?;
+        let vertex_tangents = read_slice(reader)?;
         let vertex_uvs = read_slice(reader)?;
         let indices = read_slice(reader)?;
         let bvh = read_slice(reader)?;
@@ -283,6 +296,7 @@ impl AssetLoader for MeshletMeshLoader {
         Ok(MeshletMesh {
             vertex_positions,
             vertex_normals,
+            vertex_tangents,
             vertex_uvs,
             indices,
             bvh,

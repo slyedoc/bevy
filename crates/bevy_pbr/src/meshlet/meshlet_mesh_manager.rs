@@ -20,19 +20,21 @@ use core::ops::Range;
 pub struct MeshletMeshManager {
     pub vertex_positions: PersistentGpuBuffer<Arc<[u32]>>,
     pub vertex_normals: PersistentGpuBuffer<Arc<[u32]>>,
+    pub vertex_tangents: PersistentGpuBuffer<Arc<[u32]>>,
     pub vertex_uvs: PersistentGpuBuffer<Arc<[Vec2]>>,
     pub indices: PersistentGpuBuffer<Arc<[u8]>>,
     pub bvh_nodes: PersistentGpuBuffer<Arc<[BvhNode]>>,
     pub meshlets: PersistentGpuBuffer<Arc<[Meshlet]>>,
     pub meshlet_cull_data: PersistentGpuBuffer<Arc<[MeshletCullData]>>,
     meshlet_mesh_slices:
-        HashMap<AssetId<MeshletMesh>, ([Range<BufferAddress>; 7], MeshletAabb, u32)>,
+        HashMap<AssetId<MeshletMesh>, ([Range<BufferAddress>; 8], MeshletAabb, u32)>,
 }
 
 pub fn init_meshlet_mesh_manager(mut commands: Commands, render_device: Res<RenderDevice>) {
     commands.insert_resource(MeshletMeshManager {
         vertex_positions: PersistentGpuBuffer::new("meshlet_vertex_positions", &render_device),
         vertex_normals: PersistentGpuBuffer::new("meshlet_vertex_normals", &render_device),
+        vertex_tangents: PersistentGpuBuffer::new("meshlet_vertex_tangents", &render_device),
         vertex_uvs: PersistentGpuBuffer::new("meshlet_vertex_uvs", &render_device),
         indices: PersistentGpuBuffer::new("meshlet_indices", &render_device),
         bvh_nodes: PersistentGpuBuffer::new("meshlet_bvh_nodes", &render_device),
@@ -60,6 +62,9 @@ impl MeshletMeshManager {
             let vertex_normals_slice = self
                 .vertex_normals
                 .queue_write(Arc::clone(&meshlet_mesh.vertex_normals), ());
+            let vertex_tangents_slice = self
+                .vertex_tangents
+                .queue_write(Arc::clone(&meshlet_mesh.vertex_tangents), ());
             let vertex_uvs_slice = self
                 .vertex_uvs
                 .queue_write(Arc::clone(&meshlet_mesh.vertex_uvs), ());
@@ -86,6 +91,7 @@ impl MeshletMeshManager {
                 [
                     vertex_positions_slice,
                     vertex_normals_slice,
+                    vertex_tangents_slice,
                     vertex_uvs_slice,
                     indices_slice,
                     bvh_node_slice,
@@ -98,7 +104,7 @@ impl MeshletMeshManager {
         };
 
         // If the MeshletMesh asset has not been uploaded to the GPU yet, queue it for uploading
-        let ([_, _, _, _, bvh_node_slice, _, _], aabb, bvh_depth) = self
+        let ([_, _, _, _, _, bvh_node_slice, _, _], aabb, bvh_depth) = self
             .meshlet_mesh_slices
             .entry(asset_id)
             .or_insert_with_key(queue_meshlet_mesh)
@@ -119,17 +125,17 @@ impl MeshletMeshManager {
     /// BVH-root index returned from [`queue_upload_if_needed`].
     pub fn meshlet_base_index(&self, asset_id: &AssetId<MeshletMesh>) -> Option<u32> {
         // slice array layout matches `queue_upload_if_needed`:
-        //   [0] vertex_positions, [1] vertex_normals, [2] vertex_uvs,
-        //   [3] indices,          [4] bvh_nodes,     [5] meshlets,
-        //   [6] meshlet_cull_data
+        //   [0] vertex_positions, [1] vertex_normals, [2] vertex_tangents,
+        //   [3] vertex_uvs,       [4] indices,        [5] bvh_nodes,
+        //   [6] meshlets,         [7] meshlet_cull_data
         self.meshlet_mesh_slices.get(asset_id).map(|(slices, _, _)| {
-            (slices[5].start / size_of::<Meshlet>() as u64) as u32
+            (slices[6].start / size_of::<Meshlet>() as u64) as u32
         })
     }
 
     pub fn remove(&mut self, asset_id: &AssetId<MeshletMesh>) {
         if let Some((
-            [vertex_positions_slice, vertex_normals_slice, vertex_uvs_slice, indices_slice, bvh_node_slice, meshlets_slice, meshlet_cull_data_slice],
+            [vertex_positions_slice, vertex_normals_slice, vertex_tangents_slice, vertex_uvs_slice, indices_slice, bvh_node_slice, meshlets_slice, meshlet_cull_data_slice],
             _,
             _,
         )) = self.meshlet_mesh_slices.remove(asset_id)
@@ -137,6 +143,8 @@ impl MeshletMeshManager {
             self.vertex_positions
                 .mark_slice_unused(vertex_positions_slice);
             self.vertex_normals.mark_slice_unused(vertex_normals_slice);
+            self.vertex_tangents
+                .mark_slice_unused(vertex_tangents_slice);
             self.vertex_uvs.mark_slice_unused(vertex_uvs_slice);
             self.indices.mark_slice_unused(indices_slice);
             self.bvh_nodes.mark_slice_unused(bvh_node_slice);
@@ -158,6 +166,9 @@ pub fn perform_pending_meshlet_mesh_writes(
         .perform_writes(&render_queue, &render_device);
     meshlet_mesh_manager
         .vertex_normals
+        .perform_writes(&render_queue, &render_device);
+    meshlet_mesh_manager
+        .vertex_tangents
         .perform_writes(&render_queue, &render_device);
     meshlet_mesh_manager
         .vertex_uvs
