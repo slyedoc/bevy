@@ -52,6 +52,7 @@ pub fn dlss_super_resolution(
         reset: dlss.reset,
         jitter_offset: (-temporal_jitter.offset).to_array(),
         partial_texture_size: Some(render_resolution.to_array()),
+        subrect_base: None,
         motion_vector_scale: Some((-render_resolution.as_vec2()).to_array()),
     };
 
@@ -119,6 +120,7 @@ pub fn dlss_ray_reconstruction(
         reset: dlss.reset,
         jitter_offset: (-temporal_jitter.offset).to_array(),
         partial_texture_size: Some(render_resolution.to_array()),
+        subrect_base: None,
         motion_vector_scale: Some((-render_resolution.as_vec2()).to_array()),
     };
 
