@@ -7,7 +7,15 @@
 }
 
 @vertex
-fn vertex(@builtin(vertex_index) vertex_input: u32) -> @builtin(position) vec4<f32> {
+fn vertex(@builtin(vertex_index) vertex_input: u32) -> @invariant @builtin(position) vec4<f32> {
+    // `@invariant` makes the position output bit-exact across pipelines
+    // that share this vertex shader. Required because the material
+    // pipelines built from this shader run with `CompareFunction::Equal`
+    // against the visibility-buffer depth (see
+    // `material_pipeline_prepare.rs:216,411`); without invariant, GPU
+    // drivers are free to reorder the FMA chain in this expression and
+    // produce a depth that differs from the prepass write by a ULP,
+    // causing per-pixel rejection / sparkling on some hardware.
     let vertex_index = vertex_input % 3u;
     let material_id = vertex_input / 3u;
     let material_depth = f32(material_id) / 65535.0;
