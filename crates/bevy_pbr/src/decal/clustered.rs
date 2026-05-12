@@ -122,6 +122,24 @@ impl RenderClusteredDecals {
         self.entity_to_decal_index.get(&entity).copied()
     }
 
+    /// Resolve the `AssetId<Image>` for a given decal-owning `entity`'s texture
+    /// slot (0..[`IMAGES_PER_DECAL`]). Returns `None` if the entity is not
+    /// registered or that slot has no texture.
+    ///
+    /// Used by external consumers (e.g. ray-traced renderers) that want to
+    /// reuse the light-texture / decal-texture pool without re-extracting from
+    /// the main world.
+    pub fn image_at(&self, entity: Entity, slot: usize) -> Option<AssetId<Image>> {
+        let i = *self.entity_to_decal_index.get(&entity)?;
+        let binding_idx = *self.decals.get(i)?.image_indices.get(slot)?;
+        if binding_idx < 0 {
+            return None;
+        }
+        self.binding_index_to_textures
+            .get(binding_idx as usize)
+            .copied()
+    }
+
     /// Returns the number of clustered decals in the scene.
     pub fn len(&self) -> usize {
         self.decals.len()
