@@ -77,6 +77,9 @@ fn initial_timestamp(device: &RenderDevice, queue: &RenderQueue) -> i64 {
         .poll(PollType::wait_indefinitely())
         .expect("Failed to poll device for map async");
 
-    let view = map_buffer.slice(..).get_mapped_range();
+    let view = map_buffer
+        .slice(..)
+        .get_mapped_range()
+        .expect("failed to map tracy gpu timestamp buffer");
     i64::from_le_bytes((*view).try_into().unwrap())
 }
