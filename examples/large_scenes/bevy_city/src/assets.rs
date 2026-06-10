@@ -208,10 +208,11 @@ pub fn load_assets(
             primitive: 0,
         }
         .from_asset(format!("{base_url}/city-kit-roads/tile-low.glb")));
-        let default_material: Handle<StandardMaterial> = load_asset!(format!(
-            "{base_url}/city-kit-roads/tile-low.glb#{}/std",
-            GltfAssetLabel::DefaultMaterial
-        ));
+        // This is a mesh-only `Primitive` load, so it carries no baked material —
+        // author the asphalt color here (converted to `SolariMaterial` by the RT
+        // bridge under solari, used directly otherwise), matching `grass_material`.
+        let default_material =
+            materials.add(StandardMaterial::from_color(Color::srgb_u8(105, 105, 110)));
         let grass_material =
             materials.add(StandardMaterial::from_color(Color::srgb_u8(97, 203, 139)));
 

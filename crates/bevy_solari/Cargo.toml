@@ -8,6 +8,34 @@ repository = "https://github.com/bevyengine/bevy"
 license = "MIT OR Apache-2.0"
 keywords = ["bevy"]
 
+
+[features]
+# Pulls bevy_anti_alias/dlss (for DlssInitPlugin's Vulkan extension
+# registration + DlssProjectId) plus dlss_wgpu, which the `restir` path drives
+# directly for prepass-free DLSS Ray Reconstruction.
+dlss = ["bevy_anti_alias/dlss", "dep:dlss_wgpu"]
+force_disable_dlss = ["bevy_anti_alias/force_disable_dlss"]
+# Enables baking `bevy_mesh::Mesh` into `ClusterMesh` via
+# `ClusterMesh::from_mesh`. Pulls in `meshopt` (C library) — offline
+# tools only; runtime crates do not need this feature.
+cluster_processor = ["dep:meshopt"]
+# Emits `SolariMaterial` from glTF materials at load (a `GltfExtensionHandler`),
+# so glTF scenes get real materials with `PbrPlugin` (and its glTF→StandardMaterial
+# handler) disabled. Threaded from bevy via `bevy_gltf = [..., "bevy_solari?/gltf"]`.
+gltf = ["dep:bevy_gltf"]
+# Enables the in-engine debug-view dropdown (`SolariDebugPlugin`).
+# Pulls in bevy_feathers + the UI widget stack — examples / tools
+# only; runtime games typically don't want this.
+bevy_solari_debug = [
+  "dep:bevy_dev_tools",
+  "dep:bevy_feathers",
+  "dep:bevy_input",
+  "dep:bevy_input_focus",
+  "dep:bevy_scene",
+  "dep:bevy_text",
+  "dep:bevy_ui_widgets",
+]
+
 [dependencies]
 # bevy
 bevy_anti_alias = { path = "../bevy_anti_alias", version = "0.19.0-dev" }
@@ -19,6 +47,7 @@ bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.19.0-dev" }
 bevy_derive = { path = "../bevy_derive", version = "0.19.0-dev" }
 bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.19.0-dev" }
 bevy_ecs = { path = "../bevy_ecs", version = "0.19.0-dev" }
+bevy_gltf = { path = "../bevy_gltf", version = "0.19.0-dev", optional = true }
 bevy_shader = { path = "../bevy_shader", version = "0.19.0-dev" }
 bevy_math = { path = "../bevy_math", version = "0.19.0-dev" }
 bevy_mesh = { path = "../bevy_mesh", version = "0.19.0-dev" }
@@ -29,19 +58,48 @@ bevy_platform = { path = "../bevy_platform", version = "0.19.0-dev", default-fea
   "std",
 ] }
 bevy_reflect = { path = "../bevy_reflect", version = "0.19.0-dev" }
-bevy_render = { path = "../bevy_render", version = "0.19.0-dev" }
+bevy_render = { path = "../bevy_render", version = "0.19.0-dev", features = [
+  # bevy_solari is Vulkan-only (NV cluster-AS / partitioned-AS runtime
+  # uses ash + as_hal_mut). raw_vulkan_init pulls in `wgpu/vulkan` +
+  # the RawVulkanInitSettings hook the cluster runtime needs.
+  "raw_vulkan_init",
+] }
 bevy_image = { path = "../bevy_image", version = "0.19.0-dev" }
+bevy_tasks = { path = "../bevy_tasks", version = "0.19.0-dev" }
 bevy_utils = { path = "../bevy_utils", version = "0.19.0-dev" }
 bevy_transform = { path = "../bevy_transform", version = "0.19.0-dev" }
+# Optional — only pulled in by the `bevy_solari_debug` feature for the
+# in-engine debug-view dropdowns (Solari overlay + bevy render debug).
+bevy_dev_tools = { path = "../bevy_dev_tools", version = "0.19.0-dev", optional = true }
+bevy_feathers = { path = "../bevy_feathers", version = "0.19.0-dev", optional = true }
+bevy_input = { path = "../bevy_input", version = "0.19.0-dev", optional = true }
+bevy_input_focus = { path = "../bevy_input_focus", version = "0.19.0-dev", optional = true }
+bevy_scene = { path = "../bevy_scene", version = "0.19.0-dev", optional = true }
+bevy_text = { path = "../bevy_text", version = "0.19.0-dev", optional = true }
+bevy_ui = { path = "../bevy_ui", version = "0.19.0-dev" }
+bevy_ui_widgets = { path = "../bevy_ui_widgets", version = "0.19.0-dev", optional = true }
+bevy_log = { path = "../bevy_log", version = "0.19.0-dev" }
 
-# other 
+# other
+# Direct ash + wgpu deps for the cluster runtime's
+# `as_hal_mut::<vulkan::Api>` + NV cluster-AS / partitioned-AS path.
+# bevy_solari assumes Vulkan, matching DLSS's policy (Vulkan-only
+# today, mirroring whatever bevy does for DLSS+DX12 when that lands).
+ash = { version = "0.38", features = ["provisional"] }
+wgpu = { version = "29.0.3", default-features = false }
+# DLSS Ray Reconstruction for the `restir` path — used directly (not via
+# bevy_anti_alias's `Dlss` component) so the self-contained RT path needs no
+# raster prepass. Only pulled in by the `dlss` feature.
+dlss_wgpu = { version = "4.0.0", optional = true }
 bytemuck = { version = "1" }
-derive_more = { version = "2", default-features = false, features = ["from"] }
+derive_more = { version = "2", default-features = false, features = ["display", "from"] }
+lz4_flex = { version = "0.13", default-features = false, features = ["std", "frame"] }
+meshopt = { version = "0.6.2", optional = true }
+range-alloc = "0.1"
+thiserror = "2"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+wgpu-types = { version = "29.0.3", default-features = false }
 
-[features]
-dlss = ["bevy_anti_alias/dlss"]
-force_disable_dlss = ["bevy_anti_alias/force_disable_dlss"]
 
 [lints]
 workspace = true

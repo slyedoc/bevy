@@ -4,6 +4,9 @@ use rand::{rngs::SmallRng, RngExt, SeedableRng};
 
 use crate::{assets::CityAssets, Car, Road};
 
+#[cfg(feature = "solari")]
+use bevy::solari::prelude::*;
+
 #[derive(Component)]
 pub struct CityRoot;
 
@@ -27,7 +30,14 @@ pub fn spawn_city(commands: &mut Commands, assets: &CityAssets, seed: u64, size:
     let noise_scale = 0.025;
 
     commands
-        .spawn((CityRoot, Transform::default(), Visibility::default()))
+        .spawn((
+            CityRoot, 
+            Transform::default(), 
+            Visibility::default(),
+            // Note: Since we dont ever use the GlobalTransforms on anythign in city in main world
+            // we can skip reading them back to the CPU for better performance            
+            #[cfg(feature = "solari")] NoGpuGlobalTransformReadback
+    ))
         .with_children(|commands| {
             let half_size = size as i32 / 2;
             for x in -half_size..half_size {

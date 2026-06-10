@@ -1435,6 +1435,17 @@ fn prepare_cluster_dummy_textures(
     mut texture_cache: ResMut<TextureCache>,
 ) {
     for (view_entity, view_cluster_config) in &views_query {
+        // `ClusterConfig::None` yields zero cluster dimensions — the view opts
+        // out of clustering (e.g. a ray-traced view that samples lights from
+        // its own buffer, never reading the clustered-forward froxels). A
+        // zero-sized dummy texture is invalid, so skip it; `cluster_on_gpu`
+        // already skips views without a `ViewClusteringDummyTexture`, and the
+        // rest of the GPU clustering path degrades to a no-op at zero clusters.
+        // This mirrors the CPU clustering path's `ClusterConfig::None` guard.
+        if view_cluster_config.dimensions.element_product() == 0 {
+            continue;
+        }
+
         let dummy_texture = texture_cache.get(
             &render_device,
             TextureDescriptor {
@@ -1607,6 +1618,7 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
         &ExtractedClusterConfig,
         Option<&RenderViewLightProbes<EnvironmentMapLight>>,
         Option<&RenderViewLightProbes<IrradianceVolume>>,
+        Option<&ViewClusterBindings>,
     )>,
     render_clustered_decals: Res<RenderClusteredDecals>,
     render_device: Res<RenderDevice>,
@@ -1632,6 +1644,7 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
         extracted_cluster_config,
         maybe_environment_maps,
         maybe_irradiance_volumes,
+        existing_cluster_bindings,
     ) in &views_query
     {
         // Allocate the cluster array.
@@ -1644,6 +1657,30 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
         view_clusters_bindings.reserve_clusters(cluster_count);
 
         all_view_main_entities.insert(*view_main_entity);
+
+        // `ClusterConfig::None` yields zero cluster dimensions — the view opts
+        // out of clustering (e.g. a ray-traced view that samples lights from
+        // its own buffer). The mesh view bind group's clusterable-index-list /
+        // offsets entries are non-optional, so still emit an *empty*
+        // `ViewClusterBindings` (zero clustered objects, matching the CPU
+        // clustering path's `ClusterConfig::None` handling). But skip the GPU
+        // clustering buffers and passes entirely: with no
+        // `ViewGpuClusteringBuffers`, `prepare_clustering_bind_groups` and
+        // `cluster_on_gpu` skip this view, and `prepare_cluster_dummy_textures`
+        // already did. This is what the GPU clustering path was missing.
+        if cluster_count == 0 {
+            // The render world retains the component, and an empty binding
+            // never changes — build it once and reuse it across frames.
+            // Rebuild only when it's missing or a prior frame left non-empty
+            // (clustered) bindings here (a `ClusterConfig` change).
+            if existing_cluster_bindings.is_none_or(|existing| !existing.is_empty()) {
+                view_clusters_bindings.write_buffers(render_device, &render_queue);
+                commands
+                    .entity(view_entity)
+                    .insert(view_clusters_bindings);
+            }
+            continue;
+        }
 
         // Create the readback data.
         let Ok(view_clustering_buffer_size_data) = render_view_clustering_index_list_sizes

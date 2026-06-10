@@ -1,0 +1,196 @@
+//! `bevy_solari`'s own material type and its plugin to avoid bevy_pbr systems and cpu time
+//!
+//! While `PbrPlugin` is still enabled, [`SolariMaterial`] also provides a
+//! `From<&StandardMaterial>` bridge so existing content (code-authored or
+//! glTF-loaded — both arrive as `StandardMaterial`) can be converted to a
+//! `SolariMaterial` at ray-tracing conversion time without re-authoring assets.
+
+use bevy_app::{App, Plugin};
+use bevy_asset::{Asset, AssetApp, AssetId, Assets, Handle, RenderAssetUsages};
+use bevy_color::{Color, LinearRgba};
+use bevy_derive::{Deref, DerefMut};
+use bevy_ecs::{component::Component, prelude::ReflectComponent, template::FromTemplate};
+use bevy_image::{CompressedImageFormats, Image, ImageSampler, ImageType};
+use bevy_pbr::{DfgLut, StandardMaterial};
+use bevy_reflect::{prelude::ReflectDefault, Reflect};
+use bevy_render::RenderApp;
+use derive_more::derive::From;
+
+pub mod material_slots;
+pub use material_slots::{init_material_slots, prepare_material_slots, MaterialSlots};
+
+#[cfg(feature = "gltf")]
+mod gltf;
+
+/// A physically-based material consumed by the `bevy_solari` ray tracer. Mirrors
+/// the `StandardMaterial` fields the scene binder reads; see the module docs for
+/// why it is intentionally not a `Material`.
+///
+/// Pair with [`SolariMaterial3d`] and [`crate::bindings::RaytracingMesh3d`].
+#[derive(Asset, Clone, Debug, Reflect)]
+#[reflect(Default, Clone)]
+pub struct SolariMaterial {
+    /// Base ("albedo") color. Linearized into the `GpuMaterial`.
+    pub base_color: Color,
+    /// Optional base-color texture (sampled at the ray hit's UV).
+    pub base_color_texture: Option<Handle<Image>>,
+    /// Emitted radiance. A non-black value turns the mesh into an emissive light
+    /// source for next-event estimation.
+    pub emissive: LinearRgba,
+    /// Optional emissive texture.
+    pub emissive_texture: Option<Handle<Image>>,
+    /// Perceptual roughness in `[0, 1]` (remapped to `a = r*r` in the BRDF).
+    /// `0.0` is a perfect mirror.
+    pub perceptual_roughness: f32,
+    /// Metalness in `[0, 1]`.
+    pub metallic: f32,
+    /// Optional metallic (B) + roughness (G) packed texture.
+    pub metallic_roughness_texture: Option<Handle<Image>>,
+    /// Dielectric specular reflectance at normal incidence (`F0`), scaled into
+    /// `[0, 0.16]` like `StandardMaterial`.
+    pub reflectance: f32,
+    /// Optional tangent-space normal map.
+    pub normal_map_texture: Option<Handle<Image>>,
+}
+
+impl SolariMaterial {
+    /// A material with the given base color and otherwise-default properties.
+    /// Mirrors `StandardMaterial::from_color`.
+    pub fn from_color(color: impl Into<Color>) -> Self {
+        Self {
+            base_color: color.into(),
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for SolariMaterial {
+    fn default() -> Self {
+        // Match `StandardMaterial`'s defaults so ported content and struct-literal
+        // authoring behave identically.
+        Self {
+            base_color: Color::WHITE,
+            base_color_texture: None,
+            emissive: LinearRgba::BLACK,
+            emissive_texture: None,
+            perceptual_roughness: 0.5,
+            metallic: 0.0,
+            metallic_roughness_texture: None,
+            reflectance: 0.5,
+            normal_map_texture: None,
+        }
+    }
+}
+
+/// Bridge from `bevy_pbr`'s `StandardMaterial` (transitional — lets existing
+/// `StandardMaterial`-authored or glTF-loaded content be converted to a
+/// `SolariMaterial` while `PbrPlugin` is still enabled). Copies exactly the
+/// fields the binder reads. Remove once content authors `SolariMaterial`
+/// directly and `bevy_pbr` is dropped from the dependency graph.
+impl From<&StandardMaterial> for SolariMaterial {
+    fn from(m: &StandardMaterial) -> Self {
+        Self {
+            base_color: m.base_color,
+            base_color_texture: m.base_color_texture.clone(),
+            emissive: m.emissive,
+            emissive_texture: m.emissive_texture.clone(),
+            perceptual_roughness: m.perceptual_roughness,
+            metallic: m.metallic,
+            metallic_roughness_texture: m.metallic_roughness_texture.clone(),
+            reflectance: m.reflectance,
+            normal_map_texture: m.normal_map_texture.clone(),
+        }
+    }
+}
+
+/// Component holding a [`SolariMaterial`] handle for a ray-tracing instance — the
+/// `Material`-free counterpart to `MeshMaterial3d`.
+///
+/// Modeled on `bevy_pbr::MeshMaterial3d` (newtype over a `Handle`) but with no
+/// `M: Material` bound, so it works with `PbrPlugin` disabled.
+#[derive(
+    Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From,
+)]
+#[reflect(Component, Default, Clone, PartialEq)]
+pub struct SolariMaterial3d(pub Handle<SolariMaterial>);
+
+impl From<SolariMaterial3d> for AssetId<SolariMaterial> {
+    fn from(material: SolariMaterial3d) -> Self {
+        material.id()
+    }
+}
+
+impl From<&SolariMaterial3d> for AssetId<SolariMaterial> {
+    fn from(material: &SolariMaterial3d) -> Self {
+        material.id()
+    }
+}
+
+/// Registers [`SolariMaterial`]. Added by [`crate::SolariPlugin`] ahead of the
+/// binding/instance plugins so the asset exists before anything binds it.
+///
+/// Independent of `PbrPlugin`: a single `init_asset` plus a default material at
+/// the default handle (mirroring how `PbrPlugin` seeds `StandardMaterial`) —
+/// instances with no explicit material resolve here.
+pub struct SolariMaterialPlugin;
+
+impl Plugin for SolariMaterialPlugin {
+    fn build(&self, app: &mut App) {
+        app
+        // add since we are disabling `PbrPlugin` under solari, so it doesn't register `Assets<StandardMaterial>`
+        .init_asset::<StandardMaterial>()
+        // our custom material
+        .init_asset::<SolariMaterial>()
+            .register_type::<SolariMaterial>()
+            .register_type::<SolariMaterial3d>();
+        app.world_mut()
+            .resource_mut::<Assets<SolariMaterial>>()
+            .insert(
+                &Handle::<SolariMaterial>::default(),
+                SolariMaterial::default(),
+            )
+            .unwrap();
+
+        // Emit `SolariMaterial` from glTF only when bevy_pbr's own glTF→`StandardMaterial`
+        // handler is absent — i.e. `PbrPlugin` disabled (the full-RT path). With both
+        // present they'd race to produce the same `{material}/std` label.
+        #[cfg(feature = "gltf")]
+        if !app.is_plugin_added::<bevy_pbr::PbrPlugin>() {
+            gltf::register_gltf_material_handler(app);
+        }
+
+        insert_dfg_lut(app);
+    }
+}
+
+/// Insert `bevy_pbr`'s [`DfgLut`] (the split-sum BRDF integration LUT) from a copy
+/// of `dfg.ktx2` embedded in `bevy_solari`. The ray tracer's BRDF samples it, and
+/// when `PbrPlugin` is disabled on the full-RT path nothing else provides it. No-op
+/// if a `DfgLut` is already present (PbrPlugin enabled), so the two never conflict.
+///
+/// `Assets<Image>` comes from `bevy_image`'s `ImagePlugin` (always in
+/// `DefaultPlugins`), independent of `PbrPlugin`.
+fn insert_dfg_lut(app: &mut App) {
+    let already_present = app
+        .get_sub_app(RenderApp)
+        .is_some_and(|render_app| render_app.world().contains_resource::<DfgLut>());
+    if already_present {
+        return;
+    }
+
+    let texture = app.world_mut().resource_mut::<Assets<Image>>().add(
+        Image::from_buffer(
+            include_bytes!("dfg.ktx2"),
+            ImageType::Extension("ktx2"),
+            CompressedImageFormats::NONE,
+            false,
+            ImageSampler::linear(),
+            RenderAssetUsages::RENDER_WORLD,
+        )
+        .expect("Failed to decode embedded DFG LUT"),
+    );
+
+    if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+        render_app.world_mut().insert_resource(DfgLut { texture });
+    }
+}

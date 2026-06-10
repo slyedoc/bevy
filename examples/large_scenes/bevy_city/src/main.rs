@@ -1,3 +1,6 @@
+// Under `solari` several raster-only plugins/systems (wireframe, atmosphere) are
+// gated out, leaving their imports/fns conditionally unused.
+#![cfg_attr(feature = "solari", allow(dead_code, unused_imports))]
 //! A procedurally generated city.
 //!
 //! This scene is intended to be an attractive, fairly realistic stress test of Bevy's capacity
@@ -9,24 +12,31 @@
 use argh::FromArgs;
 use assets::{load_assets, CityAssets};
 use bevy::{
-    anti_alias::taa::TemporalAntiAliasing,
-    camera::{visibility::NoCpuCulling, Exposure, Hdr},
-    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
-    color::palettes::css::WHITE,
-    feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
-    light::{
-        atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm},
-        Atmosphere, AtmosphereEnvironmentMapLight,
-    },
+    camera::{Exposure, Hdr, visibility::NoCpuCulling}, camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, color::palettes::css::WHITE, dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig}, diagnostic::FrameTimeDiagnosticsPlugin, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, light::{
+        Atmosphere,
+        atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm}
+    }, pbr::wireframe::{WireframeConfig, WireframePlugin}, post_process::bloom::Bloom, prelude::*, window::{PresentMode, WindowResolution}, winit::WinitSettings, world_serialization::WorldInstanceReady
+};
+
+// Only used by the rasterized (non-Solari) camera.
+#[cfg(not(feature = "solari"))]
+use bevy::{
     pbr::{
-        wireframe::{WireframeConfig, WireframePlugin},
-        AtmosphereSettings, ContactShadows,
+        AtmosphereSettings
     },
-    post_process::bloom::Bloom,
-    prelude::*,
-    window::{PresentMode, WindowResolution},
-    winit::WinitSettings,
-    world_serialization::WorldInstanceReady,
+    anti_alias::taa::TemporalAntiAliasing, light::AtmosphereEnvironmentMapLight, pbr::ContactShadows,
+};
+
+#[cfg(feature = "solari")]
+use bevy::{
+    camera::CameraMainTextureUsages,
+    core_pipeline::Skybox,
+    light::cluster::ClusterConfig,
+    render::render_resource::TextureUsages,
+    solari::{
+        prelude::*,
+    },
+    transform::systems::{propagate_transforms_for, sync_simple_transforms},
 };
 
 use crate::generate_city::spawn_city;
@@ -47,7 +57,7 @@ pub struct Args {
     seed: u64,
 
     /// size
-    #[argh(option, default = "30")]
+    #[argh(option, default = "100")]
     size: u32,
 
     /// adds NoCpuCulling to all meshes
@@ -58,26 +68,65 @@ pub struct Args {
 fn main() {
     let args: Args = argh::from_env();
 
-    App::new()
-        .add_plugins((
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "bevy_city".into(),
-                    resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
-                    present_mode: PresentMode::AutoNoVsync,
-                    position: WindowPosition::Centered(MonitorSelection::Primary),
-                    ..default()
-                }),
+    let mut app = App::new();
+        // DLSS needs its project id inserted before RenderPlugin (DlssInitPlugin
+        // reads it during render init). `solari` enables `bevy/dlss`.
+        #[cfg(feature = "dlss")]
+        app.insert_resource(bevy::anti_alias::dlss::DlssProjectId(
+            bevy::asset::uuid::uuid!("a0e6c8d2-1f3b-4c5a-9e7d-2b4f6a8c0e1d"),
+        ));
+        let default_plugins = DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "bevy_city".into(),
+                resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
+                present_mode: PresentMode::AutoNoVsync,
+                position: WindowPosition::Centered(MonitorSelection::Primary),
                 ..default()
             }),
+            ..default()
+        });
+        // Under `solari` the GPU transform table drives the RT scene (transform
+        // columns → Jacobi → gather into the instance transforms), so
+        // bevy_transform's CPU propagation is pure overhead — disable it. CPU
+        // `GlobalTransform` is restored below only for the small set that still
+        // reads it CPU-side (camera/sun/atmosphere + the UI tree).
+        // Under `solari` the full-RT path replaces the raster mesh/material stack,
+        // so disable `PbrPlugin` (bevy_solari owns its material/lights + vendors the
+        // DfgLut + pbr shader helpers) and the render-debug overlay (DefaultPlugins
+        // adds it with the bevy_pbr feature). `TransformPlugin` is GPU-driven.
+        #[cfg(feature = "solari")]
+        let default_plugins = default_plugins
+            .disable::<bevy::transform::TransformPlugin>()
+            .disable::<bevy::pbr::PbrPlugin>()
+            .disable::<bevy::dev_tools::render_debug::RenderDebugOverlayPlugin>();
+
+        app.add_plugins((
+            default_plugins,
             FreeCameraPlugin,
             FeathersPlugins,
+            // Wireframe needs the raster mesh pipeline (gone with PbrPlugin).
+            #[cfg(not(feature = "solari"))]
             WireframePlugin::default(),
-        ))
-        .insert_resource(args.clone())
+            FrameTimeDiagnosticsPlugin::default(),
+            FpsOverlayPlugin {
+                config: FpsOverlayConfig {
+                    frame_time_graph_config: FrameTimeGraphConfig {
+                        enabled: true,
+                        target_fps: 240.0,
+                        min_fps: 60.0,
+                    },
+                    ..default()
+                },
+            },    
+            #[cfg(feature = "solari")]  SolariPlugin     
+        ));
+    
+
+        app.insert_resource(args.clone())
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(WinitSettings::continuous())
         .init_resource::<Settings>()
+        .init_resource::<CaptureReady>()
         .insert_resource(UiTheme(create_dark_theme()))
         .insert_resource(WireframeConfig {
             global: false,
@@ -90,7 +139,15 @@ fn main() {
         .add_message::<CityAssetsLoaded>()
         .add_message::<CityAssetsReady>()
         .add_message::<CitySpawned>()
-        .add_systems(Startup, (scene.spawn(), spawn_atmosphere, load_assets))
+        // `spawn_atmosphere` needs `Assets<ScatteringMedium>` (registered via
+        // PbrPlugin's AtmospherePlugin) — gone under solari, where the RT path
+        // doesn't sample the raster atmosphere anyway.
+        .add_systems(Startup, (
+            scene.spawn(),
+            #[cfg(not(feature = "solari"))]
+            spawn_atmosphere,
+            load_assets,
+        ))
         .add_systems(
             Update,
             (
@@ -98,8 +155,18 @@ fn main() {
                 update_loading_screen,
                 process_assets.run_if(on_message::<CityAssetsLoaded>),
                 on_city_assets_ready.run_if(on_message::<CityAssetsReady>),
-                (add_no_cpu_culling, on_city_spawned, settings_ui.spawn())
+                (add_no_cpu_culling, on_city_spawned, settings_ui.spawn(), arm_capture_ready)
                     .run_if(on_message::<CitySpawned>),
+                signal_capture_ready,
+                #[cfg(feature = "solari")]
+                (
+                    convert_meshes_to_raytracing,
+                    convert_standard_materials_to_solari,
+                    mark_city_static,
+                    // Swap to `add_solari_environment_map` to test the pisa skybox
+                    // instead of the baked atmosphere on the camera.
+                    // add_solari_environment_map,
+                ),
             ),
         )
         .add_observer(add_no_cpu_culling_on_scene_ready)
@@ -110,7 +177,46 @@ fn scene() -> impl SceneList {
     bsn_list![camera(), sun(), loading_screen()]
 }
 
-fn camera() -> impl Scene {
+/// Tag the static city bulk (every non-car ray-traced mesh) with
+/// [`TransformStatic`], so the GPU transform extract skips them in its per-frame
+/// `Changed<Transform>` scan — only the moving cars (and the camera) are scanned.
+/// `Without<TransformStatic>` makes this archetype-filtered: each mesh is tagged
+/// once (as it converts to `RaytracingMesh3d`) and the system idles to zero work
+/// thereafter. Cars are excluded via `Without<Car>` so their motion still updates.
+#[cfg(feature = "solari")]
+fn mark_city_static(
+    mut commands: Commands,
+    query: Query<Entity, (With<RaytracingMesh3d>, Without<Car>, Without<TransformStatic>)>,
+) {
+    for entity in &query {
+        commands.entity(entity).insert(TransformStatic);
+    }
+}
+
+/// Give the solari camera a [`Skybox`] (sky) once it exists. The pathtracer
+/// samples its cube in the ray direction on a miss instead of returning black.
+/// `Without<Skybox>` makes this archetype-filtered — it runs once and then idles.
+/// `brightness` is in cd/m² (solari single-exposes it like the rest of the scene),
+/// so it's a calibrated value, not a finicky multiplier — tune to taste. (Only the
+/// `Pathtrace` view samples it today; the realtime ReSTIR path doesn't yet.)
+#[cfg(feature = "solari")]
+#[expect(dead_code, reason = "toggled in for skybox testing vs the baked atmosphere")]
+fn add_solari_environment_map(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    camera: Query<Entity, (With<SolariCamera>, Without<Skybox>)>,
+) {
+    for entity in &camera {
+        commands.entity(entity).insert(Skybox {
+            image: Some(asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2")),
+            brightness: 3000.0,
+            ..default()
+        });
+    }
+}
+
+#[cfg(not(feature = "solari"))]
+fn camera() -> impl Scene {        
     bsn! {
         Camera3d
         Hdr
@@ -133,6 +239,37 @@ fn camera() -> impl Scene {
         Msaa::Off
         TemporalAntiAliasing
         ContactShadows
+    }
+}
+
+#[cfg(feature = "solari")]
+fn camera() -> impl Scene {        
+    bsn! {
+        Camera3d
+        Hdr
+        template_value(Transform::from_xyz(15.0, 10.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y))
+        FreeCamera
+        Exposure::OVERCAST
+        Bloom::NATURAL
+        Msaa::Off
+        template_value(SolariCamera::default())
+        // Self-contained single-scattering sky, baked to a cube each frame and
+        // sampled on a ray miss (background + IBL). Sun = the `SolariDirectionLight`.
+        // Low-lying fog matching the raster path's `spawn_atmosphere`: ~12 km
+        // ground-level Koschmieder visibility (~660 units at this scene's ~18 m/unit)
+        // and a 100 m-tall fog layer (~5.5 units) at ground (y = 0). The elevated
+        // camera shoots over the fog, so the foreground stays crisp and the haze
+        // builds along distant near-ground paths (the far skyline fades).
+        template_value(SolariAtmosphere {
+            aerial_visibility: 1200.0,
+            aerial_fog_height: 5.5,
+            aerial_fog_base: 0.0,
+            ..default()
+        })
+        template_value(ClusterConfig::None)
+        template_value(CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING))        
+          
+        //template_value(SolariDebugView::Pathtrace)        
     }
 }
 
@@ -176,11 +313,24 @@ fn loading_screen() -> impl Scene {
     }
 }
 
+#[cfg(not(feature = "solari"))]
 fn sun() -> impl Scene {
     bsn! {
         DirectionalLight {
             shadow_maps_enabled: {Settings::default().shadow_maps_enabled},
             contact_shadows_enabled: {Settings::default().contact_shadows_enabled},
+            illuminance: light_consts::lux::RAW_SUNLIGHT,
+        }
+        template_value(Transform::from_xyz(1.0, 0.15, 1.0).looking_at(Vec3::ZERO, Vec3::Y))
+    }
+}
+
+// Under solari the sun is a `SolariDirectionLight` (own light type, direction
+// resolved from the GPU transform table — no bevy_pbr `DirectionalLight`).
+#[cfg(feature = "solari")]
+fn sun() -> impl Scene {
+    bsn! {
+        SolariDirectionLight {
             illuminance: light_consts::lux::RAW_SUNLIGHT,
         }
         template_value(Transform::from_xyz(1.0, 0.15, 1.0).looking_at(Vec3::ZERO, Vec3::Y))
@@ -329,6 +479,47 @@ fn on_city_spawned(
     commands.entity(*loading_screen).despawn();
 }
 
+/// Detects when the scene has finished spawning + streaming so profiling
+/// captures measure the settled frame, not the (very long, at size 100) spawn
+/// spike. `capture.sh` waits for the `CAPTURE_READY` log line.
+#[derive(Resource, Default)]
+struct CaptureReady {
+    /// Set once the city's spawn commands have been issued; entities + streamed
+    /// scenes still settle over the following frames.
+    armed: bool,
+    last_count: usize,
+    stable_frames: u32,
+    done: bool,
+}
+
+/// Arm the detector when the city is spawned (commands issued).
+fn arm_capture_ready(mut ready: ResMut<CaptureReady>) {
+    ready.armed = true;
+}
+
+/// Once the spatial-entity count has plateaued for ~2s after spawn, log
+/// `CAPTURE_READY` (once). Car movement changes transforms, not entity counts,
+/// so the count is stable in steady state.
+fn signal_capture_ready(
+    spatial: Query<(), With<GlobalTransform>>,
+    mut ready: ResMut<CaptureReady>,
+) {
+    if ready.done || !ready.armed {
+        return;
+    }
+    let count = spatial.iter().count();
+    if count > 0 && count == ready.last_count {
+        ready.stable_frames += 1;
+        if ready.stable_frames >= 120 {
+            info!("CAPTURE_READY (settled at {count} spatial entities)");
+            ready.done = true;
+        }
+    } else {
+        ready.last_count = count;
+        ready.stable_frames = 0;
+    }
+}
+
 #[derive(Component)]
 struct Road {
     start: Vec3,
@@ -342,38 +533,42 @@ struct Car {
     dir: f32,
 }
 
+
 /// Do a very naive traffic simulation. This will only move the car to the end of the road then
 /// spawn it back at the start.
 ///
 /// Eventually this will be a more complex traffic simulation that should stress the ECS
 fn simulate_cars(
     settings: Res<Settings>,
-    roads: Query<(&Road, &Transform, &Children), Without<Car>>,
-    mut cars: Query<(&mut Car, &mut Transform), Without<Road>>,
+    roads: Query<&Road>,
+    mut cars: Query<(&mut Car, &mut Transform, &ChildOf), Without<Road>>,
     time: Res<Time>,
 ) {
     if !settings.simulate_cars {
         return;
     }
     let speed = 1.5;
+    let dt = time.delta_secs();
 
-    for (road, _, children) in &roads {
-        for child in children {
-            let Ok((mut car, mut car_transform)) = cars.get_mut(*child) else {
-                continue;
+    // Parallel over cars (each mutated by exactly one thread): a car looks up its
+    // parent road via a read-only `get` — safe to share across the `par_iter`.
+    // Replaces the serial roads → children → `get_mut` nested loop (~2.7ms over
+    // ~120k cars at size 100).
+    cars.par_iter_mut()
+        .for_each(|(mut car, mut car_transform, child_of)| {
+            let Ok(road) = roads.get(child_of.parent()) else {
+                return;
             };
-
-            car.distance_traveled += speed * time.delta_secs();
+            car.distance_traveled += speed * dt;
             let road_len = (road.end - road.start).length();
             if car.distance_traveled > road_len {
                 car.distance_traveled = 0.0;
             }
             let direction = (road.end - road.start).normalize() * car.dir;
-
             let progress = car.distance_traveled / road_len;
-            car_transform.translation = (road.start + car.offset) + direction * road_len * progress;
-        }
-    }
+            car_transform.translation =
+                (road.start + car.offset) + direction * road_len * progress;
+        });
 }
 
 /// Adds [`NoCpuCulling`] to all meshes in the scene after the city is done spawning

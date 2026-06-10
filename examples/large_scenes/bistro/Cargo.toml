@@ -9,6 +9,8 @@ license = "MIT OR Apache-2.0"
 bevy = { path = "../../../", features = [
   "bevy_camera_controller",
   "free_camera",
+  "bevy_feathers",  
+  "bevy_dev_tools",
 ] }
 mipmap_generator = { path = "../mipmap_generator" }
 
@@ -18,6 +20,15 @@ argh = "0.1.12"
 
 default = ["debug_text"]
 debug_text = ["bevy/bevy_ui"]
+# Full ray-traced rendering via bevy_solari (PbrPlugin disabled). Mirrors the
+# bevy_city `solari` feature; `cluster_processor` gates the mesh→ClusterMesh
+# conversion helpers in `bevy_solari::prelude`.
+solari = [
+  "bevy/bevy_solari",
+  "bevy/cluster_processor",
+  "bevy/dlss", #TODO: should be optional later
+  "bevy/bevy_solari_debug",
+]
 pbr_transmission_textures = ["bevy/pbr_transmission_textures"]
 pbr_multi_layer_material_textures = ["bevy/pbr_multi_layer_material_textures"]
 pbr_anisotropy_texture = ["bevy/pbr_anisotropy_texture"]

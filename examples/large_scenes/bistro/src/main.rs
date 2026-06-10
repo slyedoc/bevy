@@ -1,6 +1,10 @@
 // Press B for benchmark.
 // Preferably after frame time is reading consistently, rust-analyzer has calmed down, and with locked gpu clocks.
 
+// Under `solari` the raster camera/light components are gated out, leaving their
+// imports conditionally unused.
+#![cfg_attr(feature = "solari", allow(dead_code, unused_imports))]
+
 use std::{
     f32::consts::PI,
     ops::{Add, Mul, Sub},
@@ -35,10 +39,21 @@ use bevy::{
     prelude::*,
     window::{PresentMode, WindowResolution},
     winit::WinitSettings,
+    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
+    feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme},
 };
 use mipmap_generator::{
     generate_mipmaps, MipmapGeneratorDebugTextPlugin, MipmapGeneratorPlugin,
     MipmapGeneratorSettings,
+};
+
+#[cfg(feature = "solari")]
+use bevy::{
+    camera::CameraMainTextureUsages,
+    light::cluster::ClusterConfig,
+    render::render_resource::TextureUsages,
+    solari::prelude::*,
+    transform::systems::{propagate_transforms_for, sync_simple_transforms},
 };
 
 use crate::light_consts::lux;
@@ -117,31 +132,84 @@ pub fn main() {
 
     let mut app = App::new();
 
+    // DLSS needs its project id inserted before RenderPlugin (DlssInitPlugin reads
+    // it during render init). `solari` enables `bevy/dlss`.
+    #[cfg(feature = "solari")]
+    app.insert_resource(bevy::anti_alias::dlss::DlssProjectId(
+        bevy::asset::uuid::uuid!("b1f7d9e3-2a4c-4d6b-8f1e-3c5a7b9d0f2e"),
+    ));
+
+    let default_plugins = DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            present_mode: PresentMode::Immediate,
+            resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
+            ..default()
+        }),
+        ..default()
+    });
+    // Under `solari` the full-RT path replaces the raster mesh/material stack, so
+    // disable `PbrPlugin` (bevy_solari owns its material/lights + vendors the DfgLut
+    // + pbr shader helpers) and `TransformPlugin` (the GPU transform table drives
+    // the RT scene; CPU `GlobalTransform` is restored below only where still read).
+    #[cfg(feature = "solari")]
+    let default_plugins = default_plugins
+        .disable::<bevy::transform::TransformPlugin>()
+        .disable::<bevy::pbr::PbrPlugin>()
+        .disable::<bevy::dev_tools::render_debug::RenderDebugOverlayPlugin>();
+
     app.init_resource::<CameraPositions>()
         .init_resource::<FrameLowHigh>()
         .insert_resource(GlobalAmbientLight::NONE)
         .insert_resource(args.clone())
         .insert_resource(ClearColor(Color::srgb(1.75, 1.9, 1.99)))
         .insert_resource(WinitSettings::continuous())
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                present_mode: PresentMode::Immediate,
-                resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(default_plugins)
         .add_plugins((
             FrameTimeDiagnosticsPlugin {
                 max_history_length: 1000,
                 ..default()
             },
             FreeCameraPlugin,
+            FeathersPlugins,
+
+            FpsOverlayPlugin {
+                config: FpsOverlayConfig {
+                    frame_time_graph_config: FrameTimeGraphConfig {
+                        enabled: true,
+                        target_fps: 240.0,
+                        min_fps: 60.0,
+                    },
+                    ..default()
+                },
+            }, 
+               
         ))
+        .insert_resource(UiTheme(create_dark_theme()))
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (input, run_animation, spin, frame_time_system, benchmark).chain(),
+        );
+
+    #[cfg(feature = "solari")]
+    app.add_plugins(SolariPlugin)
+        // Camera/sun are root leaves → `sync_simple_transforms`; the UI tree →
+        // `propagate_transforms_for`. The ~scene meshes get nothing on the CPU.
+        .add_systems(
+            PostUpdate,
+            (sync_simple_transforms, propagate_transforms_for::<With<Node>>),
+        )
+        // PbrPlugin no longer registers `Assets<StandardMaterial>`, but proc_scene /
+        // benchmark / mipmap systems still reference it.
+        .init_asset::<StandardMaterial>()
+        // Bake meshes → ClusterMesh and bridge any code-authored StandardMaterials.
+        // (glTF materials already arrive as SolariMaterial via solari's glTF handler.)
+        .add_systems(
+            Update,
+            (
+                convert_meshes_to_raytracing,
+                convert_standard_materials_to_solari,
+            ),
         );
 
     if !args.no_mip_generation {
@@ -225,6 +293,9 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
         }
     }
 
+    // The "FakeGI" glTF is a bank of fake fill lights baked to approximate global
+    // illumination for the raster path — solari traces real GI, so skip it there.
+    #[cfg(not(feature = "solari"))]
     if !args.no_gltf_lights {
         // In Repo glTF
         commands.spawn((
@@ -234,6 +305,7 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     }
 
     // Sun
+    #[cfg(not(feature = "solari"))]
     commands
         .spawn((
             Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0)),
@@ -257,14 +329,23 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
         ))
         .insert_if(OcclusionCulling, || !args.no_shadow_occlusion_culling);
 
+    // Under solari the sun is a `SolariDirectionLight` (own light type, direction
+    // resolved from the GPU transform table). Shadows/cascades are raster concepts —
+    // the ray tracer traces shadow rays directly.
+    #[cfg(feature = "solari")]
+    commands.spawn((
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0)),
+        SolariDirectionLight {
+            color: Color::srgb(1.0, 0.87, 0.78),
+            illuminance: lux::FULL_DAYLIGHT,
+            ..default()
+        },
+    ));
+
     // Camera
     let mut cam = commands.spawn((
         Msaa::Off,
         Camera3d::default(),
-        ScreenSpaceTransmission {
-            steps: 0,
-            quality: ScreenSpaceTransmissionQuality::Low,
-        },
         Hdr,
         Transform::from_xyz(-10.5, 1.7, -1.0).looking_at(Vec3::new(0.0, 3.5, 0.0), Vec3::Y),
         Projection::Perspective(PerspectiveProjection {
@@ -274,33 +355,54 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
             aspect_ratio: 1.0,
             ..Default::default()
         }),
-        EnvironmentMapLight {
-            diffuse_map: asset_server.load("environment_maps/san_giuseppe_bridge_4k_diffuse.ktx2"),
-            specular_map: asset_server
-                .load("environment_maps/san_giuseppe_bridge_4k_specular.ktx2"),
-            intensity: 600.0,
-            ..default()
-        },
-        ContactShadows::default(),
         FreeCamera::default(),
         Spin,
     ));
-    cam.insert_if(DepthPrepass, || args.deferred)
-        .insert_if(DeferredPrepass, || args.deferred)
-        .insert_if(OcclusionCulling, || !args.no_view_occlusion_culling)
-        .insert_if(NoFrustumCulling, || args.no_frustum_culling)
-        .insert_if(NoAutomaticBatching, || args.no_automatic_batching)
-        .insert_if(NoIndirectDrawing, || args.no_indirect_drawing)
-        .insert_if(NoCpuCulling, || args.no_cpu_culling);
-    if !args.minimal {
+
+    // Under solari the camera is driven by the ray tracer: no raster transmission /
+    // IBL / prepass / postfx. `STORAGE_BINDING` lets the RT compute pass write the
+    // view's main texture; `ClusterConfig::None` skips raster light clustering.
+    #[cfg(feature = "solari")]
+    cam.insert((
+        SolariCamera::default(),
+        ClusterConfig::None,
+        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
+    ));
+
+    #[cfg(not(feature = "solari"))]
+    {
         cam.insert((
-            Bloom {
-                intensity: 0.02,
+            ScreenSpaceTransmission {
+                steps: 0,
+                quality: ScreenSpaceTransmissionQuality::Low,
+            },
+            EnvironmentMapLight {
+                diffuse_map: asset_server
+                    .load("environment_maps/san_giuseppe_bridge_4k_diffuse.ktx2"),
+                specular_map: asset_server
+                    .load("environment_maps/san_giuseppe_bridge_4k_specular.ktx2"),
+                intensity: 600.0,
                 ..default()
             },
-            TemporalAntiAliasing::default(),
-        ))
-        .insert(ScreenSpaceAmbientOcclusion::default());
+            ContactShadows::default(),
+        ));
+        cam.insert_if(DepthPrepass, || args.deferred)
+            .insert_if(DeferredPrepass, || args.deferred)
+            .insert_if(OcclusionCulling, || !args.no_view_occlusion_culling)
+            .insert_if(NoFrustumCulling, || args.no_frustum_culling)
+            .insert_if(NoAutomaticBatching, || args.no_automatic_batching)
+            .insert_if(NoIndirectDrawing, || args.no_indirect_drawing)
+            .insert_if(NoCpuCulling, || args.no_cpu_culling);
+        if !args.minimal {
+            cam.insert((
+                Bloom {
+                    intensity: 0.02,
+                    ..default()
+                },
+                TemporalAntiAliasing::default(),
+            ))
+            .insert(ScreenSpaceAmbientOcclusion::default());
+        }
     }
 
     if !args.hide_frame_time {

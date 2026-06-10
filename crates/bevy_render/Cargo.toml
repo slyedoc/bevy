@@ -38,7 +38,11 @@ statically-linked-dxc = ["wgpu/static-dxc"]
 raw_vulkan_init = ["wgpu/vulkan"]
 
 trace = ["profiling"]
-tracing-tracy = ["dep:tracy-client"]
+tracing-tracy = ["dep:tracy-client", "render_diagnostics"]
+# Enables `RenderDiagnosticsPlugin` (per-pass CPU/GPU timings, synced to the
+# main-world `DiagnosticsStore`). Implied by `tracing-tracy`; enable standalone
+# to collect render diagnostics without Tracy (e.g. for an in-app perf overlay).
+render_diagnostics = []
 ci_limits = []
 webgl = ["wgpu/webgl"]
 webgpu = ["wgpu/webgpu"]
