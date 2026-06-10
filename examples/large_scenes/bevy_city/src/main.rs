@@ -162,6 +162,7 @@ fn main() {
             Update,
             (
                 simulate_cars,
+                settings::update_city_info,
                 update_loading_screen,
                 process_assets.run_if(on_message::<CityAssetsLoaded>),
                 on_city_assets_ready.run_if(on_message::<CityAssetsReady>),

@@ -4,7 +4,7 @@ use bevy::{
     feathers::{
         self,
         controls::{FeathersButton, FeathersCheckbox, FeathersSlider},
-        theme::{ThemeBackgroundColor, ThemedText},
+        theme::{ThemeBackgroundColor, ThemeTextColor, ThemedText},
     },
     pbr::wireframe::WireframeConfig,
     prelude::*,
@@ -21,6 +21,31 @@ use crate::generate_city::{spawn_city, CityRoot, LampAssets};
 
 /// Smallest / largest city the regenerate slider offers (blocks per side).
 pub const CITY_SIZE_RANGE: (u32, u32) = (3, 150);
+
+/// On the scene-info line under "Regenerate City"; [`update_city_info`] keeps
+/// it current.
+#[derive(Component, Default, Clone)]
+pub struct CityInfoText;
+
+/// Keep the scene counts current. Counting is cheap (dense-query size hints),
+/// and skipping the write when unchanged avoids re-laying-out the text.
+pub fn update_city_info(
+    entities: Query<()>,
+    cars: Query<(), With<crate::Car>>,
+    mut text: Query<&mut Text, With<CityInfoText>>,
+) {
+    let Ok(mut text) = text.single_mut() else {
+        return;
+    };
+    let want = format!(
+        "Entities: {}\nMoving: {}",
+        entities.iter().count(),
+        cars.iter().count(),
+    );
+    if text.0 != want {
+        text.0 = want;
+    }
+}
 
 #[derive(Resource)]
 pub struct Settings {
@@ -155,6 +180,24 @@ pub fn settings_ui(city_size: u32) -> impl Scene {
                     )
                 ),
                 (
+                    Text("Size")
+                    TextFont { font_size: FontSize::Px(14.0) }
+                    ThemeTextColor(feathers::tokens::CHECKBOX_TEXT)
+                ),
+                (
+                    @FeathersSlider {
+                        @min: {CITY_SIZE_RANGE.0 as f32},
+                        @max: {CITY_SIZE_RANGE.1 as f32},
+                        @value: {city_size as f32},
+                    }
+                    SliderStep(1.0)
+                    SliderPrecision(0)
+                    on(slider_self_update)
+                    on(|change: On<ValueChange<f32>>, mut settings: ResMut<Settings>| {
+                        settings.city_size = change.value.round() as u32;
+                    })
+                ),
+                (
                     @FeathersButton {
                         @caption: bsn! { Text("Regenerate City") ThemedText }
                     }
@@ -180,19 +223,11 @@ pub fn settings_ui(city_size: u32) -> impl Scene {
                         }
                     )
                 ),
-                Text("City Size"),
                 (
-                    @FeathersSlider {
-                        @min: {CITY_SIZE_RANGE.0 as f32},
-                        @max: {CITY_SIZE_RANGE.1 as f32},
-                        @value: {city_size as f32},
-                    }
-                    SliderStep(1.0)
-                    SliderPrecision(0)
-                    on(slider_self_update)
-                    on(|change: On<ValueChange<f32>>, mut settings: ResMut<Settings>| {
-                        settings.city_size = change.value.round() as u32;
-                    })
+                    CityInfoText
+                    Text("")
+                    TextFont { font_size: FontSize::Px(14.0) }
+                    ThemeTextColor(feathers::tokens::CHECKBOX_TEXT)
                 ),
             ]
         )]
