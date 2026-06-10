@@ -25,7 +25,7 @@ enable wgpu_ray_query;
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB, bend_shading_normal}
 #import bevy_solari::sampling::{LightSample, generate_random_light_sample, resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_point_visibility, sample_random_light, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, random_emissive_light_pdf, power_heuristic, isnan, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, active_light_list, directional_lights, ResolvedMaterial, LIGHT_SOURCE_KIND_NONE, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
-#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler}
+#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler, specular_hit_distance}
 
 const INITIAL_SAMPLES = 8u;
 const DI_CONFIDENCE_WEIGHT_CAP = 20.0;
@@ -242,8 +242,14 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let surface = load_surface(pixel);
     if !surface.valid {
+        // Sky: the reflection IS the environment — virtual point at infinity
+        // for the DLSS specular-motion guide.
+        textureStore(specular_hit_distance, pixel, vec4(RAY_T_MAX, 0.0, 0.0, 0.0));
         return; // diffuse passes already wrote view_output (black on miss).
     }
+    // Zero distance = "no reflection data" — the guide resolve falls back to
+    // the surface motion. Overwritten below once the reflection ray reports.
+    textureStore(specular_hit_distance, pixel, vec4(0.0));
 
     var rng = reservoir_index(pixel) + view.frame_count * 5782582u + 0x68bc21ebu;
 
@@ -263,7 +269,9 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let wi = wi_tangent.x * T + wi_tangent.y * B + wi_tangent.z * N;
     let pdf = ggx_vndf_pdf(wo_tangent, wi_tangent, surface.material.roughness);
 
-    var radiance = trace_specular_path(surface, wi, pdf, &rng);
+    var first_hit_t = RAY_T_MAX; // environment miss = reflection at infinity
+    var radiance = trace_specular_path(surface, wi, pdf, &first_hit_t, &rng);
+    textureStore(specular_hit_distance, pixel, vec4(first_hit_t, 0.0, 0.0, 0.0));
     if surface.material.roughness > MIRROR_ROUGHNESS_THRESHOLD {
         radiance /= pdf;
     }
@@ -278,7 +286,7 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 // Up to 3 GGX-sampled specular bounces with NEE. No world cache, so a glossy
 // chain just terminates (no diffuse-cache fallback at the end).
-fn trace_specular_path(primary_surface: Surface, initial_wi: vec3<f32>, initial_pdf: f32, rng: ptr<function, u32>) -> vec3<f32> {
+fn trace_specular_path(primary_surface: Surface, initial_wi: vec3<f32>, initial_pdf: f32, first_hit_t: ptr<function, f32>, rng: ptr<function, u32>) -> vec3<f32> {
     var radiance = vec3(0.0);
     var throughput = vec3(1.0);
 
@@ -294,6 +302,9 @@ fn trace_specular_path(primary_surface: Surface, initial_wi: vec3<f32>, initial_
             break;
         }
         let hit = resolve_ray_hit_full(ray);
+        if i == 0u {
+            *first_hit_t = length(hit.world_position - primary_surface.world_position);
+        }
 
         let wo = -wi;
         let hit_normal = bend_shading_normal(hit.world_normal, wo);

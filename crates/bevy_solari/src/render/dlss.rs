@@ -29,8 +29,9 @@ use bevy_image::ToExtents;
 use bevy_math::{UVec2, Vec4Swizzles};
 use bevy_render::{
     camera::TemporalJitter,
+    extract_resource::ExtractResource,
     render_resource::{
-        binding_types::{texture_storage_2d, uniform_buffer},
+        binding_types::{storage_buffer_read_only_sized, texture_storage_2d, uniform_buffer},
         BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
         CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
         ShaderStages, StorageTextureAccess, TextureDescriptor, TextureDimension, TextureFormat,
@@ -44,6 +45,7 @@ use bevy_render::{
     RenderApp,
 };
 use bevy_utils::default;
+use derive_more::Display;
 use dlss_wgpu::{
     ray_reconstruction::{
         DlssRayReconstruction, DlssRayReconstructionDepthMode,
@@ -64,12 +66,55 @@ use super::{prepare::RestirResources, SolariCamera, reset::CameraReset};
 #[derive(Resource, Clone)]
 pub struct RestirDlssSdk(pub Arc<Mutex<DlssSdk>>);
 
-/// Per-view DLSS Ray Reconstruction context (resolution-specific; recreated on
-/// resize).
+/// DLSS quality mode for every solari view (a main-world resource, extracted —
+/// global like [`SolariViewState`](super::view::SolariViewState)). Switching it
+/// recreates the per-view RR context at the mode's render resolution. Present
+/// only when DLSS Ray Reconstruction is active, so the debug UI keys its
+/// dropdown on it.
+#[derive(Resource, ExtractResource, Display, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SolariDlssMode {
+    /// Native-resolution denoise + anti-aliasing, no upscaling.
+    #[default]
+    #[display("dlaa")]
+    Dlaa,
+    #[display("quality")]
+    Quality,
+    #[display("balanced")]
+    Balanced,
+    #[display("performance")]
+    Performance,
+    #[display("ultra performance")]
+    UltraPerformance,
+}
+
+impl SolariDlssMode {
+    /// Every mode, in dropdown order.
+    pub const ALL: &'static [SolariDlssMode] = &[
+        Self::Dlaa,
+        Self::Quality,
+        Self::Balanced,
+        Self::Performance,
+        Self::UltraPerformance,
+    ];
+
+    fn perf_quality_mode(self) -> DlssPerfQualityMode {
+        match self {
+            Self::Dlaa => DlssPerfQualityMode::Dlaa,
+            Self::Quality => DlssPerfQualityMode::Quality,
+            Self::Balanced => DlssPerfQualityMode::Balanced,
+            Self::Performance => DlssPerfQualityMode::Performance,
+            Self::UltraPerformance => DlssPerfQualityMode::UltraPerformance,
+        }
+    }
+}
+
+/// Per-view DLSS Ray Reconstruction context (resolution- and mode-specific;
+/// recreated on resize or [`SolariDlssMode`] change).
 #[derive(Component)]
 pub struct RestirDlssContext {
     pub context: Mutex<DlssRayReconstruction>,
     feature_flags: DlssFeatureFlags,
+    mode: SolariDlssMode,
 }
 
 /// Per-view DLSS guide buffers (render resolution), filled by the resolve pass
@@ -134,6 +179,7 @@ pub fn init_dlss(app: &mut App) -> bool {
 /// Must run after `prepare_restir_jitter` so DLSS's `suggested_jitter` wins.
 pub fn prepare_restir_dlss(
     sdk: Option<Res<RestirDlssSdk>>,
+    mode: Res<SolariDlssMode>,
     mut query: Query<
         (
             Entity,
@@ -158,9 +204,7 @@ pub fn prepare_restir_dlss(
     let feature_flags = DlssFeatureFlags::LowResolutionMotionVectors
         | DlssFeatureFlags::HighDynamicRange
         | DlssFeatureFlags::AutoExposure;
-    // DLAA = native-res denoise + AA (render res == output res) for first
-    // bring-up; switch to Auto/Quality to actually upscale once validated.
-    let perf_quality_mode = DlssPerfQualityMode::Dlaa;
+    let mode = *mode;
 
     for (entity, view, mut temporal_jitter, dlss_context) in &mut query {
         let upscaled_resolution = view.viewport.zw();
@@ -170,6 +214,7 @@ pub fn prepare_restir_dlss(
                 UVec2::from(context.context.lock().unwrap().upscaled_resolution())
                     == upscaled_resolution
                     && context.feature_flags == feature_flags
+                    && context.mode == mode
             }
             None => false,
         };
@@ -186,7 +231,7 @@ pub fn prepare_restir_dlss(
 
         let context = DlssRayReconstruction::new(
             upscaled_resolution.to_array(),
-            perf_quality_mode,
+            mode.perf_quality_mode(),
             feature_flags,
             DlssRayReconstructionRoughnessMode::Packed,
             DlssRayReconstructionDepthMode::Linear,
@@ -220,6 +265,7 @@ pub fn prepare_restir_dlss(
             RestirDlssContext {
                 context: Mutex::new(context),
                 feature_flags,
+                mode,
             },
             ViewRestirDlssTextures {
                 depth: guide("restir_dlss_depth", TextureFormat::R32Float),
@@ -254,6 +300,10 @@ pub fn restir_dlss_resolve_bind_group_layout() -> BindGroupLayoutDescriptor {
                 texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
                 texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
                 texture_storage_2d(TextureFormat::Rg16Float, StorageTextureAccess::WriteOnly),
+                // 10: specular reflection first-hit distance
+                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
+                // 11: current/previous unjittered clip_from_world ping-pong
+                storage_buffer_read_only_sized(false, None),
             ),
         ),
     )
@@ -333,6 +383,8 @@ pub fn restir_dlss_resolve(
             &dlss_textures.diffuse_albedo,
             &dlss_textures.specular_albedo,
             &dlss_textures.specular_motion_vectors,
+            &resources.specular_hit_distance,
+            resources.view_clip_from_world.as_entire_binding(),
         )),
     );
 

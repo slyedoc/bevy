@@ -7,6 +7,8 @@
 //! and no raw `Tab` hotkey fighting the focus system). The button caption shows
 //! the current state; picking an item writes [`SolariViewState`].
 
+#[cfg(feature = "dlss")]
+use crate::render::SolariDlssMode;
 use crate::render::{
     view::{SolariDebugView, SolariLighting, SolariViewState},
     SolariCamera,
@@ -268,6 +270,104 @@ pub fn update_render_debug_label(
         };
         if text.0 != want {
             text.0 = want;
+        }
+    }
+}
+
+// ── DLSS quality dropdown ────────────────────────────────────────────────────
+//
+// Present only when DLSS Ray Reconstruction is active (the `SolariDlssMode`
+// resource exists). Same shape as the view dropdown, stacked above it.
+
+/// Marker resource: the DLSS dropdown exists.
+#[cfg(feature = "dlss")]
+#[derive(Resource)]
+pub struct DlssPanelSpawned;
+
+/// On the DLSS menu button's caption text; [`update_dlss_label`] keeps it in
+/// sync with [`SolariDlssMode`].
+#[cfg(feature = "dlss")]
+#[derive(Component, Default, Clone, Copy)]
+pub struct DlssLabel;
+
+/// One DLSS menu item: activating it selects `mode` (the per-view RR context
+/// is recreated at the mode's render resolution).
+#[cfg(feature = "dlss")]
+fn dlss_item(mode: SolariDlssMode) -> impl Scene {
+    bsn! {
+        @FeathersMenuItem {
+            @caption: bsn! { Text({mode.to_string()}) ThemedText }
+        }
+        on(move |_: On<Activate>, mut current: ResMut<SolariDlssMode>| {
+            *current = mode;
+        })
+    }
+}
+
+/// Spawn the DLSS quality dropdown once DLSS is active and a [`SolariCamera`]
+/// exists, just above the view dropdown.
+#[cfg(feature = "dlss")]
+pub fn spawn_dlss_panel(
+    mode: Option<Res<SolariDlssMode>>,
+    spawned: Option<Res<DlssPanelSpawned>>,
+    cameras: Query<Entity, With<SolariCamera>>,
+    mut commands: Commands,
+) {
+    if mode.is_none() || spawned.is_some() {
+        return;
+    }
+    let Some(camera) = cameras.iter().next() else {
+        return;
+    };
+    commands.insert_resource(DlssPanelSpawned);
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: px(48),
+                left: px(8),
+                ..Default::default()
+            },
+            TabGroup::default(),
+            UiTargetCamera(camera),
+        ))
+        .queue_spawn_related_scenes::<Children>(bsn_list! {
+            (
+                @FeathersMenu
+                Children [
+                    (
+                        @FeathersMenuButton {
+                            @caption: bsn! { Text("dlss: dlaa") ThemedText DlssLabel }
+                        }
+                    ),
+                    (
+                        @FeathersMenuPopup
+                        Children [
+                            dlss_item(SolariDlssMode::Dlaa),
+                            dlss_item(SolariDlssMode::Quality),
+                            dlss_item(SolariDlssMode::Balanced),
+                            dlss_item(SolariDlssMode::Performance),
+                            dlss_item(SolariDlssMode::UltraPerformance),
+                        ]
+                    )
+                ]
+            )
+        });
+}
+
+/// Keep the DLSS button's caption in sync with the selected mode.
+#[cfg(feature = "dlss")]
+pub fn update_dlss_label(
+    mode: Option<Res<SolariDlssMode>>,
+    mut labels: Query<&mut Text, With<DlssLabel>>,
+) {
+    let Some(mode) = mode else {
+        return;
+    };
+    let want = format!("dlss: {}", *mode);
+    for mut text in &mut labels {
+        if text.0 != want {
+            text.0 = want.clone();
         }
     }
 }

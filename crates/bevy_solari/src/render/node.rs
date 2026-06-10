@@ -73,6 +73,9 @@ pub fn restir_bind_group_layout() -> BindGroupLayoutDescriptor {
                 // (haze). Disabled (`aerial_enabled = 0`) when the view has no
                 // atmosphere; always bound so the slot is valid.
                 uniform_buffer::<GpuSolariAtmosphere>(false),
+                // 18: specular reflection first-hit distance (specular-GI pass
+                // writes; the DLSS specular-motion guide reads).
+                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
             ),
         ),
     )
@@ -191,6 +194,7 @@ pub fn restir(
             environment_map_view,
             environment_map_sampler,
             atmosphere_binding,
+            &resources.specular_hit_distance,
         )),
     );
 
@@ -268,7 +272,12 @@ pub fn restir(
 /// vectors are computed from `unjittered_clip_from_world`, so they stay
 /// jitter-free. Pre-DLSS only: once DLSS is attached it drives the jitter
 /// itself (via `suggested_jitter`).
+///
+/// Zeroed when the reference pathtracer renders instead: it integrates its
+/// own uniform per-pixel jitter into the accumulation, and a camera offset on
+/// top would push samples outside the pixel — a blur baked into the reference.
 pub fn prepare_restir_jitter(
+    state: Res<crate::render::view::SolariViewState>,
     frame_count: Res<FrameCount>,
     mut views: Query<&mut TemporalJitter, With<SolariCamera>>,
 ) {
@@ -283,7 +292,11 @@ pub fn prepare_restir_jitter(
         Vec2::new(-0.125, -0.2777778),
         Vec2::new(0.375, 0.055555582),
     ];
-    let offset = HALTON[frame_count.0 as usize % HALTON.len()];
+    let offset = if state.restir_runs() {
+        HALTON[frame_count.0 as usize % HALTON.len()]
+    } else {
+        Vec2::ZERO
+    };
     for mut jitter in &mut views {
         jitter.offset = offset;
     }

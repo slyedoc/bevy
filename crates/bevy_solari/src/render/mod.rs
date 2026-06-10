@@ -48,7 +48,7 @@ use node::{prepare_restir_jitter, restir};
 pub use gizmo_depth::{gizmo_depth_bind_group_layout, gizmo_depth_pipeline};
 pub use node::restir_bind_group_layout;
 #[cfg(feature = "dlss")]
-pub use dlss::{restir_dlss_resolve_bind_group_layout, restir_dlss_resolve_pipeline};
+pub use dlss::{restir_dlss_resolve_bind_group_layout, restir_dlss_resolve_pipeline, SolariDlssMode};
 use prepare::prepare_restir_resources;
 
 pub struct SolarRenderPlugin;
@@ -186,6 +186,10 @@ impl Plugin for SolarRenderPlugin {
         // are added in later increments.
         #[cfg(feature = "dlss")]
         if dlss::init_dlss(app) {
+            // The mode resource doubles as the main-world "DLSS is active"
+            // signal (the debug UI keys its quality dropdown on it).
+            app.init_resource::<dlss::SolariDlssMode>()
+                .add_plugins(ExtractResourcePlugin::<dlss::SolariDlssMode>::default());
             let render_app = app.sub_app_mut(RenderApp);
             // Guide-buffer overlays only make sense (and only have textures)
             // when DLSS is active.
@@ -195,7 +199,11 @@ impl Plugin for SolarRenderPlugin {
                     Render,
                     dlss::prepare_restir_dlss
                         .in_set(RenderSystems::PrepareViews)
-                        .after(prepare_restir_jitter),
+                        .after(prepare_restir_jitter)
+                        // Only the restir path is denoised — on pathtrace
+                        // frames this must not override the (zeroed) jitter or
+                        // install a render-resolution override.
+                        .run_if(restir_enabled),
                 )
                 .add_systems(
                     Core3d,

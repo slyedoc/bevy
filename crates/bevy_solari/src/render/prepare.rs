@@ -51,6 +51,10 @@ pub struct RestirResources {
     /// material re-resolve. `.xy` = uv; full-float so texture sampling is
     /// stable. Stays lean — uv + material id instead of baked albedo/pbr.
     pub uv: TextureView,
+    /// First-hit distance of the specular reflection ray (written by the
+    /// specular-GI pass; `RAY_T_MAX` on an environment miss). Drives the
+    /// virtual-reflection reprojection for DLSS's specular motion guide.
+    pub specular_hit_distance: TextureView,
     /// Per-pixel DI (direct-lighting) reservoirs. Two fixed roles (not
     /// frame-parity ping-pong): `[0]` = temporal history (persists across
     /// frames), `[1]` = this-frame intermediate (initial+temporal →
@@ -158,6 +162,10 @@ pub fn prepare_restir_resources(
             ],
             motion_vectors: storage_texture("restir_motion_vectors", TextureFormat::Rgba16Float),
             uv: storage_texture("restir_uv", TextureFormat::Rgba32Float),
+            specular_hit_distance: storage_texture(
+                "restir_specular_hit_distance",
+                TextureFormat::R32Float,
+            ),
             reservoirs: [
                 reservoir_buffer("restir_reservoirs_a"),
                 reservoir_buffer("restir_reservoirs_b"),

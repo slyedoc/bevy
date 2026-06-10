@@ -11,13 +11,16 @@ enable wgpu_ray_query;
 // switch) — it belongs in a separate render-debug-style overlay that reads the
 // G-buffer / reservoir buffers.
 
+#import bevy_solari::pbr::rand_f
 #import bevy_solari::atmosphere::{atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
+#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, RAY_T_MIN, RAY_T_MAX}
 #import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, solari_view, environment_map, environment_map_sampler, atmosphere}
 
 const AERIAL_STEPS = 8u;
 
 @compute @workgroup_size(8, 8, 1)
 fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    set_view_cull_mask(solari_view.cull_mask.x);
     if any(global_id.xy >= vec2u(view.main_pass_viewport.zw)) {
         return;
     }
@@ -27,10 +30,10 @@ fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Aerial perspective: in-scatter single-scattered sunlight + ambient
     // skylight along the camera ray through the height fog, attenuating the
     // already-shaded radiance by the fog transmittance (Koschmieder). Same
-    // model as the pathtracer's march, minus the per-step sun shadow rays
-    // (god rays): with no progressive accumulator to integrate jittered
-    // samples, per-step shadow rays would be visible noise — so the fog here
-    // is unshadowed, evaluated at fixed midpoints (deterministic ⇒ smooth).
+    // model as the pathtracer's march: each step's sunlight is shadowed by a
+    // ray toward the sun, so buildings cast real shafts (god rays) and
+    // shadowed fog stops glowing. Per-pixel jittered steps — DLSS-RR (or any
+    // temporal pass downstream) integrates the noise.
     if atmosphere.aerial_enabled > 0.0 {
         let pixel_center = vec2<f32>(global_id.xy) + 0.5;
         let pixel_uv = pixel_center / view.main_pass_viewport.zw;
@@ -59,15 +62,20 @@ fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let sky_ambient = textureSampleLevel(
             environment_map, environment_map_sampler, vec3(0.0, 1.0, 0.0), 0.0,
         ).rgb * solari_view.environment_brightness;
-        let in_scatter = sun_radiance * sun_phase + sky_ambient;
 
+        var rng = (global_id.x + global_id.y * u32(view.main_pass_viewport.z))
+            + view.frame_count * 5782582u;
+        let jitter = rand_f(&rng);
         var fog_transmittance = 1.0;
         var inscatter = vec3(0.0);
         for (var i = 0u; i < AERIAL_STEPS; i = i + 1u) {
             if fog_transmittance < 0.003 { break; } // fog is opaque — nothing more shows through
-            let p = view.world_position + ray_direction * ((f32(i) + 0.5) * ds);
+            let p = view.world_position + ray_direction * ((f32(i) + jitter) * ds);
             let sigma = atmosphere_fog_extinction(atmosphere, p.y);
-            if sigma < 1e-7 { continue; } // above the fog layer
+            if sigma < 1e-7 { continue; } // above the fog layer — no scattering, skip the shadow ray
+            let sun_ray = trace_ray(p, atmosphere.sun_direction, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
+            let sun_vis = f32(sun_ray.kind == RAY_QUERY_INTERSECTION_NONE);
+            let in_scatter = sun_radiance * (sun_phase * sun_vis) + sky_ambient;
             inscatter += fog_transmittance * sigma * in_scatter * ds;
             fog_transmittance *= exp(-sigma * ds);
         }

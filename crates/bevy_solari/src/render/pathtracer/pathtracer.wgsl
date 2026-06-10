@@ -37,7 +37,11 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let old_color = textureLoad(accumulation_texture, global_id.xy);
 
-    // Setup RNG
+    // Setup RNG, seeded by (pixel, accumulated-sample index): sample N always
+    // draws the same numbers, so a converged accumulation is bit-reproducible.
+    // Deliberate side effect: while the camera moves (reset every frame, so
+    // the sample index stays 0) the grain pattern holds still on screen —
+    // calmer to look at than per-frame varying noise boiling during motion.
     let pixel_index = global_id.x + global_id.y * u32(view.viewport.z);
     let frame_index = u32(old_color.a) * 5782582u;
     var rng = pixel_index + frame_index;

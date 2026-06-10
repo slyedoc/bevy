@@ -120,5 +120,8 @@ struct SolariView {
 // Atmosphere params + sun for primary-ray aerial perspective (distance haze).
 // Disabled (`aerial_enabled == 0`) when the view has no `SolariAtmosphere`.
 @group(1) @binding(17) var<uniform> atmosphere: Atmosphere;
+// First-hit distance of the specular reflection ray (specular-GI pass writes,
+// the DLSS guide resolve reads; `RAY_T_MAX` = environment miss).
+@group(1) @binding(18) var specular_hit_distance: texture_storage_2d<r32float, read_write>;
 // Per-frame scalars come from `view` — `view.frame_count` seeds the RNG, so no
 // push-constant block is needed.
