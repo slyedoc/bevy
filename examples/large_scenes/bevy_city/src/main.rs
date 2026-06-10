@@ -39,10 +39,10 @@ use bevy::{
     transform::systems::{propagate_transforms_for, sync_simple_transforms},
 };
 
-use crate::generate_city::spawn_city;
+use crate::generate_city::{spawn_city, LampAssets};
 use crate::{
     assets::{merge_car_meshes, strip_base_url},
-    settings::{settings_ui, Settings},
+    settings::{settings_ui, Settings, CITY_SIZE_RANGE},
 };
 
 mod assets;
@@ -63,6 +63,12 @@ pub struct Args {
     /// adds NoCpuCulling to all meshes
     #[argh(switch)]
     no_cpu_culling: bool,
+
+    /// spawn emissive street lamps along the roads (two per block — a
+    /// many-lights stress source for the solari ReSTIR path); on by default,
+    /// pass `--lights false` to disable
+    #[argh(option, default = "true")]
+    lights: bool,
 }
 
 fn main() {
@@ -125,7 +131,10 @@ fn main() {
         app.insert_resource(args.clone())
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(WinitSettings::continuous())
-        .init_resource::<Settings>()
+        .insert_resource(Settings {
+            city_size: args.size.clamp(CITY_SIZE_RANGE.0, CITY_SIZE_RANGE.1),
+            ..default()
+        })
         .init_resource::<CaptureReady>()
         .insert_resource(UiTheme(create_dark_theme()))
         .insert_resource(WireframeConfig {
@@ -147,6 +156,7 @@ fn main() {
             #[cfg(not(feature = "solari"))]
             spawn_atmosphere,
             load_assets,
+            generate_city::setup_lamp_assets,
         ))
         .add_systems(
             Update,
@@ -155,7 +165,15 @@ fn main() {
                 update_loading_screen,
                 process_assets.run_if(on_message::<CityAssetsLoaded>),
                 on_city_assets_ready.run_if(on_message::<CityAssetsReady>),
-                (add_no_cpu_culling, on_city_spawned, settings_ui.spawn(), arm_capture_ready)
+                (
+                    add_no_cpu_culling,
+                    on_city_spawned,
+                    {
+                        let city_size = args.size.clamp(CITY_SIZE_RANGE.0, CITY_SIZE_RANGE.1);
+                        (move || settings_ui(city_size)).spawn()
+                    },
+                    arm_capture_ready,
+                )
                     .run_if(on_message::<CitySpawned>),
                 signal_capture_ready,
                 #[cfg(feature = "solari")]
@@ -250,7 +268,7 @@ fn camera() -> impl Scene {
         template_value(Transform::from_xyz(15.0, 10.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y))
         FreeCamera
         Exposure::OVERCAST
-        Bloom::NATURAL
+        //Bloom::NATURAL
         Msaa::Off
         template_value(SolariCamera::default())
         // Self-contained single-scattering sky, baked to a cube each frame and
@@ -457,6 +475,7 @@ fn process_assets(
 fn on_city_assets_ready(
     mut commands: Commands,
     city_assets: Res<CityAssets>,
+    lamps: Option<Res<LampAssets>>,
     args: Res<Args>,
     mut loading_text: Query<&mut Text, With<LoadingText>>,
 ) {
@@ -465,7 +484,13 @@ fn on_city_assets_ready(
     };
     text.0 = "Spawning city...".into();
 
-    spawn_city(&mut commands, &city_assets, args.seed, args.size);
+    spawn_city(
+        &mut commands,
+        &city_assets,
+        lamps.as_deref(),
+        args.seed,
+        args.size,
+    );
     commands.write_message(CitySpawned);
 }
 
