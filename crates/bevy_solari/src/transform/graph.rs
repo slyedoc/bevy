@@ -18,7 +18,9 @@ use bevy_transform::components::{GlobalTransform, Transform};
 use bevy_utils::Parallel;
 use bytemuck::{Pod, Zeroable};
 
-use crate::ecs_gpu::{push_record, GpuSlot};
+use bevy_render::renderer::{RenderDevice, RenderQueue};
+
+use crate::ecs_gpu::{push_record, GpuColumn, GpuSlot};
 
 use super::readback::NoGpuGlobalTransformReadback;
 
@@ -133,13 +135,6 @@ impl TransformDeltaBuf {
 ///
 /// The GPU column buffers persist, so a column not re-scattered this frame keeps
 /// last value. Roots (no `ChildOf`) get `ROOT_PARENT`, scattered once at first sight.
-#[expect(
-    unsafe_code,
-    clippy::uninit_vec,
-    reason = "the parallel disjoint `copy_from_slice`s fill every word of `local` \
-              before the GPU scatter reads it (the scope blocks to completion); \
-              `set_len` after `reserve` skips a zero-init that would negate the merge"
-)]
 pub fn extract_transform_graph(
     members: Extract<
         Query<
@@ -156,6 +151,9 @@ pub fn extract_transform_graph(
     marker_added: Extract<Query<&GpuSlot<TransformGraph>, Added<NoGpuGlobalTransformReadback>>>,
     mut marker_removed: Extract<RemovedComponents<NoGpuGlobalTransformReadback>>,
     mut table: ResMut<TransformGraph>,
+    local_column: Option<ResMut<GpuColumn<LocalColumn>>>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
     mut queues: Local<Parallel<TransformDeltaBuf>>,
 ) {
     members.par_iter().for_each_init(
@@ -166,10 +164,9 @@ pub fn extract_transform_graph(
             if transform.is_changed() {
                 // Raw TRS — the propagate shader builds the matrix (no CPU pack).
                 buf.push_local(slot, LocalTRS::from_transform(&transform));
-                // The readback opt-out flag scatters at first sight only; later
-                // marker adds/removes are caught by the dedicated queries below
-                // (re-scattering it per move paid ~0.25 ms/frame in bevy_city
-                // for a flag that almost never changes).
+                // The readback opt-out flag scatters at first sight only —
+                // it almost never changes, so movers don't re-send it. Later
+                // marker adds/removes are caught by the dedicated passes below.
                 if transform.is_added() {
                     buf.push_no_readback(slot, no_cpu_global as u32);
                 }
@@ -212,29 +209,35 @@ pub fn extract_transform_graph(
         push_record(&mut table.no_readback, slot.index(), 1u32);
     }
 
-    // `local` is the big delta (one record per mover). Instead of a serial memcpy
-    // appending each thread-local buffer, pre-size the column and copy the buffers
-    // into disjoint slices in parallel across the compute pool.
+    // `local` is the big delta (one record per mover): merging the thread-local
+    // buffers through a CPU Vec would memcpy every record twice, so write them
+    // straight into the queue's staging memory for the column's delta buffer —
+    // disjoint chunks, copied in parallel across the compute pool. `table.local`
+    // stays empty, so `prepare_column<LocalColumn>` sees no records and leaves
+    // the pending count set here untouched. Extract is gated on scatter-pipeline
+    // readiness (see `gpu_table!`), so the delta written here is always consumed.
+    let Some(mut local_column) = local_column else {
+        return;
+    };
     let parts: Vec<&[u32]> = queues.iter_mut().map(|b| b.local.as_slice()).collect();
     let total: usize = parts.iter().map(|s| s.len()).sum();
-    table.local.clear();
-    table.local.reserve(total);
-    // SAFETY: the disjoint `copy_from_slice`s below write exactly `total` words —
-    // the chunks partition `0..total` (their lengths sum to `total`) — so the whole
-    // new length is initialised before any read. `u32` needs no drop.
-    unsafe {
-        table.local.set_len(total);
-    }
-    let mut dst: &mut [u32] = table.local.as_mut_slice();
-    ComputeTaskPool::get().scope(|scope| {
-        for &src in &parts {
-            let (chunk, rest) = dst.split_at_mut(src.len());
-            dst = rest;
-            scope.spawn(async move {
-                chunk.copy_from_slice(src);
+    if total > 0 {
+        local_column.write_delta_direct(total, &render_device, &render_queue, |dst| {
+            // The chunks partition the staging view exactly: their lengths sum
+            // to `total * 4`, so every byte is written before the upload.
+            let mut dst = dst;
+            ComputeTaskPool::get().scope(|scope| {
+                for &src in &parts {
+                    let (chunk, rest) = dst.split_at(size_of_val(src));
+                    dst = rest;
+                    scope.spawn(async move {
+                        let mut chunk = chunk;
+                        chunk.copy_from_slice(bytemuck::cast_slice(src));
+                    });
+                }
             });
-        }
-    });
+        });
+    }
     drop(parts);
     // Keep each thread-local's capacity for next frame (we copied, not moved).
     for buf in queues.iter_mut() {

@@ -17,6 +17,7 @@
 //! family as Bevy's raster `UniformComponentPlugin<C>` / `GpuArrayBufferPlugin<T>`.
 
 use core::marker::PhantomData;
+use core::num::NonZero;
 
 use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer};
@@ -238,6 +239,44 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
         self.delta.reserve(records.len(), device);
         if let Some(buffer) = self.delta.buffer() {
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(records));
+        }
+        *self.params.get_mut() = ScatterParams {
+            count: self.pending,
+            words_per_value: Self::WORDS,
+            force_init: 0,
+            _pad1: 0,
+        };
+        self.params.write_buffer(device, queue);
+    }
+
+    /// Like [`upload_prebuilt`](Self::upload_prebuilt), but the producer writes
+    /// the records straight into the queue's staging memory instead of handing
+    /// over a finished CPU slice — one copy (producer → staging) instead of two
+    /// (producer → merge `Vec` → staging). Worth it only for the big per-frame
+    /// deltas (the transform `local` column: one record per mover); small
+    /// columns should keep the plain [`upload_prebuilt`] path.
+    ///
+    /// `fill` receives exactly `total_words * 4` bytes of staging memory and
+    /// must write **all** of them (staging is uninitialized — unwritten bytes
+    /// would upload garbage records).
+    pub fn write_delta_direct(
+        &mut self,
+        total_words: usize,
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        fill: impl FnOnce(wgpu::WriteOnly<'_, [u8]>),
+    ) {
+        debug_assert_eq!(total_words as u32 % (Self::WORDS + 1), 0);
+        self.pending = total_words as u32 / (Self::WORDS + 1);
+        self.delta.reserve(total_words, device);
+        if let (Some(buffer), Some(bytes)) = (
+            self.delta.buffer(),
+            NonZero::<u64>::new(total_words as u64 * 4),
+        ) {
+            let mut view = queue
+                .write_buffer_with(buffer, 0, bytes)
+                .expect("delta staging allocation failed");
+            fill(view.slice(..));
         }
         *self.params.get_mut() = ScatterParams {
             count: self.pending,
