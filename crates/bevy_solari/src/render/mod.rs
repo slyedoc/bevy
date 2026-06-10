@@ -188,8 +188,8 @@ impl Plugin for SolarRenderPlugin {
         if dlss::init_dlss(app) {
             // The mode resource doubles as the main-world "DLSS is active"
             // signal (the debug UI keys its quality dropdown on it).
-            app.init_resource::<dlss::SolariDlssMode>()
-                .add_plugins(ExtractResourcePlugin::<dlss::SolariDlssMode>::default());
+            app.init_resource::<SolariDlssMode>()
+                .add_plugins(ExtractResourcePlugin::<SolariDlssMode>::default());
             let render_app = app.sub_app_mut(RenderApp);
             // Guide-buffer overlays only make sense (and only have textures)
             // when DLSS is active.
@@ -214,8 +214,13 @@ impl Plugin for SolarRenderPlugin {
                         .after(overlay::SolariDebugOverlay)
                         .in_set(Core3dSystems::EarlyPostProcess)
                         // `restir_dlss_resolve` reads the central pipeline + layout.
+                        // Skipped for the reservoir/grid debug views — running a
+                        // temporal denoiser over false-color output just smears it.
                         .run_if(
                             restir_enabled
+                                .and_then(|state: bevy_ecs::system::Res<SolariViewState>| {
+                                    state.debug.and_then(|view| view.restir_debug_mode()).is_none()
+                                })
                                 .and_then(resource_exists::<SolariResourceManager>)
                                 .and_then(resource_exists::<SolariPipelines>),
                         ),

@@ -65,10 +65,13 @@ pub struct SolariPipelines {
 
     pub restir_visibility: CachedComputePipelineId,
     pub restir_presample: CachedComputePipelineId,
+    pub restir_regir_decay: CachedComputePipelineId,
+    pub restir_regir_fill: CachedComputePipelineId,
     pub restir_initial_and_temporal: CachedComputePipelineId,
     pub restir_spatial_and_shade: CachedComputePipelineId,
     pub restir_specular_gi: CachedComputePipelineId,
     pub restir_compose: CachedComputePipelineId,
+    pub restir_debug: CachedComputePipelineId,
 
     /// Fullscreen depth-write (RT G-buffer → hardware depth); a **render** pipeline.
     pub gizmo_depth: CachedRenderPipelineId,
@@ -309,7 +312,11 @@ pub fn init_solari_pipelines(
     let restir_visibility =
         restir_pipeline("restir_visibility_pipeline", "visibility", visibility_shader);
     let restir_presample =
-        restir_pipeline("restir_presample_pipeline", "presample", presample_shader);
+        restir_pipeline("restir_presample_pipeline", "presample", presample_shader.clone());
+    let restir_regir_decay =
+        restir_pipeline("restir_regir_decay_pipeline", "regir_decay", presample_shader.clone());
+    let restir_regir_fill =
+        restir_pipeline("restir_regir_fill_pipeline", "regir_fill", presample_shader);
     let restir_initial_and_temporal = restir_pipeline(
         "restir_initial_and_temporal_pipeline",
         "initial_and_temporal",
@@ -318,6 +325,11 @@ pub fn init_solari_pipelines(
     let restir_spatial_and_shade = restir_pipeline(
         "restir_spatial_and_shade_pipeline",
         "spatial_and_shade",
+        restir_pt_shader.clone(),
+    );
+    let restir_debug = restir_pipeline(
+        "restir_debug_pipeline",
+        "restir_debug",
         restir_pt_shader.clone(),
     );
     let restir_specular_gi =
@@ -367,10 +379,13 @@ pub fn init_solari_pipelines(
         ptlas_finalize,
         restir_visibility,
         restir_presample,
+        restir_regir_decay,
+        restir_regir_fill,
         restir_initial_and_temporal,
         restir_spatial_and_shade,
         restir_specular_gi,
         restir_compose,
+        restir_debug,
         gizmo_depth,
         #[cfg(feature = "dlss")]
         dlss_resolve,

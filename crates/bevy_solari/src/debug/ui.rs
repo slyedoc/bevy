@@ -121,6 +121,10 @@ pub fn spawn_debug_panels(
                             debug_item(SolariDebugView::WorldNormal),
                             debug_item(SolariDebugView::Uv),
                             debug_item(SolariDebugView::MotionVectors),
+                            debug_item(SolariDebugView::DiWeight),
+                            debug_item(SolariDebugView::DiConfidence),
+                            debug_item(SolariDebugView::DiLight),
+                            debug_item(SolariDebugView::RegirCells),
                         ]
                     )
                 ]
@@ -343,6 +347,7 @@ pub fn spawn_dlss_panel(
                     (
                         @FeathersMenuPopup
                         Children [
+                            dlss_item(SolariDlssMode::Off),
                             dlss_item(SolariDlssMode::Dlaa),
                             dlss_item(SolariDlssMode::Quality),
                             dlss_item(SolariDlssMode::Balanced),

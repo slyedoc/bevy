@@ -4,6 +4,7 @@ use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 use crate::render::atmosphere::{AtmosphereSky, GpuSolariAtmosphere, SolariAtmosphereGpu, SolariAtmosphereView};
 use crate::render::SolariCamera;
+use crate::render::view::SolariViewState;
 use crate::render::view_cull::{SolariEnvironmentMap, SolariViewOffset, SolariViewUniform, SolariViewUniforms};
 use bevy_diagnostic::FrameCount;
 use bevy_ecs::prelude::*;
@@ -23,7 +24,7 @@ use bevy_render::{
     view::{ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
 };
 
-use super::prepare::{LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK};
+use super::prepare::{LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, REGIR_ENTRIES_PER_CELL, REGIR_TABLE_SIZE};
 
 /// The ReSTIR `@group(1)` bind-group layout (shared by all six passes). Owned by
 /// [`SolariResourceManager`](crate::resource_manager::SolariResourceManager); the
@@ -76,6 +77,11 @@ pub fn restir_bind_group_layout() -> BindGroupLayoutDescriptor {
                 // 18: specular reflection first-hit distance (specular-GI pass
                 // writes; the DLSS specular-motion guide reads).
                 texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
+                // 19-22: ReGIR light grid (checksums, life, cell data, samples).
+                storage_buffer_sized(false, None),
+                storage_buffer_sized(false, None),
+                storage_buffer_sized(false, None),
+                storage_buffer_sized(false, None),
             ),
         ),
     )
@@ -98,6 +104,7 @@ pub fn restir(
     view_uniforms: Res<ViewUniforms>,
     solari_view_uniforms: Res<SolariViewUniforms>,
     solari_atmosphere: Res<SolariAtmosphereGpu>,
+    state: Res<SolariViewState>,
     texture_assets: Res<RenderAssets<GpuImage>>,
     atmosphere_sky: Option<Res<AtmosphereSky>>,
     fallback_image: Res<FallbackImage>,
@@ -134,17 +141,23 @@ pub fn restir(
     let (
         Some(visibility_pipeline),
         Some(presample_pipeline),
+        Some(regir_decay_pipeline),
+        Some(regir_fill_pipeline),
         Some(initial_and_temporal_pipeline),
         Some(spatial_and_shade_pipeline),
         Some(specular_gi_pipeline),
         Some(compose_pipeline),
+        Some(debug_pipeline),
     ) = (
         pipeline_cache.get_compute_pipeline(pipelines.restir_visibility),
         pipeline_cache.get_compute_pipeline(pipelines.restir_presample),
+        pipeline_cache.get_compute_pipeline(pipelines.restir_regir_decay),
+        pipeline_cache.get_compute_pipeline(pipelines.restir_regir_fill),
         pipeline_cache.get_compute_pipeline(pipelines.restir_initial_and_temporal),
         pipeline_cache.get_compute_pipeline(pipelines.restir_spatial_and_shade),
         pipeline_cache.get_compute_pipeline(pipelines.restir_specular_gi),
         pipeline_cache.get_compute_pipeline(pipelines.restir_compose),
+        pipeline_cache.get_compute_pipeline(pipelines.restir_debug),
     ) else {
         return;
     };
@@ -195,6 +208,10 @@ pub fn restir(
             environment_map_sampler,
             atmosphere_binding,
             &resources.specular_hit_distance,
+            resources.regir_checksums.as_entire_binding(),
+            resources.regir_life.as_entire_binding(),
+            resources.regir_cell_data.as_entire_binding(),
+            resources.regir_samples.as_entire_binding(),
         )),
     );
 
@@ -243,6 +260,17 @@ pub fn restir(
     pass.dispatch_workgroups(((LIGHT_TILE_BLOCKS * LIGHT_TILE_SAMPLES_PER_BLOCK) as u32).div_ceil(256), 1, 1);
     d.end(&mut pass);
 
+    // 2b. ReGIR grid maintenance: age/free cells, then refill the live cells
+    //     from the fresh tile pool (the queries in pass 3 insert + mark).
+    let d = diagnostics.time_span(&mut pass, "restir/regir_decay");
+    pass.set_pipeline(regir_decay_pipeline);
+    pass.dispatch_workgroups((REGIR_TABLE_SIZE as u32).div_ceil(256), 1, 1);
+    d.end(&mut pass);
+    let d = diagnostics.time_span(&mut pass, "restir/regir_fill");
+    pass.set_pipeline(regir_fill_pipeline);
+    pass.dispatch_workgroups(((REGIR_TABLE_SIZE * REGIR_ENTRIES_PER_CELL) as u32).div_ceil(256), 1, 1);
+    d.end(&mut pass);
+
     // 3. Initial candidate generation + temporal reuse.
     let d = diagnostics.time_span(&mut pass, "restir/initial_and_temporal");
     pass.set_pipeline(initial_and_temporal_pipeline);    pass.dispatch_workgroups(dx, dy, 1);
@@ -262,6 +290,16 @@ pub fn restir(
     let d = diagnostics.time_span(&mut pass, "restir/compose");
     pass.set_pipeline(compose_pipeline);    pass.dispatch_workgroups(dx, dy, 1);
     d.end(&mut pass);
+
+    // 6. Reservoir / ReGIR debug visualization, overwriting the lit output.
+    //    Lives here (not the overlay pass) because it reads buffers only this
+    //    bind group sees; the mode rides in the per-view uniform.
+    if state.debug.is_some_and(|view| view.restir_debug_mode().is_some()) {
+        let d = diagnostics.time_span(&mut pass, "restir/debug");
+        pass.set_pipeline(debug_pipeline);
+        pass.dispatch_workgroups(dx, dy, 1);
+        d.end(&mut pass);
+    }
 }
 
 /// Drives the camera's sub-pixel jitter (Halton (2,3) − 0.5) for ReSTIR views.
@@ -277,7 +315,7 @@ pub fn restir(
 /// own uniform per-pixel jitter into the accumulation, and a camera offset on
 /// top would push samples outside the pixel — a blur baked into the reference.
 pub fn prepare_restir_jitter(
-    state: Res<crate::render::view::SolariViewState>,
+    state: Res<SolariViewState>,
     frame_count: Res<FrameCount>,
     mut views: Query<&mut TemporalJitter, With<SolariCamera>>,
 ) {

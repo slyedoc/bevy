@@ -32,6 +32,15 @@ const GI_RESERVOIR_STRUCT_SIZE: u64 = 48;
 pub const LIGHT_TILE_BLOCKS: u64 = 128;
 pub const LIGHT_TILE_SAMPLES_PER_BLOCK: u64 = 1024;
 
+/// ReGIR world-space light grid: hash-table cell count (power of two). Same
+/// spatial-hash scheme as the old world cache: position-keyed cells with
+/// distance-LOD sizing, marked alive on query and refilled each frame.
+/// MUST match `REGIR_TABLE_SIZE` in `restir_bindings.wgsl`.
+pub const REGIR_TABLE_SIZE: u64 = 65536;
+/// Presampled light entries per ReGIR cell. MUST match
+/// `REGIR_ENTRIES_PER_CELL` in `restir_bindings.wgsl`.
+pub const REGIR_ENTRIES_PER_CELL: u64 = 32;
+
 /// Per-view GPU resources for the full-RT ReSTIR path tracer.
 ///
 /// The G-buffer is kept lean — position, normal, motion — with material data
@@ -63,8 +72,23 @@ pub struct RestirResources {
     /// Per-pixel GI (indirect, one-bounce) reservoirs. Same `[history,
     /// intermediate]` roles as the DI pair.
     pub gi_reservoirs: [Buffer; 2],
-    /// Presampled light-tile sample pool.
+    /// Presampled light-tile sample pool — the uniform candidate source the
+    /// ReGIR grid selects from, and the out-of-grid fallback.
     pub light_tiles: Buffer,
+    /// ReGIR cell identity hashes (0 = empty slot). Spatial hash keyed by
+    /// quantized world position + distance LOD; linear-probed.
+    pub regir_checksums: Buffer,
+    /// ReGIR cell lifetimes: reset on query, decremented by the decay pass;
+    /// a cell that hits 0 is freed.
+    pub regir_life: Buffer,
+    /// Per-cell representative point + cell size (`xyz` = cell center, `w` =
+    /// cell size), written on insert — the fill pass's RIS target.
+    pub regir_cell_data: Buffer,
+    /// Per-cell light samples (`REGIR_TABLE_SIZE × REGIR_ENTRIES_PER_CELL`),
+    /// RIS-selected from the tile pool with a distance-to-cell target — a
+    /// pixel's initial candidates come from a pool already importance-reduced
+    /// to lights that matter NEAR its surface point.
+    pub regir_samples: Buffer,
     /// Self-owned previous-frame `clip_from_world`: two `mat4x4<f32>` slots,
     /// frame-parity ping-ponged on the GPU (one writer thread in the
     /// visibility pass). Replaces a prepass-fed previous-view uniform.
@@ -143,6 +167,23 @@ pub fn prepare_restir_resources(
             mapped_at_creation: false,
         });
 
+        // ReGIR hash grid (wgpu zero-initializes: checksum 0 = empty cell).
+        let regir_buffer = |name: &str, size: u64| {
+            render_device.create_buffer(&BufferDescriptor {
+                label: Some(name),
+                size,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        };
+        let regir_checksums = regir_buffer("restir_regir_checksums", REGIR_TABLE_SIZE * 4);
+        let regir_life = regir_buffer("restir_regir_life", REGIR_TABLE_SIZE * 4);
+        let regir_cell_data = regir_buffer("restir_regir_cell_data", REGIR_TABLE_SIZE * 16);
+        let regir_samples = regir_buffer(
+            "restir_regir_samples",
+            REGIR_TABLE_SIZE * REGIR_ENTRIES_PER_CELL * LIGHT_TILE_SAMPLE_STRUCT_SIZE,
+        );
+
         // Two `mat4x4<f32>` (64 B each): current + previous clip_from_world.
         let view_clip_from_world = render_device.create_buffer(&BufferDescriptor {
             label: Some("restir_view_clip_from_world"),
@@ -175,6 +216,10 @@ pub fn prepare_restir_resources(
                 gi_reservoir_buffer("restir_gi_reservoirs_b"),
             ],
             light_tiles,
+            regir_checksums,
+            regir_life,
+            regir_cell_data,
+            regir_samples,
             view_clip_from_world,
             view_size,
         });

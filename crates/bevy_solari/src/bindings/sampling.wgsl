@@ -147,6 +147,35 @@ fn random_emissive_light_pdf(hit: ResolvedRayHitFull) -> f32 {
     return stratum_probability / (f32(emissive_count) * f32(hit.triangle_count) * hit.triangle_area);
 }
 
+/// One uniformly random EMISSIVE light sample — the light-tile pool's source.
+/// The restir DI reservoirs manage emissive lights only: directional lights
+/// are a deterministic handful, shaded every frame outside ReSTIR (a one-slot
+/// reservoir forced to choose between the sun and a nearby emissive
+/// patchworks the screen into per-light winners that reuse then correlates
+/// into visible blobs).
+fn generate_random_emissive_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightSampleResult {
+    let emissive_count = emissive_light_count();
+    if emissive_count == 0u {
+        let null_resolved = ResolvedLightSample(vec4(0.0, 1.0, 0.0, 0.0), vec3(0.0, -1.0, 0.0), vec3(0.0), 0.0);
+        return GenerateRandomLightSampleResult(LightSample(NULL_LIGHT_ID, 0u), null_resolved);
+    }
+
+    let pick = rand_range_u(emissive_count, rng);
+    let light_id = active_light_list[2u + pick];
+    let light_source = light_sources[light_id];
+
+    let triangle_count = light_source.kind >> 1u;
+    let triangle_id = rand_range_u(triangle_count, rng);
+
+    let seed = rand_u(rng);
+    let light_sample = LightSample((light_id << 16u) | triangle_id, seed);
+
+    var resolved_light_sample = resolve_light_sample(light_sample, light_source);
+    resolved_light_sample.inverse_pdf *= f32(emissive_count);
+
+    return GenerateRandomLightSampleResult(light_sample, resolved_light_sample);
+}
+
 /// One stratified random light sample: pick the directional stratum (the sun)
 /// or the emissive stratum with probability ½ each (when both exist), then
 /// uniformly within the stratum; `inverse_pdf` carries the full pick pdf.
@@ -154,8 +183,7 @@ fn random_emissive_light_pdf(hit: ResolvedRayHitFull) -> f32 {
 /// A single uniform pick over ALL sources samples the sun only 1/total of the
 /// time at total× weight — with thousands of emissives that's firefly variance
 /// on every sunlit surface (and a progressive accumulator keeps each outlier
-/// visible for thousands of frames). Stratifying also keeps the sun present in
-/// every presampled light tile. [`random_emissive_light_pdf`] is the MIS
+/// visible for thousands of frames). [`random_emissive_light_pdf`] is the MIS
 /// counterpart and must mirror this pick exactly.
 ///
 /// The pick indexes `active_light_list` (dense, this frame's live lights);

@@ -69,6 +69,9 @@ pub struct SolariViewUniform {
     /// tonemapped — matching the raster framebuffer clear.
     pub clear_color: Vec3,
     pub environment_brightness: f32,
+    /// `restir_debug` visualization mode (0 = none; see
+    /// [`SolariDebugView::restir_debug_mode`](crate::render::view::SolariDebugView)).
+    pub debug_mode: u32,
 }
 
 /// Render-world component: the solari view's resolved linear-RGB clear color (the
@@ -159,6 +162,7 @@ pub fn extract_solari_skybox(mut main_world: ResMut<MainWorld>, mut commands: Co
 /// into the dynamic uniform buffer and record each view's offset.
 pub fn prepare_solari_view_uniforms(
     mut uniforms: ResMut<SolariViewUniforms>,
+    state: Res<crate::render::view::SolariViewState>,
     views: Query<
         (
             Entity,
@@ -173,6 +177,10 @@ pub fn prepare_solari_view_uniforms(
     render_queue: Res<RenderQueue>,
     mut commands: Commands,
 ) {
+    let debug_mode = state
+        .debug
+        .and_then(|view| view.restir_debug_mode())
+        .unwrap_or(0);
     uniforms.uniforms.clear();
     for (entity, mask, clear_color, environment_map, atmosphere_view) in &views {
         // The baked atmosphere cube already holds physical radiance (scaled by sun
@@ -187,6 +195,7 @@ pub fn prepare_solari_view_uniforms(
             cull_mask: UVec4::new(mask.0, 0, 0, 0),
             clear_color: clear_color.0,
             environment_brightness,
+            debug_mode,
         });
         commands.entity(entity).insert(SolariViewOffset(offset));
     }

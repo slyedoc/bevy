@@ -43,6 +43,18 @@ pub enum SolariDebugView {
     Uv,
     #[display("motion vectors")]
     MotionVectors,
+    /// DI reservoir contribution weight (heatmap; NaN = magenta).
+    #[display("di weight")]
+    DiWeight,
+    /// DI reservoir confidence (M) over its cap.
+    #[display("di confidence")]
+    DiConfidence,
+    /// DI reservoir light identity, hashed to a color.
+    #[display("di light")]
+    DiLight,
+    /// ReGIR cell of each surface point, hashed to a color (red = cold).
+    #[display("regir cells")]
+    RegirCells,
     #[cfg(feature = "dlss")]
     #[display("dlss depth")]
     DlssDepth,
@@ -74,6 +86,10 @@ impl SolariDebugView {
         Self::WorldNormal,
         Self::Uv,
         Self::MotionVectors,
+        Self::DiWeight,
+        Self::DiConfidence,
+        Self::DiLight,
+        Self::RegirCells,
         #[cfg(feature = "dlss")]
         Self::DlssDepth,
         #[cfg(feature = "dlss")]
@@ -86,6 +102,19 @@ impl SolariDebugView {
         Self::DlssSpecularMotion,
     ];
 
+    /// The `restir_debug` shader mode rendering this view, if it's one of the
+    /// reservoir/grid visualizations the restir node draws itself (they read
+    /// the reservoir + ReGIR buffers, which only the restir bind group sees).
+    pub fn restir_debug_mode(self) -> Option<u32> {
+        match self {
+            Self::DiWeight => Some(1),
+            Self::DiConfidence => Some(2),
+            Self::DiLight => Some(3),
+            Self::RegirCells => Some(4),
+            _ => None,
+        }
+    }
+
     /// Whether this view reads the restir chain's output (its G-buffer or the
     /// DLSS guide textures derived from it), so the chain must run to produce
     /// it. Cluster-family views trace their own primary ray instead and need
@@ -97,7 +126,11 @@ impl SolariDebugView {
             | Self::MaterialId
             | Self::WorldNormal
             | Self::Uv
-            | Self::MotionVectors => true,
+            | Self::MotionVectors
+            | Self::DiWeight
+            | Self::DiConfidence
+            | Self::DiLight
+            | Self::RegirCells => true,
             #[cfg(feature = "dlss")]
             Self::DlssDepth
             | Self::DlssNormalRoughness

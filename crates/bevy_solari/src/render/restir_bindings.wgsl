@@ -2,7 +2,7 @@
 
 #import bevy_render::view::View
 #import bevy_render::utils::{octahedral_encode, octahedral_decode}
-#import bevy_solari::pbr::{vec3_to_rgb9e5_, rgb9e5_to_vec3_}
+#import bevy_solari::pbr::{vec3_to_rgb9e5_, rgb9e5_to_vec3_, rand_f, rand_vec2f}
 #import bevy_solari::sampling::ResolvedLightSample
 #import bevy_solari::atmosphere::Atmosphere
 
@@ -111,6 +111,8 @@ struct SolariView {
     cull_mask: vec4<u32>,
     clear_color: vec3<f32>,
     environment_brightness: f32,
+    // `restir_debug` visualization mode (0 = none).
+    debug_mode: u32,
 }
 @group(1) @binding(14) var<uniform> solari_view: SolariView;
 // Environment map (sky), sampled in the ray direction on a miss. Bound to the
@@ -123,5 +125,165 @@ struct SolariView {
 // First-hit distance of the specular reflection ray (specular-GI pass writes,
 // the DLSS guide resolve reads; `RAY_T_MAX` = environment miss).
 @group(1) @binding(18) var specular_hit_distance: texture_storage_2d<r32float, read_write>;
+// ── ReGIR world-space light grid ─────────────────────────────────────────────
+//
+// A spatial hash of cells (same scheme as the GI world cache: quantized world
+// position + distance LOD, PCG key + IQ checksum, linear probing). Each LIVE
+// cell holds `REGIR_ENTRIES_PER_CELL` light samples, RIS-selected from the
+// uniform tile pool with a distance-to-cell target — so a pixel's initial DI
+// candidates draw from lights that matter NEAR its surface point. With many
+// thousands of small local lights, uniform tiles alone starve every pixel of
+// its dominant light (present in a given tile with probability lights/pool),
+// and the reservoir's rare huge-weight catches render as morphing bright
+// spots.
+//
+// Flow per frame: `regir_decay` (age cells, free the dead) → `regir_fill`
+// (refill live cells) → `initial_and_temporal` queries (insert + mark; a cell
+// inserted this frame serves candidates from NEXT frame — callers fall back
+// to the uniform tiles while it's cold).
+@group(1) @binding(19) var<storage, read_write> regir_checksums: array<atomic<u32>>;
+@group(1) @binding(20) var<storage, read_write> regir_life: array<atomic<u32>>;
+// Per-cell RIS target point: `xyz` = cell center, `w` = cell size.
+@group(1) @binding(21) var<storage, read_write> regir_cell_data: array<vec4<f32>>;
+@group(1) @binding(22) var<storage, read_write> regir_samples: array<LightTileSample>;
+
+/// Hash-table cell count (power of two). Keep in sync with `prepare.rs`.
+const REGIR_TABLE_SIZE = 65536u;
+/// Light samples per cell. Keep in sync with `prepare.rs`. Sized against
+/// intra-cell correlation: pixels in a cell draw from the same entries, so
+/// too few entries strobe the whole cell in unison.
+const REGIR_ENTRIES_PER_CELL = 32u;
+/// Cell edge length at the closest LOD, in world units.
+const REGIR_BASE_CELL_SIZE = 0.25;
+/// How fast cells grow with distance to the camera.
+const REGIR_LOD_SCALE = 15.0;
+/// Frames a cell lives without being queried.
+const REGIR_CELL_LIFETIME = 10u;
+/// Linear-probe attempts after a hash collision.
+const REGIR_MAX_SEARCH_STEPS = 3u;
+/// "No cell" sentinel returned by [`regir_query`].
+const REGIR_CELL_NONE = 0xFFFFFFFFu;
+
+fn regir_pcg_hash(input: u32) -> u32 {
+    let state = input * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+fn regir_iqint_hash(input: u32) -> u32 {
+    let n = (input << 13u) ^ input;
+    return n * (n * n * 15731u + 789221u) + 1376312589u;
+}
+
+/// Stochastically-rounded distance LOD (cube-fract bias toward the finer
+/// level, like the world cache) — returns the cell size for this lookup.
+fn regir_cell_size(world_position: vec3<f32>, view_position: vec3<f32>, rng: ptr<function, u32>) -> f32 {
+    let camera_distance = distance(view_position, world_position) / REGIR_LOD_SCALE;
+    let lod_f = log2(1.0 + camera_distance);
+    let lod_fract = fract(lod_f);
+    let lod = floor(lod_f) + select(0.0, 1.0, rand_f(rng) < lod_fract * lod_fract * lod_fract);
+    return REGIR_BASE_CELL_SIZE * exp2(lod);
+}
+
+/// The live cell index for this surface point, inserting + marking it on the
+/// way. Returns `REGIR_CELL_NONE` when the cell is cold (inserted this frame,
+/// or probing failed) — the caller falls back to the uniform light tiles. The
+/// query point is jittered in the surface's tangent plane by half a cell so
+/// the grid structure doesn't imprint on the lighting.
+fn regir_query(world_position_in: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, rng: ptr<function, u32>) -> u32 {
+    var world_position = world_position_in;
+    var cell_size = regir_cell_size(world_position, view_position, rng);
+
+    // https://tomclabault.github.io/blog/2025/regir (tangent-plane jitter)
+    let tangent = normalize(select(
+        vec3(0.0, -world_normal.z, world_normal.y),
+        vec3(-world_normal.y, world_normal.x, 0.0),
+        abs(world_normal.x) > abs(world_normal.z),
+    ));
+    let bitangent = cross(world_normal, tangent);
+    let offset = (rand_vec2f(rng) * 2.0 - 1.0) * cell_size * 0.5;
+    world_position += offset.x * tangent + offset.y * bitangent;
+    cell_size = regir_cell_size(world_position, view_position, rng);
+
+    let quantized = vec3<u32>(bitcast<vec3<u32>>(floor(world_position / cell_size + 0.0001)));
+    // The LOD is part of the cell identity: the same integer coords at two
+    // cell sizes are different regions of space.
+    let lod_bits = bitcast<u32>(cell_size);
+
+    var key = regir_pcg_hash(quantized.x);
+    key = regir_pcg_hash(key + quantized.y);
+    key = regir_pcg_hash(key + quantized.z);
+    key = regir_pcg_hash(key + lod_bits);
+    key = key & (REGIR_TABLE_SIZE - 1u);
+
+    var checksum = regir_iqint_hash(quantized.x);
+    checksum = regir_iqint_hash(checksum + quantized.y);
+    checksum = regir_iqint_hash(checksum + quantized.z);
+    checksum = regir_iqint_hash(checksum + lod_bits);
+    checksum = max(checksum, 1u); // 0 marks an empty slot
+
+    for (var i = 0u; i < REGIR_MAX_SEARCH_STEPS; i += 1u) {
+        let existing = atomicCompareExchangeWeak(&regir_checksums[key], 0u, checksum).old_value;
+        if existing == checksum {
+            atomicStore(&regir_life[key], REGIR_CELL_LIFETIME);
+            return key;
+        }
+        if existing == 0u {
+            // Claimed an empty slot: record the RIS target point. Racing
+            // inserters of the same cell write identical values. Cold until
+            // the fill pass runs next frame.
+            atomicStore(&regir_life[key], REGIR_CELL_LIFETIME);
+            let center = (floor(world_position / cell_size + 0.0001) + 0.5) * cell_size;
+            regir_cell_data[key] = vec4(center, cell_size);
+            return REGIR_CELL_NONE;
+        }
+        key = (key + 1u) & (REGIR_TABLE_SIZE - 1u);
+    }
+    return REGIR_CELL_NONE;
+}
 // Per-frame scalars come from `view` — `view.frame_count` seeds the RNG, so no
 // push-constant block is needed.
+
+/// Read-only probe: the live cell index for this surface point, WITHOUT
+/// inserting or marking it (the `restir_debug` cell view must not perturb the
+/// grid it's visualizing). Same jittered quantization as [`regir_query`].
+fn regir_find(world_position_in: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, rng: ptr<function, u32>) -> u32 {
+    var world_position = world_position_in;
+    var cell_size = regir_cell_size(world_position, view_position, rng);
+    let tangent = normalize(select(
+        vec3(0.0, -world_normal.z, world_normal.y),
+        vec3(-world_normal.y, world_normal.x, 0.0),
+        abs(world_normal.x) > abs(world_normal.z),
+    ));
+    let bitangent = cross(world_normal, tangent);
+    let offset = (rand_vec2f(rng) * 2.0 - 1.0) * cell_size * 0.5;
+    world_position += offset.x * tangent + offset.y * bitangent;
+    cell_size = regir_cell_size(world_position, view_position, rng);
+
+    let quantized = vec3<u32>(bitcast<vec3<u32>>(floor(world_position / cell_size + 0.0001)));
+    let lod_bits = bitcast<u32>(cell_size);
+
+    var key = regir_pcg_hash(quantized.x);
+    key = regir_pcg_hash(key + quantized.y);
+    key = regir_pcg_hash(key + quantized.z);
+    key = regir_pcg_hash(key + lod_bits);
+    key = key & (REGIR_TABLE_SIZE - 1u);
+
+    var checksum = regir_iqint_hash(quantized.x);
+    checksum = regir_iqint_hash(checksum + quantized.y);
+    checksum = regir_iqint_hash(checksum + quantized.z);
+    checksum = regir_iqint_hash(checksum + lod_bits);
+    checksum = max(checksum, 1u);
+
+    for (var i = 0u; i < REGIR_MAX_SEARCH_STEPS; i += 1u) {
+        let existing = atomicLoad(&regir_checksums[key]);
+        if existing == checksum {
+            return key;
+        }
+        if existing == 0u {
+            return REGIR_CELL_NONE;
+        }
+        key = (key + 1u) & (REGIR_TABLE_SIZE - 1u);
+    }
+    return REGIR_CELL_NONE;
+}

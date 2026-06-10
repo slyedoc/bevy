@@ -20,12 +20,12 @@ enable wgpu_ray_query;
 // PT reservoir later.
 
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
-#import bevy_solari::pbr::{rand_f, rand_range_u, sample_uniform_hemisphere, uniform_hemisphere_inverse_pdf, sample_disk}
+#import bevy_solari::pbr::{rand_f, rand_u, rand_range_u, sample_uniform_hemisphere, uniform_hemisphere_inverse_pdf, sample_disk}
 #import bevy_render::maths::{PI, orthonormalize}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB, bend_shading_normal}
-#import bevy_solari::sampling::{LightSample, generate_random_light_sample, resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_point_visibility, sample_random_light, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, random_emissive_light_pdf, power_heuristic, isnan, NULL_LIGHT_ID}
+#import bevy_solari::sampling::{LightSample, ResolvedLightSample, generate_random_light_sample, resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_point_visibility, sample_random_light, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, random_emissive_light_pdf, power_heuristic, isnan, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, active_light_list, directional_lights, ResolvedMaterial, LIGHT_SOURCE_KIND_NONE, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
-#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler, specular_hit_distance}
+#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LightTileSample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler, specular_hit_distance, regir_query, regir_find, regir_samples, REGIR_CELL_NONE, REGIR_ENTRIES_PER_CELL}
 
 const INITIAL_SAMPLES = 8u;
 const DI_CONFIDENCE_WEIGHT_CAP = 20.0;
@@ -39,6 +39,13 @@ const SPATIAL_RADIUS_PIXELS = 30.0;
 // lights a reflection ray can't hit) and specular GI zeroes first-bounce
 // emissive to avoid double-counting reflected emissive geometry.
 const SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD = 0.0225;
+// Within this range of a candidate light, the initial-candidate target
+// includes a real visibility trace. At point-blank range an area light
+// self-occludes most of its own surface (a receiver 2 radii from a bulb sees
+// ~25% of it), so an unshadowed target keeps electing occluded points and the
+// light's contribution gates on/off with each frame's pick. The rays are
+// short and only contact-range pixels pay for them.
+const SHADOWED_TARGET_DISTANCE_SQUARED = 1.0;
 
 struct Reservoir {
     light_id: u32,
@@ -116,8 +123,13 @@ fn initial_and_temporal(
     var rng = index + view.frame_count * 5782582u;
     let diffuse_brdf = surface.material.base_color / PI;
 
+    // ReGIR cell for this surface point (inserting + marking it). Cold cell
+    // (just inserted / probe failed) → the initial candidates fall back to
+    // the workgroup's uniform tile.
+    let regir_cell = regir_query(surface.world_position, surface.world_normal, view.world_position, &rng);
+
     // Direct (DI).
-    let di_initial = generate_initial_reservoir(tile_start, surface.world_position, surface.world_normal, diffuse_brdf, &rng);
+    let di_initial = generate_initial_reservoir(tile_start, regir_cell, surface.world_position, surface.world_normal, diffuse_brdf, &rng);
     let di_temporal = load_temporal_reservoir(pixel, surface.world_position, surface.world_normal);
     let di_merged = merge_reservoirs(di_initial, di_temporal, surface.world_position, surface.world_normal, diffuse_brdf, &rng);
     store_reservoir_b(pixel, di_merged.reservoir);
@@ -201,6 +213,27 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let F_ab = F_AB(surface.material.perceptual_roughness, NdotV);
 
     var radiance = surface.material.emissive;
+
+    // Directional lights (the sun) are shaded deterministically every frame —
+    // one cone sample + shadow ray each — OUTSIDE the reservoir. A reservoir
+    // holds one light sample per pixel; making the sun compete with a nearby
+    // emissive for that slot patchworks the screen into per-light winners,
+    // which reuse correlates into morphing light blobs. The light tiles feed
+    // the reservoir emissive samples only.
+    let emissive_count = active_light_list[0];
+    let directional_count = active_light_list[1];
+    for (var i = 0u; i < directional_count; i = i + 1u) {
+        let slot = active_light_list[2u + emissive_count + i];
+        let light_sample = LightSample(slot << 16u, rand_u(&rng));
+        let resolved = resolve_light_sample(light_sample, light_sources[slot]);
+        let contribution = calculate_resolved_light_contribution(resolved, surface.world_position, surface.world_normal);
+        let visibility = trace_light_visibility(surface.world_position + surface.world_normal * RAY_T_MIN, resolved.world_position);
+        var brdf = evaluate_diffuse_brdf(wo, contribution.wi, shading_normal, surface.material, F_ab);
+        if surface.material.roughness > SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD {
+            brdf += evaluate_specular_brdf(wo, contribution.wi, shading_normal, surface.material, F_ab);
+        }
+        radiance += contribution.radiance * resolved.inverse_pdf * visibility * brdf;
+    }
 
     // Direct lighting from the DI reservoir (final visibility traced once).
     // Diffuse always; specular NEE too unless the surface is near-mirror, where
@@ -432,31 +465,66 @@ fn find_spatial_neighbor(center_pixel: vec2<u32>, surface: Surface, rng: ptr<fun
 
 // --------------------------------------------------------------------- DI
 
-// WRS over INITIAL_SAMPLES candidates drawn from one presampled light tile.
-// The tile entry carries both the resolved payload (for the target function —
-// its packed radiance is slightly lossy, which is fine: the UCW divides by the
-// same lossy target) and the `LightSample` identity the reservoir stores for
-// exact re-resolution at merge/shade time.
-fn generate_initial_reservoir(tile_start: u32, world_position: vec3<f32>, world_normal: vec3<f32>, diffuse_brdf: vec3<f32>, rng: ptr<function, u32>) -> Reservoir {
+// WRS over INITIAL_SAMPLES candidates drawn from the surface point's ReGIR
+// cell (LIGHTS pre-selected for proximity; a fresh point is sampled per
+// candidate — see the cell branch), or from one presampled light tile while
+// the cell is cold (tile entries are points, used as-is). The selected
+// `LightSample` identity is what the reservoir stores for exact re-resolution
+// at merge/shade time. Note the cell path re-resolves the light per candidate
+// (a cluster walk for the picked triangle) — cheap for lamp-sized emissive
+// meshes; a scene with huge emissive meshes would want this bounded.
+fn generate_initial_reservoir(tile_start: u32, regir_cell: u32, world_position: vec3<f32>, world_normal: vec3<f32>, diffuse_brdf: vec3<f32>, rng: ptr<function, u32>) -> Reservoir {
     var reservoir = empty_reservoir();
     var weight_sum = 0.0;
     var reservoir_target_function = 0.0;
     let mis_weight = 1.0 / f32(INITIAL_SAMPLES);
 
     for (var i = 0u; i < INITIAL_SAMPLES; i++) {
-        let entry = light_tiles[tile_start + rand_range_u(LIGHT_TILE_SAMPLES_PER_BLOCK, rng)];
-        if entry.light_id == NULL_LIGHT_ID {
-            continue;
+        var candidate_light_id: u32;
+        var candidate_seed: u32;
+        var resolved: ResolvedLightSample;
+        if regir_cell != REGIR_CELL_NONE {
+            // The cell entry selects a LIGHT (light-space contribution weight);
+            // sample a FRESH point on it for this pixel. Pinning the entry's
+            // stored point would correlate every receiver in the cell onto one
+            // spot of the emitter — the lamp's illumination (and the shadows
+            // it casts) would swing direction with each frame's entry roll
+            // instead of resolving the penumbra spatially across pixels.
+            let entry = regir_samples[regir_cell * REGIR_ENTRIES_PER_CELL + rand_range_u(REGIR_ENTRIES_PER_CELL, rng)];
+            if entry.light_id == NULL_LIGHT_ID {
+                continue;
+            }
+            let slot = entry.light_id >> 16u;
+            let light_source = light_sources[slot];
+            let triangle_id = rand_range_u(light_source.kind >> 1u, rng);
+            candidate_light_id = (slot << 16u) | triangle_id;
+            candidate_seed = rand_u(rng);
+            resolved = resolve_light_sample(LightSample(candidate_light_id, candidate_seed), light_source);
+            // light weight × fresh point's area inverse-pdf
+            resolved.inverse_pdf *= entry.inverse_pdf;
+        } else {
+            let entry = light_tiles[tile_start + rand_range_u(LIGHT_TILE_SAMPLES_PER_BLOCK, rng)];
+            if entry.light_id == NULL_LIGHT_ID {
+                continue;
+            }
+            candidate_light_id = entry.light_id;
+            candidate_seed = entry.seed;
+            resolved = unpack_light_tile_sample(entry);
         }
-        let resolved = unpack_light_tile_sample(entry);
         let contribution = calculate_resolved_light_contribution(resolved, world_position, world_normal);
-        let target_function = luminance(contribution.radiance * diffuse_brdf * saturate(dot(contribution.wi, world_normal)));
+        var target_function = luminance(contribution.radiance * diffuse_brdf * saturate(dot(contribution.wi, world_normal)));
+        // Shadowed target at contact range (see SHADOWED_TARGET_DISTANCE_SQUARED).
+        // Valid RIS: the contribution weight divides by this same target.
+        let to_light = resolved.world_position.xyz - world_position;
+        if target_function > 0.0 && dot(to_light, to_light) < SHADOWED_TARGET_DISTANCE_SQUARED {
+            target_function *= trace_light_visibility(world_position + world_normal * RAY_T_MIN, resolved.world_position);
+        }
         let resampling_weight = mis_weight * (target_function * contribution.inverse_pdf);
 
         weight_sum += resampling_weight;
         if rand_f(rng) < resampling_weight / weight_sum {
-            reservoir.light_id = entry.light_id;
-            reservoir.seed = entry.seed;
+            reservoir.light_id = candidate_light_id;
+            reservoir.seed = candidate_seed;
             reservoir_target_function = target_function;
         }
     }
@@ -481,6 +549,24 @@ fn load_temporal_reservoir(pixel: vec2<u32>, world_position: vec3<f32>, world_no
     // reuse can briefly misattribute history to the new occupant — bounded by
     // the confidence cap.)
     reservoir.confidence_weight = min(reservoir.confidence_weight, DI_CONFIDENCE_WEIGHT_CAP);
+
+    // Visibility recheck (one shadow ray): the merge's target function is
+    // unshadowed, so an occluded history sample would keep winning merges on
+    // pure intensity and smear a bright spot for its whole confidence
+    // lifetime. Discarding it here lets this frame's initial candidates take
+    // the pixel immediately.
+    if reservoir_valid(reservoir) {
+        let light_source = light_sources[reservoir.light_id >> 16u];
+        if light_source.kind == LIGHT_SOURCE_KIND_NONE {
+            return empty_reservoir();
+        }
+        let sample = LightSample(reservoir.light_id, reservoir.seed);
+        let resolved = resolve_light_sample(sample, light_source);
+        let visibility = trace_light_visibility(world_position + world_normal * RAY_T_MIN, resolved.world_position);
+        if visibility == 0.0 {
+            return empty_reservoir();
+        }
+    }
     return reservoir;
 }
 
@@ -691,7 +777,12 @@ fn load_surface(pixel: vec2<u32>) -> Surface {
 
 fn surface_similar(p0: vec3<f32>, n0: vec3<f32>, p1: vec3<f32>, n1: vec3<f32>) -> bool {
     let camera_distance = length(view.world_position - p0);
-    if length(p0 - p1) > 0.01 * camera_distance {
+    // Plane distance, not point distance: a translating surface (a moving
+    // car, the road sliding under it) stays within its own tangent plane, so
+    // its history survives — while a depth disocclusion still rejects. A
+    // point-distance test invalidates movers every frame, which strobes their
+    // lighting and leaves denoiser afterimages where they were.
+    if abs(dot(p0 - p1, n1)) > 0.01 * camera_distance {
         return false;
     }
     return dot(n0, n1) > 0.9;
@@ -744,4 +835,72 @@ fn store_reservoir_a(pixel: vec2<u32>, reservoir: Reservoir) {
 
 fn store_reservoir_b(pixel: vec2<u32>, reservoir: Reservoir) {
     reservoir_b[reservoir_index(pixel)] = pack_reservoir(reservoir);
+}
+
+// ------------------------------------------------------------------ debug view
+//
+// Reservoir / ReGIR visualizations (`SolariDebugView::{DiWeight, DiConfidence,
+// DiLight, RegirCells}`). Dispatched by the restir node after compose when
+// `solari_view.debug_mode != 0` — these read buffers only this bind group
+// sees, so they can't live in the generic overlay pass.
+
+fn debug_hash_color(id: u32) -> vec3<f32> {
+    let h = id * 747796405u + 2891336453u;
+    return vec3(
+        f32((h >> 0u) & 1023u),
+        f32((h >> 10u) & 1023u),
+        f32((h >> 20u) & 1023u),
+    ) / 1023.0;
+}
+
+/// Blue → green → red heat ramp over `x` in [0, 1].
+fn debug_heat(x: f32) -> vec3<f32> {
+    let t = clamp(x, 0.0, 1.0);
+    return vec3(smoothstep(0.5, 1.0, t), 1.0 - abs(t - 0.5) * 2.0, 1.0 - smoothstep(0.0, 0.5, t));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn restir_debug(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    if any(global_id.xy >= vec2u(view.main_pass_viewport.zw)) {
+        return;
+    }
+    let pixel = global_id.xy;
+
+    let surface = load_surface(pixel);
+    if !surface.valid {
+        textureStore(view_output, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    var color = vec3(0.0);
+    let reservoir = load_reservoir_a(pixel);
+    switch solari_view.debug_mode {
+        case 1u: { // DI contribution weight: log heat; NaN = magenta, invalid = black.
+            let w = reservoir.unbiased_contribution_weight;
+            if isnan(w) {
+                color = vec3(1.0, 0.0, 1.0);
+            } else if reservoir_valid(reservoir) {
+                color = debug_heat(log2(1.0 + w) / 16.0);
+            }
+        }
+        case 2u: { // DI confidence (M) over its cap.
+            color = vec3(reservoir.confidence_weight / DI_CONFIDENCE_WEIGHT_CAP);
+        }
+        case 3u: { // DI light identity (stable slot), hashed.
+            if reservoir_valid(reservoir) {
+                color = debug_hash_color(reservoir.light_id >> 16u);
+            }
+        }
+        case 4u: { // ReGIR cell, hashed; red = cold/none.
+            var rng = reservoir_index(pixel) + view.frame_count * 5782582u;
+            let cell = regir_find(surface.world_position, surface.world_normal, view.world_position, &rng);
+            if cell == REGIR_CELL_NONE {
+                color = vec3(1.0, 0.0, 0.0);
+            } else {
+                color = debug_hash_color(cell);
+            }
+        }
+        default: {}
+    }
+    textureStore(view_output, pixel, vec4(color, 1.0));
 }

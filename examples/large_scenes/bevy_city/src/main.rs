@@ -39,6 +39,8 @@ use bevy::{
     transform::systems::{propagate_transforms_for, sync_simple_transforms},
 };
 
+use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+
 use crate::generate_city::{spawn_city, LampAssets};
 use crate::{
     assets::{merge_car_meshes, strip_base_url},
@@ -162,6 +164,7 @@ fn main() {
             Update,
             (
                 simulate_cars,
+                burst_screenshots,
                 settings::update_city_info,
                 update_loading_screen,
                 process_assets.run_if(on_message::<CityAssetsLoaded>),
@@ -543,6 +546,35 @@ fn signal_capture_ready(
     } else {
         ready.last_count = count;
         ready.stable_frames = 0;
+    }
+}
+
+/// F10: capture 10 consecutive frames to `/tmp/bevy_city_burst/` — for
+/// diffing temporal stability of a fixed view.
+#[derive(Resource, Default)]
+struct BurstCapture {
+    remaining: u32,
+    index: u32,
+}
+
+fn burst_screenshots(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut burst: Local<BurstCapture>,
+    mut commands: Commands,
+) {
+    if keys.just_pressed(KeyCode::F10) {
+        let _ = std::fs::create_dir_all("/tmp/bevy_city_burst");
+        burst.remaining = 10;
+        burst.index = 0;
+        info!("burst capture: 10 frames -> /tmp/bevy_city_burst/");
+    }
+    if burst.remaining > 0 {
+        burst.remaining -= 1;
+        let path = format!("/tmp/bevy_city_burst/frame_{:02}.png", burst.index);
+        burst.index += 1;
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
     }
 }
 

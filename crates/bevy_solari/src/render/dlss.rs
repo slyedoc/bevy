@@ -73,6 +73,10 @@ pub struct RestirDlssSdk(pub Arc<Mutex<DlssSdk>>);
 /// dropdown on it.
 #[derive(Resource, ExtractResource, Display, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SolariDlssMode {
+    /// DLSS bypassed entirely: raw restir output, Halton jitter — the
+    /// debugging baseline for "is the denoiser causing this".
+    #[display("off")]
+    Off,
     /// Native-resolution denoise + anti-aliasing, no upscaling.
     #[default]
     #[display("dlaa")]
@@ -90,6 +94,7 @@ pub enum SolariDlssMode {
 impl SolariDlssMode {
     /// Every mode, in dropdown order.
     pub const ALL: &'static [SolariDlssMode] = &[
+        Self::Off,
         Self::Dlaa,
         Self::Quality,
         Self::Balanced,
@@ -99,7 +104,7 @@ impl SolariDlssMode {
 
     fn perf_quality_mode(self) -> DlssPerfQualityMode {
         match self {
-            Self::Dlaa => DlssPerfQualityMode::Dlaa,
+            Self::Off | Self::Dlaa => DlssPerfQualityMode::Dlaa,
             Self::Quality => DlssPerfQualityMode::Quality,
             Self::Balanced => DlssPerfQualityMode::Balanced,
             Self::Performance => DlssPerfQualityMode::Performance,
@@ -197,6 +202,21 @@ pub fn prepare_restir_dlss(
     let Some(sdk) = sdk else {
         return;
     };
+
+    // Off: tear down the per-view DLSS state so the restir output presents
+    // raw (the Halton jitter from `prepare_restir_jitter` stays in effect).
+    if *mode == SolariDlssMode::Off {
+        for (entity, _, _, dlss_context) in &mut query {
+            if dlss_context.is_some() {
+                commands.entity(entity).remove::<(
+                    RestirDlssContext,
+                    ViewRestirDlssTextures,
+                    MainPassResolutionOverride,
+                )>();
+            }
+        }
+        return;
+    }
 
     // Linear depth (we have no hardware depth), so no `InvertedDepth`. HDR
     // because the color is linear Rgba16Float; auto-exposure since we don't feed
