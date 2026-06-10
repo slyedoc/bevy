@@ -3,7 +3,7 @@ enable wgpu_ray_query;
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
 #import bevy_solari::pbr::{rand_f, rand_vec2f}
 #import bevy_render::view::View
-#import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, view_facing_normal}
+#import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic}
 #import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, directional_lights, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 #import bevy_solari::atmosphere::{Atmosphere, atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
@@ -71,7 +71,7 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let wo = -ray_direction;
             // Bend the smooth shading normal into the view hemisphere so silhouette
             // edges (where the interpolated normal dips past 90°) don't black out.
-            let world_normal = view_facing_normal(ray_hit.world_normal, wo);
+            let world_normal = bend_shading_normal(ray_hit.world_normal, wo);
             let NdotV = max(dot(world_normal, wo), 0.0001);
             let F_ab = F_AB(ray_hit.material.perceptual_roughness, NdotV);
 
@@ -206,6 +206,14 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Camera exposure
     radiance *= view.exposure;
+
+    // Safety net: a single non-finite sample (NaN/inf that slipped past the
+    // sampling guards) would poison the running average permanently — drop
+    // this pixel's sample for the frame instead.
+    if any((bitcast<vec3<u32>>(radiance) & vec3(0x7fffffffu)) >= vec3(0x7f800000u)) {
+        textureStore(view_output, global_id.xy, vec4(old_color.rgb, 1.0));
+        return;
+    }
 
     // Accumulation over time via running average
     let new_color = mix(old_color.rgb, radiance, 1.0 / (old_color.a + 1.0));

@@ -1,18 +1,14 @@
-//! Experimental full-RT ReSTIR path tracer.
+//! The realtime full-RT render path: ReSTIR DI + GI, plus the reference
+//! pathtracer, atmosphere, debug overlays, and the gizmo depth bridge.
 //!
-//! A self-contained realtime path: its own primary-visibility pass writes a
-//! lean PT G-buffer, light-tile presampling feeds a unified-path-reservoir
-//! ReSTIR loop (initial+temporal → spatial+shade) over the shared
-//! [`RaytracingSceneBindings`](crate::bindings::RaytracingSceneBindings)
-//! scene, and a compose pass writes the final color. No world cache, no
-//! deferred prepass — everything is raytraced.
-//!
-//! Modeled on [`crate::realtime`]'s multi-pass single-compute-pass dispatch
-//! and [`crate::pathtracer`]'s extract/prepare cleanliness. Intended to
-//! eventually replace [`crate::realtime`].
-//!
-//! Not added by [`SolariPlugins`](crate::SolariPlugins) — add [`RestirPlugin`]
-//! manually.
+//! The ReSTIR path is self-contained: its own primary-visibility pass writes a
+//! lean PT G-buffer, light-tile presampling feeds the per-pixel ReSTIR loop
+//! (initial+temporal → spatial+shade, DI + one-bounce GI reservoirs) over the
+//! shared [`RaytracingSceneBindings`](crate::bindings::RaytracingSceneBindings)
+//! scene, a BRDF-sampled specular-GI pass adds glossy indirect, and a compose
+//! pass applies exposure. No world cache, no deferred prepass — everything is
+//! raytraced. Which path renders is selected globally via
+//! [`SolariViewState`](view::SolariViewState).
 
 
 pub mod pathtracer;

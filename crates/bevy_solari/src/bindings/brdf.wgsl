@@ -159,19 +159,20 @@ fn fresnel(f0: vec3<f32>, LdotH: f32) -> vec3<f32> {
     return f0 + (1.0 - f0) * pow(1.0 - LdotH, 5.0);
 }
 
-// Shading-normal adaptation. Smooth (interpolated) shading normals tilt past the
-// view horizon at silhouette edges, making `NdotV < 0` so every BRDF term zeroes
-// out and the edge renders black (only emissive survives). Bend the shading
-// normal the minimum amount needed to bring it just into the view hemisphere
-// (`NdotV ≈ eps`); interior shading, where `NdotV` is already positive, is left
-// untouched. `wo` is the (normalized) direction toward the viewer.
-fn view_facing_normal(world_normal: vec3<f32>, wo: vec3<f32>) -> vec3<f32> {
+// Shading-normal adaptation (cf. Schüssler 2017). Smooth (interpolated)
+// shading normals tilt past the view horizon at silhouette edges, making
+// `NdotV < 0` so every BRDF term zeroes out and the edge renders black (only
+// emissive survives). Bend the shading normal the minimum amount needed to
+// bring it just into the view hemisphere (`NdotV ≈ eps`); interior shading,
+// where `NdotV` is already positive, is left untouched. `wo` is the
+// (normalized) direction toward the viewer.
+fn bend_shading_normal(shading_normal: vec3<f32>, wo: vec3<f32>) -> vec3<f32> {
     let eps = 1e-3;
-    let NdotV = dot(world_normal, wo);
+    let NdotV = dot(shading_normal, wo);
     if NdotV >= eps {
-        return world_normal;
+        return shading_normal;
     }
-    return normalize(world_normal + (eps - NdotV) * wo);
+    return normalize(shading_normal + (eps - NdotV) * wo);
 }
 
 // Scale/bias approximation

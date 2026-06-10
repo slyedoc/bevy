@@ -118,22 +118,73 @@ struct GenerateRandomLightSampleResult {
     resolved_light_sample: ResolvedLightSample,
 }
 
+/// Number of emissive-mesh entries in `light_sources`. The scene binder
+/// appends the (few) directional lights at the END of the list, so peeling
+/// directionals off the tail counts both strata.
+fn emissive_light_count() -> u32 {
+    var n = arrayLength(&light_sources);
+    while n > 0u && light_sources[n - 1u].kind == LIGHT_SOURCE_KIND_DIRECTIONAL {
+        n -= 1u;
+    }
+    return n;
+}
+
 fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rng: ptr<function, u32>) -> LightContribution {
     let sample = generate_random_light_sample(rng);
+    if sample.light_sample.light_id == NULL_LIGHT_ID {
+        return LightContribution(vec3(0.0), 0.0, vec3(0.0, 1.0, 0.0), false);
+    }
     var light_contribution = calculate_resolved_light_contribution(sample.resolved_light_sample, ray_origin, origin_world_normal);
     light_contribution.radiance *= trace_light_visibility(ray_origin, sample.resolved_light_sample.world_position);
     return light_contribution;
 }
 
+/// The pdf with which [`sample_random_light`] would have generated a sample on
+/// this emissive hit — the BSDF-vs-NEE MIS counterpart. Must mirror the
+/// stratified pick above exactly.
 fn random_emissive_light_pdf(hit: ResolvedRayHitFull) -> f32 {
-    let light_count = arrayLength(&light_sources);
-    return 1.0 / (f32(light_count) * f32(hit.triangle_count) * hit.triangle_area);
+    let emissive_count = emissive_light_count();
+    let directional_count = arrayLength(&light_sources) - emissive_count;
+    let stratum_probability = select(1.0, 0.5, directional_count > 0u);
+    return stratum_probability / (f32(emissive_count) * f32(hit.triangle_count) * hit.triangle_area);
 }
 
+/// One stratified random light sample: pick the directional stratum (the sun)
+/// or the emissive stratum with probability ½ each (when both exist), then
+/// uniformly within the stratum; `inverse_pdf` carries the full pick pdf.
+///
+/// A single uniform pick over ALL sources samples the sun only 1/total of the
+/// time at total× weight — with thousands of emissives that's firefly variance
+/// on every sunlit surface (and a progressive accumulator keeps each outlier
+/// visible for thousands of frames). Stratifying also keeps the sun present in
+/// every presampled light tile. [`random_emissive_light_pdf`] is the MIS
+/// counterpart and must mirror this pick exactly.
+///
+/// Returns a `NULL_LIGHT_ID` sample (zero radiance) when the scene has no
+/// lights at all.
 fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightSampleResult {
-    let light_count = arrayLength(&light_sources);
-    let light_id = rand_range_u(light_count, rng);
+    let total = arrayLength(&light_sources);
+    let emissive_count = emissive_light_count();
+    let directional_count = total - emissive_count;
 
+    var stratum_base = 0u;
+    var stratum_count = emissive_count;
+    var stratum_probability = 1.0;
+    if directional_count > 0u && emissive_count > 0u {
+        stratum_probability = 0.5;
+        if rand_f(rng) < 0.5 {
+            stratum_base = emissive_count;
+            stratum_count = directional_count;
+        }
+    } else if directional_count > 0u {
+        stratum_base = emissive_count;
+        stratum_count = directional_count;
+    } else if emissive_count == 0u {
+        let null_resolved = ResolvedLightSample(vec4(0.0, 1.0, 0.0, 0.0), vec3(0.0, -1.0, 0.0), vec3(0.0), 0.0);
+        return GenerateRandomLightSampleResult(LightSample(NULL_LIGHT_ID, 0u), null_resolved);
+    }
+
+    let light_id = stratum_base + rand_range_u(stratum_count, rng);
     let light_source = light_sources[light_id];
 
     var triangle_id = 0u;
@@ -146,7 +197,7 @@ fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightS
     let light_sample = LightSample((light_id << 16u) | triangle_id, seed);
 
     var resolved_light_sample = resolve_light_sample(light_sample, light_source);
-    resolved_light_sample.inverse_pdf *= f32(light_count);
+    resolved_light_sample.inverse_pdf *= f32(stratum_count) / stratum_probability;
 
     return GenerateRandomLightSampleResult(light_sample, resolved_light_sample);
 }
@@ -221,7 +272,11 @@ fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) ->
 
 fn calculate_resolved_light_contribution(resolved_light_sample: ResolvedLightSample, ray_origin: vec3<f32>, origin_world_normal: vec3<f32>) -> LightContribution {
     let ray = resolved_light_sample.world_position.xyz - (resolved_light_sample.world_position.w * ray_origin);
-    let light_distance = length(ray);
+    // Clamp the inverse-square at contact range: a sample point numerically on
+    // the receiver explodes `1/d²` to inf, and `inf × 0` from the visibility
+    // trace (which returns 0 inside `RAY_T_MIN`) is NaN — one NaN permanently
+    // poisons a progressive accumulator's running average.
+    let light_distance = max(length(ray), RAY_T_MIN);
     let wi = ray / light_distance;
 
     let cos_theta_light = saturate(dot(-wi, resolved_light_sample.world_normal));

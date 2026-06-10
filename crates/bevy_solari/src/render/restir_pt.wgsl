@@ -8,10 +8,10 @@ enable wgpu_ray_query;
 //   the current world position is projected with the previous-frame clip matrix
 //   and validated against the previous-frame G-buffer. Results → the `_b`
 //   (intermediate) reservoir buffers.
-// `spatial_and_shade`: shade direct (DI reservoir, one final visibility ray) +
+// `spatial_and_shade`: merge one validated spatial neighbour into both
+//   reservoirs, shade direct (DI reservoir, one final visibility ray) +
 //   indirect (GI reservoir, one visibility ray to the reconnection vertex),
-//   sum → view_output, and persist `_b` → `_a` as next frame's history.
-//   Spatial reuse is still a no-op (3c).
+//   sum → view_output, and persist the result as next frame's history (`_a`).
 //
 // DI: light samples are world-space → no shift/Jacobian. GI: the reconnection
 // vertex needs a geometry Jacobian on reuse. Both use confidence-weighted
@@ -20,12 +20,12 @@ enable wgpu_ray_query;
 // PT reservoir later.
 
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
-#import bevy_solari::pbr::{rand_f, sample_uniform_hemisphere, uniform_hemisphere_inverse_pdf, sample_disk}
+#import bevy_solari::pbr::{rand_f, rand_range_u, sample_uniform_hemisphere, uniform_hemisphere_inverse_pdf, sample_disk}
 #import bevy_render::maths::{PI, orthonormalize}
-#import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB}
+#import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB, bend_shading_normal}
 #import bevy_solari::sampling::{LightSample, generate_random_light_sample, resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_point_visibility, sample_random_light, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, random_emissive_light_pdf, power_heuristic, isnan, NULL_LIGHT_ID}
-#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, ResolvedMaterial, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
-#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view}
+#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, directional_lights, ResolvedMaterial, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler}
 
 const INITIAL_SAMPLES = 8u;
 const DI_CONFIDENCE_WEIGHT_CAP = 20.0;
@@ -89,13 +89,22 @@ struct GiMergeResult {
 // ---------------------------------------------------------------- entry points
 
 @compute @workgroup_size(8, 8, 1)
-fn initial_and_temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn initial_and_temporal(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+) {
     set_view_cull_mask(solari_view.cull_mask.x);
     if any(global_id.xy >= vec2u(view.main_pass_viewport.zw)) {
         return;
     }
     let pixel = global_id.xy;
     let index = reservoir_index(pixel);
+
+    // Workgroup-uniform tile pick: all 64 threads draw their initial
+    // candidates from the same 1024-entry tile, so the pool reads stay
+    // coherent across the workgroup.
+    var workgroup_rng = (workgroup_id.x * 7919u + workgroup_id.y) + view.frame_count * 5782582u;
+    let tile_start = rand_range_u(LIGHT_TILE_BLOCKS, &workgroup_rng) * LIGHT_TILE_SAMPLES_PER_BLOCK;
 
     let surface = load_surface(pixel);
     if !surface.valid {
@@ -108,7 +117,7 @@ fn initial_and_temporal(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let diffuse_brdf = surface.material.base_color / PI;
 
     // Direct (DI).
-    let di_initial = generate_initial_reservoir(surface.world_position, surface.world_normal, diffuse_brdf, &rng);
+    let di_initial = generate_initial_reservoir(tile_start, surface.world_position, surface.world_normal, diffuse_brdf, &rng);
     let di_temporal = load_temporal_reservoir(pixel, surface.world_position, surface.world_normal);
     let di_merged = merge_reservoirs(di_initial, di_temporal, surface.world_position, surface.world_normal, diffuse_brdf, &rng);
     store_reservoir_b(pixel, di_merged.reservoir);
@@ -133,7 +142,26 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if !surface.valid {
         store_reservoir_a(pixel, empty_reservoir());
         gi_reservoir_a[index] = gi_empty();
-        textureStore(view_output, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        // Primary miss: the sky (or the camera clear color) is the background.
+        // Raw radiance — compose applies aerial perspective + exposure; the
+        // clear color is a fixed framebuffer value, so ÷ exposure pre-cancels.
+        let ray_direction = primary_ray_direction(pixel);
+        var background = vec3(0.0);
+        if solari_view.environment_brightness > 0.0 {
+            background = sky_radiance(ray_direction);
+        } else {
+            background = solari_view.clear_color / max(view.exposure, 1e-6);
+        }
+        // Each directional light as a disk of its angular radius — the sky
+        // bake's Mie halo doesn't draw the disk itself.
+        let num_directional = arrayLength(&directional_lights);
+        for (var i = 0u; i < num_directional; i = i + 1u) {
+            let sun = directional_lights[i];
+            if dot(ray_direction, sun.direction_to_light) >= sun.cos_theta_max {
+                background += sun.luminance;
+            }
+        }
+        textureStore(view_output, pixel, vec4(background, 1.0));
         return;
     }
 
@@ -160,7 +188,12 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
     gi_reservoir_a[index] = gi_reservoir;
 
     let wo = normalize(view.world_position - surface.world_position);
-    let NdotV = max(dot(surface.world_normal, wo), 0.0001);
+    // Bend the smooth shading normal into the view hemisphere so silhouette
+    // edges (where the interpolated normal dips past 90°) don't black out.
+    // The raw G-buffer normal stays in `surface` — reuse validation compares
+    // stored normals across pixels/frames, which must stay un-bent.
+    let shading_normal = bend_shading_normal(surface.world_normal, wo);
+    let NdotV = max(dot(shading_normal, wo), 0.0001);
     let F_ab = F_AB(surface.material.perceptual_roughness, NdotV);
 
     var radiance = surface.material.emissive;
@@ -171,9 +204,9 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if reservoir_valid(di_reservoir) {
         let contribution = reservoir_contribution(di_reservoir, surface.world_position, surface.world_normal, diffuse_brdf);
         let visibility = trace_light_visibility(surface.world_position + surface.world_normal * RAY_T_MIN, contribution.world_position);
-        var brdf = evaluate_diffuse_brdf(wo, contribution.wi, surface.world_normal, surface.material, F_ab);
+        var brdf = evaluate_diffuse_brdf(wo, contribution.wi, shading_normal, surface.material, F_ab);
         if surface.material.roughness > SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD {
-            brdf += evaluate_specular_brdf(wo, contribution.wi, surface.world_normal, surface.material, F_ab);
+            brdf += evaluate_specular_brdf(wo, contribution.wi, shading_normal, surface.material, F_ab);
         }
         radiance += contribution.radiance * di_reservoir.unbiased_contribution_weight * visibility * brdf;
     }
@@ -183,7 +216,7 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if gi_reservoir.confidence_weight > 0.0 {
         let wi = normalize(gi_reservoir.sample_point_world_position - surface.world_position);
         let visibility = trace_point_visibility(surface.world_position + surface.world_normal * RAY_T_MIN, gi_reservoir.sample_point_world_position);
-        let brdf = evaluate_diffuse_brdf(wo, wi, surface.world_normal, surface.material, F_ab);
+        let brdf = evaluate_diffuse_brdf(wo, wi, shading_normal, surface.material, F_ab);
         radiance += gi_reservoir.radiance * gi_reservoir.unbiased_contribution_weight * visibility * brdf;
     }
 
@@ -211,9 +244,10 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var rng = reservoir_index(pixel) + view.frame_count * 5782582u + 0x68bc21ebu;
 
     let wo = normalize(view.world_position - surface.world_position);
+    let shading_normal = bend_shading_normal(surface.world_normal, wo);
 
     // Sample the GGX specular lobe in tangent space.
-    let TBN = orthonormalize(surface.world_normal);
+    let TBN = orthonormalize(shading_normal);
     let T = TBN[0];
     let B = TBN[1];
     let N = TBN[2];
@@ -230,9 +264,9 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
         radiance /= pdf;
     }
 
-    let NdotV = max(dot(surface.world_normal, wo), 0.0001);
+    let NdotV = max(dot(shading_normal, wo), 0.0001);
     let F_ab = F_AB(surface.material.perceptual_roughness, NdotV);
-    radiance *= evaluate_specular_brdf(wo, wi, surface.world_normal, surface.material, F_ab);
+    radiance *= evaluate_specular_brdf(wo, wi, shading_normal, surface.material, F_ab);
 
     let existing = textureLoad(view_output, pixel).rgb;
     textureStore(view_output, pixel, vec4(existing + radiance, 1.0));
@@ -251,17 +285,20 @@ fn trace_specular_path(primary_surface: Surface, initial_wi: vec3<f32>, initial_
     for (var i = 0u; i < 3u; i++) {
         let ray = trace_ray(ray_origin, wi, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE);
         if ray.kind == RAY_QUERY_INTERSECTION_NONE {
+            // Sky reflection — full weight, the sky isn't in next-event estimation.
+            radiance += throughput * sky_radiance(wi);
             break;
         }
         let hit = resolve_ray_hit_full(ray);
 
-        let TBN = orthonormalize(hit.world_normal);
+        let wo = -wi;
+        let hit_normal = bend_shading_normal(hit.world_normal, wo);
+        let TBN = orthonormalize(hit_normal);
         let T = TBN[0];
         let B = TBN[1];
         let N = TBN[2];
-        let wo = -wi;
         let wo_tangent = vec3(dot(wo, T), dot(wo, B), dot(wo, N));
-        let NdotV = max(dot(hit.world_normal, wo), 0.0001);
+        let NdotV = max(dot(hit_normal, wo), 0.0001);
         let F_ab = F_AB(hit.material.perceptual_roughness, NdotV);
 
         // Emission MIS. Later bounces weight against the BSDF sample that found
@@ -278,9 +315,9 @@ fn trace_specular_path(primary_surface: Surface, initial_wi: vec3<f32>, initial_
 
         let is_mirror = hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && hit.material.metallic > 0.9999;
         if !is_mirror {
-            let light = sample_random_light(hit.world_position, hit.world_normal, rng);
+            let light = sample_random_light(hit.world_position, hit_normal, rng);
             let mis = specular_nee_mis_weight(light.inverse_pdf, light.brdf_rays_can_hit, light.wi, wo_tangent, hit.material.roughness, TBN);
-            radiance += throughput * mis * light.radiance * light.inverse_pdf * evaluate_brdf(wo, light.wi, hit.world_normal, hit.material, F_ab);
+            radiance += throughput * mis * light.radiance * light.inverse_pdf * evaluate_brdf(wo, light.wi, hit_normal, hit.material, F_ab);
         }
 
         let next_tangent = sample_ggx_vndf(wo_tangent, hit.material.roughness, rng);
@@ -380,22 +417,31 @@ fn find_spatial_neighbor(center_pixel: vec2<u32>, surface: Surface, rng: ptr<fun
 
 // --------------------------------------------------------------------- DI
 
-fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>, diffuse_brdf: vec3<f32>, rng: ptr<function, u32>) -> Reservoir {
+// WRS over INITIAL_SAMPLES candidates drawn from one presampled light tile.
+// The tile entry carries both the resolved payload (for the target function —
+// its packed radiance is slightly lossy, which is fine: the UCW divides by the
+// same lossy target) and the `LightSample` identity the reservoir stores for
+// exact re-resolution at merge/shade time.
+fn generate_initial_reservoir(tile_start: u32, world_position: vec3<f32>, world_normal: vec3<f32>, diffuse_brdf: vec3<f32>, rng: ptr<function, u32>) -> Reservoir {
     var reservoir = empty_reservoir();
     var weight_sum = 0.0;
     var reservoir_target_function = 0.0;
     let mis_weight = 1.0 / f32(INITIAL_SAMPLES);
 
     for (var i = 0u; i < INITIAL_SAMPLES; i++) {
-        let sample = generate_random_light_sample(rng);
-        let contribution = calculate_resolved_light_contribution(sample.resolved_light_sample, world_position, world_normal);
+        let entry = light_tiles[tile_start + rand_range_u(LIGHT_TILE_SAMPLES_PER_BLOCK, rng)];
+        if entry.light_id == NULL_LIGHT_ID {
+            continue;
+        }
+        let resolved = unpack_light_tile_sample(entry);
+        let contribution = calculate_resolved_light_contribution(resolved, world_position, world_normal);
         let target_function = luminance(contribution.radiance * diffuse_brdf * saturate(dot(contribution.wi, world_normal)));
         let resampling_weight = mis_weight * (target_function * contribution.inverse_pdf);
 
         weight_sum += resampling_weight;
         if rand_f(rng) < resampling_weight / weight_sum {
-            reservoir.light_id = sample.light_sample.light_id;
-            reservoir.seed = sample.light_sample.seed;
+            reservoir.light_id = entry.light_id;
+            reservoir.seed = entry.seed;
             reservoir_target_function = target_function;
         }
     }
@@ -414,10 +460,11 @@ fn load_temporal_reservoir(pixel: vec2<u32>, world_position: vec3<f32>, world_no
     }
 
     var reservoir = load_reservoir_a(reprojection.pixel);
-    // NOTE: the cross-frame light-id remap (old scene binding 11) was removed — it
-    // was a CPU relic, broken for emissive scenes, and only this placeholder restir
-    // path used it. `reservoir.light_id` is reused as-is; when restir is built for
-    // real, do temporal light identity GPU-native via a stable light slot.
+    // KNOWN LIMITATION: `light_id` indexes this frame's `light_sources` order,
+    // so history is only identity-stable while the light set is unchanged. On
+    // an add/remove frame a reused id may point at a different light for one
+    // temporal chain (energy flicker, self-correcting as history re-caps).
+    // The fix is a stable-slot light table (GPU column) — tracked follow-up.
     reservoir.confidence_weight = min(reservoir.confidence_weight, DI_CONFIDENCE_WEIGHT_CAP);
     return reservoir;
 }
@@ -474,6 +521,17 @@ fn gi_generate_initial(world_position: vec3<f32>, world_normal: vec3<f32>, rng: 
     let ray_direction = sample_uniform_hemisphere(world_normal, rng);
     let ray = trace_ray(world_position + world_normal * RAY_T_MIN, ray_direction, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE);
     if ray.kind == RAY_QUERY_INTERSECTION_NONE {
+        // Sky miss → skylight as a reconnection vertex at a far virtual
+        // distance. Reuse stays consistent: the shade visibility ray re-traces
+        // toward (effectively) the same direction, and the spatial/temporal
+        // jacobian degenerates to ~1 at this range.
+        if solari_view.environment_brightness > 0.0 {
+            reservoir.sample_point_world_position = world_position + ray_direction * SKY_VERTEX_DISTANCE;
+            reservoir.sample_point_world_normal = -ray_direction;
+            reservoir.confidence_weight = 1.0;
+            reservoir.radiance = sky_radiance(ray_direction);
+            reservoir.unbiased_contribution_weight = uniform_hemisphere_inverse_pdf();
+        }
         return reservoir;
     }
 
@@ -571,6 +629,30 @@ fn gi_jacobian(new_world_position: vec3<f32>, original_world_position: vec3<f32>
 }
 
 // --------------------------------------------------------------------- helpers
+
+/// Virtual reconnection-vertex distance for skylight GI samples — far enough
+/// that the reuse jacobian is ~1, well inside `RAY_T_MAX` so the shade pass's
+/// visibility ray still traces.
+const SKY_VERTEX_DISTANCE = 10000.0;
+
+/// The sky's raw radiance in `direction` (the baked atmosphere / skybox cube ×
+/// its brightness). Zero when the view has neither.
+fn sky_radiance(direction: vec3<f32>) -> vec3<f32> {
+    if solari_view.environment_brightness == 0.0 {
+        return vec3(0.0);
+    }
+    let sky = textureSampleLevel(environment_map, environment_map_sampler, direction, 0.0).rgb;
+    return sky * solari_view.environment_brightness;
+}
+
+/// The camera ray through `pixel` (jittered, like the visibility pass's).
+fn primary_ray_direction(pixel: vec2<u32>) -> vec3<f32> {
+    let pixel_center = vec2<f32>(pixel) + 0.5;
+    let pixel_uv = pixel_center / view.main_pass_viewport.zw;
+    let pixel_ndc = pixel_uv * 2.0 - 1.0;
+    let ray_target = view.world_from_clip * vec4(pixel_ndc.x, -pixel_ndc.y, 1.0, 1.0);
+    return normalize((ray_target.xyz / ray_target.w) - view.world_position);
+}
 
 fn load_surface(pixel: vec2<u32>) -> Surface {
     var surface: Surface;

@@ -22,9 +22,9 @@ use crate::render::SolariCamera;
 /// `array<PathReservoir>` stride declared in `restir_bindings.wgsl`.
 pub const PATH_RESERVOIR_STRUCT_SIZE: u64 = 80;
 
-/// Byte size of one `ResolvedLightSample` in the light-tile pool. MUST match
+/// Byte size of one `LightTileSample` in the light-tile pool. MUST match
 /// the struct in `restir_bindings.wgsl`.
-const RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE: u64 = 32;
+const LIGHT_TILE_SAMPLE_STRUCT_SIZE: u64 = 32;
 
 /// Byte size of the GI `GiReservoir` struct. MUST match `restir_bindings.wgsl`.
 const GI_RESERVOIR_STRUCT_SIZE: u64 = 48;
@@ -134,7 +134,7 @@ pub fn prepare_restir_resources(
             label: Some("restir_light_tiles"),
             size: LIGHT_TILE_BLOCKS
                 * LIGHT_TILE_SAMPLES_PER_BLOCK
-                * RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE,
+                * LIGHT_TILE_SAMPLE_STRUCT_SIZE,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
