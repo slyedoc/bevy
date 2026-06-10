@@ -153,6 +153,8 @@ pub fn extract_transform_graph(
         >,
     >,
     nodes: Extract<Query<&GpuSlot<TransformGraph>>>,
+    marker_added: Extract<Query<&GpuSlot<TransformGraph>, Added<NoGpuGlobalTransformReadback>>>,
+    mut marker_removed: Extract<RemovedComponents<NoGpuGlobalTransformReadback>>,
     mut table: ResMut<TransformGraph>,
     mut queues: Local<Parallel<TransformDeltaBuf>>,
 ) {
@@ -164,12 +166,13 @@ pub fn extract_transform_graph(
             if transform.is_changed() {
                 // Raw TRS — the propagate shader builds the matrix (no CPU pack).
                 buf.push_local(slot, LocalTRS::from_transform(&transform));
-                // Scatter the readback opt-out flag alongside `local`: it only
-                // matters for movers (the readback gather reads the `local`
-                // delta), and movers re-scatter it every move, so a marker added
-                // after first-sight (e.g. via a required component) lands within
-                // a frame.
-                buf.push_no_readback(slot, no_cpu_global as u32);
+                // The readback opt-out flag scatters at first sight only; later
+                // marker adds/removes are caught by the dedicated queries below
+                // (re-scattering it per move paid ~0.25 ms/frame in bevy_city
+                // for a flag that almost never changes).
+                if transform.is_added() {
+                    buf.push_no_readback(slot, no_cpu_global as u32);
+                }
             }
             let parent_changed = match &child_of {
                 Some(child_of) => child_of.is_changed(),
@@ -192,6 +195,21 @@ pub fn extract_transform_graph(
     for buf in queues.iter_mut() {
         table.parent.append(&mut buf.parent);
         table.no_readback.append(&mut buf.no_readback);
+    }
+
+    // Readback opt-out flag changes after first sight. Removals first: an entity
+    // whose marker was removed *and* re-added this frame still matches the
+    // `Added` query, so the later `1` record wins. A removed event for an entity
+    // that despawned misses the `nodes` lookup and is skipped (slot was freed).
+    // Catching these here (not in the mover scan) also covers `TransformStatic`
+    // entities, which the change filter never visits after first sight.
+    for entity in marker_removed.read() {
+        if let Ok(slot) = nodes.get(entity) {
+            push_record(&mut table.no_readback, slot.index(), 0u32);
+        }
+    }
+    for slot in marker_added.iter() {
+        push_record(&mut table.no_readback, slot.index(), 1u32);
     }
 
     // `local` is the big delta (one record per mover). Instead of a serial memcpy
