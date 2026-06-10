@@ -37,14 +37,16 @@ use bevy_core_pipeline::{
 use bevy_ecs::{
     component::Component,
     reflect::ReflectComponent,
-    schedule::{IntoScheduleConfigs, SystemCondition, common_conditions::{not, resource_exists}},
+    schedule::{IntoScheduleConfigs, SystemCondition, common_conditions::resource_exists},
 };
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
-    ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems, camera::TemporalJitter, extract_component::{ExtractComponent, ExtractComponentPlugin}
+    ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems, camera::TemporalJitter,
+    extract_component::{ExtractComponent, ExtractComponentPlugin},
+    extract_resource::ExtractResourcePlugin,
 };
 use bevy_shader::load_shader_library;
-use crate::{pipelines::SolariPipelines, resource_manager::SolariResourceManager, render::view::{SolariOverlay, overlay_is}, render::reset::CameraReset};
+use crate::{pipelines::SolariPipelines, resource_manager::SolariResourceManager, render::view::{pathtracer_enabled, restir_enabled, SolariViewState}, render::reset::CameraReset};
 use overlay::register_overlays;
 use node::{prepare_restir_jitter, restir};
 pub use gizmo_depth::{gizmo_depth_bind_group_layout, gizmo_depth_pipeline};
@@ -72,12 +74,13 @@ impl Plugin for SolarRenderPlugin {
         embedded_asset!(app, "dlss_resolve.wgsl");
 
         app
-        .add_plugins(ExtractComponentPlugin::<SolariOverlay>::default())
+        .init_resource::<SolariViewState>()
+        .add_plugins(ExtractResourcePlugin::<SolariViewState>::default())
         // SolariCamera is the render-world filter (`With<SolariCamera>`) every
         // Solari prepare/render system keys off; it must be extracted or those
         // systems match nothing and nothing renders.
         .add_plugins(ExtractComponentPlugin::<SolariCamera>::default())
-        .register_type::<SolariOverlay>()
+        .register_type::<SolariViewState>()
         .register_type::<atmosphere::SolariAtmosphere>();
            
 
@@ -89,7 +92,12 @@ impl Plugin for SolarRenderPlugin {
             .add_systems(
                 ExtractSchedule,
                 (
-                    (reset::clear_camera_reset, reset::reset_render_on_camera_move).chain(),
+                    (
+                        reset::clear_camera_reset,
+                        reset::reset_render_on_camera_move,
+                        reset::reset_render_on_view_state_change,
+                    )
+                        .chain(),
                     view_cull::extract_solari_view_cull_masks,
                     view_cull::extract_solari_skybox,
                     atmosphere::extract_solari_atmosphere,
@@ -122,7 +130,7 @@ impl Plugin for SolarRenderPlugin {
                     .after(Core3dSystems::MainPass)
                     .before(tonemapping)
                     .run_if(
-                        overlay_is(SolariOverlay::Pathtrace)
+                        pathtracer_enabled
                             .and_then(resource_exists::<SolariResourceManager>)
                             .and_then(resource_exists::<SolariPipelines>),
                     ),
@@ -146,9 +154,10 @@ impl Plugin for SolarRenderPlugin {
                 restir
                     .before(main_opaque_pass_3d)
                     .in_set(Core3dSystems::MainPass)
-                    // Pathtrace views are rendered by the reference path tracer.
+                    // Runs as the selected integrator, or to produce the
+                    // G-buffer a buffer-family debug view samples.
                     .run_if(
-                        not(overlay_is(SolariOverlay::Pathtrace))
+                        restir_enabled
                             .and_then(resource_exists::<SolariResourceManager>)
                             .and_then(resource_exists::<SolariPipelines>),
                     ),
@@ -161,8 +170,10 @@ impl Plugin for SolarRenderPlugin {
                 gizmo_depth::solari_gizmo_depth
                     .after(main_opaque_pass_3d)
                     .before(main_transparent_pass_3d)
+                    // Reads the restir G-buffer, so it can only bridge depth on
+                    // frames the restir chain produced one.
                     .run_if(
-                        not(overlay_is(SolariOverlay::Pathtrace))
+                        restir_enabled
                             .and_then(resource_exists::<SolariResourceManager>)
                             .and_then(resource_exists::<SolariPipelines>),
                     ),
@@ -194,13 +205,13 @@ impl Plugin for SolarRenderPlugin {
                     Core3d,
                     (dlss::restir_dlss_resolve, dlss::restir_dlss)
                         .chain()
-                        // After every overlay (so the viz is upscaled too), and
-                        // skipped entirely for the full-res pathtrace view.
+                        // After every overlay (so the viz is upscaled too);
+                        // upscales restir output, so only on restir frames.
                         .after(overlay::SolariDebugOverlay)
                         .in_set(Core3dSystems::EarlyPostProcess)
                         // `restir_dlss_resolve` reads the central pipeline + layout.
                         .run_if(
-                            not(overlay_is(SolariOverlay::Pathtrace))
+                            restir_enabled
                                 .and_then(resource_exists::<SolariResourceManager>)
                                 .and_then(resource_exists::<SolariPipelines>),
                         ),
@@ -211,6 +222,6 @@ impl Plugin for SolarRenderPlugin {
 
 #[derive(Component, Default, Reflect, Clone, ExtractComponent)]
 #[reflect(Component, Default, Clone)]
-#[require(Hdr, TemporalJitter, SolariOverlay, CameraReset)]
+#[require(Hdr, TemporalJitter, CameraReset)]
 pub struct SolariCamera;
 

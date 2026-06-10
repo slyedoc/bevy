@@ -19,7 +19,7 @@ use core::marker::PhantomData;
 use super::dlss::ViewRestirDlssTextures;
 use super::prepare::RestirResources;
 use crate::bindings::RaytracingSceneBindings;
-use crate::render::view::{overlay_is, SolariOverlay};
+use crate::render::view::{debug_is, SolariDebugView};
 use crate::render::view_cull::{SolariViewOffset, SolariViewUniform, SolariViewUniforms};
 use bevy_app::SubApp;
 use bevy_asset::{load_embedded_asset, AssetServer};
@@ -64,7 +64,7 @@ pub struct OverlayInputs<'a> {
 /// keeping a single shared body instead of one copy per view.
 pub trait OverlayView: Send + Sync + 'static {
     /// The [`SolariDebugView`] this overlay renders — its run-condition key.
-    const VIEW: SolariOverlay;
+    const VIEW: SolariDebugView;
     /// `VIEW_*` shader_defs selecting the variant in `debug_overlay.wgsl`.
     const DEFS: &'static [&'static str];
     /// Texture this view samples, or `None` for cluster-family views (which
@@ -78,7 +78,7 @@ macro_rules! overlay_view {
     ($name:ident, $view:expr, [$($def:literal),*], |$i:ident| $sel:expr) => {
         pub struct $name;
         impl OverlayView for $name {
-            const VIEW: SolariOverlay = $view;
+            const VIEW: SolariDebugView = $view;
             const DEFS: &'static [&'static str] = &[$($def),*];
             fn selected<'a>($i: &OverlayInputs<'a>) -> Option<&'a TextureView> {
                 $sel
@@ -88,42 +88,42 @@ macro_rules! overlay_view {
 }
 
 // Buffer views: sample one G-buffer texture.
-overlay_view!(WorldPositionView, SolariOverlay::WorldPosition, ["VIEW_COLOR"],
+overlay_view!(WorldPositionView, SolariDebugView::WorldPosition, ["VIEW_COLOR"],
     |i| Some(&i.res.world_position[i.curr]));
-overlay_view!(MaterialIdView, SolariOverlay::MaterialId, ["VIEW_MATERIAL_ID"],
+overlay_view!(MaterialIdView, SolariDebugView::MaterialId, ["VIEW_MATERIAL_ID"],
     |i| Some(&i.res.world_position[i.curr])); // material id is packed in world_position.w
-overlay_view!(WorldNormalView, SolariOverlay::WorldNormal, ["VIEW_NORMAL"],
+overlay_view!(WorldNormalView, SolariDebugView::WorldNormal, ["VIEW_NORMAL"],
     |i| Some(&i.res.world_normal[i.curr]));
-overlay_view!(UvView, SolariOverlay::Uv, ["VIEW_COLOR"],
+overlay_view!(UvView, SolariDebugView::Uv, ["VIEW_COLOR"],
     |i| Some(&i.res.uv));
-overlay_view!(MotionVectorsView, SolariOverlay::MotionVectors, ["VIEW_MOTION"],
+overlay_view!(MotionVectorsView, SolariDebugView::MotionVectors, ["VIEW_MOTION"],
     |i| Some(&i.res.motion_vectors));
 
 // Cluster family: trace their own primary ray; sample nothing.
-overlay_view!(LodView, SolariOverlay::Lod,
+overlay_view!(LodView, SolariDebugView::Lod,
     ["VIEW_CLUSTER_FAMILY", "VIEW_LOD"], |_i| None);
-overlay_view!(ClusterView, SolariOverlay::Cluster,
+overlay_view!(ClusterView, SolariDebugView::Cluster,
     ["VIEW_CLUSTER_FAMILY", "VIEW_CLUSTER"], |_i| None);
-overlay_view!(TriangleView, SolariOverlay::Triangle,
+overlay_view!(TriangleView, SolariDebugView::Triangle,
     ["VIEW_CLUSTER_FAMILY", "VIEW_TRIANGLE"], |_i| None);
-overlay_view!(GeometryCheckView, SolariOverlay::GeometryCheck,
+overlay_view!(GeometryCheckView, SolariDebugView::GeometryCheck,
     ["VIEW_CLUSTER_FAMILY", "VIEW_GEOMETRY_CHECK"], |_i| None);
 
 // DLSS guide buffers (only registered when DLSS is active).
 #[cfg(feature = "dlss")]
-overlay_view!(DlssDepthView, SolariOverlay::DlssDepth, ["VIEW_GRAYSCALE"],
+overlay_view!(DlssDepthView, SolariDebugView::DlssDepth, ["VIEW_GRAYSCALE"],
     |i| i.dlss.map(|d| &d.depth));
 #[cfg(feature = "dlss")]
-overlay_view!(DlssNormalRoughnessView, SolariOverlay::DlssNormalRoughness, ["VIEW_NORMAL"],
+overlay_view!(DlssNormalRoughnessView, SolariDebugView::DlssNormalRoughness, ["VIEW_NORMAL"],
     |i| i.dlss.map(|d| &d.normal_roughness));
 #[cfg(feature = "dlss")]
-overlay_view!(DlssDiffuseAlbedoView, SolariOverlay::DlssDiffuseAlbedo, ["VIEW_COLOR"],
+overlay_view!(DlssDiffuseAlbedoView, SolariDebugView::DlssDiffuseAlbedo, ["VIEW_COLOR"],
     |i| i.dlss.map(|d| &d.diffuse_albedo));
 #[cfg(feature = "dlss")]
-overlay_view!(DlssSpecularAlbedoView, SolariOverlay::DlssSpecularAlbedo, ["VIEW_COLOR"],
+overlay_view!(DlssSpecularAlbedoView, SolariDebugView::DlssSpecularAlbedo, ["VIEW_COLOR"],
     |i| i.dlss.map(|d| &d.specular_albedo));
 #[cfg(feature = "dlss")]
-overlay_view!(DlssSpecularMotionView, SolariOverlay::DlssSpecularMotion, ["VIEW_MOTION"],
+overlay_view!(DlssSpecularMotionView, SolariDebugView::DlssSpecularMotion, ["VIEW_MOTION"],
     |i| i.dlss.map(|d| &d.specular_motion_vectors));
 
 /// The overlay compute pipeline for view `V` (one per view, keyed by type).
@@ -298,7 +298,7 @@ pub fn add_overlay_view<V: OverlayView>(render_app: &mut SubApp) {
         .add_systems(
             Core3d,
             overlay::<V>
-                .run_if(overlay_is(V::VIEW))
+                .run_if(debug_is(V::VIEW))
                 .in_set(Core3dSystems::EarlyPostProcess)
                 .in_set(SolariDebugOverlay),
         );

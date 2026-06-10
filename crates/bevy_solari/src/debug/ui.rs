@@ -1,14 +1,16 @@
-//! In-engine debug-view selector for [`SolariOverlay`].
+//! In-engine selector for [`SolariViewState`]: lighting (pathtrace / restir)
+//! and the debug views.
 //!
-//! One Feathers **dropdown menu per Solari camera**, each targeted at its own
-//! camera with [`UiTargetCamera`] so it sits in that camera's viewport
-//! (split-screen / multi-view friendly), and wrapped in a [`TabGroup`] so it
+//! One global Feathers dropdown, anchored to the first [`SolariCamera`]'s
+//! viewport via [`UiTargetCamera`] and wrapped in a [`TabGroup`] so it
 //! participates in Feathers' tab navigation (no more "no tab groups" warning,
 //! and no raw `Tab` hotkey fighting the focus system). The button caption shows
-//! the camera's current view; picking an item sets that camera's
-//! [`SolariOverlay`].
+//! the current state; picking an item writes [`SolariViewState`].
 
-use crate::render::{view::SolariOverlay, SolariCamera};
+use crate::render::{
+    view::{SolariDebugView, SolariLighting, SolariViewState},
+    SolariCamera,
+};
 use bevy_dev_tools::render_debug::{RenderDebugMode, RenderDebugOverlay};
 use bevy_ecs::{
     component::Component,
@@ -16,7 +18,8 @@ use bevy_ecs::{
     hierarchy::Children,
     observer::On,
     query::{With, Without},
-    system::{Commands, Query},
+    resource::Resource,
+    system::{Commands, Query, Res, ResMut},
 };
 use bevy_feathers::{
     controls::{FeathersMenu, FeathersMenuButton, FeathersMenuItem, FeathersMenuPopup},
@@ -27,102 +30,115 @@ use bevy_scene::prelude::*;
 use bevy_ui::{px, widget::Text, Node, PositionType, UiTargetCamera};
 use bevy_ui_widgets::Activate;
 
-/// Marker on a Solari camera that already has a debug dropdown, so
-/// [`spawn_debug_panels`] never spawns a second one for it.
-#[derive(Component)]
+/// Marker resource: the (single, global) debug dropdown exists, so
+/// [`spawn_debug_panels`] never spawns a second one.
+#[derive(Resource)]
 pub struct DebugPanelSpawned;
 
-/// On the menu button's caption text, bound to the `camera` whose
-/// [`SolariOverlay`] it shows. [`update_view_label`] keeps it in sync.
-/// `Default` (placeholder) is required so it can be a `bsn!` patch; the real
-/// camera is supplied via `ViewLabel({camera})`.
-#[derive(Component, Clone, Copy)]
-pub struct ViewLabel(pub Entity);
+/// Marker on the menu button's caption text; [`update_view_label`] keeps it in
+/// sync with [`SolariViewState`].
+#[derive(Component, Default, Clone, Copy)]
+pub struct ViewLabel;
 
-impl Default for ViewLabel {
-    fn default() -> Self {
-        ViewLabel(Entity::PLACEHOLDER)
-    }
-}
-
-/// One dropdown menu item: its caption is the view's name, and activating it
-/// sets `camera`'s [`SolariOverlay`] to `view`.
-fn view_item(camera: Entity, view: SolariOverlay) -> impl Scene {
+/// A lighting menu item: activating it selects `lighting` and clears any debug
+/// view.
+fn lighting_item(lighting: SolariLighting) -> impl Scene {
     bsn! {
         @FeathersMenuItem {
-            @caption: bsn! { Text({view.to_string()}) ThemedText }
+            @caption: bsn! { Text({lighting.to_string()}) ThemedText }
         }
-        on(move |_: On<Activate>, mut overlays: Query<&mut SolariOverlay>| {
-            if let Ok(mut overlay) = overlays.get_mut(camera) {
-                *overlay = view;
-            }
+        on(move |_: On<Activate>, mut state: ResMut<SolariViewState>| {
+            state.lighting = lighting;
+            state.debug = None;
         })
     }
 }
 
-/// Spawn one bottom-left dropdown per [`SolariCamera`], targeted at that camera.
-/// Runs every frame; the [`DebugPanelSpawned`] marker keeps it idempotent and
-/// lets it pick up cameras spawned after startup.
-pub fn spawn_debug_panels(
-    cameras: Query<Entity, (With<SolariCamera>, Without<DebugPanelSpawned>)>,
-    mut commands: Commands,
-) {
-    for camera in &cameras {
-        // The root carries `UiTargetCamera` in its spawn bundle (so it propagates
-        // to the whole dropdown and confines it to this camera's viewport); the
-        // menu is attached as a child scene.
-        commands
-            .spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    bottom: px(8),
-                    left: px(8),
-                    ..Default::default()
-                },
-                TabGroup::default(),
-                UiTargetCamera(camera),
-            ))
-            .queue_spawn_related_scenes::<Children>(bsn_list! {
-                (
-                    @FeathersMenu
-                    Children [
-                        (
-                            @FeathersMenuButton {
-                                @caption: bsn! { Text("pathtrace") ThemedText ViewLabel({camera}) }
-                            }
-                        ),
-                        (
-                            @FeathersMenuPopup
-                            Children [
-                                view_item(camera, SolariOverlay::None),
-                                view_item(camera, SolariOverlay::Pathtrace),
-                                view_item(camera, SolariOverlay::Lod),
-                                view_item(camera, SolariOverlay::Cluster),
-                                view_item(camera, SolariOverlay::Triangle),
-                                view_item(camera, SolariOverlay::GeometryCheck),
-                                view_item(camera, SolariOverlay::WorldPosition),
-                                view_item(camera, SolariOverlay::MaterialId),
-                                view_item(camera, SolariOverlay::WorldNormal),
-                                view_item(camera, SolariOverlay::Uv),
-                                view_item(camera, SolariOverlay::MotionVectors),
-                            ]
-                        )
-                    ]
-                )
-            });
-        commands.entity(camera).insert(DebugPanelSpawned);
+/// A debug-view menu item: activating it overlays `view` (lighting selection is
+/// kept for when the view is cleared).
+fn debug_item(view: SolariDebugView) -> impl Scene {
+    bsn! {
+        @FeathersMenuItem {
+            @caption: bsn! { Text({view.to_string()}) ThemedText }
+        }
+        on(move |_: On<Activate>, mut state: ResMut<SolariViewState>| {
+            state.debug = Some(view);
+        })
     }
 }
 
-/// Keep each dropdown button's caption in sync with its camera's selected view.
-pub fn update_view_label(views: Query<&SolariOverlay>, mut labels: Query<(&mut Text, &ViewLabel)>) {
-    for (mut text, label) in &mut labels {
-        let Ok(view) = views.get(label.0) else {
-            continue;
-        };
-        let want = view.to_string();
+/// Spawn the global bottom-left dropdown once the first [`SolariCamera`]
+/// exists, anchored to that camera's viewport. Runs every frame; the
+/// [`DebugPanelSpawned`] resource keeps it idempotent.
+pub fn spawn_debug_panels(
+    spawned: Option<Res<DebugPanelSpawned>>,
+    cameras: Query<Entity, With<SolariCamera>>,
+    mut commands: Commands,
+) {
+    if spawned.is_some() {
+        return;
+    }
+    let Some(camera) = cameras.iter().next() else {
+        return;
+    };
+    commands.insert_resource(DebugPanelSpawned);
+    // The root carries `UiTargetCamera` in its spawn bundle (so it propagates
+    // to the whole dropdown and confines it to this camera's viewport); the
+    // menu is attached as a child scene.
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: px(8),
+                left: px(8),
+                ..Default::default()
+            },
+            TabGroup::default(),
+            UiTargetCamera(camera),
+        ))
+        .queue_spawn_related_scenes::<Children>(bsn_list! {
+            (
+                @FeathersMenu
+                Children [
+                    (
+                        @FeathersMenuButton {
+                            @caption: bsn! { Text("pathtrace") ThemedText ViewLabel }
+                        }
+                    ),
+                    (
+                        @FeathersMenuPopup
+                        Children [
+                            lighting_item(SolariLighting::Pathtracer),
+                            lighting_item(SolariLighting::Restir),
+                            debug_item(SolariDebugView::Lod),
+                            debug_item(SolariDebugView::Cluster),
+                            debug_item(SolariDebugView::Triangle),
+                            debug_item(SolariDebugView::GeometryCheck),
+                            debug_item(SolariDebugView::WorldPosition),
+                            debug_item(SolariDebugView::MaterialId),
+                            debug_item(SolariDebugView::WorldNormal),
+                            debug_item(SolariDebugView::Uv),
+                            debug_item(SolariDebugView::MotionVectors),
+                        ]
+                    )
+                ]
+            )
+        });
+}
+
+/// Keep the dropdown button's caption in sync with [`SolariViewState`]: the
+/// debug view's name when one is selected, else the lighting's.
+pub fn update_view_label(
+    state: Res<SolariViewState>,
+    mut labels: Query<&mut Text, With<ViewLabel>>,
+) {
+    let want = match state.debug {
+        Some(view) => view.to_string(),
+        None => state.lighting.to_string(),
+    };
+    for mut text in &mut labels {
         if text.0 != want {
-            text.0 = want;
+            text.0 = want.clone();
         }
     }
 }

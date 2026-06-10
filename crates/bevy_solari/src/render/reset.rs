@@ -1,9 +1,10 @@
 use bevy_camera::Camera;
-use bevy_ecs::{change_detection::DetectChanges, component::Component, query::With, system::{Commands, Query}, world::Ref};
+use bevy_ecs::{change_detection::DetectChanges, component::Component, query::With, system::{Commands, Query, Res}, world::Ref};
 use bevy_reflect::Reflect;
 use bevy_render::{Extract, sync_world::RenderEntity};
 use bevy_transform::components::GlobalTransform;
 
+use crate::render::view::SolariViewState;
 use crate::render::SolariCamera;
 
 #[derive(Component, Default, Reflect, Clone)]
@@ -35,5 +36,21 @@ pub fn reset_render_on_camera_move(
         if camera.is_active && global_transform.is_changed() {
             commands.entity(e).insert(CameraReset(true));
         }
+    }
+}
+
+/// Reset reason: [`SolariViewState`] changed (integrator or debug view
+/// switched) — accumulated history belongs to the previous mode, and the scene
+/// kept moving while the other mode rendered.
+pub fn reset_render_on_view_state_change(
+    state: Extract<Res<SolariViewState>>,
+    cameras: Extract<Query<RenderEntity, With<SolariCamera>>>,
+    mut commands: Commands,
+) {
+    if !state.is_changed() {
+        return;
+    }
+    for e in &cameras {
+        commands.entity(e).insert(CameraReset(true));
     }
 }

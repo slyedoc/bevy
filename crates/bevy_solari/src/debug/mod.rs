@@ -6,7 +6,7 @@ use bevy_feathers::FeathersCorePlugin;
 /// Plugin that adds the in-engine debug-view selector: one Feathers dropdown
 /// per [`SolariCamera`](crate::render::SolariCamera), each in its own viewport.
 /// Picking a view sets that camera's
-/// [`SolariOverlay`](crate::render::view::SolariOverlay).
+/// [`SolariViewState`](crate::render::view::SolariViewState).
 ///
 /// Replaces the old `Tab`/`Shift+Tab` hotkey, which collided with Feathers' tab
 /// navigation — the dropdown is a focusable widget in a `TabGroup`, so `Tab`
