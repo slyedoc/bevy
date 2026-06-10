@@ -95,17 +95,29 @@ struct GiMergeResult {
 
 // ---------------------------------------------------------------- entry points
 
+// Boiling filter (cf. RTXDI): a rare candidate caught with a huge
+// compensation weight survives merges on raw intensity and glows for its
+// whole confidence lifetime — the "spot that appears then slowly fades".
+// Kill any reservoir whose weight exceeds this multiple of its 8×8
+// workgroup's average. Slightly biased (drops legitimate extreme energy),
+// hugely stabilizing.
+const BOILING_FILTER_STRENGTH = 20.0;
+
+var<workgroup> boiling_energy: array<f32, 64>;
+
 @compute @workgroup_size(8, 8, 1)
 fn initial_and_temporal(
     @builtin(global_invocation_id) global_id: vec3<u32>,
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
 ) {
     set_view_cull_mask(solari_view.cull_mask.x);
-    if any(global_id.xy >= vec2u(view.main_pass_viewport.zw)) {
-        return;
-    }
     let pixel = global_id.xy;
     let index = reservoir_index(pixel);
+    // No early returns: the boiling filter's workgroup barriers below need
+    // uniform control flow, so inactive threads carry empty reservoirs
+    // through instead of bailing.
+    let in_viewport = all(pixel < vec2u(view.main_pass_viewport.zw));
 
     // Workgroup-uniform tile pick: all 64 threads draw their initial
     // candidates from the same 1024-entry tile, so the pool reads stay
@@ -113,32 +125,75 @@ fn initial_and_temporal(
     var workgroup_rng = (workgroup_id.x * 7919u + workgroup_id.y) + view.frame_count * 5782582u;
     let tile_start = rand_range_u(LIGHT_TILE_BLOCKS, &workgroup_rng) * LIGHT_TILE_SAMPLES_PER_BLOCK;
 
-    let surface = load_surface(pixel);
-    if !surface.valid {
-        store_reservoir_b(pixel, empty_reservoir());
-        gi_reservoir_b[index] = gi_empty();
-        return;
+    var surface: Surface;
+    surface.valid = false;
+    if in_viewport {
+        surface = load_surface(pixel);
     }
 
-    var rng = index + view.frame_count * 5782582u;
-    let diffuse_brdf = surface.material.base_color / PI;
+    var di_reservoir = empty_reservoir();
+    var gi_reservoir = gi_empty();
+    if surface.valid {
+        var rng = index + view.frame_count * 5782582u;
+        let diffuse_brdf = surface.material.base_color / PI;
 
-    // ReGIR cell for this surface point (inserting + marking it). Cold cell
-    // (just inserted / probe failed) → the initial candidates fall back to
-    // the workgroup's uniform tile.
-    let regir_cell = regir_query(surface.world_position, surface.world_normal, view.world_position, &rng);
+        // ReGIR cell for this surface point (inserting + marking it). Cold cell
+        // (just inserted / probe failed) → the initial candidates fall back to
+        // the workgroup's uniform tile.
+        let regir_cell = regir_query(surface.world_position, surface.world_normal, view.world_position, &rng);
 
-    // Direct (DI).
-    let di_initial = generate_initial_reservoir(tile_start, regir_cell, surface.world_position, surface.world_normal, diffuse_brdf, &rng);
-    let di_temporal = load_temporal_reservoir(pixel, surface.world_position, surface.world_normal);
-    let di_merged = merge_reservoirs(di_initial, di_temporal, surface.world_position, surface.world_normal, diffuse_brdf, &rng);
-    store_reservoir_b(pixel, di_merged.reservoir);
+        // Direct (DI).
+        let di_initial = generate_initial_reservoir(tile_start, regir_cell, surface.world_position, surface.world_normal, diffuse_brdf, &rng);
+        let di_temporal = load_temporal_reservoir(pixel, surface.world_position, surface.world_normal);
+        di_reservoir = merge_reservoirs(di_initial, di_temporal, surface.world_position, surface.world_normal, diffuse_brdf, &rng).reservoir;
 
-    // Indirect (GI).
-    let gi_initial = gi_generate_initial(surface.world_position, surface.world_normal, &rng);
-    let gi_temporal = gi_load_temporal(pixel, surface.world_position, surface.world_normal);
-    let gi_merged = gi_merge(gi_initial, gi_temporal.reservoir, gi_temporal.world_position, surface.world_position, surface.world_normal, diffuse_brdf, &rng);
-    gi_reservoir_b[index] = gi_merged.reservoir;
+        // Indirect (GI).
+        let gi_initial = gi_generate_initial(surface.world_position, surface.world_normal, &rng);
+        let gi_temporal = gi_load_temporal(pixel, surface.world_position, surface.world_normal);
+        gi_reservoir = gi_merge(gi_initial, gi_temporal.reservoir, gi_temporal.world_position, surface.world_position, surface.world_normal, diffuse_brdf, &rng).reservoir;
+    }
+
+    // DI boiling filter.
+    var energy = 0.0;
+    if reservoir_valid(di_reservoir) {
+        energy = di_reservoir.unbiased_contribution_weight;
+    }
+    boiling_energy[local_index] = energy;
+    workgroupBarrier();
+    var sum = 0.0;
+    var live = 0u;
+    for (var k = 0u; k < 64u; k += 1u) {
+        let v = boiling_energy[k];
+        sum += v;
+        live += u32(v > 0.0);
+    }
+    if live > 0u && energy > BOILING_FILTER_STRENGTH * (sum / f32(live)) {
+        di_reservoir = empty_reservoir();
+    }
+
+    // GI boiling filter (energy = expected contribution scale).
+    workgroupBarrier();
+    energy = 0.0;
+    if gi_reservoir.confidence_weight > 0.0 {
+        energy = luminance(gi_reservoir.radiance) * gi_reservoir.unbiased_contribution_weight;
+    }
+    boiling_energy[local_index] = energy;
+    workgroupBarrier();
+    sum = 0.0;
+    live = 0u;
+    for (var k = 0u; k < 64u; k += 1u) {
+        let v = boiling_energy[k];
+        sum += v;
+        live += u32(v > 0.0);
+    }
+    if live > 0u && energy > BOILING_FILTER_STRENGTH * (sum / f32(live)) {
+        gi_reservoir = gi_empty();
+    }
+
+    if in_viewport {
+        store_reservoir_b(pixel, di_reservoir);
+        gi_reservoir_b[index] = gi_reservoir;
+    }
 }
 
 @compute @workgroup_size(8, 8, 1)
