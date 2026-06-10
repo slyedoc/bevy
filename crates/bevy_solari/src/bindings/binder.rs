@@ -137,6 +137,21 @@ pub fn prepare_raytracing_scene_bindings(
 
         let emissive_vec3 = material.emissive.to_vec3();
 
+        // Beer–Lambert: attenuation_color remains after attenuation_distance,
+        // so σ = -ln(color) / distance. Infinite distance ⇒ a clear volume.
+        let extinction = if material.attenuation_distance.is_finite()
+            && material.attenuation_distance > 0.0
+        {
+            let c = LinearRgba::from(material.attenuation_color).to_vec3();
+            -Vec3::new(
+                c.x.clamp(1e-4, 1.0).ln(),
+                c.y.clamp(1e-4, 1.0).ln(),
+                c.z.clamp(1e-4, 1.0).ln(),
+            ) / material.attenuation_distance
+        } else {
+            Vec3::ZERO
+        };
+
         materials.get_mut()[slot as usize] = GpuMaterial {
             normal_map_texture_id,
             base_color_texture_id,
@@ -147,7 +162,11 @@ pub fn prepare_raytracing_scene_bindings(
             perceptual_roughness: material.perceptual_roughness,
             emissive: emissive_vec3,
             metallic: material.metallic,
+            extinction,
             reflectance: material.reflectance,
+            ior: material.ior,
+            specular_transmission: material.specular_transmission,
+            nested_priority: material.nested_priority,
             _padding: Default::default(),
         };
     }
@@ -314,8 +333,14 @@ struct GpuMaterial {
     perceptual_roughness: f32,
     emissive: Vec3,
     metallic: f32,
-    _padding: Vec3,
+    // Beer–Lambert extinction σ (1/world-unit), precomputed from
+    // attenuation color/distance.
+    extinction: Vec3,
     reflectance: f32,
+    ior: f32,
+    specular_transmission: f32,
+    nested_priority: u32,
+    _padding: f32,
 }
 
 // `GpuLightSource` + `GpuDirectionalLight` now live in `crate::lights` (the lights

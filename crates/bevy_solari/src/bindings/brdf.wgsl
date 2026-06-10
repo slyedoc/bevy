@@ -159,6 +159,46 @@ fn fresnel(f0: vec3<f32>, LdotH: f32) -> vec3<f32> {
     return f0 + (1.0 - f0) * pow(1.0 - LdotH, 5.0);
 }
 
+// Exact unpolarized dielectric Fresnel. `eta` is n_incident / n_transmitted
+// along the ray; returns 1.0 past the critical angle (total internal
+// reflection).
+fn fresnel_dielectric(cos_i: f32, eta: f32) -> f32 {
+    let sin2_t = eta * eta * (1.0 - cos_i * cos_i);
+    if sin2_t >= 1.0 {
+        return 1.0;
+    }
+    let cos_t = sqrt(1.0 - sin2_t);
+    let r_parallel = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+    let r_perpendicular = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+    return 0.5 * (r_parallel * r_parallel + r_perpendicular * r_perpendicular);
+}
+
+struct GlassBsdfSample {
+    wi: vec3<f32>,
+    throughput: vec3<f32>,
+    refracted: bool,
+}
+
+// Smooth-dielectric sample for transmissive materials: one delta lobe chosen
+// by exact Fresnel (the selection probability cancels the lobe weight, so the
+// interface itself is lossless — color comes from volume absorption inside
+// the medium, not from filtering at the surface). `normal` must lie in `wo`'s
+// hemisphere; `eta` is n_incident / n_transmitted across the interface (the
+// caller knows both media — nested dielectrics make neither side "air").
+fn sample_glass_bsdf(
+    wo: vec3<f32>,
+    normal: vec3<f32>,
+    eta: f32,
+    rng: ptr<function, u32>,
+) -> GlassBsdfSample {
+    let cos_i = min(dot(wo, normal), 1.0);
+    let reflectance = fresnel_dielectric(cos_i, eta);
+    if rand_f(rng) < reflectance {
+        return GlassBsdfSample(reflect(-wo, normal), vec3(1.0), false);
+    }
+    return GlassBsdfSample(refract(-wo, normal, eta), vec3(1.0), true);
+}
+
 // Shading-normal adaptation (cf. Schüssler 2017). Smooth (interpolated)
 // shading normals tilt past the view horizon at silhouette edges, making
 // `NdotV < 0` so every BRDF term zeroes out and the edge renders black (only

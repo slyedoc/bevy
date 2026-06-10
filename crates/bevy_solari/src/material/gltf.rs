@@ -17,7 +17,7 @@ use bevy_gltf::{
 
 use crate::material::{SolariMaterial, SolariMaterial3d};
 
-/// Convert a [`GltfMaterial`] to a [`SolariMaterial`] — the 9 fields the RT path
+/// Convert a [`GltfMaterial`] to a [`SolariMaterial`] — the fields the RT path
 /// reads. Mirrors `bevy_pbr::standard_material_from_gltf_material`, minus the
 /// raster-only fields. `GltfMaterial`'s field types line up exactly.
 fn solari_material_from_gltf(material: &GltfMaterial) -> SolariMaterial {
@@ -30,8 +30,25 @@ fn solari_material_from_gltf(material: &GltfMaterial) -> SolariMaterial {
         metallic: material.metallic,
         metallic_roughness_texture: material.metallic_roughness_texture.clone(),
         reflectance: material.reflectance,
+        specular_transmission: material.specular_transmission,
+        ior: material.ior,
+        attenuation_distance: material.attenuation_distance,
+        attenuation_color: material.attenuation_color,
+        nested_priority: 0,
         normal_map_texture: material.normal_map_texture.clone(),
     }
+}
+
+/// glTF has no standard extension for nested-dielectric priorities, so they
+/// travel in the material's `extras` (e.g. `"extras": {"nested_priority": 5}`,
+/// as written by the bistro asset pipeline from NVIDIA's pyscene data).
+fn nested_priority_from_extras(gltf_material: &gltf::Material) -> u32 {
+    gltf_material
+        .extras()
+        .as_ref()
+        .and_then(|extras| serde_json::from_str::<serde_json::Value>(extras.get()).ok())
+        .and_then(|value| value.get("nested_priority")?.as_u64())
+        .map_or(0, |priority| priority as u32)
 }
 
 #[derive(Default, Clone)]
@@ -56,13 +73,15 @@ impl GltfExtensionHandler for SolariGltfMaterialHandler {
     fn on_material(
         &mut self,
         load_context: &mut LoadContext<'_>,
-        _gltf_material: &gltf::Material,
+        gltf_material: &gltf::Material,
         _material: Handle<GltfMaterial>,
         material_asset: &GltfMaterial,
         material_label: &str,
     ) {
         let label = format!("{material_label}/std");
-        load_context.add_labeled_asset(label, solari_material_from_gltf(material_asset));
+        let mut material = solari_material_from_gltf(material_asset);
+        material.nested_priority = nested_priority_from_extras(gltf_material);
+        load_context.add_labeled_asset(label, material);
     }
 
     fn on_spawn_mesh_and_material(

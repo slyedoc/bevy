@@ -3,9 +3,9 @@ enable wgpu_ray_query;
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
 #import bevy_solari::pbr::{rand_f, rand_vec2f}
 #import bevy_render::view::View
-#import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
+#import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic}
-#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, directional_lights, light_sources, active_light_list, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, offset_ray_origin, directional_lights, light_sources, active_light_list, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 #import bevy_solari::atmosphere::{Atmosphere, atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
 
 @group(1) @binding(0) var accumulation_texture: texture_storage_2d<rgba32float, read_write>;
@@ -27,6 +27,12 @@ struct SolariView {
 // Atmosphere params + sun for primary-ray aerial perspective (distance haze).
 // Disabled (`aerial_enabled == 0`) when the view has no `SolariAtmosphere`.
 @group(1) @binding(6) var<uniform> atmosphere: Atmosphere;
+
+const MAX_BOUNCES = 64u;
+// Max simultaneously-nested transmissive volumes a path tracks (air → bottle
+// glass → wine is 2; 4 leaves headroom).
+const MEDIUM_STACK_SIZE = 4u;
+const MEDIUM_NOT_FOUND = 0xFFFFFFFFu;
 
 @compute @workgroup_size(8, 8, 1)
 fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -65,10 +71,27 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var radiance = vec3(0.0);
     var throughput = vec3(1.0);
     var p_bounce = 0.0;
+    // Nested-dielectric medium stack (Schmidt & Budge): every transmissive
+    // volume the path is currently inside, identified by material slot. The
+    // highest-priority entry is the ACTIVE medium (air when empty) — it
+    // provides the segment absorption and the incident IOR, and boundaries of
+    // lower-priority volumes inside it are false interfaces (NVIDIA models
+    // the wine interpenetrating its glass; priority resolves the overlap).
+    var medium_id: array<u32, MEDIUM_STACK_SIZE>;
+    var medium_priority: array<u32, MEDIUM_STACK_SIZE>;
+    var medium_ior: array<f32, MEDIUM_STACK_SIZE>;
+    var medium_extinction_entry: array<vec3<f32>, MEDIUM_STACK_SIZE>;
+    var medium_count = 0u;
+    // Active-medium absorption, recomputed from the stack on every crossing.
+    var medium_extinction = vec3(0.0);
+    // Hard path-length cap: russian roulette terminates almost every path
+    // long before this; the cap is GPU-timeout insurance.
+    var bounces = 0u;
     loop {
         let ray = trace_ray(ray_origin, ray_direction, ray_t_min, RAY_T_MAX, RAY_FLAG_NONE);
         if ray.kind != RAY_QUERY_INTERSECTION_NONE {
             let ray_hit = resolve_ray_hit_full(ray);
+            throughput *= exp(-medium_extinction * length(ray_hit.world_position - ray_origin));
             if p_bounce == 0.0 { // Primary hit — distance for aerial perspective.
                 primary_distance = length(ray_hit.world_position - camera_position);
             }
@@ -87,34 +110,136 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
             radiance += mis_weight * throughput * ray_hit.material.emissive;
 
-            // Sample direct lighting, but only if the surface is not mirror-like
-            let is_perfectly_specular = ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
-            if !is_perfectly_specular {
-                let direct_lighting = sample_random_light(ray_hit.world_position, world_normal, &rng);
+            if rand_f(&rng) < ray_hit.material.specular_transmission {
+                // Transmissive surface: reflect or refract (delta lobes — no
+                // next-event estimation), crossing in/out of a volume.
+                // Whether the ray is entering: tested against the TRUE
+                // (planar, vertex-normal-sign-matched) triangle normal — not
+                // `front_face` (these assets' winding is inconsistent, which
+                // alternates eta per triangle) and not the interpolated
+                // normal (which crosses the horizon mid-facet at grazing) —
+                // either mismatch reads as bands of total-internal-reflection
+                // mirror. `bend_shading_normal` then handles the residual
+                // past-horizon interpolation of the shading normal.
+                let entering = dot(ray_direction, ray_hit.geometric_world_normal) < 0.0;
+                let oriented_geometric_normal = select(
+                    -ray_hit.geometric_world_normal,
+                    ray_hit.geometric_world_normal,
+                    entering,
+                );
+                let oriented_normal = bend_shading_normal(
+                    select(-ray_hit.world_normal, ray_hit.world_normal, entering),
+                    wo);
 
-                mis_weight = 1.0;
-                if direct_lighting.brdf_rays_can_hit {
-                    let pdf_of_bounce = brdf_pdf(wo, direct_lighting.wi, world_normal, ray_hit.material, F_ab);
-                    mis_weight = power_heuristic(1.0 / direct_lighting.inverse_pdf, pdf_of_bounce);
+                // Stack lookup: this material's entry (for exits), and the
+                // dominant medium among the OTHER entries — the medium on the
+                // far side of this boundary (air when none).
+                var self_index = MEDIUM_NOT_FOUND;
+                var other_priority = 0u;
+                var other_ior = 1.0;
+                for (var i = 0u; i < medium_count; i += 1u) {
+                    if medium_id[i] == ray_hit.material_id {
+                        self_index = i;
+                        continue;
+                    }
+                    if medium_priority[i] >= other_priority {
+                        other_priority = medium_priority[i];
+                        other_ior = medium_ior[i];
+                    }
+                }
+                // A boundary inside a strictly higher-priority volume is a
+                // false interface: the overlap belongs to the other medium,
+                // so the ray crosses with no optical event. Stack membership
+                // still updates so the real exit is recognized later.
+                let true_interface = ray_hit.material.nested_priority >= other_priority;
+
+                var crossed = true;
+                if true_interface {
+                    let eta = select(
+                        ray_hit.material.ior / other_ior, // exiting: M → far side
+                        other_ior / ray_hit.material.ior, // entering: far side → M
+                        entering,
+                    );
+                    let glass = sample_glass_bsdf(wo, oriented_normal, eta, &rng);
+                    ray_direction = glass.wi;
+                    crossed = glass.refracted;
+                    p_bounce = bitcast<f32>(0x7F800000u); // INF: delta lobe
                 }
 
-                let direct_lighting_brdf = evaluate_brdf(wo, direct_lighting.wi, world_normal, ray_hit.material, F_ab);
-                radiance += mis_weight * throughput * direct_lighting.radiance * direct_lighting.inverse_pdf * direct_lighting_brdf;
+                if crossed {
+                    if entering {
+                        if self_index == MEDIUM_NOT_FOUND && medium_count < MEDIUM_STACK_SIZE {
+                            medium_id[medium_count] = ray_hit.material_id;
+                            medium_priority[medium_count] = ray_hit.material.nested_priority;
+                            medium_ior[medium_count] = ray_hit.material.ior;
+                            medium_extinction_entry[medium_count] = ray_hit.material.extinction;
+                            medium_count += 1u;
+                        }
+                    } else if self_index != MEDIUM_NOT_FOUND {
+                        medium_count -= 1u;
+                        medium_id[self_index] = medium_id[medium_count];
+                        medium_priority[self_index] = medium_priority[medium_count];
+                        medium_ior[self_index] = medium_ior[medium_count];
+                        medium_extinction_entry[self_index] = medium_extinction_entry[medium_count];
+                    }
+                    // Active medium = highest-priority remaining entry.
+                    medium_extinction = vec3(0.0);
+                    var active_priority = 0u;
+                    var found = false;
+                    for (var i = 0u; i < medium_count; i += 1u) {
+                        if !found || medium_priority[i] >= active_priority {
+                            active_priority = medium_priority[i];
+                            medium_extinction = medium_extinction_entry[i];
+                            found = true;
+                        }
+                    }
+                }
+
+                // Continue on the side of the surface the path is now on,
+                // from a ULP-offset origin: any world-space epsilon either
+                // skips interfaces (a wine glass wall is ~1 mm and its liquid
+                // sits closer still — skipped boundaries also corrupt the
+                // medium stack) or self-intersects at large coordinates.
+                let offset_normal = select(oriented_geometric_normal, -oriented_geometric_normal, crossed);
+                ray_origin = offset_ray_origin(ray_hit.world_position, offset_normal);
+                ray_t_min = 0.0;
+            } else {
+                // Sample direct lighting, but only if the surface is not mirror-like
+                let is_perfectly_specular = ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
+                if !is_perfectly_specular {
+                    let direct_lighting = sample_random_light(ray_hit.world_position, world_normal, &rng);
+
+                    mis_weight = 1.0;
+                    if direct_lighting.brdf_rays_can_hit {
+                        let pdf_of_bounce = brdf_pdf(wo, direct_lighting.wi, world_normal, ray_hit.material, F_ab);
+                        mis_weight = power_heuristic(1.0 / direct_lighting.inverse_pdf, pdf_of_bounce);
+                    }
+
+                    let direct_lighting_brdf = evaluate_brdf(wo, direct_lighting.wi, world_normal, ray_hit.material, F_ab);
+                    radiance += mis_weight * throughput * direct_lighting.radiance * direct_lighting.inverse_pdf * direct_lighting_brdf;
+                }
+
+                // Sample new ray direction from the material BRDF for next bounce and apply BRDF
+                let next_bounce = evaluate_and_sample_brdf(wo, world_normal, ray_hit.material, F_ab, &rng);
+                if next_bounce.pdf == 0.0 { break; }
+                ray_direction = next_bounce.wi;
+                ray_origin = offset_ray_origin(ray_hit.world_position, ray_hit.geometric_world_normal);
+                ray_t_min = 0.0;
+                p_bounce = next_bounce.pdf;
+                throughput *= next_bounce.throughput;
             }
 
-            // Sample new ray direction from the material BRDF for next bounce and apply BRDF
-            let next_bounce = evaluate_and_sample_brdf(wo, world_normal, ray_hit.material, F_ab, &rng);
-            if next_bounce.pdf == 0.0 { break; }
-            ray_direction = next_bounce.wi;
-            ray_origin = ray_hit.world_position + (ray_hit.geometric_world_normal * RAY_T_MIN);
-            ray_t_min = RAY_T_MIN;
-            p_bounce = next_bounce.pdf;
-            throughput *= next_bounce.throughput;
-
-            // Russian roulette for early termination
-            let p = luminance(throughput);
+            // Russian roulette for early termination. Survival is capped
+            // below 1 (unbiased — the ÷p compensates) so even lossless paths
+            // terminate: clear glass keeps throughput at exactly 1, and a ray
+            // in total internal reflection inside a window pane would
+            // otherwise bounce forever.
+            let p = min(luminance(throughput), 0.95);
             if rand_f(&rng) > p { break; }
             throughput /= p;
+
+            bounces += 1u;
+            if bounces >= MAX_BOUNCES { break; }
         } else {
             // Ray escaped the scene. With a skybox: add it (cube × brightness) in
             // the ray direction — raw radiance, exposed once at the end; the sky

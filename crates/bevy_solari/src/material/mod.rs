@@ -49,6 +49,24 @@ pub struct SolariMaterial {
     /// Dielectric specular reflectance at normal incidence (`F0`), scaled into
     /// `[0, 0.16]` like `StandardMaterial`.
     pub reflectance: f32,
+    /// Fraction of light passing through the surface as specular transmission
+    /// (glass/water). `> 0` makes the ray tracer refract through the mesh
+    /// (treated as a closed volume) instead of shading it opaque.
+    pub specular_transmission: f32,
+    /// Index of refraction for transmissive surfaces (1.5 ≈ glass, 1.33 water).
+    pub ior: f32,
+    /// Distance (world units) light travels inside the volume before
+    /// [`Self::attenuation_color`] remains (Beer–Lambert). `INFINITY` = clear.
+    pub attenuation_distance: f32,
+    /// The color remaining after white light travels [`Self::attenuation_distance`]
+    /// through the volume.
+    pub attenuation_color: Color,
+    /// Nested-dielectric priority for transmissive volumes that overlap
+    /// (wine modeled interpenetrating its glass): at a boundary inside a
+    /// higher-priority volume the boundary is ignored, so the higher priority
+    /// wins the overlap region. Read from the glTF material's
+    /// `extras.nested_priority`. `0` = no nesting expected.
+    pub nested_priority: u32,
     /// Optional tangent-space normal map.
     pub normal_map_texture: Option<Handle<Image>>,
 }
@@ -77,6 +95,11 @@ impl Default for SolariMaterial {
             metallic: 0.0,
             metallic_roughness_texture: None,
             reflectance: 0.5,
+            specular_transmission: 0.0,
+            ior: 1.5,
+            attenuation_distance: f32::INFINITY,
+            attenuation_color: Color::WHITE,
+            nested_priority: 0,
             normal_map_texture: None,
         }
     }
@@ -98,6 +121,11 @@ impl From<&StandardMaterial> for SolariMaterial {
             metallic: m.metallic,
             metallic_roughness_texture: m.metallic_roughness_texture.clone(),
             reflectance: m.reflectance,
+            specular_transmission: m.specular_transmission,
+            ior: m.ior,
+            attenuation_distance: m.attenuation_distance,
+            attenuation_color: m.attenuation_color,
+            nested_priority: 0,
             normal_map_texture: m.normal_map_texture.clone(),
         }
     }

@@ -8,10 +8,10 @@ use derive_more::Display;
 pub enum SolariLighting {
     /// Reference path tracer: unbiased, progressive accumulation. The ground
     /// truth the realtime path is validated against.
+    #[default]
     #[display("pathtrace")]
     Pathtracer,
-    /// Realtime ReSTIR path.
-    #[default]
+    /// Realtime ReSTIR path.    
     #[display("restir")]
     Restir,
 }

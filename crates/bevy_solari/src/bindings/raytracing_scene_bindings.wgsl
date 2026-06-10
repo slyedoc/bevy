@@ -36,8 +36,13 @@ struct Material {
     perceptual_roughness: f32,
     emissive: vec3<f32>,
     metallic: f32,
-    _padding: vec3<f32>,
+    // Beer-Lambert extinction per channel (1/world-unit) inside the volume.
+    extinction: vec3<f32>,
     reflectance: f32,
+    ior: f32,
+    specular_transmission: f32,
+    nested_priority: u32,
+    _padding: f32,
 }
 
 const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
@@ -140,6 +145,26 @@ struct InstanceClusterRange {
 const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
 
+// Self-intersection-free ray origin for continuation rays (Wächter & Binder,
+// "A Fast and Robust Method for Avoiding Self-Intersection", Ray Tracing
+// Gems ch. 6). Offsets the hit point along the geometric normal by a few ULPs
+// of its own float representation — exactly as much as precision requires, so
+// it can neither re-hit the surface it left nor skip real geometry (no fixed
+// world-space epsilon to outgrow a millimeter-scale wine glass or underflow a
+// kilometer-scale city). Trace from the result with `t_min = 0`.
+fn offset_ray_origin(p: vec3<f32>, geometric_normal: vec3<f32>) -> vec3<f32> {
+    let int_offset = vec3<i32>(geometric_normal * 256.0);
+    let p_int = vec3<f32>(
+        bitcast<f32>(bitcast<i32>(p.x) + select(int_offset.x, -int_offset.x, p.x < 0.0)),
+        bitcast<f32>(bitcast<i32>(p.y) + select(int_offset.y, -int_offset.y, p.y < 0.0)),
+        bitcast<f32>(bitcast<i32>(p.z) + select(int_offset.z, -int_offset.z, p.z < 0.0)),
+    );
+    // Near zero a fixed float offset replaces the integer bump (the ULP size
+    // collapses as the exponent does).
+    let near_origin = abs(p) < vec3(1.0 / 32.0);
+    return select(p_int, p + geometric_normal * (1.0 / 65536.0), near_origin);
+}
+
 const RAY_NO_CULL = 0xFFu;
 
 // Per-view RT cull mask (the camera's `RenderLayers` → low 8 bits). `trace_ray`
@@ -173,6 +198,10 @@ struct ResolvedMaterial {
     perceptual_roughness: f32,
     roughness: f32,
     metallic: f32,
+    specular_transmission: f32,
+    ior: f32,
+    extinction: vec3<f32>,
+    nested_priority: u32,
 }
 
 struct ResolvedRayHitFull {
@@ -185,6 +214,8 @@ struct ResolvedRayHitFull {
     triangle_area: f32,
     triangle_count: u32,
     material: ResolvedMaterial,
+    // Stable material slot — the identity nested-dielectric stacks pop on.
+    material_id: u32,
 }
 
 fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
@@ -211,6 +242,11 @@ fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
     }
 
     m.roughness = m.perceptual_roughness * m.perceptual_roughness;
+
+    m.specular_transmission = material.specular_transmission;
+    m.ior = material.ior;
+    m.extinction = material.extinction;
+    m.nested_priority = material.nested_priority;
 
     return m;
 }
@@ -344,9 +380,24 @@ fn resolve_triangle_data_full(
         vertices[0].tangent.w,
     );
 
-    let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics; // TODO: Use barycentric lerp, ray_hit.object_to_world, cross product geo normal
+    let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics;
     var world_normal = normalize(affine_transform_direction(transform, local_normal));
-    let geometric_world_normal = world_normal;
+
+    let triangle_edge0 = world_vertices[0] - world_vertices[1];
+    let triangle_edge1 = world_vertices[0] - world_vertices[2];
+    let triangle_cross = cross(triangle_edge0, triangle_edge1);
+    let triangle_area = length(triangle_cross) / 2.0;
+
+    // True (planar) triangle normal. The cross product's sign follows the
+    // index winding, which these assets don't keep consistent (authored for
+    // double-sided raster) — sign-match it to the interpolated vertex normal,
+    // which IS consistently outward, so inside/outside tests get an exact
+    // plane with a stable orientation.
+    var geometric_world_normal = normalize(triangle_cross);
+    if dot(geometric_world_normal, world_normal) < 0.0 {
+        geometric_world_normal = -geometric_world_normal;
+    }
+
     if material.normal_map_texture_id != TEXTURE_MAP_NONE {
         let TBN = calculate_tbn_mikktspace(world_normal, world_tangent);
         let T = TBN[0];
@@ -355,10 +406,6 @@ fn resolve_triangle_data_full(
         let Nt = sample_texture(material.normal_map_texture_id, uv);
         world_normal = normalize(Nt.x * T + Nt.y * B + Nt.z * N);
     }
-
-    let triangle_edge0 = world_vertices[0] - world_vertices[1];
-    let triangle_edge1 = world_vertices[0] - world_vertices[2];
-    let triangle_area = length(cross(triangle_edge0, triangle_edge1)) / 2.0;
 
     let resolved_material = resolve_material(material, uv);
 
@@ -372,5 +419,6 @@ fn resolve_triangle_data_full(
         triangle_area,
         cluster.triangle_count,
         resolved_material,
+        material_id,
     );
 }

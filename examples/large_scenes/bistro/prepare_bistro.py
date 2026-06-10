@@ -374,3 +374,89 @@ bpy.ops.export_scene.gltf(
     filepath=str(OUT_PATH), export_format="GLB", export_lights=True
 )
 print(f"exported {OUT_PATH}")
+
+# ---------------------------------------------------------------------------
+# 7. Glass materials. FBX can't express transmission, so the exported GLB has
+#    the glassware as plain alpha-blended surfaces. Patch the glTF JSON with
+#    KHR_materials_transmission / ior / volume using the values from NVIDIA's
+#    own BistroInterior_Wine.pyscene (which does the same fix-up for Falcor).
+#    Absorption coefficients are per meter; attenuationColor is what remains
+#    after ATTENUATION_DISTANCE meters.
+# ---------------------------------------------------------------------------
+
+# name -> (ior, roughness, absorption sigma 1/m or None, nested priority)
+# Priorities are NVIDIA's pyscene nestedPriority values: where transmissive
+# volumes overlap (the liquids are modeled interpenetrating their glass), the
+# higher priority owns the overlap region.
+GLASS_MATERIALS = {
+    "TransparentGlass": (1.55, 0.0, None, 5),
+    "TransparentGlassWine": (1.55, 0.0, (102.68063, 168.015, 246.80438), 5),
+    "Paris_LiquorBottle_01_Glass_Wine": (1.55, 0.0, (102.68063, 168.015, 246.80438), 5),
+    "Water": (1.33, 0.0, None, 1),
+    "Ice": (1.31, 0.1, None, 4),
+    "White_Wine": (1.33, 0.0, (12.28758, 16.51818, 20.30273), 1),
+    "Red_Wine": (1.33, 0.0, (117.13133, 251.91133, 294.33867), 1),
+    "Beer": (1.33, 0.0, (11.78552, 25.45862, 58.37241), 1),
+    # Window/door panes (thin sheets, not in the pyscene -- plain glass)
+    "MASTER_Glass_Exterior": (1.55, 0.0, None, 5),
+}
+ATTENUATION_DISTANCE = 0.01
+
+
+def patch_glass_materials(path):
+    import json
+    import math
+    import struct
+
+    data = open(path, "rb").read()
+    magic, version, _length = struct.unpack_from("<III", data, 0)
+    assert magic == 0x46546C67, "not a GLB"
+    json_len, json_type = struct.unpack_from("<II", data, 12)
+    assert json_type == 0x4E4F534A
+    gltf = json.loads(data[20 : 20 + json_len])
+    rest = data[20 + json_len :]
+
+    patched = 0
+    for material in gltf.get("materials", []):
+        spec = GLASS_MATERIALS.get(material.get("name"))
+        if spec is None:
+            continue
+        ior, roughness, sigma, priority = spec
+        extensions = material.setdefault("extensions", {})
+        extensions["KHR_materials_transmission"] = {"transmissionFactor": 1.0}
+        extensions["KHR_materials_ior"] = {"ior": ior}
+        if sigma is not None:
+            extensions["KHR_materials_volume"] = {
+                "thicknessFactor": 1.0,
+                "attenuationDistance": ATTENUATION_DISTANCE,
+                "attenuationColor": [
+                    math.exp(-s * ATTENUATION_DISTANCE) for s in sigma
+                ],
+            }
+        # No standard extension exists for nested-dielectric priorities;
+        # bevy_solari's glTF handler reads them from extras.
+        material.setdefault("extras", {})["nested_priority"] = priority
+        pbr = material.setdefault("pbrMetallicRoughness", {})
+        pbr["roughnessFactor"] = roughness
+        pbr["metallicFactor"] = 0.0
+        material["alphaMode"] = "OPAQUE"
+        patched += 1
+
+    used = set(gltf.get("extensionsUsed", []))
+    used.update(
+        ["KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_volume"]
+    )
+    gltf["extensionsUsed"] = sorted(used)
+
+    payload = json.dumps(gltf, separators=(",", ":")).encode()
+    payload += b" " * (-len(payload) % 4)
+    out = bytearray()
+    out += struct.pack("<III", magic, version, 12 + 8 + len(payload) + len(rest))
+    out += struct.pack("<II", len(payload), json_type)
+    out += payload
+    out += rest
+    open(path, "wb").write(out)
+    print(f"patched {patched} glass materials")
+
+
+patch_glass_materials(OUT_PATH)

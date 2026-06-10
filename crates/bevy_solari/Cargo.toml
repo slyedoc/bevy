@@ -22,7 +22,7 @@ cluster_processor = ["dep:meshopt"]
 # Emits `SolariMaterial` from glTF materials at load (a `GltfExtensionHandler`),
 # so glTF scenes get real materials with `PbrPlugin` (and its glTF→StandardMaterial
 # handler) disabled. Threaded from bevy via `bevy_gltf = [..., "bevy_solari?/gltf"]`.
-gltf = ["dep:bevy_gltf"]
+gltf = ["dep:bevy_gltf", "dep:serde_json"]
 # Enables the in-engine debug-view dropdown (`SolariDebugPlugin`).
 # Pulls in bevy_feathers + the UI widget stack — examples / tools
 # only; runtime games typically don't want this.
@@ -91,6 +91,7 @@ wgpu = { version = "29.0.3", default-features = false }
 # bevy_anti_alias's `Dlss` component) so the self-contained RT path needs no
 # raster prepass. Only pulled in by the `dlss` feature.
 dlss_wgpu = { version = "4.0.0", optional = true }
+serde_json = { version = "1.0.140", optional = true }
 bytemuck = { version = "1" }
 derive_more = { version = "2", default-features = false, features = ["display", "from"] }
 lz4_flex = { version = "0.13", default-features = false, features = ["std", "frame"] }
