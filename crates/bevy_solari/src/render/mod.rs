@@ -42,7 +42,8 @@ use bevy_render::{
     extract_resource::ExtractResourcePlugin,
 };
 use bevy_shader::load_shader_library;
-use crate::{pipelines::SolariPipelines, resource_manager::SolariResourceManager, render::view::{pathtracer_enabled, restir_enabled, SolariViewState}, render::reset::CameraReset};
+use crate::{pipelines::SolariPipelines, resource_manager::SolariResourceManager, render::view::{pathtracer_enabled, restir_enabled, SolariViewState}};
+pub use reset::CameraReset;
 use overlay::register_overlays;
 use node::{prepare_restir_jitter, restir};
 pub use gizmo_depth::{gizmo_depth_bind_group_layout, gizmo_depth_pipeline};
@@ -92,6 +93,7 @@ impl Plugin for SolarRenderPlugin {
                         reset::clear_camera_reset,
                         reset::reset_render_on_camera_move,
                         reset::reset_render_on_view_state_change,
+                        reset::reset_render_on_request,
                     )
                         .chain(),
                     view_cull::extract_solari_view_cull_masks,

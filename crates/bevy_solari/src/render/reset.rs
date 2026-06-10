@@ -7,6 +7,11 @@ use bevy_transform::components::GlobalTransform;
 use crate::render::view::SolariViewState;
 use crate::render::SolariCamera;
 
+/// Per-frame "drop temporal history / accumulation" flag on a solari camera's
+/// render entity. Reset-reason systems in extract set it; the main-world copy
+/// (required by [`SolariCamera`]) doubles as an app-side request channel:
+/// write `true` to it (e.g. after changing lighting under a progressive
+/// integrator) and [`reset_render_on_request`] forwards it for that frame.
 #[derive(Component, Default, Reflect, Clone)]
 pub struct CameraReset(pub bool);
 
@@ -34,6 +39,20 @@ pub fn reset_render_on_camera_move(
 ) {
     for (e, camera, global_transform) in &cameras_3d {
         if camera.is_active && global_transform.is_changed() {
+            commands.entity(e).insert(CameraReset(true));
+        }
+    }
+}
+
+/// Reset reason: the app wrote `true` to the main-world [`CameraReset`]
+/// (edge-triggered by change detection, so a flag left `true` doesn't keep
+/// resetting).
+pub fn reset_render_on_request(
+    cameras: Extract<Query<(RenderEntity, Ref<CameraReset>), With<SolariCamera>>>,
+    mut commands: Commands,
+) {
+    for (e, reset) in &cameras {
+        if reset.is_changed() && reset.0 {
             commands.entity(e).insert(CameraReset(true));
         }
     }

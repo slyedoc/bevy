@@ -34,13 +34,13 @@ use bevy::{
 };
 use bevy::{
     camera::Hdr,
+    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
     diagnostic::FrameTimeDiagnosticsPlugin,
+    feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     light::CascadeShadowConfigBuilder,
     prelude::*,
     window::{PresentMode, WindowResolution},
     winit::WinitSettings,
-    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
-    feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme},
 };
 use mipmap_generator::{
     generate_mipmaps, MipmapGeneratorDebugTextPlugin, MipmapGeneratorPlugin,
@@ -53,10 +53,12 @@ use bevy::{
     light::cluster::ClusterConfig,
     render::render_resource::TextureUsages,
     solari::prelude::*,
-    transform::systems::{propagate_transforms_for, sync_simple_transforms},
 };
 
 use crate::light_consts::lux;
+
+#[cfg(feature = "solari")]
+mod settings;
 
 #[derive(FromArgs, Resource, Clone)]
 /// Config
@@ -134,15 +136,17 @@ pub fn main() {
 
     // DLSS needs its project id inserted before RenderPlugin (DlssInitPlugin reads
     // it during render init). `solari` enables `bevy/dlss`.
-    #[cfg(feature = "solari")]
+    #[cfg(feature = "dlss")]
     app.insert_resource(bevy::anti_alias::dlss::DlssProjectId(
         bevy::asset::uuid::uuid!("b1f7d9e3-2a4c-4d6b-8f1e-3c5a7b9d0f2e"),
     ));
 
     let default_plugins = DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
-            present_mode: PresentMode::Immediate,
+            title: "Bistro".into(),            
             resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
+            present_mode: PresentMode::AutoNoVsync,
+            position: WindowPosition::Centered(MonitorSelection::Primary),
             ..default()
         }),
         ..default()
@@ -157,13 +161,7 @@ pub fn main() {
         .disable::<bevy::pbr::PbrPlugin>()
         .disable::<bevy::dev_tools::render_debug::RenderDebugOverlayPlugin>();
 
-    app.init_resource::<CameraPositions>()
-        .init_resource::<FrameLowHigh>()
-        .insert_resource(GlobalAmbientLight::NONE)
-        .insert_resource(args.clone())
-        .insert_resource(ClearColor(Color::srgb(1.75, 1.9, 1.99)))
-        .insert_resource(WinitSettings::continuous())
-        .add_plugins(default_plugins)
+    app.add_plugins(default_plugins)
         .add_plugins((
             FrameTimeDiagnosticsPlugin {
                 max_history_length: 1000,
@@ -171,7 +169,6 @@ pub fn main() {
             },
             FreeCameraPlugin,
             FeathersPlugins,
-
             FpsOverlayPlugin {
                 config: FpsOverlayConfig {
                     frame_time_graph_config: FrameTimeGraphConfig {
@@ -181,9 +178,14 @@ pub fn main() {
                     },
                     ..default()
                 },
-            }, 
-               
+            },
         ))
+        .init_resource::<CameraPositions>()
+        .init_resource::<FrameLowHigh>()
+        .insert_resource(GlobalAmbientLight::NONE)
+        .insert_resource(args.clone())
+        .insert_resource(ClearColor(Color::srgb(1.75, 1.9, 1.99)))
+        .insert_resource(WinitSettings::continuous())
         .insert_resource(UiTheme(create_dark_theme()))
         .add_systems(Startup, setup)
         .add_systems(
@@ -192,13 +194,7 @@ pub fn main() {
         );
 
     #[cfg(feature = "solari")]
-    app.add_plugins(SolariPlugin)
-        // Camera/sun are root leaves → `sync_simple_transforms`; the UI tree →
-        // `propagate_transforms_for`. The ~scene meshes get nothing on the CPU.
-        .add_systems(
-            PostUpdate,
-            (sync_simple_transforms, propagate_transforms_for::<With<Node>>),
-        )
+    app.add_plugins((SolariPlugin, settings::LightSettingsPlugin))
         // PbrPlugin no longer registers `Assets<StandardMaterial>`, but proc_scene /
         // benchmark / mipmap systems still reference it.
         .init_asset::<StandardMaterial>()
@@ -250,14 +246,12 @@ struct FrameTimeText;
 pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<Args>) {
     println!("Loading models, generating mipmaps");
 
-    let bistro_exterior = asset_server.load("bistro_exterior/BistroExterior.gltf#Scene0");
+    // Combined BistroExterior + BistroInterior_Wine, produced by
+    // `prepare_bistro.py` (scales/positions reconciled, duplicate building
+    // shell removed, entrance doors split and opened).
+    let bistro = asset_server.load("bistro/Bistro.glb#Scene0");
     commands
-        .spawn((WorldAssetRoot(bistro_exterior.clone()), Spin))
-        .observe(proc_scene);
-
-    let bistro_interior = asset_server.load("bistro_interior_wine/BistroInterior_Wine.gltf#Scene0");
-    commands
-        .spawn((WorldAssetRoot(bistro_interior.clone()), Spin))
+        .spawn((WorldAssetRoot(bistro.clone()), Spin))
         .observe(proc_scene);
 
     let mut count = 0;
@@ -276,15 +270,8 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
                 }
                 commands
                     .spawn((
-                        WorldAssetRoot(bistro_exterior.clone()),
+                        WorldAssetRoot(bistro.clone()),
                         Transform::from_xyz(x as f32 * 150.0, 0.0, z as f32 * 150.0),
-                        Spin,
-                    ))
-                    .observe(proc_scene);
-                commands
-                    .spawn((
-                        WorldAssetRoot(bistro_interior.clone()),
-                        Transform::from_xyz(x as f32 * 150.0, 0.3, z as f32 * 150.0 - 0.2),
                         Spin,
                     ))
                     .observe(proc_scene);
@@ -340,6 +327,7 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
             illuminance: lux::FULL_DAYLIGHT,
             ..default()
         },
+        settings::Sun,
     ));
 
     // Camera
@@ -365,6 +353,11 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     #[cfg(feature = "solari")]
     cam.insert((
         SolariCamera::default(),
+        // Self-contained single-scattering sky, baked to a cube and sampled on
+        // ray miss (background + IBL); sun = the `SolariDirectionLight`. The
+        // defaults are metres-scale (~12 km visibility, 100 m fog layer), which
+        // matches this scene.
+        SolariAtmosphere::default(),
         ClusterConfig::None,
         CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
     ));

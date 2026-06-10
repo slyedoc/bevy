@@ -33,10 +33,7 @@ use bevy::{
     core_pipeline::Skybox,
     light::cluster::ClusterConfig,
     render::render_resource::TextureUsages,
-    solari::{
-        prelude::*,
-    },
-    transform::systems::{propagate_transforms_for, sync_simple_transforms},
+    solari::prelude::*,
 };
 
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
