@@ -13,7 +13,7 @@ use bevy_ecs::{
 use bevy_math::Vec3;
 use bevy_pbr::DfgLut;
 
-use crate::lights::{ActiveDirectionalLights, EmissiveLights, GpuLightSource};
+use crate::lights::{GpuLightSource, LightSources};
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     render_asset::RenderAssets,
@@ -34,8 +34,7 @@ pub struct RaytracingSceneBindings {
 }
 
 pub fn prepare_raytracing_scene_bindings(
-    active_lights: Res<ActiveDirectionalLights>,
-    emissive_lights: Res<EmissiveLights>,
+    lights: Res<LightSources>,
     
     instance_manager: Res<InstanceManager>,
     cluster_mesh_manager: Res<ClusterMeshManager>,
@@ -158,27 +157,24 @@ pub fn prepare_raytracing_scene_bindings(
         samplers.push(fallback_texture.d2.sampler.deref());
     }
 
-    // Seed this frame's light list with the cached emissive-mesh lights
-    // (`crate::lights::EmissiveLights`, rebuilt change-driven); directional lights
-    // are appended below.
-    *light_sources.get_mut() = emissive_lights.lights.clone();
-
-    // Directional lights: the `directional_lights` column buffer (settings +
-    // GPU-resolved direction) is owned by `crate::lights`; here we only append each
-    // active light to the light-source index list — its `directional_light_id` is
-    // its stable **table slot** (the column is slot-indexed).
-    for &(_entity, slot) in &active_lights.0 {
-        light_sources
-            .get_mut()
-            .push(GpuLightSource::new_directional_light(slot));
+    // The light-source table (`crate::lights::LightSources`, rebuilt
+    // change-driven) is **stable-slot indexed** — reservoirs / light tiles
+    // store the slot as their light identity — plus the dense active list the
+    // uniform pick samples from. A `NONE` placeholder keeps the bindings valid
+    // in a lightless scene (the active list's zero counts gate sampling).
+    *light_sources.get_mut() = lights.table.clone();
+    if light_sources.get().is_empty() {
+        light_sources.get_mut().push(GpuLightSource::NONE);
     }
-
-    if light_sources.get().len() > u16::MAX as usize {
-        panic!("Too many light sources in the scene, maximum is 65535.");
+    let mut active_light_list = StorageBufferList::<u32>::default();
+    *active_light_list.get_mut() = lights.active.clone();
+    if active_light_list.get().is_empty() {
+        active_light_list.get_mut().extend([0u32, 0u32]);
     }
 
     materials.write_buffer(&render_device, &render_queue);
     light_sources.write_buffer(&render_device, &render_queue);
+    active_light_list.write_buffer(&render_device, &render_queue);
 
     // PTLAS is built by `ptlas::dispatch_ptlas`; no TLAS build here.
 
@@ -218,6 +214,7 @@ pub fn prepare_raytracing_scene_bindings(
             deform.normals.as_entire_binding(),
             deform.animated_table().as_entire_binding(),
             deform.tangents.as_entire_binding(),
+            active_light_list.binding().unwrap(),
         )),
     ));
 }
@@ -257,6 +254,7 @@ impl RaytracingSceneBindings {
                         storage_buffer_read_only_sized(false, None), // 14: deform_normals
                         storage_buffer_read_only_sized(false, None), // 15: instance_animated
                         storage_buffer_read_only_sized(false, None), // 16: deform_tangents
+                        storage_buffer_read_only_sized(false, None), // 17: active_light_list
                     ),
                 ),
             ),

@@ -5,7 +5,7 @@ enable wgpu_ray_query;
 #import bevy_solari::pbr::D_GGX
 #import bevy_solari::pbr::{rand_f, rand_vec2f, rand_u, rand_range_u}
 #import bevy_render::maths::{PI_2, orthonormalize}
-#import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD, clusters, instance_cluster_ranges}
+#import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, active_light_list, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD, clusters, instance_cluster_ranges}
 
 fn power_heuristic(f: f32, g: f32) -> f32 {
     return balance_heuristic(f * f, g * g);
@@ -118,15 +118,14 @@ struct GenerateRandomLightSampleResult {
     resolved_light_sample: ResolvedLightSample,
 }
 
-/// Number of emissive-mesh entries in `light_sources`. The scene binder
-/// appends the (few) directional lights at the END of the list, so peeling
-/// directionals off the tail counts both strata.
+/// Number of active emissive-mesh lights (the `active_light_list` header).
 fn emissive_light_count() -> u32 {
-    var n = arrayLength(&light_sources);
-    while n > 0u && light_sources[n - 1u].kind == LIGHT_SOURCE_KIND_DIRECTIONAL {
-        n -= 1u;
-    }
-    return n;
+    return active_light_list[0];
+}
+
+/// Number of active directional lights (the `active_light_list` header).
+fn directional_light_count() -> u32 {
+    return active_light_list[1];
 }
 
 fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rng: ptr<function, u32>) -> LightContribution {
@@ -144,8 +143,7 @@ fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rn
 /// stratified pick above exactly.
 fn random_emissive_light_pdf(hit: ResolvedRayHitFull) -> f32 {
     let emissive_count = emissive_light_count();
-    let directional_count = arrayLength(&light_sources) - emissive_count;
-    let stratum_probability = select(1.0, 0.5, directional_count > 0u);
+    let stratum_probability = select(1.0, 0.5, directional_light_count() > 0u);
     return stratum_probability / (f32(emissive_count) * f32(hit.triangle_count) * hit.triangle_area);
 }
 
@@ -160,12 +158,16 @@ fn random_emissive_light_pdf(hit: ResolvedRayHitFull) -> f32 {
 /// every presampled light tile. [`random_emissive_light_pdf`] is the MIS
 /// counterpart and must mirror this pick exactly.
 ///
+/// The pick indexes `active_light_list` (dense, this frame's live lights);
+/// the resulting `light_id` packs the picked light's **stable slot** into
+/// `light_sources` — the identity reservoirs and light tiles store, valid
+/// across frames regardless of lights being added or removed.
+///
 /// Returns a `NULL_LIGHT_ID` sample (zero radiance) when the scene has no
 /// lights at all.
 fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightSampleResult {
-    let total = arrayLength(&light_sources);
     let emissive_count = emissive_light_count();
-    let directional_count = total - emissive_count;
+    let directional_count = directional_light_count();
 
     var stratum_base = 0u;
     var stratum_count = emissive_count;
@@ -184,7 +186,8 @@ fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightS
         return GenerateRandomLightSampleResult(LightSample(NULL_LIGHT_ID, 0u), null_resolved);
     }
 
-    let light_id = stratum_base + rand_range_u(stratum_count, rng);
+    let pick = stratum_base + rand_range_u(stratum_count, rng);
+    let light_id = active_light_list[2u + pick];
     let light_source = light_sources[light_id];
 
     var triangle_id = 0u;

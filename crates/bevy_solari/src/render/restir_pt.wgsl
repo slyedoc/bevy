@@ -24,7 +24,7 @@ enable wgpu_ray_query;
 #import bevy_render::maths::{PI, orthonormalize}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB, bend_shading_normal}
 #import bevy_solari::sampling::{LightSample, generate_random_light_sample, resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_point_visibility, sample_random_light, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, random_emissive_light_pdf, power_heuristic, isnan, NULL_LIGHT_ID}
-#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, directional_lights, ResolvedMaterial, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, active_light_list, directional_lights, ResolvedMaterial, LIGHT_SOURCE_KIND_NONE, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 #import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler}
 
 const INITIAL_SAMPLES = 8u;
@@ -152,11 +152,15 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
         } else {
             background = solari_view.clear_color / max(view.exposure, 1e-6);
         }
-        // Each directional light as a disk of its angular radius — the sky
-        // bake's Mie halo doesn't draw the disk itself.
-        let num_directional = arrayLength(&directional_lights);
+        // Each ACTIVE directional light as a disk of its angular radius — the
+        // sky bake's Mie halo doesn't draw the disk itself. Walked via the
+        // active list: the slot-indexed column keeps stale luminance in freed
+        // slots, which would draw a ghost sun.
+        let emissive_count = active_light_list[0];
+        let num_directional = active_light_list[1];
         for (var i = 0u; i < num_directional; i = i + 1u) {
-            let sun = directional_lights[i];
+            let source = light_sources[active_light_list[2u + emissive_count + i]];
+            let sun = directional_lights[source.id];
             if dot(ray_direction, sun.direction_to_light) >= sun.cos_theta_max {
                 background += sun.luminance;
             }
@@ -460,11 +464,11 @@ fn load_temporal_reservoir(pixel: vec2<u32>, world_position: vec3<f32>, world_no
     }
 
     var reservoir = load_reservoir_a(reprojection.pixel);
-    // KNOWN LIMITATION: `light_id` indexes this frame's `light_sources` order,
-    // so history is only identity-stable while the light set is unchanged. On
-    // an add/remove frame a reused id may point at a different light for one
-    // temporal chain (energy flicker, self-correcting as history re-caps).
-    // The fix is a stable-slot light table (GPU column) — tracked follow-up.
+    // `light_id` packs the light's STABLE slot, so history survives lights
+    // being added/removed; a dead light's slot resolves to a `NONE` hole and
+    // the reservoir is rejected in `reservoir_contribution`. (A freed slot's
+    // reuse can briefly misattribute history to the new occupant — bounded by
+    // the confidence cap.)
     reservoir.confidence_weight = min(reservoir.confidence_weight, DI_CONFIDENCE_WEIGHT_CAP);
     return reservoir;
 }
@@ -506,8 +510,14 @@ fn reservoir_contribution(reservoir: Reservoir, world_position: vec3<f32>, world
     if !reservoir_valid(reservoir) {
         return ReservoirContribution(vec3(0.0), 0.0, vec3(0.0), vec4(0.0));
     }
+    // The stored slot's light died (slot holed out as `NONE`): resolving it
+    // would read another instance's geometry — reject the reservoir instead.
+    let light_source = light_sources[reservoir.light_id >> 16u];
+    if light_source.kind == LIGHT_SOURCE_KIND_NONE {
+        return ReservoirContribution(vec3(0.0), 0.0, vec3(0.0), vec4(0.0));
+    }
     let sample = LightSample(reservoir.light_id, reservoir.seed);
-    let resolved = resolve_light_sample(sample, light_sources[reservoir.light_id >> 16u]);
+    let resolved = resolve_light_sample(sample, light_source);
     let contribution = calculate_resolved_light_contribution(resolved, world_position, world_normal);
     let target_function = luminance(contribution.radiance * diffuse_brdf * saturate(dot(contribution.wi, world_normal)));
     return ReservoirContribution(contribution.radiance, target_function, contribution.wi, resolved.world_position);

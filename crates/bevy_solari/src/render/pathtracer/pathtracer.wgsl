@@ -5,7 +5,7 @@ enable wgpu_ray_query;
 #import bevy_render::view::View
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic}
-#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, directional_lights, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, directional_lights, light_sources, active_light_list, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 #import bevy_solari::atmosphere::{Atmosphere, atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
 
 @group(1) @binding(0) var accumulation_texture: texture_storage_2d<rgba32float, read_write>;
@@ -136,9 +136,13 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // double-count it. The atmosphere's Mie glow halo comes from the sky
             // cube; this is the bright disk itself, which the bake doesn't draw.
             if p_bounce == 0.0 {
-                let num_directional = arrayLength(&directional_lights);
+                // Walked via the active list: the slot-indexed column keeps
+                // stale luminance in freed slots (would draw a ghost sun).
+                let emissive_count = active_light_list[0];
+                let num_directional = active_light_list[1];
                 for (var i = 0u; i < num_directional; i = i + 1u) {
-                    let sun = directional_lights[i];
+                    let source = light_sources[active_light_list[2u + emissive_count + i]];
+                    let sun = directional_lights[source.id];
                     if dot(ray_direction, sun.direction_to_light) >= sun.cos_theta_max {
                         radiance += throughput * sun.luminance;
                     }

@@ -51,7 +51,7 @@ use bytemuck::{Pod, Zeroable};
 use core::f32::consts::TAU;
 
 use crate::bindings::SolariMaterialAssets;
-use crate::ecs_gpu::{GpuColumn, GpuSlot, GpuTable};
+use crate::ecs_gpu::{GpuColumn, GpuSlot, GpuTable, SlotPool};
 use crate::instance::InstanceManager;
 use crate::material::SolariMaterial;
 use crate::pipelines::SolariPipelines;
@@ -177,7 +177,7 @@ pub fn extract_solari_lights(
     }
 }
 
-/// One entry in the path tracer's light-source RIS list (`light_sources`), shared
+/// One entry in the path tracer's light-source table (`light_sources`), shared
 /// by emissive-mesh lights and directional lights. Mirrors the WGSL `LightSource`.
 #[derive(ShaderType, Clone)]
 pub struct GpuLightSource {
@@ -186,6 +186,11 @@ pub struct GpuLightSource {
 }
 
 impl GpuLightSource {
+    /// A freed slot in the slot-indexed table: `kind = 0` is an emissive light
+    /// with zero triangles, which nothing can sample — consumers treat it as
+    /// "no light here" (`LIGHT_SOURCE_KIND_NONE` in WGSL).
+    pub const NONE: GpuLightSource = GpuLightSource { kind: 0, id: 0 };
+
     /// Emissive instance: `kind` packs the instance's total triangle count in bits
     /// 1..=31; bit 0 stays 0 so it doesn't collide with the directional kind (= 1).
     /// `id` is the PTLAS instance slot ray hits report as `instance_index`.
@@ -206,28 +211,54 @@ impl GpuLightSource {
     }
 }
 
-/// Render-world cache of emissive-mesh `GpuLightSource`s, rebuilt by
-/// [`prepare_emissive_lights`] only when the emissive set could have changed. The
-/// scene binder seeds its `light_sources` list with this, then appends directional
-/// lights (from [`ActiveDirectionalLights`]).
-#[derive(Resource, Default)]
-pub struct EmissiveLights {
-    /// One [`GpuLightSource`] per active emissive-mesh instance.
-    pub lights: Vec<GpuLightSource>,
-    /// The emissive material set the cache was built against — a diff catches a
-    /// material whose `emissive` was edited without any instance changing.
-    cached_assets: HashSet<AssetId<SolariMaterial>, FixedHasher>,
+/// Identity of one light source, keyed for [`LightSources`]' stable slots.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum LightKey {
+    /// An emissive-mesh instance, by its (stable) instance slot.
+    Emissive(u32),
+    /// A directional light, by its (stable) lights-table slot.
+    Directional(u32),
 }
 
-/// `Render::Prepare`: rebuild the emissive-mesh light list — but only when the
-/// emissive set could have changed (a material's emissiveness edited, or an
-/// instance added / released / re-materialed). On a move-only frame the O(active)
-/// walk is skipped and the cache reused — the headline saving. (Light *transforms*
-/// are GPU-side via the PTLAS; this only tracks which instances emit.)
-pub fn prepare_emissive_lights(
-    mut emissive: ResMut<EmissiveLights>,
+/// Render-world light-source table with **stable slots**: each light keeps its
+/// `light_sources[]` index for its lifetime (a [`SlotPool`] keyed by instance /
+/// lights-table slot; freed slots hole out as [`GpuLightSource::NONE`] and are
+/// reused). ReSTIR reservoirs and light-tile samples store the slot as their
+/// light identity, so in-flight history survives lights being added or removed
+/// — a dense per-frame list would re-index every light on any set change,
+/// silently repointing every reservoir at a different light. (A freed slot's
+/// *reuse* still briefly misattributes history to the new occupant; bounded by
+/// the confidence cap, and gone within a re-cap.)
+///
+/// Rebuilt by [`prepare_light_sources`] only when the light set could have
+/// changed; the scene binder uploads `table` + `active` verbatim.
+#[derive(Resource, Default)]
+pub struct LightSources {
+    /// Slot-indexed table (`pool.len()` entries, holes = `NONE`).
+    pub table: Vec<GpuLightSource>,
+    /// The uniform-pick list: `[emissive_count, directional_count]` header,
+    /// then the active emissive slots, then the active directional slots
+    /// (strata contiguous so the stratified pick indexes directly).
+    pub active: Vec<u32>,
+    pool: SlotPool<LightKey>,
+    /// The emissive material set the table was built against — a diff catches a
+    /// material whose `emissive` was edited without any instance changing.
+    cached_assets: HashSet<AssetId<SolariMaterial>, FixedHasher>,
+    /// The directional lights-table slots the table was built against.
+    cached_directional: Vec<u32>,
+}
+
+/// `Render::Prepare`: rebuild the light-source table — but only when the light
+/// set could have changed (a material's emissiveness edited, an instance added /
+/// released / re-materialed, or a directional light added / removed). On a
+/// move-only frame the O(active) walk is skipped and the table reused — the
+/// headline saving. (Light *transforms* are GPU-side via the PTLAS; this only
+/// tracks which sources exist.)
+pub fn prepare_light_sources(
+    mut lights: ResMut<LightSources>,
     materials: Res<SolariMaterialAssets>,
     instances: Res<InstanceManager>,
+    active_directional: Res<ActiveDirectionalLights>,
 ) {
     // Material assets whose `emissive` is non-black.
     let mut emissive_assets = HashSet::<AssetId<SolariMaterial>, FixedHasher>::default();
@@ -236,8 +267,10 @@ pub fn prepare_emissive_lights(
             emissive_assets.insert(*asset_id);
         }
     }
+    let directional: Vec<u32> = active_directional.0.iter().map(|&(_, slot)| slot).collect();
 
-    let changed = emissive_assets != emissive.cached_assets
+    let changed = emissive_assets != lights.cached_assets
+        || directional != lights.cached_directional
         || !instances.added_slots().is_empty()
         || !instances.released_slots().is_empty()
         || !instances.material_dirty().is_empty();
@@ -245,19 +278,58 @@ pub fn prepare_emissive_lights(
         return;
     }
 
-    emissive.lights.clear();
+    // The current light set, with each emissive instance's source entry.
+    let mut present: Vec<(LightKey, GpuLightSource)> = Vec::new();
     for &slot in instances.active_slots() {
         let asset_id = instances.instance_material_asset_id(slot);
         if emissive_assets.contains(&asset_id) {
             let triangle_count = instances.instance_total_triangle_count(slot);
             if triangle_count > 0 && triangle_count <= u16::MAX as u32 {
-                emissive
-                    .lights
-                    .push(GpuLightSource::new_emissive_mesh_light(slot.0, triangle_count));
+                present.push((
+                    LightKey::Emissive(slot.0),
+                    GpuLightSource::new_emissive_mesh_light(slot.0, triangle_count),
+                ));
             }
         }
     }
-    emissive.cached_assets = emissive_assets;
+    for &slot in &directional {
+        present.push((
+            LightKey::Directional(slot),
+            GpuLightSource::new_directional_light(slot),
+        ));
+    }
+
+    let present_keys: HashSet<LightKey, FixedHasher> =
+        present.iter().map(|&(key, _)| key).collect();
+    let LightSources { pool, table, active, .. } = &mut *lights;
+    pool.reconcile(present_keys.iter().copied(), |key| present_keys.contains(&key));
+    // Reservoirs pack the slot into 16 bits (`light_id = slot << 16 | triangle`).
+    assert!(
+        pool.len() <= u16::MAX as u32,
+        "too many light sources in the scene, maximum is 65535"
+    );
+
+    table.clear();
+    table.resize(pool.len() as usize, GpuLightSource::NONE);
+    active.clear();
+    active.extend([0u32, 0u32]); // [emissive_count, directional_count]
+    for (key, source) in &present {
+        let slot = pool.slot_of(*key).unwrap();
+        table[slot as usize] = source.clone();
+        if matches!(key, LightKey::Emissive(_)) {
+            active.push(slot);
+        }
+    }
+    active[0] = present.len() as u32 - directional.len() as u32;
+    active[1] = directional.len() as u32;
+    for (key, _) in &present {
+        if let LightKey::Directional(_) = key {
+            active.push(pool.slot_of(*key).unwrap());
+        }
+    }
+
+    lights.cached_assets = emissive_assets;
+    lights.cached_directional = directional;
 }
 
 /// Uniform shared with `light_resolve.wgsl::ResolveParams`.
@@ -414,12 +486,12 @@ impl Plugin for SolariLightsPlugin {
         };
         render_app
             .init_resource::<ActiveDirectionalLights>()
-            .init_resource::<EmissiveLights>()
+            .init_resource::<LightSources>()
             .add_systems(RenderStartup, init_light_resolve.after(SolariSetup))
             .add_systems(
                 Render,
                 (
-                    prepare_emissive_lights.in_set(RenderSystems::Prepare),
+                    prepare_light_sources.in_set(RenderSystems::Prepare),
                     prepare_light_resolve.in_set(RenderSystems::Prepare),
                     prepare_light_resolve_bind_group.in_set(RenderSystems::PrepareBindGroups),
                 ),

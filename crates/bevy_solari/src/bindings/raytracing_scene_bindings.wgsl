@@ -51,6 +51,10 @@ struct LightSource {
 
 const LIGHT_SOURCE_KIND_EMISSIVE_MESH = 0u;
 const LIGHT_SOURCE_KIND_DIRECTIONAL = 1u;
+// A freed slot in the slot-indexed `light_sources` table: an emissive light
+// with zero triangles (`kind == 0`), which nothing can sample. A reservoir
+// whose stored slot resolves to this holds a dead light — reject it.
+const LIGHT_SOURCE_KIND_NONE = 0u;
 
 struct DirectionalLight {
     direction_to_light: vec3<f32>,
@@ -87,7 +91,14 @@ struct DirectionalLight {
 
 // Ray-tracing acceleration structure + lighting.
 @group(0) @binding(9) var tlas: acceleration_structure;
+// STABLE-SLOT indexed: a light keeps its index for its lifetime (freed slots
+// hole out as `LIGHT_SOURCE_KIND_NONE` and are reused), so a slot stored in a
+// reservoir / light tile stays a valid identity across light add/remove.
 @group(0) @binding(10) var<storage> light_sources: array<LightSource>;
+// The uniform-pick list over ACTIVE lights: `[emissive_count,
+// directional_count]` header, then the active emissive slots, then the active
+// directional slots (strata contiguous for the stratified pick).
+@group(0) @binding(17) var<storage> active_light_list: array<u32>;
 // `directional_lights` is also a scene column (the lights table owns it).
 @group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(3) var<storage> directional_lights: array<DirectionalLight>;
 
