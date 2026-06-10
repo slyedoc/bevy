@@ -1,10 +1,12 @@
 //! Self-contained single-scattering atmosphere → sky cubemap for the pathtracer.
 //!
 //! A compute pre-pass ([`atmosphere_bake.wgsl`](mod@self)) bakes the atmosphere
-//! into a cube each frame from [`SolariAtmosphere`] + the primary
-//! [`SolariDirectionLight`]; the pathtracer samples that cube on a ray miss (the
-//! existing skybox path). Fully solari-owned — no `bevy_pbr` atmosphere / raster
-//! `GpuLights` coupling — so it works with `PbrPlugin` disabled.
+//! into a cube from [`SolariAtmosphere`] + the primary [`SolariDirectionLight`];
+//! the pathtracer samples that cube on a ray miss (the existing skybox path).
+//! The cube persists, so the bake re-runs only when its inputs change (a moving
+//! sun re-bakes; a static sky is free). Fully solari-owned — no `bevy_pbr`
+//! atmosphere / raster `GpuLights` coupling — so it works with `PbrPlugin`
+//! disabled.
 
 use bevy_ecs::{
     component::Component,
@@ -39,9 +41,10 @@ use crate::render::SolariCamera;
 const SKY_SIZE: u32 = 256;
 
 /// Self-contained atmosphere for the solari pathtracer. Add it to a
-/// [`SolariCamera`] to bake a single-scattering sky each frame (sampled on a ray
-/// miss instead of a skybox). Defaults model Earth. Driving sun = the primary
-/// [`SolariDirectionLight`]'s direction + illuminance.
+/// [`SolariCamera`] to bake a single-scattering sky (sampled on a ray miss
+/// instead of a skybox), re-baked whenever these parameters or the sun change.
+/// Defaults model Earth. Driving sun = the primary [`SolariDirectionLight`]'s
+/// direction + illuminance.
 #[derive(Component, Clone, Debug, Reflect)]
 #[reflect(Default, Clone)]
 pub struct SolariAtmosphere {
@@ -105,7 +108,7 @@ impl Default for SolariAtmosphere {
 /// GPU mirror of [`SolariAtmosphere`] + the sun — matches `Atmosphere` in
 /// `atmosphere.wgsl`. `Default` is the "disabled" state (`aerial_enabled = 0`),
 /// bound by the pathtracer when no view has an atmosphere.
-#[derive(Clone, Copy, Default, ShaderType)]
+#[derive(Clone, Copy, Default, PartialEq, ShaderType)]
 pub struct GpuSolariAtmosphere {
     bottom_radius: f32,
     top_radius: f32,
@@ -133,11 +136,17 @@ pub struct GpuSolariAtmosphere {
 pub struct SolariAtmosphereGpu {
     uniform: UniformBuffer<GpuSolariAtmosphere>,
     pub enabled: bool,
+    /// The last extracted uniform value, to detect changes.
+    current: GpuSolariAtmosphere,
+    /// The sky cube is stale: the uniform changed while enabled. Cleared by
+    /// [`dispatch_atmosphere_bake`] only once a bake is actually encoded, so a
+    /// pending bake survives pipeline compilation.
+    needs_bake: bool,
 }
 
 impl SolariAtmosphereGpu {
     /// The atmosphere uniform's binding, for the pathtracer's group(1) slot 6.
-    /// `Some` once [`prepare_atmosphere_sky`] has uploaded it (every frame).
+    /// `Some` once [`prepare_atmosphere_sky`] has created the buffer.
     pub fn binding(&self) -> Option<bevy_render::render_resource::BindingResource<'_>> {
         self.uniform.binding()
     }
@@ -196,10 +205,11 @@ pub fn extract_solari_atmosphere(
         .unwrap_or((Vec3::Y, 0.0));
 
     let mut any = false;
+    let mut next = GpuSolariAtmosphere::default();
     for (render_entity, atmosphere) in &cameras {
         any = true;
         commands.entity(render_entity).insert(SolariAtmosphereView);
-        *gpu.uniform.get_mut() = GpuSolariAtmosphere {
+        next = GpuSolariAtmosphere {
             bottom_radius: atmosphere.bottom_radius,
             top_radius: atmosphere.top_radius,
             rayleigh_scattering: atmosphere.rayleigh_scattering,
@@ -218,10 +228,18 @@ pub fn extract_solari_atmosphere(
             aerial_enabled: 1.0,
         };
     }
-    // No atmosphere view: leave a disabled uniform so the pathtracer still has a
-    // valid binding (it gates aerial perspective on `aerial_enabled`).
-    if !any {
-        *gpu.uniform.get_mut() = GpuSolariAtmosphere::default();
+    // No atmosphere view: a disabled (default) uniform keeps the pathtracer's
+    // binding valid (it gates aerial perspective on `aerial_enabled`).
+    //
+    // Touch the uniform only when its contents actually changed — `get_mut`
+    // marks it for re-upload, and an unchanged sky needs no re-bake. A typical
+    // frame (static sun + params) costs one compare here and nothing on the GPU.
+    if next != gpu.current {
+        gpu.current = next;
+        *gpu.uniform.get_mut() = next;
+        if any {
+            gpu.needs_bake = true;
+        }
     }
     gpu.enabled = any;
 }
@@ -240,8 +258,8 @@ pub fn prepare_atmosphere_sky(
     render_queue: Res<RenderQueue>,
     mut gpu: ResMut<SolariAtmosphereGpu>,
 ) {
-    // Always upload the uniform so the pathtracer's binding is valid even with no
-    // atmosphere view (it gates aerial perspective on `aerial_enabled`).
+    // Keep the uniform binding valid every frame (the pathtracer binds it even
+    // with no atmosphere view); `UniformBuffer` skips the upload when unchanged.
     gpu.uniform.write_buffer(&render_device, &render_queue);
 
     if !gpu.enabled || sky.is_some() {
@@ -277,7 +295,9 @@ pub fn prepare_atmosphere_sky(
     });
 }
 
-/// `Render::PrepareBindGroups`: (re)build the bake bind group.
+/// `Render::PrepareBindGroups`: build the bake bind group **once** — the uniform
+/// buffer never reallocates after its first write and the sky cube is allocated
+/// once, so the group stays valid for the resource lifetimes.
 pub fn prepare_atmosphere_bind_group(
     mut pipeline: ResMut<AtmospherePipeline>,
     resource_manager: Option<Res<SolariResourceManager>>,
@@ -286,10 +306,12 @@ pub fn prepare_atmosphere_bind_group(
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
+    if pipeline.bind_group.is_some() {
+        return;
+    }
     let (Some(resource_manager), Some(sky), Some(uniform)) =
         (resource_manager, sky, gpu.uniform.binding())
     else {
-        pipeline.bind_group = None;
         return;
     };
     let layout = pipeline_cache.get_bind_group_layout(&resource_manager.atmosphere);
@@ -300,15 +322,16 @@ pub fn prepare_atmosphere_bind_group(
     ));
 }
 
-/// `RenderGraph` (before the pathtracer): bake the sky cube.
+/// `RenderGraph` (before the pathtracer): bake the sky cube, but only when its
+/// inputs changed — the cube persists, so a static sun + params re-bakes nothing.
 pub fn dispatch_atmosphere_bake(
     pipeline: Res<AtmospherePipeline>,
     pipelines: Res<SolariPipelines>,
-    gpu: Res<SolariAtmosphereGpu>,
+    mut gpu: ResMut<SolariAtmosphereGpu>,
     pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
-    if !gpu.enabled {
+    if !gpu.enabled || !gpu.needs_bake {
         return;
     }
     let (Some(compute), Some(bind_group)) = (
@@ -317,6 +340,7 @@ pub fn dispatch_atmosphere_bake(
     ) else {
         return;
     };
+    gpu.needs_bake = false;
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let encoder = ctx.command_encoder();
