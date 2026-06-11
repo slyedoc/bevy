@@ -20,7 +20,23 @@ use crate::material::{SolariMaterial, SolariMaterial3d};
 /// Convert a [`GltfMaterial`] to a [`SolariMaterial`] — the fields the RT path
 /// reads. Mirrors `bevy_pbr::standard_material_from_gltf_material`, minus the
 /// raster-only fields. `GltfMaterial`'s field types line up exactly.
-fn solari_material_from_gltf(material: &GltfMaterial) -> SolariMaterial {
+///
+/// Solari-only authoring with no standard glTF extension travels in the
+/// material's `extras` (e.g. `"extras": {"nested_priority": 5}` for
+/// nested-dielectric priority, as written by the bistro asset pipeline from
+/// NVIDIA's pyscene data); `None` for the synthesized default material.
+fn solari_material_from_gltf(
+    material: &GltfMaterial,
+    gltf_material: Option<&gltf::Material>,
+) -> SolariMaterial {
+    let extras = gltf_material
+        .and_then(|m| m.extras().as_ref())
+        .and_then(|extras| serde_json::from_str::<serde_json::Value>(extras.get()).ok());
+    let nested_priority = extras
+        .as_ref()
+        .and_then(|value| value.get("nested_priority")?.as_u64())
+        .map_or(0, |priority| priority as u32);
+
     SolariMaterial {
         base_color: material.base_color,
         base_color_texture: material.base_color_texture.clone(),
@@ -34,21 +50,9 @@ fn solari_material_from_gltf(material: &GltfMaterial) -> SolariMaterial {
         ior: material.ior,
         attenuation_distance: material.attenuation_distance,
         attenuation_color: material.attenuation_color,
-        nested_priority: 0,
+        nested_priority,
         normal_map_texture: material.normal_map_texture.clone(),
     }
-}
-
-/// glTF has no standard extension for nested-dielectric priorities, so they
-/// travel in the material's `extras` (e.g. `"extras": {"nested_priority": 5}`,
-/// as written by the bistro asset pipeline from NVIDIA's pyscene data).
-fn nested_priority_from_extras(gltf_material: &gltf::Material) -> u32 {
-    gltf_material
-        .extras()
-        .as_ref()
-        .and_then(|extras| serde_json::from_str::<serde_json::Value>(extras.get()).ok())
-        .and_then(|value| value.get("nested_priority")?.as_u64())
-        .map_or(0, |priority| priority as u32)
 }
 
 #[derive(Default, Clone)]
@@ -67,7 +71,8 @@ impl GltfExtensionHandler for SolariGltfMaterialHandler {
     ) {
         // The glTF default material, for meshes without one (`DefaultMaterial/std`).
         let label = format!("{}/std", GltfAssetLabel::DefaultMaterial);
-        load_context.add_labeled_asset(label, solari_material_from_gltf(&GltfMaterial::default()));
+        load_context
+            .add_labeled_asset(label, solari_material_from_gltf(&GltfMaterial::default(), None));
     }
 
     fn on_material(
@@ -79,8 +84,7 @@ impl GltfExtensionHandler for SolariGltfMaterialHandler {
         material_label: &str,
     ) {
         let label = format!("{material_label}/std");
-        let mut material = solari_material_from_gltf(material_asset);
-        material.nested_priority = nested_priority_from_extras(gltf_material);
+        let material = solari_material_from_gltf(material_asset, Some(gltf_material));
         load_context.add_labeled_asset(label, material);
     }
 
