@@ -302,41 +302,19 @@ pub fn restir(
     }
 }
 
-/// Drives the camera's sub-pixel jitter (Halton (2,3) − 0.5) for ReSTIR views.
+/// Zeroes the camera's sub-pixel jitter every frame. Jitter exists FOR a
+/// temporal resolver: when DLSS-RR is active, `prepare_restir_dlss` (which
+/// runs after this) overwrites the offset with the SDK's `suggested_jitter`.
+/// Without a resolver, a camera jitter is pure image wobble — sub-pixel on
+/// directly-seen surfaces, but LENS-MAGNIFIED to multiple pixels by anything
+/// seen through refractive glass (clearly visible at low frame rates).
 ///
-/// bevy's `prepare_view_uniforms` applies this offset to `clip_from_world`, so
-/// the visibility ray (which uses `view.world_from_clip`) samples a different
-/// sub-pixel each frame — anti-aliasing / temporal-upscaler input. Motion
-/// vectors are computed from `unjittered_clip_from_world`, so they stay
-/// jitter-free. Pre-DLSS only: once DLSS is attached it drives the jitter
-/// itself (via `suggested_jitter`).
-///
-/// Zeroed when the reference pathtracer renders instead: it integrates its
-/// own uniform per-pixel jitter into the accumulation, and a camera offset on
-/// top would push samples outside the pixel — a blur baked into the reference.
-pub fn prepare_restir_jitter(
-    state: Res<SolariViewState>,
-    frame_count: Res<FrameCount>,
-    mut views: Query<&mut TemporalJitter, With<SolariCamera>>,
-) {
-    // Halton (2, 3) − 0.5, matching bevy's TAA.
-    const HALTON: [Vec2; 8] = [
-        Vec2::new(0.0, 0.0),
-        Vec2::new(0.0, -0.16666666),
-        Vec2::new(-0.25, 0.16666669),
-        Vec2::new(0.25, -0.3888889),
-        Vec2::new(-0.375, -0.055555552),
-        Vec2::new(0.125, 0.2777778),
-        Vec2::new(-0.125, -0.2777778),
-        Vec2::new(0.375, 0.055555582),
-    ];
-    let offset = if state.restir_runs() {
-        HALTON[frame_count.0 as usize % HALTON.len()]
-    } else {
-        Vec2::ZERO
-    };
+/// The pathtracer likewise needs zero: it integrates its own per-pixel jitter
+/// into the accumulation, and a camera offset on top would push samples
+/// outside the pixel — a blur baked into the reference.
+pub fn prepare_restir_jitter(mut views: Query<&mut TemporalJitter, With<SolariCamera>>) {
     for mut jitter in &mut views {
-        jitter.offset = offset;
+        jitter.offset = Vec2::ZERO;
     }
 }
 

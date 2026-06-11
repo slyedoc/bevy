@@ -22,9 +22,9 @@ enable wgpu_ray_query;
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
 #import bevy_solari::pbr::{rand_f, rand_u, rand_range_u, sample_uniform_hemisphere, uniform_hemisphere_inverse_pdf, sample_disk}
 #import bevy_render::maths::{PI, orthonormalize}
-#import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB, bend_shading_normal}
+#import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB, bend_shading_normal, fresnel_dielectric}
 #import bevy_solari::sampling::{LightSample, ResolvedLightSample, generate_random_light_sample, resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_point_visibility, sample_random_light, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, random_emissive_light_pdf, power_heuristic, isnan, NULL_LIGHT_ID}
-#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, active_light_list, directional_lights, ResolvedMaterial, LIGHT_SOURCE_KIND_NONE, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, active_light_list, directional_lights, ResolvedMaterial, LIGHT_SOURCE_KIND_NONE, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, offset_ray_origin}
 #import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LightTileSample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler, specular_hit_distance, regir_query, regir_find, regir_samples, REGIR_CELL_NONE, REGIR_ENTRIES_PER_CELL}
 
 const INITIAL_SAMPLES = 8u;
@@ -58,6 +58,7 @@ struct Surface {
     world_position: vec3<f32>,
     world_normal: vec3<f32>,
     material: ResolvedMaterial,
+    material_id: u32,
     valid: bool,
 }
 
@@ -269,6 +270,11 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     var radiance = surface.material.emissive;
 
+    // Transmissive surfaces have no diffuse lobe to that extent — light passes
+    // through instead of scattering. The specular GI pass owns everything that
+    // remains (reflection + refraction), so scale the diffuse passes out here.
+    let diffuse_fraction = 1.0 - surface.material.specular_transmission;
+
     // Directional lights (the sun) are shaded deterministically every frame —
     // one cone sample + shadow ray each — OUTSIDE the reservoir. A reservoir
     // holds one light sample per pixel; making the sun compete with a nearby
@@ -287,7 +293,7 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if surface.material.roughness > SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD {
             brdf += evaluate_specular_brdf(wo, contribution.wi, shading_normal, surface.material, F_ab);
         }
-        radiance += contribution.radiance * resolved.inverse_pdf * visibility * brdf;
+        radiance += diffuse_fraction * contribution.radiance * resolved.inverse_pdf * visibility * brdf;
     }
 
     // Direct lighting from the DI reservoir (final visibility traced once).
@@ -300,7 +306,7 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if surface.material.roughness > SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD {
             brdf += evaluate_specular_brdf(wo, contribution.wi, shading_normal, surface.material, F_ab);
         }
-        radiance += contribution.radiance * di_reservoir.unbiased_contribution_weight * visibility * brdf;
+        radiance += diffuse_fraction * contribution.radiance * di_reservoir.unbiased_contribution_weight * visibility * brdf;
     }
 
     // Indirect lighting from the GI reservoir (visibility to the reconnection
@@ -309,17 +315,18 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let wi = normalize(gi_reservoir.sample_point_world_position - surface.world_position);
         let visibility = trace_point_visibility(surface.world_position + surface.world_normal * RAY_T_MIN, gi_reservoir.sample_point_world_position);
         let brdf = evaluate_diffuse_brdf(wo, wi, shading_normal, surface.material, F_ab);
-        radiance += gi_reservoir.radiance * gi_reservoir.unbiased_contribution_weight * visibility * brdf;
+        radiance += diffuse_fraction * gi_reservoir.radiance * gi_reservoir.unbiased_contribution_weight * visibility * brdf;
     }
 
     // Raw linear radiance — `compose` applies exposure.
     textureStore(view_output, pixel, vec4(radiance, 1.0));
 }
 
-// Pass 4b — specular GI. Trace a fresh GGX-sampled specular path each frame and
-// add it on top of the diffuse passes' output. Not ReSTIR'd (single noisy
+// Pass 4b — specular GI. Trace a fresh BSDF-sampled specular path each frame
+// and add it on top of the diffuse passes' output. Not ReSTIR'd (single noisy
 // sample, meant to be denoised downstream). Owns ALL specular, including
-// direct-light highlights (reflected emissives), since DI shades diffuse only.
+// direct-light highlights (reflected emissives), since DI shades diffuse only —
+// and owns transmission: glass pixels are shaded almost entirely by this pass.
 @compute @workgroup_size(8, 8, 1)
 fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
     set_view_cull_mask(solari_view.cull_mask.x);
@@ -341,60 +348,265 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     var rng = reservoir_index(pixel) + view.frame_count * 5782582u + 0x68bc21ebu;
 
-    let wo = normalize(view.world_position - surface.world_position);
-    let shading_normal = bend_shading_normal(surface.world_normal, wo);
-
-    // Sample the GGX specular lobe in tangent space.
-    let TBN = orthonormalize(shading_normal);
-    let T = TBN[0];
-    let B = TBN[1];
-    let N = TBN[2];
-    let wo_tangent = vec3(dot(wo, T), dot(wo, B), dot(wo, N));
-    let wi_tangent = sample_ggx_vndf(wo_tangent, surface.material.roughness, &rng);
-    if ggx_vndf_sample_invalid(wi_tangent) {
-        return;
-    }
-    let wi = wi_tangent.x * T + wi_tangent.y * B + wi_tangent.z * N;
-    let pdf = ggx_vndf_pdf(wo_tangent, wi_tangent, surface.material.roughness);
-
+    // Transmissive primaries SPLIT deterministically: both the reflection and
+    // the refraction path are traced and blended by exact Fresnel. A
+    // stochastic lobe pick here flickers the pixel between "mirror" and
+    // "through the glass" every frame — temporally stable when still, but the
+    // moment the camera moves the denoiser loses its history and smears all
+    // glass into a blur.
+    var radiance = vec3(0.0);
     var first_hit_t = RAY_T_MAX; // environment miss = reflection at infinity
-    var radiance = trace_specular_path(surface, wi, pdf, &first_hit_t, &rng);
-    textureStore(specular_hit_distance, pixel, vec4(first_hit_t, 0.0, 0.0, 0.0));
-    if surface.material.roughness > MIRROR_ROUGHNESS_THRESHOLD {
-        radiance /= pdf;
+    let transmission = surface.material.specular_transmission;
+    if transmission > 0.0 {
+        let wo = normalize(view.world_position - surface.world_position);
+        let primary_normal = bend_shading_normal(surface.world_normal, wo);
+        let reflectance = fresnel_dielectric(
+            min(dot(wo, primary_normal), 1.0), 1.0 / surface.material.ior);
+        var reflect_hit_t = RAY_T_MAX;
+        if reflectance < 1.0 {
+            radiance += transmission * (1.0 - reflectance)
+                * trace_specular_path(surface, PRIMARY_LOBE_REFRACT, &first_hit_t, &rng);
+        }
+        radiance += transmission * reflectance
+            * trace_specular_path(surface, PRIMARY_LOBE_REFLECT, &reflect_hit_t, &rng);
+        // The DLSS guide gets the dominant branch's content distance (for a
+        // refracted branch that's the accumulated path length to the first
+        // opaque hit — RTXPT's virtual-point scheme).
+        if reflectance >= 0.5 {
+            first_hit_t = reflect_hit_t;
+        }
     }
-
-    let NdotV = max(dot(shading_normal, wo), 0.0001);
-    let F_ab = F_AB(surface.material.perceptual_roughness, NdotV);
-    radiance *= evaluate_specular_brdf(wo, wi, shading_normal, surface.material, F_ab);
+    if transmission < 1.0 {
+        var ggx_hit_t = RAY_T_MAX;
+        radiance += (1.0 - transmission)
+            * trace_specular_path(surface, PRIMARY_LOBE_GGX, &ggx_hit_t, &rng);
+        if transmission == 0.0 {
+            first_hit_t = ggx_hit_t;
+        }
+    }
+    textureStore(specular_hit_distance, pixel, vec4(first_hit_t, 0.0, 0.0, 0.0));
 
     let existing = textureLoad(view_output, pixel).rgb;
     textureStore(view_output, pixel, vec4(existing + radiance, 1.0));
 }
 
-// Up to 3 GGX-sampled specular bounces with NEE. No world cache, so a glossy
-// chain just terminates (no diffuse-cache fallback at the end).
-fn trace_specular_path(primary_surface: Surface, initial_wi: vec3<f32>, initial_pdf: f32, first_hit_t: ptr<function, f32>, rng: ptr<function, u32>) -> vec3<f32> {
+const PRIMARY_LOBE_GGX = 0u;
+const PRIMARY_LOBE_REFLECT = 1u;
+const PRIMARY_LOBE_REFRACT = 2u;
+
+// Glossy-bounce budget, transmissive-crossing budget (a window is already 2
+// interfaces, a wine glass with liquid 4+), and the nested-medium stack depth
+// (see the pathtracer's twin).
+const SPECULAR_GLOSSY_BOUNCES = 3u;
+// Concave glass (the attenuation dragon) drives long total-internal-reflection
+// cascades; paths that exhaust this budget return no radiance, so a tight cap
+// shows as view-swimming dark patches.
+const SPECULAR_GLASS_CROSSINGS = 16u;
+// Above this roughness a specular-path hit takes its NEE light and ends the
+// chain instead of continuing (see the loop).
+const SPECULAR_PATH_CONTINUE_ROUGHNESS = 0.25;
+const MEDIUM_STACK_SIZE = 4u;
+const MEDIUM_NOT_FOUND = 0xFFFFFFFFu;
+
+// BSDF-sampled specular path from the primary surface: GGX reflection lobes
+// with NEE at glossy hits, and exact-Fresnel reflect/refract delta lobes with
+// Beer-Lambert absorption + a nested-dielectric medium stack at transmissive
+// hits (the pathtracer's scheme, bounded for realtime). No world cache, so a
+// glossy chain just terminates (no diffuse-cache fallback at the end).
+fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t: ptr<function, f32>, rng: ptr<function, u32>) -> vec3<f32> {
     var radiance = vec3(0.0);
     var throughput = vec3(1.0);
 
-    var ray_origin = primary_surface.world_position + primary_surface.world_normal * RAY_T_MIN;
-    var wi = initial_wi;
-    var p_bounce = initial_pdf;
+    let wo_primary = normalize(view.world_position - primary_surface.world_position);
+    let primary_normal = bend_shading_normal(primary_surface.world_normal, wo_primary);
 
-    for (var i = 0u; i < 3u; i++) {
-        let ray = trace_ray(ray_origin, wi, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE);
+    // Nested-dielectric medium stack (see the pathtracer for the full notes):
+    // the highest-priority entry is the active medium; boundaries of
+    // lower-priority volumes inside it are false interfaces.
+    var medium_id: array<u32, MEDIUM_STACK_SIZE>;
+    var medium_priority: array<u32, MEDIUM_STACK_SIZE>;
+    var medium_ior: array<f32, MEDIUM_STACK_SIZE>;
+    var medium_extinction_entry: array<vec3<f32>, MEDIUM_STACK_SIZE>;
+    var medium_count = 0u;
+    var medium_extinction = vec3(0.0);
+
+    var wi: vec3<f32>;
+    var p_bounce = 0.0;
+    var ray_origin: vec3<f32>;
+
+    // The caller selected the primary lobe (Fresnel-weighted split for
+    // transmissive surfaces — deterministic, the Fresnel factors are applied
+    // outside).
+    if primary_lobe == PRIMARY_LOBE_REFRACT {
+        // The camera is in air, so the far side of the interface is the material.
+        wi = refract(-wo_primary, primary_normal, 1.0 / primary_surface.material.ior);
+        p_bounce = bitcast<f32>(0x7F800000u); // INF: delta lobe
+        medium_id[0] = primary_surface.material_id;
+        medium_priority[0] = primary_surface.material.nested_priority;
+        medium_ior[0] = primary_surface.material.ior;
+        medium_extinction_entry[0] = primary_surface.material.extinction;
+        medium_count = 1u;
+        medium_extinction = primary_surface.material.extinction;
+        ray_origin = offset_ray_origin(primary_surface.world_position, -primary_surface.world_normal);
+    } else if primary_lobe == PRIMARY_LOBE_REFLECT {
+        wi = reflect(-wo_primary, primary_normal);
+        p_bounce = bitcast<f32>(0x7F800000u); // INF: delta lobe
+        ray_origin = offset_ray_origin(primary_surface.world_position, primary_surface.world_normal);
+    } else {
+        // Opaque primary: sample the GGX specular lobe in tangent space; its
+        // BRDF/pdf weight folds into the path throughput up front.
+        let TBN = orthonormalize(primary_normal);
+        let wo_tangent = vec3(dot(wo_primary, TBN[0]), dot(wo_primary, TBN[1]), dot(wo_primary, TBN[2]));
+        let wi_tangent = sample_ggx_vndf(wo_tangent, primary_surface.material.roughness, rng);
+        if ggx_vndf_sample_invalid(wi_tangent) {
+            return vec3(0.0);
+        }
+        wi = wi_tangent.x * TBN[0] + wi_tangent.y * TBN[1] + wi_tangent.z * TBN[2];
+        p_bounce = ggx_vndf_pdf(wo_tangent, wi_tangent, primary_surface.material.roughness);
+        let NdotV = max(dot(primary_normal, wo_primary), 0.0001);
+        let F_ab = F_AB(primary_surface.material.perceptual_roughness, NdotV);
+        throughput = evaluate_specular_brdf(wo_primary, wi, primary_normal, primary_surface.material, F_ab);
+        if primary_surface.material.roughness > MIRROR_ROUGHNESS_THRESHOLD {
+            throughput /= p_bounce;
+        }
+        ray_origin = offset_ray_origin(primary_surface.world_position, primary_surface.world_normal);
+    }
+
+    var glossy_bounces = 0u;
+    var crossings = 0u;
+    var first_event = true;
+    // Path length until the first NON-transmissive event — what the pixel is
+    // actually showing. Reporting the first interface instead (a glass inner
+    // wall is sub-mm away) puts the DLSS virtual point on the glass while the
+    // visible content is meters beyond it, smearing refractions in motion.
+    var path_t = 0.0;
+    var first_interface_t = 0.0;
+    var hit_distance_pending = true;
+    loop {
+        if glossy_bounces >= SPECULAR_GLOSSY_BOUNCES || crossings >= SPECULAR_GLASS_CROSSINGS {
+            break;
+        }
+        let ray = trace_ray(ray_origin, wi, 0.0, RAY_T_MAX, RAY_FLAG_NONE);
         if ray.kind == RAY_QUERY_INTERSECTION_NONE {
             // Sky reflection — full weight, the sky isn't in next-event estimation.
             radiance += throughput * sky_radiance(wi);
+            hit_distance_pending = false; // content at infinity (caller's RAY_T_MAX init)
             break;
         }
         let hit = resolve_ray_hit_full(ray);
-        if i == 0u {
-            *first_hit_t = length(hit.world_position - primary_surface.world_position);
+        let segment_length = length(hit.world_position - ray_origin);
+        throughput *= exp(-medium_extinction * segment_length);
+        path_t += segment_length;
+        if first_event {
+            first_interface_t = segment_length;
         }
 
         let wo = -wi;
+
+        // Emission MIS. Later bounces weight against the BSDF sample that found
+        // the hit (delta lobes have p = INF → weight 1). First event: full
+        // weight only if DI did NOT do specular NEE (near-mirror or transmissive
+        // primary); otherwise 0 to avoid double-counting reflected emissive
+        // geometry that DI's light sampling already caught.
+        var emissive_mis = 0.0;
+        if !first_event {
+            emissive_mis = power_heuristic(p_bounce, random_emissive_light_pdf(hit));
+        } else if primary_surface.material.roughness <= SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD
+            || primary_surface.material.specular_transmission > 0.0 {
+            emissive_mis = 1.0;
+        }
+        radiance += throughput * emissive_mis * hit.material.emissive;
+        first_event = false;
+
+        if rand_f(rng) < hit.material.specular_transmission {
+            // Transmissive hit: cross the interface (no NEE at delta lobes).
+            // Entering is tested against the true triangle normal — see the
+            // pathtracer's twin of this branch for the reasoning.
+            let entering = dot(wi, hit.geometric_world_normal) < 0.0;
+            let oriented_geometric_normal = select(
+                -hit.geometric_world_normal, hit.geometric_world_normal, entering);
+            let oriented_normal = bend_shading_normal(
+                select(-hit.world_normal, hit.world_normal, entering), wo);
+
+            var self_index = MEDIUM_NOT_FOUND;
+            var other_priority = 0u;
+            var other_ior = 1.0;
+            for (var i = 0u; i < medium_count; i += 1u) {
+                if medium_id[i] == hit.material_id {
+                    self_index = i;
+                    continue;
+                }
+                if medium_priority[i] >= other_priority {
+                    other_priority = medium_priority[i];
+                    other_ior = medium_ior[i];
+                }
+            }
+            let true_interface = hit.material.nested_priority >= other_priority;
+
+            var crossed = true;
+            if true_interface {
+                let eta = select(
+                    hit.material.ior / other_ior,
+                    other_ior / hit.material.ior,
+                    entering,
+                );
+                // Deterministic dominant lobe — no per-frame coin flip (the
+                // denoiser needs a temporally stable signal): follow refract
+                // unless Fresnel favors reflection (incl. TIR), weighted by
+                // the followed lobe's Fresnel factor. The minority lobe's
+                // energy is dropped: slight darkening at grazing interior
+                // angles, traded for stability in motion.
+                let reflectance = fresnel_dielectric(min(dot(wo, oriented_normal), 1.0), eta);
+                if reflectance > 0.5 {
+                    wi = reflect(-wo, oriented_normal);
+                    crossed = false;
+                    throughput *= reflectance;
+                } else {
+                    wi = refract(-wo, oriented_normal, eta);
+                    throughput *= 1.0 - reflectance;
+                }
+                p_bounce = bitcast<f32>(0x7F800000u);
+            }
+
+            if crossed {
+                if entering {
+                    if self_index == MEDIUM_NOT_FOUND && medium_count < MEDIUM_STACK_SIZE {
+                        medium_id[medium_count] = hit.material_id;
+                        medium_priority[medium_count] = hit.material.nested_priority;
+                        medium_ior[medium_count] = hit.material.ior;
+                        medium_extinction_entry[medium_count] = hit.material.extinction;
+                        medium_count += 1u;
+                    }
+                } else if self_index != MEDIUM_NOT_FOUND {
+                    medium_count -= 1u;
+                    medium_id[self_index] = medium_id[medium_count];
+                    medium_priority[self_index] = medium_priority[medium_count];
+                    medium_ior[self_index] = medium_ior[medium_count];
+                    medium_extinction_entry[self_index] = medium_extinction_entry[medium_count];
+                }
+                medium_extinction = vec3(0.0);
+                var active_priority = 0u;
+                var found = false;
+                for (var i = 0u; i < medium_count; i += 1u) {
+                    if !found || medium_priority[i] >= active_priority {
+                        active_priority = medium_priority[i];
+                        medium_extinction = medium_extinction_entry[i];
+                        found = true;
+                    }
+                }
+            }
+
+            let offset_normal = select(oriented_geometric_normal, -oriented_geometric_normal, crossed);
+            ray_origin = offset_ray_origin(hit.world_position, offset_normal);
+            crossings += 1u;
+            continue;
+        }
+
+        if hit_distance_pending {
+            *first_hit_t = path_t;
+            hit_distance_pending = false;
+        }
+
         let hit_normal = bend_shading_normal(hit.world_normal, wo);
         let TBN = orthonormalize(hit_normal);
         let T = TBN[0];
@@ -404,18 +616,6 @@ fn trace_specular_path(primary_surface: Surface, initial_wi: vec3<f32>, initial_
         let NdotV = max(dot(hit_normal, wo), 0.0001);
         let F_ab = F_AB(hit.material.perceptual_roughness, NdotV);
 
-        // Emission MIS. Later bounces weight against the BSDF sample that found
-        // the hit. First bounce: full weight only if DI did NOT do specular NEE
-        // (near-mirror primary); otherwise 0 to avoid double-counting reflected
-        // emissive geometry that DI's light sampling already caught.
-        var emissive_mis = 0.0;
-        if i != 0u {
-            emissive_mis = power_heuristic(p_bounce, random_emissive_light_pdf(hit));
-        } else if primary_surface.material.roughness <= SPECULAR_GI_FOR_DI_ROUGHNESS_THRESHOLD {
-            emissive_mis = 1.0;
-        }
-        radiance += throughput * emissive_mis * hit.material.emissive;
-
         let is_mirror = hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && hit.material.metallic > 0.9999;
         if !is_mirror {
             let light = sample_random_light(hit.world_position, hit_normal, rng);
@@ -423,23 +623,50 @@ fn trace_specular_path(primary_surface: Surface, initial_wi: vec3<f32>, initial_
             radiance += throughput * mis * light.radiance * light.inverse_pdf * evaluate_brdf(wo, light.wi, hit_normal, hit.material, F_ab);
         }
 
+        // End the chain at rough hits (after their NEE): continuing means a
+        // near-random GGX direction each frame — sky one frame, wall the
+        // next — and through glass this single-sample variance is the whole
+        // signal, flickering pixels the denoiser then smears in motion.
+        // Mirror-like hits continue (their continuation is deterministic).
+        if hit.material.roughness > SPECULAR_PATH_CONTINUE_ROUGHNESS {
+            // A surface reached THROUGH glass has no other lighting channel
+            // (the diffuse passes shade directly-visible surfaces only), so
+            // where its sun NEE is occluded — under a glass object's own base
+            // — it would go pitch black; the pathtracer fills the same spot
+            // with skylight via path continuation. Approximate that with one
+            // deterministic env sample along the normal: irradiance ≈ π·L_sky,
+            // diffuse brdf = albedo/π ⇒ albedo · L_sky.
+            if crossings > 0u {
+                radiance += throughput * hit.material.base_color * sky_radiance(hit_normal);
+            }
+            break;
+        }
         let next_tangent = sample_ggx_vndf(wo_tangent, hit.material.roughness, rng);
         if ggx_vndf_sample_invalid(next_tangent) {
             break;
         }
         wi = next_tangent.x * T + next_tangent.y * B + next_tangent.z * N;
-        ray_origin = hit.world_position + hit.geometric_world_normal * RAY_T_MIN;
+        ray_origin = offset_ray_origin(hit.world_position, hit.geometric_world_normal);
         p_bounce = ggx_vndf_pdf(wo_tangent, next_tangent, hit.material.roughness);
         throughput *= evaluate_brdf(wo, wi, N, hit.material, F_ab);
         if hit.material.roughness > MIRROR_ROUGHNESS_THRESHOLD {
             throughput /= p_bounce;
         }
+        glossy_bounces += 1u;
 
-        let p = luminance(throughput);
+        let p = min(luminance(throughput), 0.95);
         if rand_f(rng) > p {
             break;
         }
         throughput /= p;
+    }
+
+    // Path ended without reaching opaque content (TIR cascade exhausted the
+    // crossing budget): report the first interface, not RAY_T_MAX — pixels
+    // flickering between a finite content distance and infinity destabilize
+    // the DLSS hit-distance guide and smear the whole object in motion.
+    if hit_distance_pending {
+        *first_hit_t = first_interface_t;
     }
 
     return radiance;
@@ -826,7 +1053,8 @@ fn load_surface(pixel: vec2<u32>) -> Surface {
     surface.world_position = gpos.xyz;
     surface.world_normal = textureLoad(gbuffer_normal, pixel).xyz;
     let uv = textureLoad(gbuffer_uv, pixel).xy;
-    surface.material = resolve_material(materials[u32(gpos.w)], uv);
+    surface.material_id = u32(gpos.w);
+    surface.material = resolve_material(materials[surface.material_id], uv);
     return surface;
 }
 
