@@ -25,9 +25,14 @@ pub fn clear_camera_reset(mut resets: Query<&mut CameraReset>) {
     }
 }
 
-/// Reset reason: the camera moved this frame — temporal history is invalid, so
-/// force a reset (pathtracer re-clears accumulation, DLSS drops its history).
+/// Reset reason: the camera moved this frame and the PATHTRACER is the active
+/// integrator — its progressive accumulation is view-locked, so any movement
+/// restarts it. Restir must NOT reset on movement: its temporal machinery
+/// (reservoirs, DLSS-RR history) follows motion through motion vectors, and a
+/// reset every moving frame leaves the denoiser spatial-only — the whole
+/// image degrades exactly and only while the camera moves.
 pub fn reset_render_on_camera_move(
+    state: Extract<Res<SolariViewState>>,
     cameras_3d: Extract<
         Query<(
             RenderEntity,
@@ -37,6 +42,9 @@ pub fn reset_render_on_camera_move(
     >,
     mut commands: Commands,
 ) {
+    if !state.pathtracer_runs() {
+        return;
+    }
     for (e, camera, global_transform) in &cameras_3d {
         if camera.is_active && global_transform.is_changed() {
             commands.entity(e).insert(CameraReset(true));
