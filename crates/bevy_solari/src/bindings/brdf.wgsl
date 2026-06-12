@@ -242,6 +242,63 @@ fn sample_glass_bsdf(
     return GlassBsdfSample(refract(-wo, normal, eta), vec3(1.0), true);
 }
 
+// ── Path-regularized caustics (phase A) ─────────────────────────────────────
+
+// Roughness (α) a delta glass interface is widened to for caustic next-event
+// estimation. Sharper = crisper caustics but slower convergence. (Behind a
+// function: naga_oil can't import consts.)
+fn regularized_glass_roughness() -> f32 {
+    return 0.01;
+}
+
+// Rough-dielectric transmission (Walter et al. 2007, eq. 21) for a light
+// connection across a glass interface, premultiplied by the |n·wi| cosine.
+// `wo` points away from the surface on the incident side, `wi` toward the
+// light on the FAR side, `normal` lies in `wo`'s hemisphere, and `eta` is
+// n_incident / n_transmitted (the sampling convention). Scalar — the
+// interface is colorless; volume absorption colors the path.
+fn evaluate_regularized_glass_transmission(wo: vec3<f32>, wi: vec3<f32>, normal: vec3<f32>, eta: f32, alpha: f32) -> f32 {
+    let n_dot_v = dot(normal, wo);
+    let n_dot_l = dot(normal, wi); // negative: wi is on the far side
+    if n_dot_v <= 1e-4 || n_dot_l >= -1e-4 {
+        return 0.0;
+    }
+    // Refraction half-vector (Walter eq. 16, scaled into the incident
+    // medium), flipped into the normal's hemisphere.
+    var h = -(eta * wo + wi);
+    let h_len = length(h);
+    if h_len < 1e-6 {
+        return 0.0;
+    }
+    h = h / h_len;
+    if dot(h, normal) < 0.0 {
+        h = -h;
+    }
+    let v_dot_h = dot(wo, h);
+    let l_dot_h = dot(wi, h);
+    // Both directions must straddle the microfacet.
+    if v_dot_h <= 0.0 || l_dot_h >= 0.0 {
+        return 0.0;
+    }
+    let fresnel_t = 1.0 - fresnel_dielectric(v_dot_h, eta);
+    if fresnel_t <= 0.0 {
+        return 0.0;
+    }
+    let d = D_GGX(alpha, dot(normal, h));
+    // V = G2 / (4 |n·v| |n·l|) ⇒ recover G2.
+    let g = V_SmithGGXCorrelated(alpha, n_dot_v, abs(n_dot_l)) * 4.0 * n_dot_v * abs(n_dot_l);
+    // |v·h||l·h| / (|n·v||n·l|) · D G (1−F) / (η(v·h) + (l·h))², times |n·l|.
+    // Capped: the half-vector Jacobian denominator vanishes near the total-
+    // internal-reflection boundary, and an unbounded lobe value times sun
+    // radiance is a firefly the accumulator keeps for thousands of frames.
+    let denom = eta * v_dot_h + l_dot_h;
+    return min(
+        abs(v_dot_h * l_dot_h) * d * g * fresnel_t
+            / max(n_dot_v * denom * denom, 1e-6),
+        500.0,
+    );
+}
+
 // Shading-normal adaptation (cf. Schüssler 2017). Smooth (interpolated)
 // shading normals tilt past the view horizon at silhouette edges, making
 // `NdotV < 0` so every BRDF term zeroes out and the edge renders black (only

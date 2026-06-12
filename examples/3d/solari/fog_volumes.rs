@@ -266,12 +266,9 @@ fn setup_scene(
         CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
-        // The atmosphere drives the sun's color/attenuation and the sky; the
-        // global height fog is off (visibility 0) — all the fog in this scene
-        // is the local volumes.
-        SolariAtmosphere {
-            aerial_visibility: 0.0,
-            ..default()
-        },
+        // The atmosphere drives the sun's color/attenuation and the sky;
+        // global height fog defaults off — all the fog in this scene is the
+        // local volumes.
+        SolariAtmosphere::default(),
     ));
 }

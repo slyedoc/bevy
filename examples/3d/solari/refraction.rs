@@ -4,9 +4,9 @@
 //! Exercises transmissive materials end to end: exact-Fresnel reflect/refract,
 //! total internal reflection, Beer–Lambert volume absorption (the bottle is
 //! dark green glass; the wine is red by absorption, not surface color), and
-//! chromatic dispersion — a flint-glass prism splits refractions per
-//! wavelength, and the dispersion slider applies the same to every glass in
-//! the scene (rainbow fringes on the dragon's edges).
+//! chromatic dispersion — the slider applies it to every glass in the scene
+//! (rainbow fringes on the dragon's edges). For the staged prism-spectrum
+//! demo see the `solari_prism` example.
 //!
 //! The asset is produced by
 //! `examples/large_scenes/bistro/extract_refraction_assets.py`, which carves
@@ -82,7 +82,6 @@ fn setup_scene(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut solari_materials: ResMut<Assets<SolariMaterial>>,
 ) {
     // The glassware (bottle + glass + wine), floor at y = 0. The asset's
     // second, larger bottle is stripped on spawn — the prism stands in its
@@ -118,7 +117,7 @@ fn setup_scene(
             ),
             // The asset's origin is not at the dragon's feet: the Dragon node
             // sits at y = -0.7306 (standing on the stripped backdrop cloth).
-            Transform::from_xyz(-0.25, 0.7306 * 0.12, -0.05)
+            Transform::from_xyz(-0.4, 0.7306 * 0.12, -0.12)
                 .with_scale(Vec3::splat(0.12))
                 .with_rotation(Quat::from_rotation_y(1.0)),
         ))
@@ -136,30 +135,6 @@ fn setup_scene(
                 }
             },
         );
-
-    // A flint-glass prism (authored as `SolariMaterial` directly —
-    // `StandardMaterial` has no dispersion field). The triangle profile is
-    // equilateral, flat side down; look through it edge-on for the strongest
-    // wavelength split.
-    commands.spawn((
-        Mesh3d(meshes.add(Extrusion::new(
-            Triangle2d::new(
-                Vec2::new(0.0, 0.0924),
-                Vec2::new(-0.08, -0.0462),
-                Vec2::new(0.08, -0.0462),
-            ),
-            0.18,
-        ))),
-        SolariMaterial3d(solari_materials.add(SolariMaterial {
-            base_color: Color::WHITE,
-            perceptual_roughness: 0.0,
-            specular_transmission: 1.0,
-            ior: 1.62,
-            dispersion: 0.63,
-            ..default()
-        })),
-        Transform::from_xyz(0.05, 0.0462, -0.08).with_rotation(Quat::from_rotation_y(0.5)),
-    ));
 
     // A small stage: checkered floor so refraction visibly bends straight
     // lines, and a back wall to catch caustic-ish light patterns.

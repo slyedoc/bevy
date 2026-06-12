@@ -1,10 +1,10 @@
 enable wgpu_ray_query;
 
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
-#import bevy_solari::pbr::{rand_f, rand_vec2f, rand_range_u}
+#import bevy_solari::pbr::{rand_f, rand_vec2f, rand_range_u, rand_u}
 #import bevy_render::view::View
-#import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf, dispersive_ior, spectral_rgb_weight, sample_hero_wavelength}
-#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, generate_random_emissive_light_sample, calculate_resolved_light_contribution, trace_light_visibility, emissive_light_count, NULL_LIGHT_ID}
+#import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf, dispersive_ior, spectral_rgb_weight, sample_hero_wavelength, evaluate_regularized_glass_transmission, regularized_glass_roughness}
+#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, generate_random_emissive_light_sample, calculate_resolved_light_contribution, trace_light_visibility, emissive_light_count, directional_light_count, resolve_light_sample, LightSample, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, offset_ray_origin, directional_lights, light_sources, active_light_list, fog_volumes_sample, fog_volumes_range, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 #import bevy_solari::atmosphere::{Atmosphere, atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
 
@@ -113,6 +113,11 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // spectral→RGB weight once), and every dispersive eta after that uses
     // n(λ). Paths that never touch dispersive glass pay nothing.
     var lambda = 0.0;
+    // Path regularization (Kaplanyan & Dachsbacher): true once the path has
+    // bounced off a non-mirror surface — glass interfaces after that stop
+    // being pure deltas for next-event estimation (caustics). Camera-visible
+    // glass stays exact.
+    var regularize = false;
     // Hard path-length cap: russian roulette terminates almost every path
     // long before this; the cap is GPU-timeout insurance.
     var bounces = 0u;
@@ -213,6 +218,42 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         far_ior / self_ior, // entering: far side → M
                         entering,
                     );
+
+                    // Caustic next-event estimation (phase A, path
+                    // regularization): on a regularized path, connect this
+                    // interface to the sun through a GGX-widened transmission
+                    // lobe. This is the ONLY sun-through-glass transport for
+                    // bounce paths — the sun disk draws on primary misses
+                    // only — so a glass object's shadow gains its caustic
+                    // instead of staying black. Directional lights only: an
+                    // emissive connected here would double-count with
+                    // delta-chain hits on the emitter itself. Occlusion is a
+                    // real shadow ray from the far side, so entry interfaces
+                    // self-occlude against the body of the glass and only
+                    // exit-side vertices contribute. `eta` is the dispersive
+                    // value on spectral paths — prism caustics fan into a
+                    // rainbow.
+                    if regularize && directional_light_count() > 0u {
+                        let emissive_count = active_light_list[0];
+                        let directional_count = active_light_list[1];
+                        let sun_slot = active_light_list[
+                            2u + emissive_count + rand_range_u(directional_count, &rng)];
+                        let resolved = resolve_light_sample(
+                            LightSample(sun_slot << 16u, rand_u(&rng)), light_sources[sun_slot]);
+                        let sun_wi = resolved.world_position.xyz;
+                        if dot(sun_wi, oriented_normal) < 0.0 {
+                            let f = evaluate_regularized_glass_transmission(
+                                wo, sun_wi, oriented_normal, eta, regularized_glass_roughness());
+                            if f > 0.0 {
+                                let nee_origin = offset_ray_origin(
+                                    ray_hit.world_position, -oriented_geometric_normal);
+                                let visibility = trace_light_visibility(nee_origin, resolved.world_position);
+                                radiance += throughput * resolved.radiance
+                                    * (resolved.inverse_pdf * f32(directional_count) * f * visibility);
+                            }
+                        }
+                    }
+
                     let glass = sample_glass_bsdf(wo, oriented_normal, eta, &rng);
                     ray_direction = glass.wi;
                     crossed = glass.refracted;
@@ -261,6 +302,9 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             } else {
                 // Sample direct lighting, but only if the surface is not mirror-like
                 let is_perfectly_specular = ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
+                // A non-mirror bounce arms caustic NEE at later glass
+                // vertices; pure mirror chains stay exact deltas.
+                regularize = regularize || !is_perfectly_specular;
                 if !is_perfectly_specular {
                     let direct_lighting = sample_random_light(ray_hit.world_position, world_normal, &rng);
 
@@ -289,7 +333,17 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // terminate: clear glass keeps throughput at exactly 1, and a ray
             // in total internal reflection inside a window pane would
             // otherwise bounce forever.
-            let p = min(luminance(throughput), 0.95);
+            //
+            // Spectral (hero-λ) paths roulette on their MAX channel: a
+            // deep-red or deep-blue λ has near-zero luminance, so
+            // luminance-RR kills almost every such path and the survivors'
+            // 1/p boost renders as saturated splats — red confetti across a
+            // prism caustic instead of a spectrum.
+            var rr_throughput = luminance(throughput);
+            if lambda != 0.0 {
+                rr_throughput = max(throughput.r, max(throughput.g, throughput.b));
+            }
+            let p = min(rr_throughput, 0.95);
             if rand_f(&rng) > p { break; }
             throughput /= p;
 

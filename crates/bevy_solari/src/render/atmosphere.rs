@@ -69,9 +69,10 @@ pub struct SolariAtmosphere {
     /// Aerial-perspective **ground-level visibility** in WORLD units (Koschmieder
     /// meteorological range): the view distance at which a surface *in the densest
     /// fog* fades to ~2 % contrast. Lower ⇒ haze closer/thicker; higher ⇒ clearer.
-    /// `0.0` (or non-finite) disables the global height fog entirely — the sky and
-    /// sun keep working, and local
-    /// [`SolariFogVolume`](crate::bindings::SolariFogVolume)s still march.
+    /// `0.0` (the default, or non-finite) disables the global height fog entirely —
+    /// the sky and sun keep working, and local
+    /// [`SolariFogVolume`](crate::bindings::SolariFogVolume)s still march. Set it
+    /// to your scene's units to opt in (e.g. ~12000 for metres-scale clear air).
     pub aerial_visibility: f32,
     /// Fog-layer **scale height** in WORLD units: density falls off as
     /// `exp(-(y - fog_base) / fog_height)`, so the haze is densest at the ground and
@@ -98,9 +99,10 @@ impl Default for SolariAtmosphere {
             mie_scale_height: 1.2,
             mie_phase_g: 0.8,
             camera_altitude: 0.2,
-            // Generic defaults for a metres-scale world: ~12 km ground visibility,
-            // a 100 m-tall fog layer at y = 0. Set to your scene's units.
-            aerial_visibility: 12000.0,
+            // Global height fog is opt-in (0 = off): its march costs per-step
+            // shadow rays, and the right visibility depends on scene units.
+            // The layer shape defaults suit a metres-scale world.
+            aerial_visibility: 0.0,
             aerial_fog_height: 100.0,
             aerial_fog_base: 0.0,
             aerial_phase_g: 0.4,
