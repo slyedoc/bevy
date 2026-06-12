@@ -19,10 +19,12 @@
 
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @builtin(frag_depth) f32 {
-    // Framebuffer pixel → G-buffer texel. The Solari view's viewport origin is
-    // 0 (it renders to the top-left of its target, matching the compose pass),
-    // so the framebuffer coordinate indexes the G-buffer directly.
-    let coords = vec2<i32>(in.position.xy);
+    // Framebuffer pixel → G-buffer texel. The Solari view renders to the
+    // top-left of its target (origin 0), but under DLSS upscaling the
+    // G-buffer is RENDER resolution while this pass covers the full-res
+    // depth texture — nearest-scale the coordinate (1:1 when dims match).
+    let gbuffer_dims = textureDimensions(gbuffer_position);
+    let coords = vec2<i32>(vec2<u32>(in.position.xy) * gbuffer_dims / vec2<u32>(view.viewport.zw));
     let hit = textureLoad(gbuffer_position, coords, 0);
 
     // Miss: w < 0 marks "no geometry". Discard so the cleared far-plane depth

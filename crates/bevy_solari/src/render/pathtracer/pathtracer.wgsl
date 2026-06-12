@@ -18,6 +18,10 @@ struct SolariView {
     cull_mask: vec4<u32>,
     clear_color: vec3<f32>,
     environment_brightness: f32,
+    debug_mode: u32,
+    // Thin-lens DoF (`SolariLens`); aperture 0 = pinhole.
+    focus_distance: f32,
+    aperture_radius: f32,
 }
 @group(1) @binding(3) var<uniform> solari_view: SolariView;
 // Environment map (sky), sampled in the ray direction on a miss. Bound to the
@@ -61,6 +65,25 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var ray_origin = view.world_position;
     var ray_direction = normalize((primary_ray_target.xyz / primary_ray_target.w) - ray_origin);
     var ray_t_min = 0.0;
+
+    // Thin-lens depth of field (`SolariLens`): jitter the origin across the
+    // aperture disk and re-aim at this ray's focal-plane point — the plane at
+    // `focus_distance` along the VIEW axis stays sharp, everything off it
+    // blurs, and the accumulation converges the blur into true bokeh.
+    if solari_view.aperture_radius > 0.0 {
+        let camera_right = view.world_from_view[0].xyz;
+        let camera_up = view.world_from_view[1].xyz;
+        let camera_forward = -view.world_from_view[2].xyz;
+        let focus_t = solari_view.focus_distance / max(dot(ray_direction, camera_forward), 1e-4);
+        let focus_point = ray_origin + ray_direction * focus_t;
+        // Uniform disk sample (r = sqrt(u) for uniform area density).
+        let lens_rand = rand_vec2f(&rng);
+        let lens_r = solari_view.aperture_radius * sqrt(lens_rand.x);
+        let lens_theta = 6.283185307 * lens_rand.y;
+        ray_origin += camera_right * (lens_r * cos(lens_theta))
+            + camera_up * (lens_r * sin(lens_theta));
+        ray_direction = normalize(focus_point - ray_origin);
+    }
 
     // Aerial perspective (primary ray only): remember the camera ray and capture
     // the primary hit distance, to apply distance haze once the path completes.

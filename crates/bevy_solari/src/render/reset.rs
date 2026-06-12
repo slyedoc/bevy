@@ -1,5 +1,5 @@
 use bevy_camera::Camera;
-use bevy_ecs::{change_detection::DetectChanges, component::Component, query::With, system::{Commands, Query, Res}, world::Ref};
+use bevy_ecs::{change_detection::DetectChanges, component::Component, lifecycle::RemovedComponents, query::With, system::{Commands, Query, Res}, world::Ref};
 use bevy_reflect::Reflect;
 use bevy_render::{Extract, sync_world::RenderEntity};
 use bevy_transform::components::GlobalTransform;
@@ -48,6 +48,42 @@ pub fn reset_render_on_camera_move(
     for (e, camera, global_transform) in &cameras_3d {
         if camera.is_active && global_transform.is_changed() {
             commands.entity(e).insert(CameraReset(true));
+        }
+    }
+}
+
+/// Reset reason: the camera's `DepthOfField` (the pathtracer's thin lens)
+/// changed or was removed while the PATHTRACER is the active integrator —
+/// its accumulation holds the old lens's image. Restir blurs in post (no
+/// history involvement), so a continuous focus pull must not nuke its
+/// temporal history every frame.
+pub fn reset_render_on_lens_change(
+    state: Extract<Res<SolariViewState>>,
+    cameras: Extract<
+        Query<
+            (RenderEntity, Ref<bevy_post_process::dof::DepthOfField>),
+            With<SolariCamera>,
+        >,
+    >,
+    mut removed: Extract<RemovedComponents<bevy_post_process::dof::DepthOfField>>,
+    all_cameras: Query<&mut CameraReset>,
+    mut commands: Commands,
+) {
+    if !state.pathtracer_runs() {
+        let _ = all_cameras;
+        removed.clear();
+        return;
+    }
+    for (e, lens) in &cameras {
+        if lens.is_changed() {
+            commands.entity(e).insert(CameraReset(true));
+        }
+    }
+    // Lens removed → the accumulation still holds the blurred image.
+    if !removed.is_empty() {
+        removed.clear();
+        for mut reset in all_cameras {
+            reset.0 = true;
         }
     }
 }

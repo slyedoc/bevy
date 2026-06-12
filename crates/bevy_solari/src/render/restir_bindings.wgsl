@@ -113,6 +113,9 @@ struct SolariView {
     environment_brightness: f32,
     // `restir_debug` visualization mode (0 = none).
     debug_mode: u32,
+    // Thin-lens DoF (`SolariLens`); aperture 0 = pinhole. Pathtracer-only.
+    focus_distance: f32,
+    aperture_radius: f32,
 }
 @group(1) @binding(14) var<uniform> solari_view: SolariView;
 // Environment map (sky), sampled in the ray direction on a miss. Bound to the

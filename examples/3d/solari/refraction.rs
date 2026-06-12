@@ -16,13 +16,21 @@
 
 use bevy::{
     camera::CameraMainTextureUsages,
-    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin, FreeCameraState},
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
     diagnostic::FrameTimeDiagnosticsPlugin,
-    feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
+    feathers::{
+        self,
+        controls::FeathersSlider,
+        dark_theme::create_dark_theme,
+        theme::{ThemeBackgroundColor, ThemeTextColor, UiTheme},
+        FeathersPlugins,
+    },
+    post_process::dof::{DepthOfField, DepthOfFieldMode},
     prelude::*,
     render::render_resource::TextureUsages,
     solari::prelude::*,
+    ui_widgets::{slider_self_update, SliderPrecision, SliderStep, ValueChange},
     world_serialization::WorldInstanceReady,
 };
 use std::f32::consts::PI;
@@ -56,7 +64,7 @@ fn main() {
                 },
             },
         ))
-        .add_systems(Startup, setup_scene)
+        .add_systems(Startup, (setup_scene, lens_ui.spawn()))
         // The glTF materials load as `StandardMaterial` (PbrPlugin is enabled);
         // convert meshes + materials for the RT scene.
         .add_systems(
@@ -166,6 +174,94 @@ fn setup_scene(
         CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
+        // Depth of field: bevy's standard component. The pathtracer consumes
+        // it as a true thin lens (real bokeh, converged in the accumulation);
+        // the realtime path blurs in post from the RT depth. f/∞ = off.
+        DepthOfField {
+            mode: DepthOfFieldMode::Bokeh,
+            focal_distance: 0.65,
+            aperture_f_stops: f32::INFINITY,
+            ..default()
+        },
         SolariAtmosphere::default(),
     ));
+}
+
+/// Thin-lens control panel (top right): focus-distance + aperture sliders
+/// writing straight to the camera's [`SolariLens`] (whose change detection
+/// restarts the pathtracer's accumulation). DoF is visible in the pathtrace
+/// view; aperture 0 = pinhole.
+fn lens_ui() -> impl Scene {
+    bsn! {
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(10),
+            right: px(10),
+            padding: px(8),
+        }
+        ThemeBackgroundColor(feathers::tokens::WINDOW_BG)
+        on(|_: On<Pointer<Over>>, mut free_camera_state: Single<&mut FreeCameraState>| {
+            free_camera_state.enabled = false;
+        })
+        on(|_: On<Pointer<Out>>, mut free_camera_state: Single<&mut FreeCameraState>| {
+            free_camera_state.enabled = true;
+        })
+        Children [(
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Stretch,
+                justify_content: JustifyContent::Start,
+                row_gap: px(8),
+                min_width: px(180),
+            }
+            Children [
+                Text("Lens"),
+                (
+                    Text("Focus distance (m)")
+                    TextFont { font_size: FontSize::Px(14.0) }
+                    ThemeTextColor(feathers::tokens::CHECKBOX_TEXT)
+                ),
+                (
+                    @FeathersSlider {
+                        @min: 0.05,
+                        @max: 3.0,
+                        @value: 0.65,
+                    }
+                    SliderStep(0.05)
+                    SliderPrecision(2)
+                    on(slider_self_update)
+                    on(|change: On<ValueChange<f32>>, mut lens: Single<&mut DepthOfField>| {
+                        lens.focal_distance = change.value;
+                    })
+                ),
+                (
+                    Text("Aperture (f-stop)")
+                    TextFont { font_size: FontSize::Px(14.0) }
+                    ThemeTextColor(feathers::tokens::CHECKBOX_TEXT)
+                ),
+                (
+                    // Slider is in stops (thirds): f-number = 2^(value/2), so
+                    // each unit halves the light-gathering area — perceptually
+                    // uniform blur change, like a camera's aperture ring.
+                    // Max (f/22+) snaps to pinhole.
+                    @FeathersSlider {
+                        @min: 0.0,
+                        @max: 9.0,
+                        @value: 9.0,
+                    }
+                    SliderStep(0.33333)
+                    SliderPrecision(2)
+                    on(slider_self_update)
+                    on(|change: On<ValueChange<f32>>, mut lens: Single<&mut DepthOfField>| {
+                        lens.aperture_f_stops = if change.value >= 9.0 {
+                            f32::INFINITY
+                        } else {
+                            2f32.powf(change.value / 2.0)
+                        };
+                    })
+                ),
+            ]
+        )]
+    }
 }

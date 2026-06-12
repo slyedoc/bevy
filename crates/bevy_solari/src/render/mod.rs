@@ -32,8 +32,11 @@ use bevy_core_pipeline::{
 };
 use bevy_ecs::{
     component::Component,
+    entity::Entity,
+    query::With,
     reflect::ReflectComponent,
     schedule::{IntoScheduleConfigs, SystemCondition, common_conditions::resource_exists},
+    system::{Commands, Query, Res},
 };
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
@@ -92,6 +95,7 @@ impl Plugin for SolarRenderPlugin {
                     (
                         reset::clear_camera_reset,
                         reset::reset_render_on_camera_move,
+                        reset::reset_render_on_lens_change,
                         reset::reset_render_on_view_state_change,
                         reset::reset_render_on_request,
                     )
@@ -109,6 +113,10 @@ impl Plugin for SolarRenderPlugin {
                     atmosphere::prepare_atmosphere_sky,
                 )
                     .in_set(RenderSystems::PrepareResources),
+            )
+            .add_systems(
+                Render,
+                suppress_post_process_dof.in_set(RenderSystems::CreateViews),
             )
             .add_systems(
                 Render,
@@ -240,4 +248,47 @@ impl Plugin for SolarRenderPlugin {
 #[reflect(Component, Default, Clone)]
 #[require(Hdr, TemporalJitter, CameraReset)]
 pub struct SolariCamera;
+
+/// `Render` (`CreateViews`): strip the render-world
+/// [`DepthOfField`](bevy_post_process::dof::DepthOfField) from solari views
+/// when the post-process node must not run — before its pipeline prepare
+/// (`RenderSystems::Prepare`) queries it. The same suppress-by-removal
+/// pattern as `extract_solari_skybox`.
+///
+/// Depth of field on a [`SolariCamera`] is one component, two fidelities:
+/// the realtime path renders sharp (lens-sampled primaries would feed the
+/// denoiser a stochastic G-buffer) and blurs AFTER denoise + upscale via
+/// bevy's standard post effect, from the bridged hardware depth
+/// (`gizmo_depth`) — the architecture Unreal uses for its ray-traced modes.
+/// The PATHTRACER instead consumes the same component as a true thin lens in
+/// its ray generation (real bokeh, converged in the accumulation), so the
+/// post effect is suppressed there — blurring twice would be wrong. Also
+/// suppressed over debug views (blurring a visualization helps no one).
+pub fn suppress_post_process_dof(
+    state: Res<SolariViewState>,
+    views: Query<
+        Entity,
+        (With<SolariCamera>, With<bevy_post_process::dof::DepthOfField>),
+    >,
+    mut commands: Commands,
+) {
+    if !(state.pathtracer_runs() || state.debug.is_some()) {
+        return;
+    }
+    for entity in &views {
+        // The whole dof view-component set, not just `DepthOfField`: its
+        // extract also inserts `DepthOfFieldUniform`, and its prepare leaves
+        // `DepthOfFieldPipelines` behind on the entity — a stale pipelines
+        // component plus the fresh uniform would satisfy the node's ViewQuery
+        // and run it against a depth texture created (this frame, with the
+        // configure system skipped) WITHOUT `TEXTURE_BINDING`.
+        commands.entity(entity).remove::<(
+            bevy_post_process::dof::DepthOfField,
+            bevy_post_process::dof::DepthOfFieldUniform,
+            bevy_post_process::dof::DepthOfFieldPipelines,
+            bevy_post_process::dof::ViewDepthOfFieldBindGroupLayouts,
+            bevy_post_process::dof::AuxiliaryDepthOfFieldTexture,
+        )>();
+    }
+}
 

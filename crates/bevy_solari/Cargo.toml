@@ -55,6 +55,7 @@ bevy_mesh = { path = "../bevy_mesh", version = "0.19.0-dev" }
 bevy_pbr = { path = "../bevy_pbr", version = "0.19.0-dev", features = [
   "dfg_lut",
 ] }
+bevy_post_process = { path = "../bevy_post_process", version = "0.19.0-dev" }
 bevy_platform = { path = "../bevy_platform", version = "0.19.0-dev", default-features = false, features = [
   "std",
 ] }
