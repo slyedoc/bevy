@@ -1637,6 +1637,25 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
+name = "solari_scope"
+path = "examples/3d/solari/scope.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_gltf",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_scope]
+name = "Solari (scope)"
+description = "A working 4x Galilean telescope built from real lens geometry - magnification emerges from refraction."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
 name = "spherical_area_lights"
 path = "examples/3d/spherical_area_lights.rs"
 doc-scrape-examples = true
