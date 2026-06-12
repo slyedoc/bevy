@@ -11,10 +11,11 @@ enable wgpu_ray_query;
 // switch) — it belongs in a separate render-debug-style overlay that reads the
 // G-buffer / reservoir buffers.
 
-#import bevy_solari::pbr::rand_f
+#import bevy_solari::pbr::{rand_f, rand_u, rand_range_u}
 #import bevy_solari::atmosphere::{atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
-#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, fog_volumes_sample, fog_volumes_range, RAY_T_MIN, RAY_T_MAX}
-#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, solari_view, environment_map, environment_map_sampler, atmosphere}
+#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, fog_volumes_sample, fog_volumes_range, light_sources, RAY_T_MIN, RAY_T_MAX}
+#import bevy_solari::sampling::{resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, emissive_light_count, LightSample, ResolvedLightSample, NULL_LIGHT_ID}
+#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, solari_view, environment_map, environment_map_sampler, atmosphere, light_tiles, unpack_light_tile_sample, regir_query, regir_samples, REGIR_CELL_NONE, REGIR_ENTRIES_PER_CELL}
 
 const AERIAL_STEPS = 8u;
 
@@ -133,6 +134,8 @@ fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     s.sigma_t += sigma;
                     s.sigma_s += vec3(sigma);
                     s.sun_scatter += vec3(sigma * sun_phase);
+                    s.phase_g_sum += atmosphere.aerial_phase_g * (3.0 * sigma);
+                    s.phase_weight += 3.0 * sigma;
                 }
                 if s.sigma_t < 1e-7 { continue; } // empty step — no scattering, skip the shadow ray
                 var sun_vis = 0.0;
@@ -142,6 +145,51 @@ fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 }
                 let in_scatter = sun_radiance * (sun_vis * s.sun_scatter) + sky_ambient * s.sigma_s;
                 inscatter += fog_transmittance * in_scatter * ds;
+
+                // Local (emissive) lights: one ReGIR-guided NEE sample for the
+                // step. A live cell hands us a light its RIS already vetted
+                // for this region (fresh point on it, chained weight — the
+                // same consumption as the per-pixel DI candidates); a cold or
+                // missing cell falls back to a uniform light-tile sample, and
+                // the query itself inserts the cell so it's warm next frame.
+                // The grid and tiles are emissive-only, so the sun term above
+                // is never double-counted. The "normal" handed to the query is
+                // the view ray — its tangent-plane jitter then decorrelates
+                // the two directions the march doesn't already jitter along.
+                if emissive_light_count() > 0u && s.phase_weight > 1e-7 {
+                    var resolved = ResolvedLightSample(vec4(0.0), vec3(0.0), vec3(0.0), 0.0);
+                    var light_valid = false;
+                    let cell = regir_query(p, ray_direction, view.world_position, &rng);
+                    if cell != REGIR_CELL_NONE {
+                        let entry = regir_samples[cell * REGIR_ENTRIES_PER_CELL + rand_range_u(REGIR_ENTRIES_PER_CELL, &rng)];
+                        if entry.light_id != NULL_LIGHT_ID {
+                            let slot = entry.light_id >> 16u;
+                            let light_source = light_sources[slot];
+                            let triangle_id = rand_range_u(light_source.kind >> 1u, &rng);
+                            resolved = resolve_light_sample(LightSample((slot << 16u) | triangle_id, rand_u(&rng)), light_source);
+                            // light weight × fresh point's area inverse-pdf
+                            resolved.inverse_pdf *= entry.inverse_pdf;
+                            light_valid = true;
+                        }
+                    } else {
+                        let entry = light_tiles[rand_range_u(arrayLength(&light_tiles), &rng)];
+                        if entry.light_id != NULL_LIGHT_ID {
+                            resolved = unpack_light_tile_sample(entry);
+                            light_valid = true;
+                        }
+                    }
+                    if light_valid {
+                        let light = calculate_resolved_light_contribution(resolved, p, ray_direction);
+                        if any(light.radiance > vec3(0.0)) {
+                            let g_eff = s.phase_g_sum / s.phase_weight;
+                            let phase = atmosphere_mie_phase(g_eff, dot(light.wi, ray_direction));
+                            let vis = trace_light_visibility(p, resolved.world_position);
+                            inscatter += fog_transmittance * s.sigma_s
+                                * (phase * light.inverse_pdf * vis) * light.radiance * ds;
+                        }
+                    }
+                }
+
                 fog_transmittance *= exp(-s.sigma_t * ds);
             }
         }

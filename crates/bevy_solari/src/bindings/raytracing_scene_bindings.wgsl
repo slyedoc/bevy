@@ -463,15 +463,21 @@ fn portal_redirect(
 // scattering (the isotropic sky-ambient term), and sun-phase-weighted
 // scattering — each volume applies its own HG lobe at the caller's sun angle.
 // The global height fog is NOT included; the marches add it (its phase uses
-// the per-view atmosphere `g`).
+// the per-view atmosphere `g`). `phase_g_sum / phase_weight` is the
+// scattering-weighted HG asymmetry for evaluating the phase toward an
+// ARBITRARY direction (a local-light NEE sample) when overlapping media
+// carry different `g` — the sun direction is fixed per ray, light samples
+// aren't.
 struct FogSample {
     sigma_t: f32,
     sigma_s: vec3<f32>,
     sun_scatter: vec3<f32>,
+    phase_g_sum: f32,
+    phase_weight: f32,
 }
 
 fn fog_volumes_sample(p: vec3<f32>, cos_theta: f32) -> FogSample {
-    var s = FogSample(0.0, vec3(0.0), vec3(0.0));
+    var s = FogSample(0.0, vec3(0.0), vec3(0.0), 0.0, 0.0);
     for (var i = 0u; i < arrayLength(&fog_volumes); i += 1u) {
         let vol = fog_volumes[i];
         if vol.scattering.w < 1e-7 {
@@ -494,6 +500,9 @@ fn fog_volumes_sample(p: vec3<f32>, cos_theta: f32) -> FogSample {
         s.sigma_t += vol.scattering.w * density;
         s.sigma_s += sigma_s;
         s.sun_scatter += sigma_s * atmosphere_mie_phase(vol.params.x, cos_theta);
+        let w = sigma_s.x + sigma_s.y + sigma_s.z;
+        s.phase_g_sum += vol.params.x * w;
+        s.phase_weight += w;
     }
     return s;
 }

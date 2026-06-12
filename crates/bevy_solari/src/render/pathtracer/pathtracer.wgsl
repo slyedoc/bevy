@@ -4,7 +4,7 @@ enable wgpu_ray_query;
 #import bevy_solari::pbr::{rand_f, rand_vec2f}
 #import bevy_render::view::View
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf}
-#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic}
+#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, generate_random_emissive_light_sample, calculate_resolved_light_contribution, trace_light_visibility, emissive_light_count, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, offset_ray_origin, directional_lights, light_sources, active_light_list, fog_volumes_sample, fog_volumes_range, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 #import bevy_solari::atmosphere::{Atmosphere, atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
 
@@ -418,6 +418,8 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         s.sigma_t += sigma;
                         s.sigma_s += vec3(sigma);
                         s.sun_scatter += vec3(sigma * sun_phase);
+                        s.phase_g_sum += atmosphere.aerial_phase_g * (3.0 * sigma);
+                        s.phase_weight += 3.0 * sigma;
                     }
                     if s.sigma_t < 1e-7 { continue; } // empty step — no scattering, skip the shadow ray
                     var sun_vis = 0.0;
@@ -427,6 +429,28 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     }
                     let in_scatter = sun_radiance * (sun_vis * s.sun_scatter) + sky_ambient * s.sigma_s;
                     inscatter += fog_transmittance * in_scatter * ds;
+
+                    // Local (emissive) lights: one uniform NEE sample for the
+                    // step — emissive-only (the sun term above is the
+                    // directional stratum), phase-weighted at the media's
+                    // scattering-averaged `g`, shadowed by a real visibility
+                    // ray. Accumulation converges the single-sample variance;
+                    // the realtime compose pass uses the ReGIR grid instead.
+                    if emissive_light_count() > 0u && s.phase_weight > 1e-7 {
+                        let light = generate_random_emissive_light_sample(&rng);
+                        if light.light_sample.light_id != NULL_LIGHT_ID {
+                            let contribution = calculate_resolved_light_contribution(
+                                light.resolved_light_sample, p, primary_ray_direction);
+                            if any(contribution.radiance > vec3(0.0)) {
+                                let g_eff = s.phase_g_sum / s.phase_weight;
+                                let phase = atmosphere_mie_phase(g_eff, dot(contribution.wi, primary_ray_direction));
+                                let vis = trace_light_visibility(p, light.resolved_light_sample.world_position);
+                                inscatter += fog_transmittance * s.sigma_s
+                                    * (phase * contribution.inverse_pdf * vis) * contribution.radiance * ds;
+                            }
+                        }
+                    }
+
                     fog_transmittance *= exp(-s.sigma_t * ds);
                 }
             }
