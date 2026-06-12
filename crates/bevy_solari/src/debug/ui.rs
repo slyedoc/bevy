@@ -109,6 +109,7 @@ pub fn spawn_debug_panels(
                     ),
                     (
                         @FeathersMenuPopup
+                        ViewMenuPopup
                         Children [
                             lighting_item(SolariLighting::Pathtracer),
                             lighting_item(SolariLighting::Restir),
@@ -130,6 +131,30 @@ pub fn spawn_debug_panels(
                 ]
             )
         });
+}
+
+/// Marks the view dropdown's popup, so the DLSS guide views can be appended
+/// as separate children (a `bsn_list!` can't be extended conditionally).
+#[derive(Component, Default, Clone)]
+pub struct ViewMenuPopup;
+
+/// Append the DLSS guide-buffer views to the dropdown once the popup exists.
+#[cfg(feature = "dlss")]
+pub fn append_dlss_guide_items(
+    popup: Query<Entity, bevy_ecs::prelude::Added<ViewMenuPopup>>,
+    mut commands: Commands,
+) {
+    for entity in &popup {
+        commands
+            .entity(entity)
+            .queue_spawn_related_scenes::<Children>(bsn_list! {
+                debug_item(SolariDebugView::DlssDepth),
+                debug_item(SolariDebugView::DlssNormalRoughness),
+                debug_item(SolariDebugView::DlssDiffuseAlbedo),
+                debug_item(SolariDebugView::DlssSpecularAlbedo),
+                debug_item(SolariDebugView::DlssSpecularMotion),
+            });
+    }
 }
 
 /// Keep the dropdown button's caption in sync with [`SolariViewState`]: the
