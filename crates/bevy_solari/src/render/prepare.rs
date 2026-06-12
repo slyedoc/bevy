@@ -40,6 +40,10 @@ pub const REGIR_TABLE_SIZE: u64 = 65536;
 /// Presampled light entries per ReGIR cell. MUST match
 /// `REGIR_ENTRIES_PER_CELL` in `restir_bindings.wgsl`.
 pub const REGIR_ENTRIES_PER_CELL: u64 = 32;
+/// Caustic photon-grid cell count (power of two): 4 words per cell —
+/// `[checksum, r, g, b]`. MUST match `CAUSTIC_TABLE_SIZE` in
+/// `restir_bindings.wgsl`.
+pub const CAUSTIC_TABLE_SIZE: u64 = 65536;
 
 /// Per-view GPU resources for the full-RT ReSTIR path tracer.
 ///
@@ -89,6 +93,12 @@ pub struct RestirResources {
     /// pixel's initial candidates come from a pool already importance-reduced
     /// to lights that matter NEAR its surface point.
     pub regir_samples: Buffer,
+    /// Caustic photon grid: `[checksum, r, g, b]` per cell, written by the
+    /// photon-emission pass and gathered at diffuse shading.
+    pub caustic_cells: Buffer,
+    /// Caustic emitter scratch + parameters, computed entirely on the GPU by
+    /// the `caustic_prepare_*` passes (see `restir_bindings.wgsl` layout).
+    pub caustic_emitter: Buffer,
     /// Self-owned previous-frame `clip_from_world`: two `mat4x4<f32>` slots,
     /// frame-parity ping-ponged on the GPU (one writer thread in the
     /// visibility pass). Replaces a prepass-fed previous-view uniform.
@@ -198,6 +208,11 @@ pub fn prepare_restir_resources(
             "restir_regir_samples",
             REGIR_TABLE_SIZE * REGIR_ENTRIES_PER_CELL * LIGHT_TILE_SAMPLE_STRUCT_SIZE,
         );
+        let caustic_cells = regir_buffer("restir_caustic_cells", CAUSTIC_TABLE_SIZE * 16);
+        let caustic_emitter = regir_buffer(
+            "restir_caustic_emitter",
+            super::caustics::CAUSTIC_EMITTER_WORDS * 4,
+        );
 
         // Two `mat4x4<f32>` (64 B each): current + previous clip_from_world.
         let view_clip_from_world = render_device.create_buffer(&BufferDescriptor {
@@ -235,6 +250,8 @@ pub fn prepare_restir_resources(
             regir_life,
             regir_cell_data,
             regir_samples,
+            caustic_cells,
+            caustic_emitter,
             view_clip_from_world,
             #[cfg(feature = "dlss")]
             guide_depth: storage_texture("restir_guide_depth", TextureFormat::R32Float),

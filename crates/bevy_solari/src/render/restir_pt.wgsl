@@ -25,7 +25,7 @@ enable wgpu_ray_query;
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB, bend_shading_normal, fresnel_dielectric, dispersive_ior, spectral_lambda_rgb}
 #import bevy_solari::sampling::{LightSample, ResolvedLightSample, generate_random_light_sample, resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_point_visibility, sample_random_light, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, random_emissive_light_pdf, power_heuristic, isnan, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, active_light_list, directional_lights, ResolvedMaterial, LIGHT_SOURCE_KIND_NONE, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, offset_ray_origin}
-#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LightTileSample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler, specular_hit_distance, regir_query, regir_find, regir_samples, REGIR_CELL_NONE, REGIR_ENTRIES_PER_CELL}
+#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LightTileSample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler, specular_hit_distance, regir_query, regir_find, regir_samples, REGIR_CELL_NONE, REGIR_ENTRIES_PER_CELL, caustic_gather}
 
 const INITIAL_SAMPLES = 8u;
 const DI_CONFIDENCE_WEIGHT_CAP = 20.0;
@@ -323,6 +323,12 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let brdf = evaluate_diffuse_brdf(wo, wi, shading_normal, surface.material, F_ab);
         radiance += diffuse_fraction * gi_reservoir.radiance * gi_reservoir.unbiased_contribution_weight * visibility * brdf;
     }
+
+    // Caustics: photon-mapped flux through specular chains, gathered from
+    // the world-space grid the `caustic_emit` pass maintains — transport
+    // the reservoirs structurally can't find (NEE can't thread a delta
+    // chain). The grid stores irradiance; lambertian out.
+    radiance += diffuse_fraction * caustic_gather(surface.world_position, &rng) * diffuse_brdf;
 
     // Raw linear radiance — `compose` applies exposure.
     textureStore(view_output, pixel, vec4(radiance, 1.0));
@@ -735,9 +741,20 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
             // — it would go pitch black; the pathtracer fills the same spot
             // with skylight via path continuation. Approximate that with one
             // deterministic env sample along the normal: irradiance ≈ π·L_sky,
-            // diffuse brdf = albedo/π ⇒ albedo · L_sky.
+            // diffuse brdf = albedo/π ⇒ albedo · L_sky — VISIBILITY-TESTED:
+            // the unconditional fill lit sealed interiors with sky that can't
+            // reach them (a dark-room prism glowed sky-bright). One ray along
+            // the normal is conservative (a window off-normal won't fill),
+            // deterministic, and only glass pixels pay it. The caustic grid
+            // is gathered here too, so caustics show IN the refracted view,
+            // not just on directly-visible surfaces.
             if crossings > 0u {
-                radiance += gate * throughput * hit.material.base_color * sky_radiance(hit_normal);
+                let sky_visibility = trace_light_visibility(
+                    offset_ray_origin(hit.world_position, hit.geometric_world_normal),
+                    vec4(hit_normal, 0.0));
+                radiance += gate * sky_visibility * throughput * hit.material.base_color * sky_radiance(hit_normal);
+                radiance += gate * throughput * (hit.material.base_color / PI)
+                    * caustic_gather(hit.world_position, rng);
             }
             break;
         }
@@ -1282,6 +1299,11 @@ fn restir_debug(@builtin(global_invocation_id) global_id: vec3<u32>) {
             } else {
                 color = debug_hash_color(cell);
             }
+        }
+        case 5u: { // Caustic photon-grid irradiance: log heat over luminance.
+            var rng = reservoir_index(pixel) + view.frame_count * 5782582u;
+            let e = caustic_gather(surface.world_position, &rng);
+            color = debug_heat(log2(1.0 + luminance(e)) / 20.0);
         }
         default: {}
     }

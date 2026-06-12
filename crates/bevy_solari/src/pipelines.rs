@@ -71,6 +71,11 @@ pub struct SolariPipelines {
     pub restir_spatial_and_shade: CachedComputePipelineId,
     pub restir_specular_gi: CachedComputePipelineId,
     pub restir_compose: CachedComputePipelineId,
+    pub restir_caustic_decay: CachedComputePipelineId,
+    pub restir_caustic_emit: CachedComputePipelineId,
+    pub restir_caustic_prepare_reset: CachedComputePipelineId,
+    pub restir_caustic_prepare_reduce: CachedComputePipelineId,
+    pub restir_caustic_prepare_finalize: CachedComputePipelineId,
     pub restir_debug: CachedComputePipelineId,
 
     /// Fullscreen depth-write (RT G-buffer → hardware depth); a **render** pipeline.
@@ -101,6 +106,7 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "render/presample.wgsl");
     embedded_asset!(app, "render/restir_pt.wgsl");
     embedded_asset!(app, "render/compose.wgsl");
+    embedded_asset!(app, "render/caustics.wgsl");
 }
 
 /// `RenderStartup`, after [`SolariResourceManager`] is built: queue every pass's
@@ -335,6 +341,32 @@ pub fn init_solari_pipelines(
     let restir_specular_gi =
         restir_pipeline("restir_specular_gi_pipeline", "specular_gi", restir_pt_shader);
     let restir_compose = restir_pipeline("restir_compose_pipeline", "compose", compose_shader);
+    let caustics_shader = load_embedded_asset!(asset_server.as_ref(), "render/caustics.wgsl");
+    let restir_caustic_decay = restir_pipeline(
+        "restir_caustic_decay_pipeline",
+        "caustic_decay",
+        caustics_shader.clone(),
+    );
+    let restir_caustic_emit = restir_pipeline(
+        "restir_caustic_emit_pipeline",
+        "caustic_emit",
+        caustics_shader.clone(),
+    );
+    let restir_caustic_prepare_reset = restir_pipeline(
+        "restir_caustic_prepare_reset_pipeline",
+        "caustic_prepare_reset",
+        caustics_shader.clone(),
+    );
+    let restir_caustic_prepare_reduce = restir_pipeline(
+        "restir_caustic_prepare_reduce_pipeline",
+        "caustic_prepare_reduce",
+        caustics_shader.clone(),
+    );
+    let restir_caustic_prepare_finalize = restir_pipeline(
+        "restir_caustic_prepare_finalize_pipeline",
+        "caustic_prepare_finalize",
+        caustics_shader,
+    );
 
     // Fullscreen depth-write — a render pipeline; its bulky descriptor lives in
     // `render::gizmo_depth`, only the id lands here.
@@ -385,6 +417,11 @@ pub fn init_solari_pipelines(
         restir_spatial_and_shade,
         restir_specular_gi,
         restir_compose,
+        restir_caustic_decay,
+        restir_caustic_emit,
+        restir_caustic_prepare_reset,
+        restir_caustic_prepare_reduce,
+        restir_caustic_prepare_finalize,
         restir_debug,
         gizmo_depth,
         #[cfg(feature = "dlss")]

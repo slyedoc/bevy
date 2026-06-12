@@ -189,6 +189,18 @@ struct FogVolume {
 }
 @group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(7) var<storage> fog_volumes: array<FogVolume>;
 
+// Per-instance mesh-local AABB (the cluster asset's baked bounds, bind-only).
+// Combine with the LIVE `transforms` column for world bounds — the caustic
+// emitter pass sizes its photon rect from these. All-zero entries (never
+// bound, grown-buffer tail) are inert: zero half extents span nothing.
+struct InstanceAabb {
+    // xyz = mesh-local center.
+    center: vec4<f32>,
+    // xyz = mesh-local half extents.
+    half_extent: vec4<f32>,
+}
+@group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(8) var<storage> instance_aabbs: array<InstanceAabb>;
+
 const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
 

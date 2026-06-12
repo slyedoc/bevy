@@ -13,6 +13,7 @@
 
 pub mod pathtracer;
 pub mod atmosphere;
+pub mod caustics;
 mod node;
 mod gizmo_depth;
 mod overlay;

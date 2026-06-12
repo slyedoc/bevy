@@ -150,6 +150,182 @@ struct SolariView {
 @group(1) @binding(21) var<storage, read_write> regir_cell_data: array<vec4<f32>>;
 @group(1) @binding(22) var<storage, read_write> regir_samples: array<LightTileSample>;
 
+// ── Caustic photon grid ──────────────────────────────────────────────────────
+//
+// Photon-mapped light → specular chain → diffuse transport, deposited by the
+// `caustic_emit` pass (`caustics.wgsl`) and gathered at diffuse shading —
+// the transport the reservoirs structurally can't find (NEE can't thread a
+// delta chain). World-space, so the caustic is stable under camera motion;
+// a 16-frame exponential running average (the decay pass), so light/glass
+// changes re-converge without explicit invalidation. Each cell is 4 words:
+// `[identity checksum, r, g, b]` with flux in fixed point.
+@group(1) @binding(23) var<storage, read_write> caustic_cells: array<atomic<u32>>;
+// The photon-emission parameters, computed ENTIRELY on the GPU by the
+// `caustic_prepare_*` passes (reset → reduce over instances → finalize) from
+// the live transforms / material ids / instance AABBs / light columns — no
+// CPU mirror of the scene is consulted. Word layout (f32s bitcast except
+// where noted):
+//   0-4   reduce scratch: min_u, max_u, min_v, max_v, min_depth
+//         (orderable-encoded u32 atomics)
+//   5     reduce scratch: transmissive instance count (u32)
+//   8-10  rect center xyz        11 half extent along u
+//   12-14 rect basis u           15 half extent along v
+//   16-18 rect basis v           19 unused
+//   20-22 photon travel dir      23 up-beam start distance
+//   24-26 per-photon power rgb   27 enabled (1.0 / 0.0)
+@group(1) @binding(24) var<storage, read_write> caustic_emitter: array<atomic<u32>, 32>;
+
+fn caustic_emitter_load(i: u32) -> f32 {
+    return bitcast<f32>(atomicLoad(&caustic_emitter[i]));
+}
+
+fn caustic_emitter_store(i: u32, value: f32) {
+    atomicStore(&caustic_emitter[i], bitcast<u32>(value));
+}
+
+// Monotonic (orderable) encoding of an f32 into a u32, so atomicMin/Max
+// order floats correctly across signs.
+fn caustic_float_to_orderable(f: f32) -> u32 {
+    let b = bitcast<u32>(f);
+    return select(~b, b ^ 0x80000000u, (b >> 31u) == 0u);
+}
+
+fn caustic_orderable_to_float(o: u32) -> f32 {
+    return bitcast<f32>(select(~o, o ^ 0x80000000u, (o >> 31u) == 1u));
+}
+
+/// Hash-table cell count (power of two). Keep in sync with `prepare.rs`.
+const CAUSTIC_TABLE_SIZE = 65536u;
+/// Cell edge length, world units. Fixed (no LOD): caustic sharpness is a
+/// world-space property, and a 2 cm texel resolves a spectrum band.
+const CAUSTIC_CELL_SIZE = 0.02;
+/// Fixed-point scale for the flux atomics.
+const CAUSTIC_FIXED_SCALE = 4096.0;
+/// The decay pass's exponential window (×15/16 per frame ⇒ ~16 frames).
+const CAUSTIC_EMA_FRAMES = 16.0;
+/// Linear-probe attempts after a hash collision.
+const CAUSTIC_PROBE_STEPS = 8u;
+
+fn caustic_cell_key(quantized: vec3<u32>) -> u32 {
+    var key = regir_pcg_hash(quantized.x);
+    key = regir_pcg_hash(key + quantized.y);
+    key = regir_pcg_hash(key + quantized.z);
+    return key & (CAUSTIC_TABLE_SIZE - 1u);
+}
+
+// The cell checksum carries a KIND bit (bit 31): surface deposits store
+// irradiance (flux/area), volume deposits store in-scattered radiance —
+// different units, so the same world position hashes to DISTINCT cells per
+// kind and each gather sees only its own.
+fn caustic_cell_checksum(quantized: vec3<u32>, volume: bool) -> u32 {
+    var checksum = regir_iqint_hash(quantized.x);
+    checksum = regir_iqint_hash(checksum + quantized.y);
+    checksum = regir_iqint_hash(checksum + quantized.z);
+    checksum = max(checksum & 0x7FFFFFFFu, 1u); // 0 marks an empty slot
+    return select(checksum, checksum | 0x80000000u, volume);
+}
+
+/// The table size behind a function — naga_oil resolves only functions and
+/// structs across modules, so `caustics.wgsl` can't import the const.
+fn caustic_table_size() -> u32 {
+    return CAUSTIC_TABLE_SIZE;
+}
+
+/// One decay step for one cell (the `caustic_decay` pass body): age the flux
+/// toward zero (×15/16, but at least −1 so residues die) and free the cell
+/// when it empties, so the table never silts up with stale claims.
+fn caustic_decay_cell(cell: u32) {
+    let base = cell * 4u;
+    if atomicLoad(&caustic_cells[base]) == 0u {
+        return;
+    }
+    var live = false;
+    for (var c = 1u; c <= 3u; c += 1u) {
+        var e = atomicLoad(&caustic_cells[base + c]);
+        if e > 0u {
+            e -= max(e >> 4u, 1u);
+        }
+        atomicStore(&caustic_cells[base + c], e);
+        live = live || e > 0u;
+    }
+    if !live {
+        atomicStore(&caustic_cells[base], 0u);
+    }
+}
+
+fn caustic_deposit_kind(p: vec3<f32>, flux: vec3<f32>, volume: bool) {
+    let quantized = bitcast<vec3<u32>>(floor(p / CAUSTIC_CELL_SIZE + 0.0001));
+    var key = caustic_cell_key(quantized);
+    let checksum = caustic_cell_checksum(quantized, volume);
+    for (var i = 0u; i < CAUSTIC_PROBE_STEPS; i += 1u) {
+        let existing = atomicCompareExchangeWeak(&caustic_cells[key * 4u], 0u, checksum).old_value;
+        if existing == 0u || existing == checksum {
+            let e = vec3<u32>(flux * CAUSTIC_FIXED_SCALE + 0.5);
+            atomicAdd(&caustic_cells[key * 4u + 1u], e.x);
+            atomicAdd(&caustic_cells[key * 4u + 2u], e.y);
+            atomicAdd(&caustic_cells[key * 4u + 3u], e.z);
+            return;
+        }
+        key = (key + 1u) & (CAUSTIC_TABLE_SIZE - 1u);
+    }
+}
+
+/// Claim-or-match the cell for `p` and accumulate fixed-point photon flux
+/// (the emit pass's surface deposit).
+fn caustic_deposit(p: vec3<f32>, flux: vec3<f32>) {
+    caustic_deposit_kind(p, flux, false);
+}
+
+/// One volumetric photon-march step: `flux_step` = photon power × σ_s × ds.
+/// The 1/(4π·cell) here folds the isotropic phase and the volume↔area
+/// normalization difference, so the gather's surface-style estimate returns
+/// in-scattered RADIANCE directly — the fog march multiplies by its own
+/// transmittance × ds and nothing else.
+fn caustic_deposit_volume(p: vec3<f32>, flux_step: vec3<f32>) {
+    caustic_deposit_kind(p, flux_step / (12.566371 * CAUSTIC_CELL_SIZE), true);
+}
+
+/// Irradiance estimate (lm/m²) at a surface point from the photon grid:
+/// flux ÷ (EMA window × cell area). The query position is jittered by half a
+/// cell so the 2 cm texels dither instead of showing as blocks — the
+/// temporal pass integrates the dither out. Photon density already encodes
+/// the incidence cosine (grazing flux spreads over more cells), so the
+/// caller multiplies by the diffuse albedo / π only.
+fn caustic_gather_kind(world_position: vec3<f32>, rng: ptr<function, u32>, volume: bool) -> vec3<f32> {
+    let jitter = vec3(rand_f(rng), rand_f(rng), rand_f(rng)) - 0.5;
+    let p = world_position + jitter * CAUSTIC_CELL_SIZE;
+    let quantized = bitcast<vec3<u32>>(floor(p / CAUSTIC_CELL_SIZE + 0.0001));
+    var key = caustic_cell_key(quantized);
+    let checksum = caustic_cell_checksum(quantized, volume);
+    for (var i = 0u; i < CAUSTIC_PROBE_STEPS; i += 1u) {
+        let existing = atomicLoad(&caustic_cells[key * 4u]);
+        if existing == checksum {
+            let flux = vec3(
+                f32(atomicLoad(&caustic_cells[key * 4u + 1u])),
+                f32(atomicLoad(&caustic_cells[key * 4u + 2u])),
+                f32(atomicLoad(&caustic_cells[key * 4u + 3u])),
+            ) / CAUSTIC_FIXED_SCALE;
+            return flux / (CAUSTIC_EMA_FRAMES * CAUSTIC_CELL_SIZE * CAUSTIC_CELL_SIZE);
+        }
+        if existing == 0u {
+            return vec3(0.0);
+        }
+        key = (key + 1u) & (CAUSTIC_TABLE_SIZE - 1u);
+    }
+    return vec3(0.0);
+}
+
+fn caustic_gather(world_position: vec3<f32>, rng: ptr<function, u32>) -> vec3<f32> {
+    return caustic_gather_kind(world_position, rng, false);
+}
+
+/// In-scattered radiance (cd/m²) at a fog point from volumetric photon
+/// deposits — the dispersed beams glowing in the dust. See
+/// [`caustic_deposit_volume`] for the folded normalization.
+fn caustic_gather_volume(world_position: vec3<f32>, rng: ptr<function, u32>) -> vec3<f32> {
+    return caustic_gather_kind(world_position, rng, true);
+}
+
 /// Hash-table cell count (power of two). Keep in sync with `prepare.rs`.
 const REGIR_TABLE_SIZE = 65536u;
 /// Light samples per cell. Keep in sync with `prepare.rs`. Sized against

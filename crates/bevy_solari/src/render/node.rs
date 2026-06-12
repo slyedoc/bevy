@@ -1,5 +1,8 @@
-use super::{prepare::RestirResources};
+use super::caustics::CAUSTIC_PHOTONS;
+use super::prepare::{RestirResources, CAUSTIC_TABLE_SIZE};
 use crate::bindings::RaytracingSceneBindings;
+use crate::ecs_gpu::GpuTable as _;
+use crate::instance::instance_manager::InstanceManager;
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 use crate::render::atmosphere::{AtmosphereSky, GpuSolariAtmosphere, SolariAtmosphereGpu, SolariAtmosphereView};
@@ -82,6 +85,10 @@ pub fn restir_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
+                // 23: caustic photon grid ([checksum, r, g, b] per cell).
+                storage_buffer_sized(false, None),
+                // 24: caustic emitter scratch + parameters (GPU-computed).
+                storage_buffer_sized(false, None),
             ),
         ),
     )
@@ -103,7 +110,8 @@ pub fn restir(
     scene_columns: Res<crate::ecs_gpu::SceneColumns>,
     view_uniforms: Res<ViewUniforms>,
     solari_view_uniforms: Res<SolariViewUniforms>,
-    solari_atmosphere: Res<SolariAtmosphereGpu>,
+    // Tupled: a bevy system takes at most 16 parameters.
+    (solari_atmosphere, instance_manager): (Res<SolariAtmosphereGpu>, Res<InstanceManager>),
     state: Res<SolariViewState>,
     texture_assets: Res<RenderAssets<GpuImage>>,
     atmosphere_sky: Option<Res<AtmosphereSky>>,
@@ -148,6 +156,11 @@ pub fn restir(
         Some(specular_gi_pipeline),
         Some(compose_pipeline),
         Some(debug_pipeline),
+        Some(caustic_decay_pipeline),
+        Some(caustic_emit_pipeline),
+        Some(caustic_prepare_reset_pipeline),
+        Some(caustic_prepare_reduce_pipeline),
+        Some(caustic_prepare_finalize_pipeline),
     ) = (
         pipeline_cache.get_compute_pipeline(pipelines.restir_visibility),
         pipeline_cache.get_compute_pipeline(pipelines.restir_presample),
@@ -158,6 +171,11 @@ pub fn restir(
         pipeline_cache.get_compute_pipeline(pipelines.restir_specular_gi),
         pipeline_cache.get_compute_pipeline(pipelines.restir_compose),
         pipeline_cache.get_compute_pipeline(pipelines.restir_debug),
+        pipeline_cache.get_compute_pipeline(pipelines.restir_caustic_decay),
+        pipeline_cache.get_compute_pipeline(pipelines.restir_caustic_emit),
+        pipeline_cache.get_compute_pipeline(pipelines.restir_caustic_prepare_reset),
+        pipeline_cache.get_compute_pipeline(pipelines.restir_caustic_prepare_reduce),
+        pipeline_cache.get_compute_pipeline(pipelines.restir_caustic_prepare_finalize),
     ) else {
         return;
     };
@@ -212,6 +230,8 @@ pub fn restir(
             resources.regir_life.as_entire_binding(),
             resources.regir_cell_data.as_entire_binding(),
             resources.regir_samples.as_entire_binding(),
+            resources.caustic_cells.as_entire_binding(),
+            resources.caustic_emitter.as_entire_binding(),
         )),
     );
 
@@ -269,6 +289,27 @@ pub fn restir(
     let d = diagnostics.time_span(&mut pass, "restir/regir_fill");
     pass.set_pipeline(regir_fill_pipeline);
     pass.dispatch_workgroups(((REGIR_TABLE_SIZE * REGIR_ENTRIES_PER_CELL) as u32).div_ceil(256), 1, 1);
+    d.end(&mut pass);
+
+    // 2c. Caustic photon grid: derive the photon-emission rect from the live
+    //     instance columns (reset → reduce → finalize), age the grid's
+    //     running average, then trace this frame's photons from the sun
+    //     through the glass into it (the shade pass gathers it).
+    let d = diagnostics.time_span(&mut pass, "restir/caustic_prepare");
+    pass.set_pipeline(caustic_prepare_reset_pipeline);
+    pass.dispatch_workgroups(1, 1, 1);
+    pass.set_pipeline(caustic_prepare_reduce_pipeline);
+    pass.dispatch_workgroups(instance_manager.high_water().max(1).div_ceil(256), 1, 1);
+    pass.set_pipeline(caustic_prepare_finalize_pipeline);
+    pass.dispatch_workgroups(1, 1, 1);
+    d.end(&mut pass);
+    let d = diagnostics.time_span(&mut pass, "restir/caustic_decay");
+    pass.set_pipeline(caustic_decay_pipeline);
+    pass.dispatch_workgroups((CAUSTIC_TABLE_SIZE as u32).div_ceil(256), 1, 1);
+    d.end(&mut pass);
+    let d = diagnostics.time_span(&mut pass, "restir/caustic_emit");
+    pass.set_pipeline(caustic_emit_pipeline);
+    pass.dispatch_workgroups(CAUSTIC_PHOTONS.div_ceil(256), 1, 1);
     d.end(&mut pass);
 
     // 3. Initial candidate generation + temporal reuse.

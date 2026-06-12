@@ -51,6 +51,9 @@ pub enum SolariDebugView {
     /// ReGIR cell of each surface point, hashed to a color (red = cold).
     #[display("regir cells")]
     RegirCells,
+    /// Caustic photon-grid irradiance at each surface point (log heatmap).
+    #[display("caustic grid")]
+    CausticGrid,
     #[cfg(feature = "dlss")]
     #[display("dlss depth")]
     DlssDepth,
@@ -84,6 +87,7 @@ impl SolariDebugView {
         Self::DiConfidence,
         Self::DiLight,
         Self::RegirCells,
+        Self::CausticGrid,
         #[cfg(feature = "dlss")]
         Self::DlssDepth,
         #[cfg(feature = "dlss")]
@@ -105,6 +109,7 @@ impl SolariDebugView {
             Self::DiConfidence => Some(2),
             Self::DiLight => Some(3),
             Self::RegirCells => Some(4),
+            Self::CausticGrid => Some(5),
             _ => None,
         }
     }
@@ -122,7 +127,8 @@ impl SolariDebugView {
             | Self::DiWeight
             | Self::DiConfidence
             | Self::DiLight
-            | Self::RegirCells => true,
+            | Self::RegirCells
+            | Self::CausticGrid => true,
             #[cfg(feature = "dlss")]
             Self::DlssDepth
             | Self::DlssNormalRoughness

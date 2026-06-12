@@ -23,7 +23,7 @@
 //!   `ClusterMesh` asset becomes ready — see the `pending` retry set).
 //! - Freed on `RemovedComponents<RaytracingMesh3d>` / despawn.
 
-use crate::geometry::{ClusterMeshManager, ClusterMeshUpload};
+use crate::geometry::{ClusterMeshAabb, ClusterMeshManager, ClusterMeshUpload};
 use crate::geometry::{ClusterIndex, GroupIndex, GpuEntity};
 use crate::bindings::RaytracingMesh3d;
 use crate::geometry::ClusterMesh;
@@ -80,6 +80,9 @@ struct SlotMeshPointers {
     total_triangle_count: u32,
     /// Dense geometry id (which unique `ClusterMesh`) — BLAS sharing key.
     geometry_id: u32,
+    /// Mesh-local AABB (the cluster asset's baked bounds) — scattered into
+    /// the `instance_aabbs` column for GPU consumers (caustic emitter).
+    aabb: ClusterMeshAabb,
 }
 
 /// Packed per-instance LOD inputs, slot-indexed. Consumed by the
@@ -180,6 +183,7 @@ pub struct InstanceManager {
     group_base_delta: Vec<u32>,
     lod_input_delta: Vec<u32>,
     geometry_id_delta: Vec<u32>,
+    aabb_delta: Vec<u32>,
     material_delta: Vec<u32>,
     /// Cull mask scatter delta — pushed at bind and on a `RenderLayers` change.
     instance_mask_delta: Vec<u32>,
@@ -221,6 +225,7 @@ impl InstanceManager {
             released_slots: Vec::new(),
             group_base_delta: Vec::new(),
             lod_input_delta: Vec::new(),
+            aabb_delta: Vec::new(),
             geometry_id_delta: Vec::new(),
             material_delta: Vec::new(),
             instance_mask_delta: Vec::new(),
@@ -348,6 +353,11 @@ impl InstanceManager {
     pub fn lod_input_delta(&self) -> &[u32] {
         &self.lod_input_delta
     }
+
+    /// This frame's mesh-local AABB scatter delta (pushed at bind).
+    pub fn aabb_delta(&self) -> &[u32] {
+        &self.aabb_delta
+    }
     #[inline]
     pub fn geometry_id_delta(&self) -> &[u32] {
         &self.geometry_id_delta
@@ -407,6 +417,7 @@ impl InstanceManager {
         self.group_base_delta.clear();
         self.lod_input_delta.clear();
         self.geometry_id_delta.clear();
+        self.aabb_delta.clear();
         self.material_delta.clear();
         self.instance_mask_delta.clear();
         self.node_slot_delta.clear();
@@ -447,6 +458,7 @@ impl InstanceManager {
             },
         );
         push_delta_record(&mut self.geometry_id_delta, slot, ptrs.geometry_id);
+        push_delta_record(&mut self.aabb_delta, slot, ptrs.aabb);
         push_delta_record(&mut self.instance_mask_delta, slot, cull_mask);
         push_delta_record(&mut self.node_slot_delta, slot, node_slot);
         // New material → resolve its GPU index this frame.
@@ -786,6 +798,7 @@ fn try_bind_instance(
             cluster_count: upload.cluster_count,
             total_triangle_count: upload.total_triangle_count,
             geometry_id: upload.geometry_id,
+            aabb: upload.aabb,
         },
         material,
         cull_mask,

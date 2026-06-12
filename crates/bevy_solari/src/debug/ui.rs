@@ -153,6 +153,7 @@ pub fn spawn_debug_panels(
                             debug_item(SolariDebugView::DiConfidence),
                             debug_item(SolariDebugView::DiLight),
                             debug_item(SolariDebugView::RegirCells),
+                            debug_item(SolariDebugView::CausticGrid),
                         ]
                     )
                 ]

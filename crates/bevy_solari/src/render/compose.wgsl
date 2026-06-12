@@ -15,7 +15,7 @@ enable wgpu_ray_query;
 #import bevy_solari::atmosphere::{atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
 #import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, fog_volumes_sample, fog_volumes_range, light_sources, RAY_T_MIN, RAY_T_MAX}
 #import bevy_solari::sampling::{resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, emissive_light_count, LightSample, ResolvedLightSample, NULL_LIGHT_ID}
-#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, solari_view, environment_map, environment_map_sampler, atmosphere, light_tiles, unpack_light_tile_sample, regir_query, regir_samples, REGIR_CELL_NONE, REGIR_ENTRIES_PER_CELL}
+#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, solari_view, environment_map, environment_map_sampler, atmosphere, light_tiles, unpack_light_tile_sample, regir_query, regir_samples, caustic_gather_volume, REGIR_CELL_NONE, REGIR_ENTRIES_PER_CELL}
 
 const AERIAL_STEPS = 8u;
 
@@ -163,6 +163,14 @@ fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 }
                 let in_scatter = sun_radiance * (sun_vis * s.sun_scatter) + sky_ambient * s.sigma_s;
                 inscatter += fog_transmittance * in_scatter * ds;
+
+                // Volumetric caustics: in-scatter the photon pass deposited
+                // mid-air (post-glass beam segments crossing fog volumes) —
+                // the dispersed beams glow in the dust as colored shafts.
+                // σ_s and phase are folded at deposit time.
+                if volume_light_weight > 1e-7 {
+                    inscatter += fog_transmittance * caustic_gather_volume(p, &rng) * ds;
+                }
 
                 // Local (emissive) lights: one ReGIR-guided NEE sample for the
                 // step. A live cell hands us a light its RIS already vetted

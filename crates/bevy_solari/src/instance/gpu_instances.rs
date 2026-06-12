@@ -122,6 +122,22 @@ impl GpuColumnDesc for LodInputColumn {
     }
 }
 
+/// Per-instance mesh-local AABB (the cluster asset's baked bounds). Bind-only.
+/// GPU consumers that need an instance's world bounds combine it with the
+/// LIVE `transforms` column — the caustic emitter pass projects it to size
+/// its photon-emission rect.
+pub struct InstanceAabbColumn;
+impl GpuColumnDesc for InstanceAabbColumn {
+    type Value = crate::geometry::ClusterMeshAabb;
+    type Table = InstanceManager;
+    const LABEL: &'static str = "gpu_instances.instance_aabbs";
+    /// Scene-columns group: `instance_aabbs` @binding(8).
+    const SCENE_BINDING: Option<u32> = Some(8);
+    fn delta_records(m: &InstanceManager) -> &[u32] {
+        m.aabb_delta()
+    }
+}
+
 /// Per-instance geometry id (BLAS sharing + PTLAS fill read these). Bind-only.
 pub struct GeometryIdColumn;
 impl GpuColumnDesc for GeometryIdColumn {
@@ -172,6 +188,7 @@ pub struct InstanceColumns<'w> {
     pub material_ids: Res<'w, GpuColumn<MaterialColumn>>,
     pub group_bases: Res<'w, GpuColumn<GroupBaseColumn>>,
     pub lod_inputs: Res<'w, GpuColumn<LodInputColumn>>,
+    pub instance_aabbs: Res<'w, GpuColumn<InstanceAabbColumn>>,
     pub geometry_ids: Res<'w, GpuColumn<GeometryIdColumn>>,
     pub instance_masks: Res<'w, GpuColumn<InstanceMaskColumn>>,
     /// Per-instance transform-table node slot (transform-gather reads this).
@@ -198,6 +215,7 @@ pub fn cluster_columns_ready(columns: InstanceColumns, cache: Res<PipelineCache>
         && columns.material_ids.scatter_pipeline_ready(&cache)
         && columns.group_bases.scatter_pipeline_ready(&cache)
         && columns.lod_inputs.scatter_pipeline_ready(&cache)
+        && columns.instance_aabbs.scatter_pipeline_ready(&cache)
         && columns.geometry_ids.scatter_pipeline_ready(&cache)
         && columns.instance_masks.scatter_pipeline_ready(&cache)
         && columns.node_slots.scatter_pipeline_ready(&cache)
@@ -214,6 +232,7 @@ impl Plugin for GpuInstancesPlugin {
             GpuColumnPlugin::<MaterialColumn>::default(),
             GpuColumnPlugin::<GroupBaseColumn>::default(),
             GpuColumnPlugin::<LodInputColumn>::default(),
+            GpuColumnPlugin::<InstanceAabbColumn>::default(),
             GpuColumnPlugin::<GeometryIdColumn>::default(),
             GpuColumnPlugin::<InstanceMaskColumn>::default(),
             GpuColumnPlugin::<NodeSlotColumn>::default(),
