@@ -45,7 +45,6 @@ pub fn prepare_raytracing_scene_bindings(
     texture_assets: Res<RenderAssets<GpuImage>>,
     fallback_texture: Res<FallbackImage>,
     dfg_lut: Res<DfgLut>,
-    portals: Res<super::PortalTable>,
     render_device: Res<RenderDevice>,
     pipeline_cache: Res<PipelineCache>,
     render_queue: Res<RenderQueue>,
@@ -235,7 +234,6 @@ pub fn prepare_raytracing_scene_bindings(
             deform.animated_table().as_entire_binding(),
             deform.tangents.as_entire_binding(),
             active_light_list.binding().unwrap(),
-            portals.buffer.binding().unwrap(),
         )),
     ));
 }
@@ -276,7 +274,6 @@ impl RaytracingSceneBindings {
                         storage_buffer_read_only_sized(false, None), // 15: instance_animated
                         storage_buffer_read_only_sized(false, None), // 16: deform_tangents
                         storage_buffer_read_only_sized(false, None), // 17: active_light_list
-                        storage_buffer_read_only_sized(false, None), // 18: portals
                     ),
                 ),
             ),

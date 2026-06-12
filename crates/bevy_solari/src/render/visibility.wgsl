@@ -16,7 +16,7 @@ enable wgpu_ray_query;
 // shade time.
 
 #import bevy_solari::restir_bindings::{view, gbuffer_position, gbuffer_normal, motion_vectors, gbuffer_uv, view_clip_from_world, solari_view}
-#import bevy_solari::scene_bindings::{trace_ray, trace_ray_through_portals, set_view_cull_mask, resolve_ray_hit_full, material_ids, RAY_T_MAX}
+#import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, material_ids, RAY_T_MAX}
 
 @compute @workgroup_size(8, 8, 1)
 fn visibility(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -42,12 +42,26 @@ fn visibility(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var ray_origin = view.world_position;
     var ray_direction = normalize((ray_target.xyz / ray_target.w) - ray_origin);
 
-    // Portal surfaces teleport the primary ray: the G-buffer holds the
-    // DESTINATION surface, so lighting, NEE, and temporal reprojection all
-    // operate on what the portal SHOWS. (View-dependent specular at those
-    // pixels uses the camera direction rather than the teleported ray — a
-    // known approximation; the pathtracer is exact.)
-    let ray = trace_ray_through_portals(&ray_origin, &ray_direction, 0.0, RAY_FLAG_NONE);
+    // Portal surfaces teleport the primary ray and black holes bend it: the
+    // G-buffer holds the DESTINATION surface, so lighting, NEE, and temporal
+    // reprojection all operate on what the pixel actually SHOWS.
+    // (View-dependent specular at those pixels uses the camera direction
+    // rather than the redirected ray — a known approximation; the pathtracer
+    // is exact. Accretion-disk emission is dropped on the primary here — the
+    // realtime view gets the lensing and the black horizon; the disk's glow
+    // is pathtracer + reflections.)
+    var traversal_emitted = vec3(0.0);
+    var traversal_captured = 0u;
+    let ray = trace_ray_traversal(&ray_origin, &ray_direction, 0.0, RAY_FLAG_NONE, &traversal_emitted, &traversal_captured);
+
+    if traversal_captured != 0u {
+        // Horizon-captured: `w = -2` — the diffuse pass paints BLACK, not sky.
+        textureStore(gbuffer_position, global_id.xy, vec4(0.0, 0.0, 0.0, -2.0));
+        textureStore(gbuffer_normal, global_id.xy, vec4(0.0));
+        textureStore(motion_vectors, global_id.xy, vec4(0.0));
+        textureStore(gbuffer_uv, global_id.xy, vec4(0.0));
+        return;
+    }
 
     if ray.kind == RAY_QUERY_INTERSECTION_NONE {
         // Miss: negative w marks "no geometry"; later passes skip it.

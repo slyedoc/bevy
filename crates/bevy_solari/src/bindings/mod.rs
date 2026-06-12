@@ -27,6 +27,7 @@ use crate::SolariSetup;
 
 mod bind_groups;
 mod binder;
+mod black_hole;
 mod extract;
 mod portal;
 mod types;
@@ -36,8 +37,9 @@ pub use bind_groups::{
     ClusterSceneBindGroupLayout,
 };
 pub use binder::{prepare_raytracing_scene_bindings, RaytracingSceneBindings};
+pub use black_hole::{SolariBlackHole, SolariBlackHoles, SolariBlackHolesTablePlugin};
 pub use extract::SolariMaterialAssets;
-pub use portal::{PortalTable, SolariPortal};
+pub use portal::{SolariPortal, SolariPortals, SolariPortalsTablePlugin};
 pub use types::RaytracingMesh3d;
 
 /// Register the cluster scene-bind-group shader library (the `@group(0)`
@@ -70,23 +72,24 @@ impl Plugin for BindingsPlugin {
         register_scene_shaders(app);
         app.add_plugins(ExtractResourcePlugin::<SolariMaterialAssets>::default());
         app.register_type::<SolariPortal>();
+        app.register_type::<SolariBlackHole>();
+        // Portal + black-hole gpu_table!s (slot allocators, column scatter,
+        // change-driven extracts; their columns join the scene-columns group).
+        app.add_plugins((SolariPortalsTablePlugin, SolariBlackHolesTablePlugin));
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
         render_app
             .init_resource::<ClusterSceneBindGroup>()
-            .init_resource::<PortalTable>()
             .insert_resource(RaytracingSceneBindings::new())
             .add_systems(
                 RenderStartup,
                 init_cluster_scene_bind_group_layout.in_set(SolariSetup),
             )
-            .add_systems(bevy_render::ExtractSchedule, portal::extract_solari_portals)
             .add_systems(
                 Render,
                 (
-                    portal::prepare_solari_portals.in_set(RenderSystems::Prepare),
                     prepare_cluster_scene_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     prepare_raytracing_scene_bindings
                         .in_set(RenderSystems::PrepareBindGroups)

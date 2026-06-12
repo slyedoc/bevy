@@ -105,16 +105,6 @@ struct DirectionalLight {
 // directional_count]` header, then the active emissive slots, then the active
 // directional slots (strata contiguous for the stratified pick).
 @group(0) @binding(17) var<storage> active_light_list: array<u32>;
-
-// Ray portals (`bindings::portal`): surfaces that teleport rays. Just the
-// instance-slot pairing — the ray map derives on hit from the LIVE GPU
-// transform table (`transforms`), so portals on GPU-propagated / moving
-// parents stay exact. `u32::MAX` slot = dummy keeping the binding valid.
-struct Portal {
-    slot: u32,
-    target_slot: u32,
-}
-@group(0) @binding(18) var<storage> portals: array<Portal>;
 // `directional_lights` is also a scene column (the lights table owns it).
 @group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(3) var<storage> directional_lights: array<DirectionalLight>;
 
@@ -152,6 +142,33 @@ struct InstanceClusterRange {
     root_group: u32,
 }
 @group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(4) var<storage> instance_cluster_ranges: array<InstanceClusterRange>;
+
+// Ray portals (`bindings::portal`, the `SolariPortals` gpu_table, indexed by
+// portal slot): the instance-slot pairing the traversal scan matches hits
+// against. The ray map derives on hit from the LIVE GPU transform table
+// (`transforms`), so portals on GPU-propagated / moving parents stay exact.
+// `valid == 0` covers tombstones AND the zero-initialized tail of a grown
+// column buffer (instance slot 0 is real — zeros must read as inert).
+struct Portal {
+    instance_slot: u32,
+    target_slot: u32,
+    valid: u32,
+    _pad: u32,
+}
+@group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(5) var<storage> portals: array<Portal>;
+
+// Black holes (`bindings::black_hole`, the `SolariBlackHoles` gpu_table):
+// regions that gravitationally bend rays. All-zero entries (tombstones,
+// grown-buffer tail) are inert: a zero influence radius never matches a ray.
+struct BlackHole {
+    // xyz = world center, w = influence radius.
+    center_influence: vec4<f32>,
+    // xyz = accretion-disk plane normal, w = Schwarzschild radius.
+    normal_rs: vec4<f32>,
+    // x = disk inner radius, y = outer radius, z = emission scale.
+    disk: vec4<f32>,
+}
+@group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(6) var<storage> black_holes: array<BlackHole>;
 
 const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
@@ -407,10 +424,10 @@ fn portal_redirect(
     ray_direction: ptr<function, vec3<f32>>,
 ) -> bool {
     for (var i = 0u; i < arrayLength(&portals); i += 1u) {
-        if portals[i].slot != hit_instance {
+        if portals[i].valid == 0u || portals[i].instance_slot != hit_instance {
             continue;
         }
-        let into_portal = affine_inverse(transforms[portals[i].slot]);
+        let into_portal = affine_inverse(transforms[portals[i].instance_slot]);
         let out_of_target = transforms[portals[i].target_slot];
         var p = affine_transform_point(into_portal, hit_position);
         var d = affine_transform_direction(into_portal, *ray_direction);
@@ -425,24 +442,135 @@ fn portal_redirect(
     return false;
 }
 
-// `trace_ray`, following portal teleports (≤ 4 crossings): origin/direction
-// are updated in place so the caller's ray state matches the returned
-// intersection (the first NON-portal result). Structured with `let`s only —
-// naga rejects re-assigning a `var` of the special RayIntersection type.
-fn trace_ray_through_portals(
+const GRAVITY_MARCH_STEPS = 256u;
+
+// Procedural accretion-disk radiance at disk radius `r`: white-hot inner
+// edge cooling to deep orange-red at the rim.
+fn black_hole_disk_emission(r: f32, disk: vec4<f32>) -> vec3<f32> {
+    let t = saturate((r - disk.x) / max(disk.y - disk.x, 1e-4));
+    let brightness = disk.z * (0.05 + pow(1.0 - t, 2.0));
+    let color = mix(vec3(1.0, 0.96, 0.9), vec3(1.0, 0.3, 0.05), saturate(t * 1.6));
+    return color * brightness;
+}
+
+// March the ray through black hole `i` from `*ray_origin` (already on or
+// inside the influence sphere) until it exits or is captured. Schwarzschild
+// photon bend: d(dir)/ds ∝ −1.5·r_s·h²·r⃗/r⁵ (h² = |r⃗×d̂|² is conserved) —
+// the 1.5 is the GR factor that produces the photon ring. Thin-disk
+// crossings accumulate emission into `*emitted`. Returns true if captured.
+fn black_hole_march(
+    i: u32,
+    ray_origin: ptr<function, vec3<f32>>,
+    ray_direction: ptr<function, vec3<f32>>,
+    emitted: ptr<function, vec3<f32>>,
+) -> bool {
+    let hole = black_holes[i];
+    let center = hole.center_influence.xyz;
+    let influence = hole.center_influence.w;
+    let disk_normal = hole.normal_rs.xyz;
+    let rs = hole.normal_rs.w;
+
+    var p = *ray_origin - center;
+    var d = *ray_direction;
+    let h = cross(p, d);
+    let h2 = dot(h, h);
+    var side = dot(p, disk_normal);
+
+    for (var step = 0u; step < GRAVITY_MARCH_STEPS; step += 1u) {
+        let r = length(p);
+        if r < rs {
+            return true; // inside the horizon — captured (black, not sky)
+        }
+        if r > influence {
+            *ray_origin = p + center;
+            *ray_direction = d;
+            return false;
+        }
+        // Adaptive step: fine near the horizon (where the bend rate explodes),
+        // coarse near the influence boundary.
+        let ds = clamp(r * 0.1, rs * 0.05, influence * 0.04);
+        d = normalize(d - (1.5 * rs * h2 / pow(r, 5.0)) * p * ds);
+        p += d * ds;
+        // Thin accretion disk: a plane crossing inside the annulus emits.
+        // Wrapped rays cross repeatedly — the photon ring brightens itself.
+        let new_side = dot(p, disk_normal);
+        if hole.disk.z > 0.0 && side * new_side < 0.0 {
+            let disk_r = length(p - disk_normal * new_side);
+            if disk_r > hole.disk.x && disk_r < hole.disk.y {
+                *emitted += black_hole_disk_emission(disk_r, hole.disk);
+            }
+        }
+        side = new_side;
+    }
+    return true; // step budget spent spiraling — treat as captured
+}
+
+// Nearest black-hole influence-sphere entry along the segment [0, max_t),
+// or `0xFFFFFFFF` if the segment never enters one. `entry_t` may be 0 (the
+// origin is already inside a region).
+fn nearest_black_hole_entry(origin: vec3<f32>, direction: vec3<f32>, max_t: f32, entry_t: ptr<function, f32>) -> u32 {
+    var best = 0xFFFFFFFFu;
+    for (var i = 0u; i < arrayLength(&black_holes); i += 1u) {
+        let influence = black_holes[i].center_influence.w;
+        if influence <= 0.0 {
+            continue;
+        }
+        let oc = origin - black_holes[i].center_influence.xyz;
+        let b = dot(oc, direction);
+        let c = dot(oc, oc) - influence * influence;
+        let disc = b * b - c;
+        if disc < 0.0 {
+            continue;
+        }
+        let t0 = max(-b - sqrt(disc), 0.0);
+        let t1 = -b + sqrt(disc);
+        if t1 <= 0.0 || t0 >= max_t || t0 >= *entry_t {
+            continue;
+        }
+        *entry_t = t0;
+        best = i;
+    }
+    return best;
+}
+
+// `trace_ray`, following portal teleports and black-hole bends (≤ 6 hops):
+// origin/direction are updated in place so the caller's ray state matches
+// the returned intersection. Accretion-disk radiance accumulates into
+// `*emitted` (scale by throughput and add); `*captured` is set when the ray
+// fell into a horizon — the caller must show BLACK, not the sky, and ignore
+// the returned (stale) intersection. Structured with `let`s only — naga
+// rejects re-assigning a `var` of the special RayIntersection type.
+fn trace_ray_traversal(
     ray_origin: ptr<function, vec3<f32>>,
     ray_direction: ptr<function, vec3<f32>>,
     ray_t_min: f32,
     ray_flag: u32,
+    emitted: ptr<function, vec3<f32>>,
+    captured: ptr<function, u32>,
 ) -> RayIntersection {
-    for (var crossing = 0u; crossing < 4u; crossing += 1u) {
+    *captured = 0u;
+    for (var hop = 0u; hop < 6u; hop += 1u) {
         let ray = trace_ray(
             *ray_origin,
             *ray_direction,
-            select(0.0, ray_t_min, crossing == 0u),
+            select(0.0, ray_t_min, hop == 0u),
             RAY_T_MAX,
             ray_flag,
         );
+        let scene_t = select(1e30, ray.t, ray.kind != RAY_QUERY_INTERSECTION_NONE);
+
+        // A black-hole region before the scene hit bends the ray first.
+        var entry_t = scene_t;
+        let hole = nearest_black_hole_entry(*ray_origin, *ray_direction, scene_t, &entry_t);
+        if hole != 0xFFFFFFFFu {
+            *ray_origin += *ray_direction * entry_t;
+            if black_hole_march(hole, ray_origin, ray_direction, emitted) {
+                *captured = 1u;
+                return ray;
+            }
+            continue; // re-trace from the region exit
+        }
+
         if ray.kind == RAY_QUERY_INTERSECTION_NONE
             || !portal_redirect(ray.instance_index, *ray_origin + *ray_direction * ray.t, ray_origin, ray_direction) {
             return ray;

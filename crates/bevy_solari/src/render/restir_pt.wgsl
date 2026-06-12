@@ -24,7 +24,7 @@ enable wgpu_ray_query;
 #import bevy_render::maths::{PI, orthonormalize}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB, bend_shading_normal, fresnel_dielectric}
 #import bevy_solari::sampling::{LightSample, ResolvedLightSample, generate_random_light_sample, resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_point_visibility, sample_random_light, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, random_emissive_light_pdf, power_heuristic, isnan, NULL_LIGHT_ID}
-#import bevy_solari::scene_bindings::{trace_ray, trace_ray_through_portals, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, active_light_list, directional_lights, ResolvedMaterial, LIGHT_SOURCE_KIND_NONE, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, offset_ray_origin}
+#import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, active_light_list, directional_lights, ResolvedMaterial, LIGHT_SOURCE_KIND_NONE, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, offset_ray_origin}
 #import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LightTileSample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler, specular_hit_distance, regir_query, regir_find, regir_samples, REGIR_CELL_NONE, REGIR_ENTRIES_PER_CELL}
 
 const INITIAL_SAMPLES = 8u;
@@ -210,6 +210,12 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if !surface.valid {
         store_reservoir_a(pixel, empty_reservoir());
         gi_reservoir_a[index] = gi_empty();
+        // Captured by a black-hole horizon (`w = -2` sentinel from the
+        // visibility pass): black, NOT the sky.
+        if textureLoad(gbuffer_position, pixel).w <= -1.5 {
+            textureStore(view_output, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+            return;
+        }
         // Primary miss: the sky (or the camera clear color) is the background.
         // Raw radiance — compose applies aerial perspective + exposure; the
         // clear color is a fixed framebuffer value, so ÷ exposure pre-cancels.
@@ -486,9 +492,18 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
         if glossy_bounces >= SPECULAR_GLOSSY_BOUNCES || crossings >= SPECULAR_GLASS_CROSSINGS {
             break;
         }
-        // Portals teleport the ray mid-trace (so they show up in reflections
-        // and through glass); origin/direction updated in place.
-        let ray = trace_ray_through_portals(&ray_origin, &wi, 0.0, RAY_FLAG_NONE);
+        // Portals teleport and black holes bend the ray mid-trace (so both
+        // show up in reflections and through glass); origin/direction updated
+        // in place. Disk emission rides back; captured rays end the chain
+        // black (no sky).
+        var traversal_emitted = vec3(0.0);
+        var traversal_captured = 0u;
+        let ray = trace_ray_traversal(&ray_origin, &wi, 0.0, RAY_FLAG_NONE, &traversal_emitted, &traversal_captured);
+        radiance += throughput * traversal_emitted;
+        if traversal_captured != 0u {
+            hit_distance_pending = false;
+            break;
+        }
         if ray.kind == RAY_QUERY_INTERSECTION_NONE {
             // Sky reflection — full weight, the sky isn't in next-event estimation.
             radiance += throughput * sky_radiance(wi);
