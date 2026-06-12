@@ -37,10 +37,15 @@ use bevy_ui_widgets::Activate;
 #[derive(Resource)]
 pub struct DebugPanelSpawned;
 
-/// Marker on the menu button's caption text; [`update_view_label`] keeps it in
-/// sync with [`SolariViewState`].
+/// Marker on the integrator menu button's caption text; [`update_view_label`]
+/// keeps it in sync with [`SolariViewState::lighting`].
 #[derive(Component, Default, Clone, Copy)]
 pub struct ViewLabel;
+
+/// Marker on the debug-view menu button's caption text; [`update_view_label`]
+/// keeps it in sync with [`SolariViewState::debug`].
+#[derive(Component, Default, Clone, Copy)]
+pub struct DebugViewLabel;
 
 /// A lighting menu item: activating it selects `lighting` and clears any debug
 /// view.
@@ -93,6 +98,7 @@ pub fn spawn_debug_panels(
                 position_type: PositionType::Absolute,
                 bottom: px(8),
                 left: px(8),
+                column_gap: px(8),
                 ..Default::default()
             },
             TabGroup::default(),
@@ -109,10 +115,32 @@ pub fn spawn_debug_panels(
                     ),
                     (
                         @FeathersMenuPopup
-                        ViewMenuPopup
                         Children [
                             lighting_item(SolariLighting::Pathtracer),
                             lighting_item(SolariLighting::Restir),
+                        ]
+                    )
+                ]
+            ),
+            (
+                @FeathersMenu
+                Children [
+                    (
+                        @FeathersMenuButton {
+                            @caption: bsn! { Text("debug: none") ThemedText DebugViewLabel }
+                        }
+                    ),
+                    (
+                        @FeathersMenuPopup
+                        Children [
+                            (
+                                @FeathersMenuItem {
+                                    @caption: bsn! { Text("none") ThemedText }
+                                }
+                                on(|_: On<Activate>, mut state: ResMut<SolariViewState>| {
+                                    state.debug = None;
+                                })
+                            ),
                             debug_item(SolariDebugView::Lod),
                             debug_item(SolariDebugView::Cluster),
                             debug_item(SolariDebugView::Triangle),
@@ -133,41 +161,24 @@ pub fn spawn_debug_panels(
         });
 }
 
-/// Marks the view dropdown's popup, so the DLSS guide views can be appended
-/// as separate children (a `bsn_list!` can't be extended conditionally).
-#[derive(Component, Default, Clone)]
-pub struct ViewMenuPopup;
-
-/// Append the DLSS guide-buffer views to the dropdown once the popup exists.
-#[cfg(feature = "dlss")]
-pub fn append_dlss_guide_items(
-    popup: Query<Entity, bevy_ecs::prelude::Added<ViewMenuPopup>>,
-    mut commands: Commands,
-) {
-    for entity in &popup {
-        commands
-            .entity(entity)
-            .queue_spawn_related_scenes::<Children>(bsn_list! {
-                debug_item(SolariDebugView::DlssDepth),
-                debug_item(SolariDebugView::DlssNormalRoughness),
-                debug_item(SolariDebugView::DlssDiffuseAlbedo),
-                debug_item(SolariDebugView::DlssSpecularAlbedo),
-                debug_item(SolariDebugView::DlssSpecularMotion),
-            });
-    }
-}
-
-/// Keep the dropdown button's caption in sync with [`SolariViewState`]: the
-/// debug view's name when one is selected, else the lighting's.
+/// Keep both menu captions in sync with [`SolariViewState`]: the integrator
+/// button shows the lighting selection, the debug button the active view.
 pub fn update_view_label(
     state: Res<SolariViewState>,
     mut labels: Query<&mut Text, With<ViewLabel>>,
+    mut debug_labels: Query<&mut Text, (With<DebugViewLabel>, Without<ViewLabel>)>,
 ) {
-    let want = match state.debug {
-        Some(view) => view.to_string(),
-        None => state.lighting.to_string(),
-    };
+    let want = state.lighting.to_string();
     for mut text in &mut labels {
+        if text.0 != want {
+            text.0 = want.clone();
+        }
+    }
+    let want = match state.debug {
+        Some(view) => format!("debug: {view}"),
+        None => "debug: none".to_string(),
+    };
+    for mut text in &mut debug_labels {
         if text.0 != want {
             text.0 = want.clone();
         }
@@ -378,6 +389,13 @@ pub fn spawn_dlss_panel(
                             dlss_item(SolariDlssMode::Balanced),
                             dlss_item(SolariDlssMode::Performance),
                             dlss_item(SolariDlssMode::UltraPerformance),
+                            // The RR guide-buffer debug views live with the
+                            // DLSS controls (they only exist while DLSS runs).
+                            debug_item(SolariDebugView::DlssDepth),
+                            debug_item(SolariDebugView::DlssNormalRoughness),
+                            debug_item(SolariDebugView::DlssDiffuseAlbedo),
+                            debug_item(SolariDebugView::DlssSpecularAlbedo),
+                            debug_item(SolariDebugView::DlssSpecularMotion),
                         ]
                     )
                 ]

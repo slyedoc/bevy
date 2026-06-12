@@ -1,8 +1,6 @@
 mod ui;
 
 use bevy_app::{App, Plugin, Update};
-#[cfg(feature = "dlss")]
-use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_feathers::FeathersCorePlugin;
 
 /// Plugin that adds the in-engine debug-view selector: one Feathers dropdown
@@ -28,8 +26,6 @@ impl Plugin for SolariDebugPlugin {
                 ui::spawn_dlss_panel,
                 #[cfg(feature = "dlss")]
                 ui::update_dlss_label,
-                #[cfg(feature = "dlss")]
-                ui::append_dlss_guide_items.after(ui::spawn_debug_panels),
             ),
         );
     }
