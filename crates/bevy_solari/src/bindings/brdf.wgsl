@@ -173,6 +173,49 @@ fn fresnel_dielectric(cos_i: f32, eta: f32) -> f32 {
     return 0.5 * (r_parallel * r_parallel + r_perpendicular * r_perpendicular);
 }
 
+// ── Spectral dispersion ──────────────────────────────────────────────────────
+
+// Sampled visible-spectrum range for hero-wavelength paths (nm).
+const SPECTRUM_MIN_NM = 380.0;
+const SPECTRUM_MAX_NM = 730.0;
+
+// Wavelength-dependent IOR via a two-term Cauchy fit. `dispersion` follows
+// `KHR_materials_dispersion` (`20 / Abbe number`, 0 = none) with `base_ior`
+// the value at the Fraunhofer d line (587.6 nm): the Cauchy B coefficient is
+// `(n_d − 1) / (V_d (λ_F⁻² − λ_C⁻²))`, folded into a constant with the F/C
+// lines at 486.1/656.3 nm. Returns `base_ior` exactly when `dispersion` is 0.
+fn dispersive_ior(base_ior: f32, dispersion: f32, lambda_nm: f32) -> f32 {
+    let lambda_um = lambda_nm * 1e-3;
+    let b = (base_ior - 1.0) * dispersion * 0.0261829;
+    return base_ior + b * (1.0 / (lambda_um * lambda_um) - 2.89663);
+}
+
+// Hero-wavelength → RGB conversion weight for a λ sampled UNIFORMLY over
+// [SPECTRUM_MIN_NM, SPECTRUM_MAX_NM]: Gaussian channel responses, each
+// normalized by its integral so a spectrally flat path averages back to
+// white (range / (σ√2π) at the peak). The path's RGB throughput collapses
+// to this on its first dispersive interface.
+fn spectral_rgb_weight(lambda_nm: f32) -> vec3<f32> {
+    let d = vec3(lambda_nm) - vec3(612.0, 549.0, 465.0);
+    let sigma = vec3(45.0, 42.0, 38.0);
+    let g = exp(-d * d / (2.0 * sigma * sigma));
+    return g * ((SPECTRUM_MAX_NM - SPECTRUM_MIN_NM) / 2.5066283) / sigma;
+}
+
+// One uniformly sampled hero wavelength over the visible range — what a path
+// collapses to at its first dispersive interface (naga_oil can't export
+// consts across modules, so the range is behind this function).
+fn sample_hero_wavelength(rng: ptr<function, u32>) -> f32 {
+    return mix(SPECTRUM_MIN_NM, SPECTRUM_MAX_NM, rand_f(rng));
+}
+
+// The fixed wavelengths (nm) of the realtime path's deterministic 3-channel
+// split — the Gaussian response peaks of `spectral_rgb_weight`, so each
+// channel's chain carries exactly that channel's energy.
+fn spectral_lambda_rgb() -> vec3<f32> {
+    return vec3(612.0, 549.0, 465.0);
+}
+
 struct GlassBsdfSample {
     wi: vec3<f32>,
     throughput: vec3<f32>,

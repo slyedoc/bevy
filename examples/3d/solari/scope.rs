@@ -76,11 +76,16 @@ fn setup_scene(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut solari_materials: ResMut<Assets<SolariMaterial>>,
 ) {
-    let glass = materials.add(StandardMaterial {
+    // BK7 crown glass, authored as `SolariMaterial` for its dispersion field
+    // (Abbe 64.2 → 20/64.2): an uncorrected singlet telescope fringes color
+    // at high-contrast edges — real chromatic aberration, not a post effect.
+    let glass = solari_materials.add(SolariMaterial {
         base_color: Color::WHITE,
         specular_transmission: 1.0,
         ior: LENS_IOR,
+        dispersion: 0.31,
         perceptual_roughness: 0.0,
         metallic: 0.0,
         ..default()
@@ -104,14 +109,14 @@ fn setup_scene(
     let objective = meshes.add(lens_mesh(0.20, 0.20, 0.030, 0.012));
     commands.spawn((
         Mesh3d(objective),
-        MeshMaterial3d(glass.clone()),
+        SolariMaterial3d(glass.clone()),
         Transform::from_xyz(0.0, AXIS_Y, objective_z),
     ));
 
     let eyepiece = meshes.add(lens_mesh(-0.05, -0.05, 0.012, 0.004));
     commands.spawn((
         Mesh3d(eyepiece),
-        MeshMaterial3d(glass.clone()),
+        SolariMaterial3d(glass.clone()),
         Transform::from_xyz(0.0, AXIS_Y, eyepiece_z),
     ));
 

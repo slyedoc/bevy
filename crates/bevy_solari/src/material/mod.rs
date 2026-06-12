@@ -61,6 +61,12 @@ pub struct SolariMaterial {
     pub specular_transmission: f32,
     /// Index of refraction for transmissive surfaces (1.5 ≈ glass, 1.33 water).
     pub ior: f32,
+    /// Strength of chromatic dispersion — how much the IOR varies across the
+    /// visible spectrum (`KHR_materials_dispersion` convention: `20 / Abbe
+    /// number`, with [`Self::ior`] as the spectrum-center value). `0.0` = no
+    /// dispersion. Crown glass ≈ 0.34, dense flint ≈ 0.55, diamond ≈ 0.63.
+    /// Refractions then split into rainbow fringes per wavelength.
+    pub dispersion: f32,
     /// Distance (world units) light travels inside the volume before
     /// [`Self::attenuation_color`] remains (Beer–Lambert). `INFINITY` = clear.
     pub attenuation_distance: f32,
@@ -128,6 +134,7 @@ impl Default for SolariMaterial {
             reflectance: 0.5,
             specular_transmission: 0.0,
             ior: 1.5,
+            dispersion: 0.0,
             attenuation_distance: f32::INFINITY,
             attenuation_color: Color::WHITE,
             nested_priority: 0,
@@ -155,6 +162,8 @@ impl From<&StandardMaterial> for SolariMaterial {
             reflectance: m.reflectance,
             specular_transmission: m.specular_transmission,
             ior: m.ior,
+            // `StandardMaterial` has no dispersion field.
+            dispersion: 0.0,
             attenuation_distance: m.attenuation_distance,
             attenuation_color: m.attenuation_color,
             nested_priority: 0,

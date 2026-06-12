@@ -32,6 +32,11 @@ fn solari_material_from_gltf(
     let nested_priority = gltf_material
         .and_then(|m| m.extras().as_ref())
         .map_or(0, |extras| nested_priority_from_extras(extras.get()));
+    // `KHR_materials_dispersion` isn't surfaced by `GltfMaterial`, so like
+    // `nested_priority` it travels in `extras` (`"extras": {"dispersion": 0.34}`).
+    let dispersion = gltf_material
+        .and_then(|m| m.extras().as_ref())
+        .map_or(0.0, |extras| dispersion_from_extras(extras.get()));
 
     SolariMaterial {
         base_color: material.base_color,
@@ -44,6 +49,7 @@ fn solari_material_from_gltf(
         reflectance: material.reflectance,
         specular_transmission: material.specular_transmission,
         ior: material.ior,
+        dispersion,
         attenuation_distance: material.attenuation_distance,
         attenuation_color: material.attenuation_color,
         nested_priority,
@@ -62,6 +68,15 @@ pub(crate) fn nested_priority_from_extras(extras: &str) -> u32 {
         .ok()
         .and_then(|value| value.get("nested_priority")?.as_u64())
         .map_or(0, |priority| priority as u32)
+}
+
+/// Parse `dispersion` out of a material's extras JSON (see
+/// [`SolariMaterial::dispersion`]).
+pub(crate) fn dispersion_from_extras(extras: &str) -> f32 {
+    serde_json::from_str::<serde_json::Value>(extras)
+        .ok()
+        .and_then(|value| value.get("dispersion")?.as_f64())
+        .map_or(0.0, |dispersion| dispersion as f32)
 }
 
 #[derive(Default, Clone)]

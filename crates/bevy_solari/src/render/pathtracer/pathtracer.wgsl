@@ -3,7 +3,7 @@ enable wgpu_ray_query;
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
 #import bevy_solari::pbr::{rand_f, rand_vec2f, rand_range_u}
 #import bevy_render::view::View
-#import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf}
+#import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf, dispersive_ior, spectral_rgb_weight, sample_hero_wavelength}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, generate_random_emissive_light_sample, calculate_resolved_light_contribution, trace_light_visibility, emissive_light_count, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, offset_ray_origin, directional_lights, light_sources, active_light_list, fog_volumes_sample, fog_volumes_range, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 #import bevy_solari::atmosphere::{Atmosphere, atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
@@ -103,10 +103,16 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var medium_id: array<u32, MEDIUM_STACK_SIZE>;
     var medium_priority: array<u32, MEDIUM_STACK_SIZE>;
     var medium_ior: array<f32, MEDIUM_STACK_SIZE>;
+    var medium_dispersion: array<f32, MEDIUM_STACK_SIZE>;
     var medium_extinction_entry: array<vec3<f32>, MEDIUM_STACK_SIZE>;
     var medium_count = 0u;
     // Active-medium absorption, recomputed from the stack on every crossing.
     var medium_extinction = vec3(0.0);
+    // Hero wavelength (nm). 0 = the path is still RGB; the first dispersive
+    // interface collapses it to a single sampled λ (throughput takes the
+    // spectral→RGB weight once), and every dispersive eta after that uses
+    // n(λ). Paths that never touch dispersive glass pay nothing.
+    var lambda = 0.0;
     // Hard path-length cap: russian roulette terminates almost every path
     // long before this; the cap is GPU-timeout insurance.
     var bounces = 0u;
@@ -169,6 +175,7 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 var self_index = MEDIUM_NOT_FOUND;
                 var other_priority = 0u;
                 var other_ior = 1.0;
+                var other_dispersion = 0.0;
                 for (var i = 0u; i < medium_count; i += 1u) {
                     if medium_id[i] == ray_hit.material_id {
                         self_index = i;
@@ -177,6 +184,7 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     if medium_priority[i] >= other_priority {
                         other_priority = medium_priority[i];
                         other_ior = medium_ior[i];
+                        other_dispersion = medium_dispersion[i];
                     }
                 }
                 // A boundary inside a strictly higher-priority volume is a
@@ -187,9 +195,22 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
                 var crossed = true;
                 if true_interface {
+                    var self_ior = ray_hit.material.ior;
+                    var far_ior = other_ior;
+                    if ray_hit.material.dispersion > 0.0 || other_dispersion > 0.0 {
+                        // Hero-wavelength collapse at the first dispersive
+                        // interface; both sides of the boundary then refract
+                        // at their λ-dependent indices.
+                        if lambda == 0.0 {
+                            lambda = sample_hero_wavelength(&rng);
+                            throughput *= spectral_rgb_weight(lambda);
+                        }
+                        self_ior = dispersive_ior(self_ior, ray_hit.material.dispersion, lambda);
+                        far_ior = dispersive_ior(far_ior, other_dispersion, lambda);
+                    }
                     let eta = select(
-                        ray_hit.material.ior / other_ior, // exiting: M → far side
-                        other_ior / ray_hit.material.ior, // entering: far side → M
+                        self_ior / far_ior, // exiting: M → far side
+                        far_ior / self_ior, // entering: far side → M
                         entering,
                     );
                     let glass = sample_glass_bsdf(wo, oriented_normal, eta, &rng);
@@ -204,6 +225,7 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                             medium_id[medium_count] = ray_hit.material_id;
                             medium_priority[medium_count] = ray_hit.material.nested_priority;
                             medium_ior[medium_count] = ray_hit.material.ior;
+                            medium_dispersion[medium_count] = ray_hit.material.dispersion;
                             medium_extinction_entry[medium_count] = ray_hit.material.extinction;
                             medium_count += 1u;
                         }
@@ -212,6 +234,7 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         medium_id[self_index] = medium_id[medium_count];
                         medium_priority[self_index] = medium_priority[medium_count];
                         medium_ior[self_index] = medium_ior[medium_count];
+                        medium_dispersion[self_index] = medium_dispersion[medium_count];
                         medium_extinction_entry[self_index] = medium_extinction_entry[medium_count];
                     }
                     // Active medium = highest-priority remaining entry.

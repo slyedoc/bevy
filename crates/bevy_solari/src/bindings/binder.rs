@@ -168,6 +168,7 @@ pub fn prepare_raytracing_scene_bindings(
             specular_transmission: material.specular_transmission,
             nested_priority: material.nested_priority,
             alpha_mask: material.traversal_alpha_cutoff(),
+            dispersion: material.dispersion.max(0.0),
         };
     }
 
@@ -342,6 +343,8 @@ struct GpuMaterial {
     nested_priority: u32,
     // Alpha-mask cutoff; negative = opaque (no alpha test during traversal).
     alpha_mask: f32,
+    // Chromatic dispersion (20/Abbe, `KHR_materials_dispersion`); 0 = none.
+    dispersion: f32,
 }
 
 impl Default for GpuMaterial {
@@ -362,6 +365,7 @@ impl Default for GpuMaterial {
             nested_priority: 0,
             // Opaque: freed material slots must not alpha-test in traversal.
             alpha_mask: -1.0,
+            dispersion: 0.0,
         }
     }
 }

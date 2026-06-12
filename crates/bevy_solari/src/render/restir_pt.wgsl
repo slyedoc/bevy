@@ -22,7 +22,7 @@ enable wgpu_ray_query;
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
 #import bevy_solari::pbr::{rand_f, rand_u, rand_range_u, sample_uniform_hemisphere, uniform_hemisphere_inverse_pdf, sample_disk}
 #import bevy_render::maths::{PI, orthonormalize}
-#import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB, bend_shading_normal, fresnel_dielectric}
+#import bevy_solari::brdf::{evaluate_brdf, evaluate_diffuse_brdf, evaluate_specular_brdf, F_AB, bend_shading_normal, fresnel_dielectric, dispersive_ior, spectral_lambda_rgb}
 #import bevy_solari::sampling::{LightSample, ResolvedLightSample, generate_random_light_sample, resolve_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_point_visibility, sample_random_light, sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid, random_emissive_light_pdf, power_heuristic, isnan, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, resolve_material, materials, light_sources, active_light_list, directional_lights, ResolvedMaterial, LIGHT_SOURCE_KIND_NONE, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, offset_ray_origin}
 #import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, previous_gbuffer_position, previous_gbuffer_normal, gbuffer_uv, motion_vectors, reservoir_a, reservoir_b, gi_reservoir_a, gi_reservoir_b, GiReservoir, solari_view, light_tiles, unpack_light_tile_sample, LightTileSample, LIGHT_TILE_BLOCKS, LIGHT_TILE_SAMPLES_PER_BLOCK, environment_map, environment_map_sampler, specular_hit_distance, regir_query, regir_find, regir_samples, REGIR_CELL_NONE, REGIR_ENTRIES_PER_CELL}
@@ -371,10 +371,10 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
         var reflect_hit_t = RAY_T_MAX;
         if reflectance < 1.0 {
             radiance += transmission * (1.0 - reflectance)
-                * trace_specular_path(surface, PRIMARY_LOBE_REFRACT, &first_hit_t, &rng);
+                * trace_specular_path_spectral(surface, PRIMARY_LOBE_REFRACT, &first_hit_t, &rng);
         }
         radiance += transmission * reflectance
-            * trace_specular_path(surface, PRIMARY_LOBE_REFLECT, &reflect_hit_t, &rng);
+            * trace_specular_path_spectral(surface, PRIMARY_LOBE_REFLECT, &reflect_hit_t, &rng);
         // The DLSS guide gets the dominant branch's content distance (for a
         // refracted branch that's the accumulated path length to the first
         // opaque hit — RTXPT's virtual-point scheme).
@@ -385,7 +385,7 @@ fn specular_gi(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if transmission < 1.0 {
         var ggx_hit_t = RAY_T_MAX;
         radiance += (1.0 - transmission)
-            * trace_specular_path(surface, PRIMARY_LOBE_GGX, &ggx_hit_t, &rng);
+            * trace_specular_path_spectral(surface, PRIMARY_LOBE_GGX, &ggx_hit_t, &rng);
         if transmission == 0.0 {
             first_hit_t = ggx_hit_t;
         }
@@ -414,14 +414,69 @@ const SPECULAR_PATH_CONTINUE_ROUGHNESS = 0.25;
 const MEDIUM_STACK_SIZE = 4u;
 const MEDIUM_NOT_FOUND = 0xFFFFFFFFu;
 
+// Spectral wrapper around [`trace_specular_path`]: green traces the chain
+// first carrying full RGB; only if it crossed a dispersive interface do red
+// and blue re-trace from the SAME rng state — identical lobe decisions and
+// light picks, different n(λ) — so the split is deterministic (the denoiser
+// never sees per-frame color flicker) and the 3× cost lands only on pixels
+// whose chain actually touches dispersive glass. Pre-dispersion contributions
+// are gated to the green call (full RGB, counted once); post-collapse each
+// chain carries exactly its own channel.
+fn trace_specular_path_spectral(primary_surface: Surface, primary_lobe: u32, first_hit_t: ptr<function, f32>, rng: ptr<function, u32>) -> vec3<f32> {
+    // ONE call site in a channel loop, not three inlined calls: WGSL inlines
+    // every call and the chain is the biggest function in this shader —
+    // three static calls per lobe site would triple the inlined shader body
+    // (register pressure, occupancy) and tax every pixel, dispersive or not.
+    let rng_start = *rng;
+    let lambda_rgb = spectral_lambda_rgb();
+    // Green first: it carries full RGB until a dispersive interface, and if
+    // it never crosses one the loop ends after one pass with the chain
+    // identical to the pre-spectral path.
+    let lambdas = vec3(lambda_rgb.y, lambda_rgb.x, lambda_rgb.z);
+    let masks = mat3x3<f32>(
+        vec3(0.0, 1.0, 0.0),
+        vec3(1.0, 0.0, 0.0),
+        vec3(0.0, 0.0, 1.0),
+    );
+    var radiance = vec3(0.0);
+    var rng_out = rng_start;
+    for (var c = 0u; c < 3u; c += 1u) {
+        // Every channel restarts from the same rng state — identical lobe
+        // decisions and light picks, different n(λ).
+        var rng_c = rng_start;
+        var dispersed = false;
+        var t_c = *first_hit_t;
+        radiance += trace_specular_path(
+            primary_surface, primary_lobe, &t_c, &rng_c,
+            lambdas[c], masks[c], select(0.0, 1.0, c == 0u), &dispersed);
+        if c == 0u {
+            rng_out = rng_c;
+            *first_hit_t = t_c;
+            if !dispersed {
+                break;
+            }
+        }
+    }
+    *rng = rng_out;
+    return radiance;
+}
+
 // BSDF-sampled specular path from the primary surface: GGX reflection lobes
 // with NEE at glossy hits, and exact-Fresnel reflect/refract delta lobes with
 // Beer-Lambert absorption + a nested-dielectric medium stack at transmissive
 // hits (the pathtracer's scheme, bounded for realtime). No world cache, so a
 // glossy chain just terminates (no diffuse-cache fallback at the end).
-fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t: ptr<function, f32>, rng: ptr<function, u32>) -> vec3<f32> {
+//
+// Spectral arguments (see [`trace_specular_path_spectral`]): `lambda_nm` is
+// this chain's wavelength for dispersive etas; on the first dispersive
+// interface the throughput collapses to `channel_mask` and `prefix_gate`
+// (0 on the red/blue re-traces) stops gating the radiance sums — pre-collapse
+// light belongs to the green call alone.
+fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t: ptr<function, f32>, rng: ptr<function, u32>, lambda_nm: f32, channel_mask: vec3<f32>, prefix_gate: f32, dispersed: ptr<function, bool>) -> vec3<f32> {
     var radiance = vec3(0.0);
     var throughput = vec3(1.0);
+    var gate = prefix_gate;
+    var spectral_masked = false;
 
     let wo_primary = normalize(view.world_position - primary_surface.world_position);
     let primary_normal = bend_shading_normal(primary_surface.world_normal, wo_primary);
@@ -432,6 +487,7 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
     var medium_id: array<u32, MEDIUM_STACK_SIZE>;
     var medium_priority: array<u32, MEDIUM_STACK_SIZE>;
     var medium_ior: array<f32, MEDIUM_STACK_SIZE>;
+    var medium_dispersion: array<f32, MEDIUM_STACK_SIZE>;
     var medium_extinction_entry: array<vec3<f32>, MEDIUM_STACK_SIZE>;
     var medium_count = 0u;
     var medium_extinction = vec3(0.0);
@@ -445,11 +501,20 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
     // outside).
     if primary_lobe == PRIMARY_LOBE_REFRACT {
         // The camera is in air, so the far side of the interface is the material.
-        wi = refract(-wo_primary, primary_normal, 1.0 / primary_surface.material.ior);
+        var primary_ior = primary_surface.material.ior;
+        if primary_surface.material.dispersion > 0.0 {
+            primary_ior = dispersive_ior(primary_ior, primary_surface.material.dispersion, lambda_nm);
+            throughput *= channel_mask;
+            gate = 1.0;
+            spectral_masked = true;
+            *dispersed = true;
+        }
+        wi = refract(-wo_primary, primary_normal, 1.0 / primary_ior);
         p_bounce = bitcast<f32>(0x7F800000u); // INF: delta lobe
         medium_id[0] = primary_surface.material_id;
         medium_priority[0] = primary_surface.material.nested_priority;
         medium_ior[0] = primary_surface.material.ior;
+        medium_dispersion[0] = primary_surface.material.dispersion;
         medium_extinction_entry[0] = primary_surface.material.extinction;
         medium_count = 1u;
         medium_extinction = primary_surface.material.extinction;
@@ -499,14 +564,14 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
         var traversal_emitted = vec3(0.0);
         var traversal_captured = 0u;
         let ray = trace_ray_traversal(&ray_origin, &wi, 0.0, RAY_FLAG_NONE, &traversal_emitted, &traversal_captured);
-        radiance += throughput * traversal_emitted;
+        radiance += gate * throughput * traversal_emitted;
         if traversal_captured != 0u {
             hit_distance_pending = false;
             break;
         }
         if ray.kind == RAY_QUERY_INTERSECTION_NONE {
             // Sky reflection — full weight, the sky isn't in next-event estimation.
-            radiance += throughput * sky_radiance(wi);
+            radiance += gate * throughput * sky_radiance(wi);
             hit_distance_pending = false; // content at infinity (caller's RAY_T_MAX init)
             break;
         }
@@ -532,7 +597,7 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
             || primary_surface.material.specular_transmission > 0.0 {
             emissive_mis = 1.0;
         }
-        radiance += throughput * emissive_mis * hit.material.emissive;
+        radiance += gate * throughput * emissive_mis * hit.material.emissive;
         first_event = false;
 
         if rand_f(rng) < hit.material.specular_transmission {
@@ -548,6 +613,7 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
             var self_index = MEDIUM_NOT_FOUND;
             var other_priority = 0u;
             var other_ior = 1.0;
+            var other_dispersion = 0.0;
             for (var i = 0u; i < medium_count; i += 1u) {
                 if medium_id[i] == hit.material_id {
                     self_index = i;
@@ -556,15 +622,30 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
                 if medium_priority[i] >= other_priority {
                     other_priority = medium_priority[i];
                     other_ior = medium_ior[i];
+                    other_dispersion = medium_dispersion[i];
                 }
             }
             let true_interface = hit.material.nested_priority >= other_priority;
 
             var crossed = true;
             if true_interface {
+                var self_ior = hit.material.ior;
+                var far_ior = other_ior;
+                if hit.material.dispersion > 0.0 || other_dispersion > 0.0 {
+                    // Dispersive interface: this chain collapses to its
+                    // channel (once) and refracts at n(λ) on both sides.
+                    if !spectral_masked {
+                        throughput *= channel_mask;
+                        gate = 1.0;
+                        spectral_masked = true;
+                    }
+                    *dispersed = true;
+                    self_ior = dispersive_ior(self_ior, hit.material.dispersion, lambda_nm);
+                    far_ior = dispersive_ior(far_ior, other_dispersion, lambda_nm);
+                }
                 let eta = select(
-                    hit.material.ior / other_ior,
-                    other_ior / hit.material.ior,
+                    self_ior / far_ior,
+                    far_ior / self_ior,
                     entering,
                 );
                 // Deterministic dominant lobe — no per-frame coin flip (the
@@ -591,6 +672,7 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
                         medium_id[medium_count] = hit.material_id;
                         medium_priority[medium_count] = hit.material.nested_priority;
                         medium_ior[medium_count] = hit.material.ior;
+                        medium_dispersion[medium_count] = hit.material.dispersion;
                         medium_extinction_entry[medium_count] = hit.material.extinction;
                         medium_count += 1u;
                     }
@@ -599,6 +681,7 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
                     medium_id[self_index] = medium_id[medium_count];
                     medium_priority[self_index] = medium_priority[medium_count];
                     medium_ior[self_index] = medium_ior[medium_count];
+                    medium_dispersion[self_index] = medium_dispersion[medium_count];
                     medium_extinction_entry[self_index] = medium_extinction_entry[medium_count];
                 }
                 medium_extinction = vec3(0.0);
@@ -637,7 +720,7 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
         if !is_mirror {
             let light = sample_random_light(hit.world_position, hit_normal, rng);
             let mis = specular_nee_mis_weight(light.inverse_pdf, light.brdf_rays_can_hit, light.wi, wo_tangent, hit.material.roughness, TBN);
-            radiance += throughput * mis * light.radiance * light.inverse_pdf * evaluate_brdf(wo, light.wi, hit_normal, hit.material, F_ab);
+            radiance += gate * throughput * mis * light.radiance * light.inverse_pdf * evaluate_brdf(wo, light.wi, hit_normal, hit.material, F_ab);
         }
 
         // End the chain at rough hits (after their NEE): continuing means a
@@ -654,7 +737,7 @@ fn trace_specular_path(primary_surface: Surface, primary_lobe: u32, first_hit_t:
             // deterministic env sample along the normal: irradiance ≈ π·L_sky,
             // diffuse brdf = albedo/π ⇒ albedo · L_sky.
             if crossings > 0u {
-                radiance += throughput * hit.material.base_color * sky_radiance(hit_normal);
+                radiance += gate * throughput * hit.material.base_color * sky_radiance(hit_normal);
             }
             break;
         }

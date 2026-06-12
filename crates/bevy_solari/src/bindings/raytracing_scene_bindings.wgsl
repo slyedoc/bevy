@@ -45,6 +45,8 @@ struct Material {
     nested_priority: u32,
     // Alpha-mask cutoff; negative = opaque (no alpha test during traversal).
     alpha_mask: f32,
+    // Chromatic dispersion (20/Abbe, `KHR_materials_dispersion`); 0 = none.
+    dispersion: f32,
 }
 
 const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
@@ -278,6 +280,7 @@ struct ResolvedMaterial {
     metallic: f32,
     specular_transmission: f32,
     ior: f32,
+    dispersion: f32,
     extinction: vec3<f32>,
     nested_priority: u32,
 }
@@ -323,6 +326,7 @@ fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
 
     m.specular_transmission = material.specular_transmission;
     m.ior = material.ior;
+    m.dispersion = material.dispersion;
     m.extinction = material.extinction;
     m.nested_priority = material.nested_priority;
 
