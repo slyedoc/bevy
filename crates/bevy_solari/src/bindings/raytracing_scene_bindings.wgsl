@@ -4,6 +4,7 @@ enable wgpu_ray_query;
 
 #import bevy_solari::pbr::perceptualRoughnessToRoughness
 #import bevy_solari::pbr::calculate_tbn_mikktspace
+#import bevy_solari::atmosphere::atmosphere_mie_phase
 #import bevy_render::utils::octahedral_decode_signed
 
 // Cluster pool layout — mirrors `bevy_solari::cluster::asset::Cluster`.
@@ -169,6 +170,22 @@ struct BlackHole {
     disk: vec4<f32>,
 }
 @group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(6) var<storage> black_holes: array<BlackHole>;
+
+// Fog volumes (`bindings::fog_volume`, the `SolariFogVolumes` gpu_table):
+// bounded participating media the aerial-perspective marches sample on top of
+// the global height fog. The unit shape (box half-extents 1, or sphere radius
+// 1) lives in entity-local space — the transform places/scales/rotates it.
+// All-zero entries (tombstones, grown-buffer tail) are inert: zero extinction
+// is skipped before the transform is read.
+struct FogVolume {
+    // World → entity-local affine (row-packed, column k = the 4x4's row k).
+    local_from_world: mat3x4<f32>,
+    // xyz = scattering σ_s (1/world unit), w = extinction σ_t.
+    scattering: vec4<f32>,
+    // x = HG phase g, y = edge softness (0..1), z = 1 for sphere / 0 for box.
+    params: vec4<f32>,
+}
+@group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(7) var<storage> fog_volumes: array<FogVolume>;
 
 const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
@@ -440,6 +457,93 @@ fn portal_redirect(
         return true;
     }
     return false;
+}
+
+// One march step's combined fog-volume medium at `p`: extinction, plain
+// scattering (the isotropic sky-ambient term), and sun-phase-weighted
+// scattering — each volume applies its own HG lobe at the caller's sun angle.
+// The global height fog is NOT included; the marches add it (its phase uses
+// the per-view atmosphere `g`).
+struct FogSample {
+    sigma_t: f32,
+    sigma_s: vec3<f32>,
+    sun_scatter: vec3<f32>,
+}
+
+fn fog_volumes_sample(p: vec3<f32>, cos_theta: f32) -> FogSample {
+    var s = FogSample(0.0, vec3(0.0), vec3(0.0));
+    for (var i = 0u; i < arrayLength(&fog_volumes); i += 1u) {
+        let vol = fog_volumes[i];
+        if vol.scattering.w < 1e-7 {
+            continue;
+        }
+        let lp = abs(affine_transform_point(vol.local_from_world, p));
+        // Distance metric to the unit shape — 1 at the boundary: Chebyshev
+        // for the box, Euclidean for the sphere.
+        var m = max(lp.x, max(lp.y, lp.z));
+        if vol.params.z > 0.5 {
+            m = length(lp);
+        }
+        if m >= 1.0 {
+            continue;
+        }
+        // Edge softness: full density in the core, fading to zero over the
+        // outer `softness` fraction of the shape.
+        let density = saturate((1.0 - m) / max(vol.params.y, 1e-4));
+        let sigma_s = vol.scattering.xyz * density;
+        s.sigma_t += vol.scattering.w * density;
+        s.sigma_s += sigma_s;
+        s.sun_scatter += sigma_s * atmosphere_mie_phase(vol.params.x, cos_theta);
+    }
+    return s;
+}
+
+// The `[t_entry, t_exit]` span of `[0, t_cap]` along a ray that can contain
+// any fog volume (union over volumes; `y <= x` = none). Lets the aerial
+// marches concentrate their steps on the occupied segment — and skip the
+// march entirely — when the global height fog is off.
+fn fog_volumes_range(origin: vec3<f32>, direction: vec3<f32>, t_cap: f32) -> vec2<f32> {
+    var range = vec2(t_cap, 0.0);
+    for (var i = 0u; i < arrayLength(&fog_volumes); i += 1u) {
+        let vol = fog_volumes[i];
+        if vol.scattering.w < 1e-7 {
+            continue;
+        }
+        let lo = affine_transform_point(vol.local_from_world, origin);
+        let ld = affine_transform_direction(vol.local_from_world, direction);
+        var t0: f32;
+        var t1: f32;
+        if vol.params.z > 0.5 {
+            // Unit sphere.
+            let a = dot(ld, ld);
+            let b = dot(lo, ld);
+            let disc = b * b - a * (dot(lo, lo) - 1.0);
+            if disc < 0.0 {
+                continue;
+            }
+            let sq = sqrt(disc);
+            t0 = (-b - sq) / a;
+            t1 = (-b + sq) / a;
+        } else {
+            // Unit-box slabs (axis-parallel rays resolve through ±inf).
+            let inv_d = 1.0 / ld;
+            let ta = (vec3(-1.0) - lo) * inv_d;
+            let tb = (vec3(1.0) - lo) * inv_d;
+            let tmin = min(ta, tb);
+            let tmax = max(ta, tb);
+            t0 = max(tmin.x, max(tmin.y, tmin.z));
+            t1 = min(tmax.x, min(tmax.y, tmax.z));
+            if t0 > t1 {
+                continue;
+            }
+        }
+        if t1 < 0.0 || t0 > t_cap {
+            continue;
+        }
+        range.x = min(range.x, max(t0, 0.0));
+        range.y = max(range.y, min(t1, t_cap));
+    }
+    return range;
 }
 
 const GRAVITY_MARCH_STEPS = 256u;

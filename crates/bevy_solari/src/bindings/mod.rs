@@ -29,6 +29,7 @@ mod bind_groups;
 mod binder;
 mod black_hole;
 mod extract;
+mod fog_volume;
 mod portal;
 mod types;
 
@@ -39,6 +40,7 @@ pub use bind_groups::{
 pub use binder::{prepare_raytracing_scene_bindings, RaytracingSceneBindings};
 pub use black_hole::{SolariBlackHole, SolariBlackHoles, SolariBlackHolesTablePlugin};
 pub use extract::SolariMaterialAssets;
+pub use fog_volume::{SolariFogVolume, SolariFogVolumes, SolariFogVolumesTablePlugin};
 pub use portal::{SolariPortal, SolariPortals, SolariPortalsTablePlugin};
 pub use types::RaytracingMesh3d;
 
@@ -73,9 +75,15 @@ impl Plugin for BindingsPlugin {
         app.add_plugins(ExtractResourcePlugin::<SolariMaterialAssets>::default());
         app.register_type::<SolariPortal>();
         app.register_type::<SolariBlackHole>();
-        // Portal + black-hole gpu_table!s (slot allocators, column scatter,
-        // change-driven extracts; their columns join the scene-columns group).
-        app.add_plugins((SolariPortalsTablePlugin, SolariBlackHolesTablePlugin));
+        app.register_type::<SolariFogVolume>();
+        // Portal + black-hole + fog-volume gpu_table!s (slot allocators, column
+        // scatter, change-driven extracts; their columns join the scene-columns
+        // group).
+        app.add_plugins((
+            SolariPortalsTablePlugin,
+            SolariBlackHolesTablePlugin,
+            SolariFogVolumesTablePlugin,
+        ));
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;

@@ -1694,6 +1694,25 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
+name = "solari_fog_volumes"
+path = "examples/3d/solari/fog_volumes.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_gltf",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_fog_volumes]
+name = "Solari (fog volumes)"
+description = "Local participating media - a mist pool and a smoke column sliced into god rays by per-step shadow rays."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
 name = "spherical_area_lights"
 path = "examples/3d/spherical_area_lights.rs"
 doc-scrape-examples = true

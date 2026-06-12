@@ -69,6 +69,9 @@ pub struct SolariAtmosphere {
     /// Aerial-perspective **ground-level visibility** in WORLD units (Koschmieder
     /// meteorological range): the view distance at which a surface *in the densest
     /// fog* fades to ~2 % contrast. Lower ⇒ haze closer/thicker; higher ⇒ clearer.
+    /// `0.0` (or non-finite) disables the global height fog entirely — the sky and
+    /// sun keep working, and local
+    /// [`SolariFogVolume`](crate::bindings::SolariFogVolume)s still march.
     pub aerial_visibility: f32,
     /// Fog-layer **scale height** in WORLD units: density falls off as
     /// `exp(-(y - fog_base) / fog_height)`, so the haze is densest at the ground and
@@ -225,7 +228,15 @@ pub fn extract_solari_atmosphere(
             aerial_fog_height: atmosphere.aerial_fog_height,
             aerial_fog_base: atmosphere.aerial_fog_base,
             aerial_phase_g: atmosphere.aerial_phase_g,
-            aerial_enabled: 1.0,
+            // Zero/non-finite visibility = no global height fog; the rest of
+            // the uniform (sun, optical depths) still lights fog volumes.
+            aerial_enabled: if atmosphere.aerial_visibility > 0.0
+                && atmosphere.aerial_visibility.is_finite()
+            {
+                1.0
+            } else {
+                0.0
+            },
         };
     }
     // No atmosphere view: a disabled (default) uniform keeps the pathtracer's

@@ -5,7 +5,7 @@ enable wgpu_ray_query;
 #import bevy_render::view::View
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic}
-#import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, offset_ray_origin, directional_lights, light_sources, active_light_list, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, offset_ray_origin, directional_lights, light_sources, active_light_list, fog_volumes_sample, fog_volumes_range, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 #import bevy_solari::atmosphere::{Atmosphere, atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
 
 @group(1) @binding(0) var accumulation_texture: texture_storage_2d<rgba32float, read_write>;
@@ -318,55 +318,120 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // sky cube — rather than a separately-calibrated inscatter — makes distant
     // geometry converge to exactly the sky behind it, so it's seamless with rays
     // that fall through to sky. Primary rays only (NVIDIA-style); reflections/
-    // bounces stay unhazed. A primary miss already shows the full sky.
-    if atmosphere.aerial_enabled > 0.0 {
-        // Volumetric aerial perspective (god rays), applied to BOTH primary hits and
-        // primary misses (the sky) — otherwise the near fog hazes geometry but not
-        // the sky behind it, leaving a hard seam at the silhouette. March the
-        // camera→hit segment for a hit, or out to the fog's visibility range for a
-        // miss (past which the height fog has faded). Accumulate single-scattered
-        // sunlight — shadowed per step by a ray toward the sun, so buildings cast
-        // real shafts and shadowed fog stops glowing — plus isotropic ambient
-        // skylight (a soft sky tint, no sun-ward glare). In-scatter is weighted by
-        // running fog transmittance; the surface/sky already in `radiance` is
-        // attenuated by the total. Few steps + per-pixel jitter + the path tracer's
-        // temporal accumulation keep it smooth. Primary rays only.
-        let aerial_distance = select(
-            atmosphere.aerial_visibility,
-            min(primary_distance, atmosphere.aerial_visibility),
-            primary_distance > 0.0,
-        );
-        let AERIAL_STEPS = 16u;
-        let ds = aerial_distance / f32(AERIAL_STEPS);
-        let cos_theta = dot(atmosphere.sun_direction, primary_ray_direction);
-        let sun_phase = atmosphere_mie_phase(atmosphere.aerial_phase_g, cos_theta);
-        // Sunlight reaching the fog, attenuated by the atmosphere toward the sun
-        // (Beer-Lambert over the same optical depth the sky bake uses). For a low
-        // sun this reddens and dims the shafts so they match the sky instead of
-        // blowing out to white. Evaluated once at the camera — the fog is a thin
-        // near-ground layer, so the sun transmittance is ~constant across it.
-        let planet_camera = vec3(0.0, atmosphere.bottom_radius + atmosphere.camera_altitude, 0.0);
-        let sun_od = atmosphere_sun_optical_depth(atmosphere, planet_camera);
-        let sun_radiance = atmosphere.sun_illuminance * exp(-(
-            atmosphere.rayleigh_scattering * sun_od.x + vec3(atmosphere.mie_extinction) * sun_od.y));
-        let sky_ambient = textureSampleLevel(
-            environment_map, environment_map_sampler, vec3(0.0, 1.0, 0.0), 0.0,
-        ).rgb * solari_view.environment_brightness;
-        let jitter = rand_f(&rng);
-        var fog_transmittance = 1.0;
-        var inscatter = vec3(0.0);
-        for (var i = 0u; i < AERIAL_STEPS; i = i + 1u) {
-            if fog_transmittance < 0.003 { break; } // fog is opaque — nothing more shows through
-            let p = camera_position + primary_ray_direction * ((f32(i) + jitter) * ds);
-            let sigma = atmosphere_fog_extinction(atmosphere, p.y);
-            if sigma < 1e-7 { continue; } // above the fog layer — no scattering, skip the shadow ray
-            let sun_ray = trace_ray(p, atmosphere.sun_direction, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
-            let sun_vis = f32(sun_ray.kind == RAY_QUERY_INTERSECTION_NONE);
-            let in_scatter = sun_radiance * (sun_phase * sun_vis) + sky_ambient;
-            inscatter += fog_transmittance * sigma * in_scatter * ds;
-            fog_transmittance *= exp(-sigma * ds);
+    // bounces stay unhazed.
+    //
+    // Volumetric aerial perspective (god rays), applied to BOTH primary hits and
+    // primary misses (the sky) — otherwise the near fog hazes geometry but not
+    // the sky behind it, leaving a hard seam at the silhouette. The medium is the
+    // global height fog plus any local fog volumes. March the camera→hit segment
+    // for a hit, or out to the medium's extent for a miss. Accumulate
+    // single-scattered sunlight — shadowed per step by a ray toward the sun, so
+    // buildings cast real shafts and shadowed fog stops glowing — plus isotropic
+    // ambient skylight (a soft sky tint, no sun-ward glare). In-scatter is
+    // weighted by running fog transmittance; the surface/sky already in
+    // `radiance` is attenuated by the total. Few steps + per-pixel jitter + the
+    // path tracer's temporal accumulation keep it smooth. Primary rays only.
+    {
+        var hit_t = RAY_T_MAX;
+        if primary_distance > 0.0 {
+            hit_t = primary_distance;
         }
-        radiance = radiance * fog_transmittance + inscatter;
+        // March span: the global height fog covers out to its visibility range
+        // (past which it's opaque anyway); fog volumes extend it — or, with the
+        // global fog off, define it — so a volume-only view marches just the
+        // occupied segment and medium-free pixels skip the march entirely.
+        var t_start = 0.0;
+        var t_end = 0.0;
+        if atmosphere.aerial_enabled > 0.0 {
+            t_end = min(hit_t, atmosphere.aerial_visibility);
+        }
+        let vol_span = fog_volumes_range(camera_position, primary_ray_direction, hit_t);
+        if vol_span.y > vol_span.x {
+            if t_end > 0.0 {
+                t_end = max(t_end, vol_span.y);
+            } else {
+                t_start = vol_span.x;
+                t_end = vol_span.y;
+            }
+        }
+        if t_end > t_start {
+            let AERIAL_STEPS = 16u;
+            // Strata: when the volumes occupy a small slice of a long global
+            // span, a uniform march undersamples them (a few-metre mist pool
+            // gets <1 of the steps over a hundreds-of-metres sky ray) —
+            // low-frequency noise until accumulation settles. Bracket the
+            // march at the volume span and give that segment half the steps.
+            var seg_bounds: array<vec2<f32>, 3>;
+            var seg_steps: array<u32, 3>;
+            var seg_count = 0u;
+            if atmosphere.aerial_enabled > 0.0 && vol_span.y > vol_span.x {
+                let a = clamp(vol_span.x, t_start, t_end);
+                let b = clamp(vol_span.y, t_start, t_end);
+                if a > t_start {
+                    seg_bounds[seg_count] = vec2(t_start, a);
+                    seg_steps[seg_count] = AERIAL_STEPS / 4u;
+                    seg_count += 1u;
+                }
+                seg_bounds[seg_count] = vec2(a, b);
+                seg_steps[seg_count] = AERIAL_STEPS / 2u;
+                seg_count += 1u;
+                if b < t_end {
+                    seg_bounds[seg_count] = vec2(b, t_end);
+                    seg_steps[seg_count] = AERIAL_STEPS / 4u;
+                    seg_count += 1u;
+                }
+            } else {
+                seg_bounds[0] = vec2(t_start, t_end);
+                seg_steps[0] = AERIAL_STEPS;
+                seg_count = 1u;
+            }
+            let cos_theta = dot(atmosphere.sun_direction, primary_ray_direction);
+            let sun_phase = atmosphere_mie_phase(atmosphere.aerial_phase_g, cos_theta);
+            // Sunlight reaching the fog, attenuated by the atmosphere toward the sun
+            // (Beer-Lambert over the same optical depth the sky bake uses). For a low
+            // sun this reddens and dims the shafts so they match the sky instead of
+            // blowing out to white. Evaluated once at the camera — the fog is a thin
+            // near-ground layer, so the sun transmittance is ~constant across it.
+            // Zero without an atmosphere view: fog volumes are then ambient-lit.
+            let planet_camera = vec3(0.0, atmosphere.bottom_radius + atmosphere.camera_altitude, 0.0);
+            let sun_od = atmosphere_sun_optical_depth(atmosphere, planet_camera);
+            let sun_radiance = atmosphere.sun_illuminance * exp(-(
+                atmosphere.rayleigh_scattering * sun_od.x + vec3(atmosphere.mie_extinction) * sun_od.y));
+            let sun_lit = any(sun_radiance > vec3(0.0));
+            let sky_ambient = textureSampleLevel(
+                environment_map, environment_map_sampler, vec3(0.0, 1.0, 0.0), 0.0,
+            ).rgb * solari_view.environment_brightness;
+            var fog_transmittance = 1.0;
+            var inscatter = vec3(0.0);
+            for (var si = 0u; si < seg_count; si += 1u) {
+                let ds = (seg_bounds[si].y - seg_bounds[si].x) / f32(seg_steps[si]);
+                for (var i = 0u; i < seg_steps[si]; i = i + 1u) {
+                    if fog_transmittance < 0.003 { break; } // fog is opaque — nothing more shows through
+                    // Independent per-step jitter: a shared offset makes the
+                    // whole march's error coherent per pixel (blotches);
+                    // independent strata read as fine grain and settle faster.
+                    let p = camera_position + primary_ray_direction
+                        * (seg_bounds[si].x + (f32(i) + rand_f(&rng)) * ds);
+                    var s = fog_volumes_sample(p, cos_theta);
+                    if atmosphere.aerial_enabled > 0.0 {
+                        let sigma = atmosphere_fog_extinction(atmosphere, p.y);
+                        s.sigma_t += sigma;
+                        s.sigma_s += vec3(sigma);
+                        s.sun_scatter += vec3(sigma * sun_phase);
+                    }
+                    if s.sigma_t < 1e-7 { continue; } // empty step — no scattering, skip the shadow ray
+                    var sun_vis = 0.0;
+                    if sun_lit {
+                        let sun_ray = trace_ray(p, atmosphere.sun_direction, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
+                        sun_vis = f32(sun_ray.kind == RAY_QUERY_INTERSECTION_NONE);
+                    }
+                    let in_scatter = sun_radiance * (sun_vis * s.sun_scatter) + sky_ambient * s.sigma_s;
+                    inscatter += fog_transmittance * in_scatter * ds;
+                    fog_transmittance *= exp(-s.sigma_t * ds);
+                }
+            }
+            radiance = radiance * fog_transmittance + inscatter;
+        }
     }
 
     // Camera exposure
