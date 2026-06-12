@@ -15,8 +15,6 @@
 
 use core::marker::PhantomData;
 
-#[cfg(feature = "dlss")]
-use super::dlss::ViewRestirDlssTextures;
 use super::prepare::RestirResources;
 use crate::bindings::RaytracingSceneBindings;
 use crate::render::view::{debug_is, SolariDebugView};
@@ -55,8 +53,6 @@ pub struct OverlayInputs<'a> {
     res: &'a RestirResources,
     /// Current ping-pong slot (`frame_count & 1`).
     curr: usize,
-    #[cfg(feature = "dlss")]
-    dlss: Option<&'a ViewRestirDlssTextures>,
 }
 
 /// One debug view's overlay config. Implemented by a zero-size marker per view
@@ -88,12 +84,8 @@ macro_rules! overlay_view {
 }
 
 // Buffer views: sample one G-buffer texture.
-overlay_view!(WorldPositionView, SolariDebugView::WorldPosition, ["VIEW_COLOR"],
-    |i| Some(&i.res.world_position[i.curr]));
 overlay_view!(MaterialIdView, SolariDebugView::MaterialId, ["VIEW_MATERIAL_ID"],
     |i| Some(&i.res.world_position[i.curr])); // material id is packed in world_position.w
-overlay_view!(WorldNormalView, SolariDebugView::WorldNormal, ["VIEW_NORMAL"],
-    |i| Some(&i.res.world_normal[i.curr]));
 overlay_view!(UvView, SolariDebugView::Uv, ["VIEW_COLOR"],
     |i| Some(&i.res.uv));
 overlay_view!(MotionVectorsView, SolariDebugView::MotionVectors, ["VIEW_MOTION"],
@@ -109,22 +101,22 @@ overlay_view!(TriangleView, SolariDebugView::Triangle,
 overlay_view!(GeometryCheckView, SolariDebugView::GeometryCheck,
     ["VIEW_CLUSTER_FAMILY", "VIEW_GEOMETRY_CHECK"], |_i| None);
 
-// DLSS guide buffers (only registered when DLSS is active).
+// DLSS guide buffers (resolved from the G-buffer; inspectable with DLSS off).
 #[cfg(feature = "dlss")]
 overlay_view!(DlssDepthView, SolariDebugView::DlssDepth, ["VIEW_GRAYSCALE"],
-    |i| i.dlss.map(|d| &d.depth));
+    |i| Some(&i.res.guide_depth));
 #[cfg(feature = "dlss")]
 overlay_view!(DlssNormalRoughnessView, SolariDebugView::DlssNormalRoughness, ["VIEW_NORMAL"],
-    |i| i.dlss.map(|d| &d.normal_roughness));
+    |i| Some(&i.res.guide_normal_roughness));
 #[cfg(feature = "dlss")]
 overlay_view!(DlssDiffuseAlbedoView, SolariDebugView::DlssDiffuseAlbedo, ["VIEW_COLOR"],
-    |i| i.dlss.map(|d| &d.diffuse_albedo));
+    |i| Some(&i.res.guide_diffuse_albedo));
 #[cfg(feature = "dlss")]
 overlay_view!(DlssSpecularAlbedoView, SolariDebugView::DlssSpecularAlbedo, ["VIEW_COLOR"],
-    |i| i.dlss.map(|d| &d.specular_albedo));
+    |i| Some(&i.res.guide_specular_albedo));
 #[cfg(feature = "dlss")]
 overlay_view!(DlssSpecularMotionView, SolariDebugView::DlssSpecularMotion, ["VIEW_MOTION"],
-    |i| i.dlss.map(|d| &d.specular_motion_vectors));
+    |i| Some(&i.res.guide_specular_motion));
 
 /// The overlay compute pipeline for view `V` (one per view, keyed by type).
 #[derive(Resource)]
@@ -195,15 +187,6 @@ pub fn init_overlay_pipeline<V: OverlayView>(
     commands.insert_resource(OverlayPipeline::<V>(pipeline, PhantomData));
 }
 
-#[cfg(feature = "dlss")]
-type OverlayViewData = (
-    &'static RestirResources,
-    &'static ViewTarget,
-    &'static ViewUniformOffset,
-    &'static SolariViewOffset,
-    Option<&'static ViewRestirDlssTextures>,
-);
-#[cfg(not(feature = "dlss"))]
 type OverlayViewData = (
     &'static RestirResources,
     &'static ViewTarget,
@@ -225,9 +208,6 @@ pub fn overlay<V: OverlayView>(
     render_device: Res<RenderDevice>,
     mut ctx: RenderContext,
 ) {
-    #[cfg(feature = "dlss")]
-    let (resources, view_target, view_uniform_offset, solari_view_offset, dlss) = view.into_inner();
-    #[cfg(not(feature = "dlss"))]
     let (resources, view_target, view_uniform_offset, solari_view_offset) = view.into_inner();
 
     let Some(pipeline) = pipeline else {
@@ -253,8 +233,6 @@ pub fn overlay<V: OverlayView>(
     let inputs = OverlayInputs {
         res: resources,
         curr,
-        #[cfg(feature = "dlss")]
-        dlss,
     };
     // Cluster-family views trace their own ray — bind any texture as a
     // placeholder to satisfy the layout.
@@ -306,9 +284,7 @@ pub fn add_overlay_view<V: OverlayView>(render_app: &mut SubApp) {
 
 /// Registers every always-available overlay (buffer + cluster families).
 pub fn register_overlays(render_app: &mut SubApp) {
-    add_overlay_view::<WorldPositionView>(render_app);
     add_overlay_view::<MaterialIdView>(render_app);
-    add_overlay_view::<WorldNormalView>(render_app);
     add_overlay_view::<UvView>(render_app);
     add_overlay_view::<MotionVectorsView>(render_app);
     add_overlay_view::<LodView>(render_app);

@@ -93,6 +93,21 @@ pub struct RestirResources {
     /// frame-parity ping-ponged on the GPU (one writer thread in the
     /// visibility pass). Replaces a prepass-fed previous-view uniform.
     pub view_clip_from_world: Buffer,
+    /// DLSS-RR guide buffers, derived from the G-buffer by the resolve pass.
+    /// Owned here (not by the DLSS context) so the guide debug views can
+    /// inspect them with DLSS off — they're a pure function of the G-buffer.
+    /// Linear camera-space depth.
+    #[cfg(feature = "dlss")]
+    pub guide_depth: TextureView,
+    /// World-space normal (xyz) + linear roughness (w) — `Packed` roughness.
+    #[cfg(feature = "dlss")]
+    pub guide_normal_roughness: TextureView,
+    #[cfg(feature = "dlss")]
+    pub guide_diffuse_albedo: TextureView,
+    #[cfg(feature = "dlss")]
+    pub guide_specular_albedo: TextureView,
+    #[cfg(feature = "dlss")]
+    pub guide_specular_motion: TextureView,
     pub view_size: UVec2,
 }
 
@@ -221,6 +236,28 @@ pub fn prepare_restir_resources(
             regir_cell_data,
             regir_samples,
             view_clip_from_world,
+            #[cfg(feature = "dlss")]
+            guide_depth: storage_texture("restir_guide_depth", TextureFormat::R32Float),
+            #[cfg(feature = "dlss")]
+            guide_normal_roughness: storage_texture(
+                "restir_guide_normal_roughness",
+                TextureFormat::Rgba16Float,
+            ),
+            #[cfg(feature = "dlss")]
+            guide_diffuse_albedo: storage_texture(
+                "restir_guide_diffuse_albedo",
+                TextureFormat::Rgba8Unorm,
+            ),
+            #[cfg(feature = "dlss")]
+            guide_specular_albedo: storage_texture(
+                "restir_guide_specular_albedo",
+                TextureFormat::Rgba8Unorm,
+            ),
+            #[cfg(feature = "dlss")]
+            guide_specular_motion: storage_texture(
+                "restir_guide_specular_motion",
+                TextureFormat::Rg16Float,
+            ),
             view_size,
         });
     }

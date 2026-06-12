@@ -132,6 +132,7 @@ pub fn spawn_debug_panels(
                     ),
                     (
                         @FeathersMenuPopup
+                        DebugMenuPopup
                         Children [
                             (
                                 @FeathersMenuItem {
@@ -145,9 +146,7 @@ pub fn spawn_debug_panels(
                             debug_item(SolariDebugView::Cluster),
                             debug_item(SolariDebugView::Triangle),
                             debug_item(SolariDebugView::GeometryCheck),
-                            debug_item(SolariDebugView::WorldPosition),
                             debug_item(SolariDebugView::MaterialId),
-                            debug_item(SolariDebugView::WorldNormal),
                             debug_item(SolariDebugView::Uv),
                             debug_item(SolariDebugView::MotionVectors),
                             debug_item(SolariDebugView::DiWeight),
@@ -159,6 +158,32 @@ pub fn spawn_debug_panels(
                 ]
             )
         });
+}
+
+/// Marks the debug-view menu's popup, so the DLSS guide views can be appended
+/// as separate children (a `bsn_list!` item can't carry a `#[cfg]`, and the
+/// guide views only exist under the `dlss` feature).
+#[derive(Component, Default, Clone)]
+pub struct DebugMenuPopup;
+
+/// Append the DLSS guide-buffer views to the debug-view dropdown once its
+/// popup exists.
+#[cfg(feature = "dlss")]
+pub fn append_dlss_guide_items(
+    popup: Query<Entity, bevy_ecs::prelude::Added<DebugMenuPopup>>,
+    mut commands: Commands,
+) {
+    for entity in &popup {
+        commands
+            .entity(entity)
+            .queue_spawn_related_scenes::<Children>(bsn_list! {
+                debug_item(SolariDebugView::DlssDepth),
+                debug_item(SolariDebugView::DlssNormalRoughness),
+                debug_item(SolariDebugView::DlssDiffuseAlbedo),
+                debug_item(SolariDebugView::DlssSpecularAlbedo),
+                debug_item(SolariDebugView::DlssSpecularMotion),
+            });
+    }
 }
 
 /// Keep both menu captions in sync with [`SolariViewState`]: the integrator
@@ -384,18 +409,12 @@ pub fn spawn_dlss_panel(
                         @FeathersMenuPopup
                         Children [
                             dlss_item(SolariDlssMode::Off),
+                            dlss_item(SolariDlssMode::Auto),
                             dlss_item(SolariDlssMode::Dlaa),
                             dlss_item(SolariDlssMode::Quality),
                             dlss_item(SolariDlssMode::Balanced),
                             dlss_item(SolariDlssMode::Performance),
                             dlss_item(SolariDlssMode::UltraPerformance),
-                            // The RR guide-buffer debug views live with the
-                            // DLSS controls (they only exist while DLSS runs).
-                            debug_item(SolariDebugView::DlssDepth),
-                            debug_item(SolariDebugView::DlssNormalRoughness),
-                            debug_item(SolariDebugView::DlssDiffuseAlbedo),
-                            debug_item(SolariDebugView::DlssSpecularAlbedo),
-                            debug_item(SolariDebugView::DlssSpecularMotion),
                         ]
                     )
                 ]

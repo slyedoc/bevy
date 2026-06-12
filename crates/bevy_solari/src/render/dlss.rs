@@ -23,9 +23,8 @@ use bevy_ecs::{
     entity::Entity,
     query::With,
     resource::Resource,
-    system::{Commands, Query, Res},
+    system::{Commands, Query, Res, ResMut},
 };
-use bevy_image::ToExtents;
 use bevy_math::{UVec2, Vec4Swizzles};
 use bevy_render::{
     camera::TemporalJitter,
@@ -34,8 +33,7 @@ use bevy_render::{
         binding_types::{storage_buffer_read_only_sized, texture_storage_2d, uniform_buffer},
         BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
         CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
-        ShaderStages, StorageTextureAccess, TextureDescriptor, TextureDimension, TextureFormat,
-        TextureUsages, TextureView, TextureViewDescriptor,
+        ShaderStages, StorageTextureAccess, TextureFormat,
     },
     renderer::{
         raw_vulkan_init::AdditionalVulkanFeatures, RenderAdapter, RenderContext, RenderDevice,
@@ -58,6 +56,7 @@ use tracing::info;
 
 use crate::bindings::RaytracingSceneBindings;
 use crate::pipelines::SolariPipelines;
+use crate::render::view::SolariViewState;
 use crate::resource_manager::SolariResourceManager;
 use super::{prepare::RestirResources, SolariCamera, reset::CameraReset};
 
@@ -73,12 +72,19 @@ pub struct RestirDlssSdk(pub Arc<Mutex<DlssSdk>>);
 /// dropdown on it.
 #[derive(Resource, ExtractResource, Display, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SolariDlssMode {
-    /// DLSS bypassed entirely: raw restir output, Halton jitter — the
-    /// debugging baseline for "is the denoiser causing this".
+    /// DLSS bypassed entirely: raw restir output, no jitter — the debugging
+    /// baseline for "is the denoiser causing this".
     #[display("off")]
     Off,
-    /// Native-resolution denoise + anti-aliasing, no upscaling.
+    /// DLSS picks the upscale factor for the output resolution. The default:
+    /// every ray traced scales with internal-resolution pixels, and RR's
+    /// primary design regime is reconstructing from a noisy LOWER-res input
+    /// (this matches upstream bevy's `Dlss` component default).
     #[default]
+    #[display("auto")]
+    Auto,
+    /// Native-resolution denoise + anti-aliasing, no upscaling — maximum ray
+    /// cost.
     #[display("dlaa")]
     Dlaa,
     #[display("quality")]
@@ -95,6 +101,7 @@ impl SolariDlssMode {
     /// Every mode, in dropdown order.
     pub const ALL: &'static [SolariDlssMode] = &[
         Self::Off,
+        Self::Auto,
         Self::Dlaa,
         Self::Quality,
         Self::Balanced,
@@ -104,6 +111,7 @@ impl SolariDlssMode {
 
     fn perf_quality_mode(self) -> DlssPerfQualityMode {
         match self {
+            Self::Auto => DlssPerfQualityMode::Auto,
             Self::Off | Self::Dlaa => DlssPerfQualityMode::Dlaa,
             Self::Quality => DlssPerfQualityMode::Quality,
             Self::Balanced => DlssPerfQualityMode::Balanced,
@@ -120,19 +128,6 @@ pub struct RestirDlssContext {
     pub context: Mutex<DlssRayReconstruction>,
     feature_flags: DlssFeatureFlags,
     mode: SolariDlssMode,
-}
-
-/// Per-view DLSS guide buffers (render resolution), filled by the resolve pass
-/// and consumed by the ray-reconstruction render node.
-#[derive(Component)]
-pub struct ViewRestirDlssTextures {
-    /// Linear camera-space depth (R32Float).
-    pub depth: TextureView,
-    /// World-space normal (xyz) + linear roughness (w) — `Packed` roughness.
-    pub normal_roughness: TextureView,
-    pub diffuse_albedo: TextureView,
-    pub specular_albedo: TextureView,
-    pub specular_motion_vectors: TextureView,
 }
 
 /// Creates the DLSS SDK if Ray Reconstruction is supported on this machine and
@@ -182,6 +177,23 @@ pub fn init_dlss(app: &mut App) -> bool {
 /// otherwise a no-op and the restir output is presented raw.
 ///
 /// Must run after `prepare_restir_jitter` so DLSS's `suggested_jitter` wins.
+///
+/// State coupling (main world, every frame): DLSS only ever runs as
+/// `restir` + no debug view. Any other selection forces the mode to `Off` —
+/// the three dropdowns can never silently disagree, the DLSS caption always
+/// shows the truth, and every transition goes through the one proven teardown
+/// path. Re-enable manually after switching back.
+pub fn force_dlss_off_for_non_restir(
+    state: Res<SolariViewState>,
+    mut mode: ResMut<SolariDlssMode>,
+) {
+    let dlss_allowed =
+        state.lighting == crate::render::view::SolariLighting::Restir && state.debug.is_none();
+    if !dlss_allowed && *mode != SolariDlssMode::Off {
+        *mode = SolariDlssMode::Off;
+    }
+}
+
 pub fn prepare_restir_dlss(
     sdk: Option<Res<RestirDlssSdk>>,
     mode: Res<SolariDlssMode>,
@@ -204,13 +216,12 @@ pub fn prepare_restir_dlss(
     };
 
     // Off: tear down the per-view DLSS state so the restir output presents
-    // raw (the Halton jitter from `prepare_restir_jitter` stays in effect).
+    // raw (and unjittered — `prepare_restir_jitter` zeroes the offset).
     if *mode == SolariDlssMode::Off {
         for (entity, _, _, dlss_context) in &mut query {
             if dlss_context.is_some() {
                 commands.entity(entity).remove::<(
                     RestirDlssContext,
-                    ViewRestirDlssTextures,
                     MainPassResolutionOverride,
                 )>();
             }
@@ -266,36 +277,11 @@ pub fn prepare_restir_dlss(
             .suggested_jitter(frame_count.0, render_resolution.to_array())
             .into();
 
-        let guide = |name: &str, format: TextureFormat| {
-            render_device
-                .create_texture(&TextureDescriptor {
-                    label: Some(name),
-                    size: render_resolution.to_extents(),
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: TextureDimension::D2,
-                    format,
-                    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&TextureViewDescriptor::default())
-        };
-
         commands.entity(entity).insert((
             RestirDlssContext {
                 context: Mutex::new(context),
                 feature_flags,
                 mode,
-            },
-            ViewRestirDlssTextures {
-                depth: guide("restir_dlss_depth", TextureFormat::R32Float),
-                normal_roughness: guide("restir_dlss_normal_roughness", TextureFormat::Rgba16Float),
-                diffuse_albedo: guide("restir_dlss_diffuse_albedo", TextureFormat::Rgba8Unorm),
-                specular_albedo: guide("restir_dlss_specular_albedo", TextureFormat::Rgba8Unorm),
-                specular_motion_vectors: guide(
-                    "restir_dlss_specular_motion",
-                    TextureFormat::Rg16Float,
-                ),
             },
             MainPassResolutionOverride(render_resolution),
         ));
@@ -359,7 +345,6 @@ pub fn restir_dlss_resolve_pipeline(
 pub fn restir_dlss_resolve(
     view: ViewQuery<(
         &RestirResources,
-        &ViewRestirDlssTextures,
         &ViewUniformOffset,
     )>,
     pipelines: Res<SolariPipelines>,
@@ -373,7 +358,7 @@ pub fn restir_dlss_resolve(
     mut ctx: RenderContext,
 ) {
     // Gated by `run_if(not(view_is(Pathtrace)) + the two resources exist)`.
-    let (resources, dlss_textures, view_uniform_offset) = view.into_inner();
+    let (resources, view_uniform_offset) = view.into_inner();
     let (
         Some(compute_pipeline),
         Some(scene_bind_group),
@@ -398,11 +383,11 @@ pub fn restir_dlss_resolve(
             &resources.uv,
             &resources.motion_vectors,
             view_uniforms_binding,
-            &dlss_textures.depth,
-            &dlss_textures.normal_roughness,
-            &dlss_textures.diffuse_albedo,
-            &dlss_textures.specular_albedo,
-            &dlss_textures.specular_motion_vectors,
+            &resources.guide_depth,
+            &resources.guide_normal_roughness,
+            &resources.guide_diffuse_albedo,
+            &resources.guide_specular_albedo,
+            &resources.guide_specular_motion,
             &resources.specular_hit_distance,
             resources.view_clip_from_world.as_entire_binding(),
         )),
@@ -428,18 +413,16 @@ pub fn restir_dlss_resolve(
 pub fn restir_dlss(
     view: ViewQuery<(
         &RestirDlssContext,
-        &ViewRestirDlssTextures,
         &RestirResources,
         &TemporalJitter,
         &CameraReset,
-        &ViewTarget,        
+        &ViewTarget,
     ), With<SolariCamera>>,
     adapter: Res<RenderAdapter>,
     mut ctx: RenderContext,
 ) {
     // Gated by `run_if(not(view_is(Pathtrace)))` at registration.
-    let (dlss_context, dlss_textures, resources, temporal_jitter, reset, view_target) =
-        view.into_inner();
+    let (dlss_context, resources, temporal_jitter, reset, view_target) = view.into_inner();
 
     let view_target = view_target.post_process_write();
 
@@ -447,15 +430,15 @@ pub fn restir_dlss(
     let render_resolution = UVec2::from(context.render_resolution());
 
     let render_parameters = DlssRayReconstructionRenderParameters {
-        diffuse_albedo: &dlss_textures.diffuse_albedo,
-        specular_albedo: &dlss_textures.specular_albedo,
-        normals: &dlss_textures.normal_roughness,
+        diffuse_albedo: &resources.guide_diffuse_albedo,
+        specular_albedo: &resources.guide_specular_albedo,
+        normals: &resources.guide_normal_roughness,
         roughness: None, // packed into normals.w
         color: &view_target.source,
-        depth: &dlss_textures.depth,
+        depth: &resources.guide_depth,
         motion_vectors: &resources.motion_vectors,
         specular_guide: DlssRayReconstructionSpecularGuide::SpecularMotionVectors(
-            &dlss_textures.specular_motion_vectors,
+            &resources.guide_specular_motion,
         ),
         screen_space_subsurface_scattering_guide: None,
         bias: None,

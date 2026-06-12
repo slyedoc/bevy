@@ -26,6 +26,8 @@ impl Plugin for SolariDebugPlugin {
                 ui::spawn_dlss_panel,
                 #[cfg(feature = "dlss")]
                 ui::update_dlss_label,
+                #[cfg(feature = "dlss")]
+                ui::append_dlss_guide_items,
             ),
         );
     }

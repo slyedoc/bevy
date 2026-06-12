@@ -33,12 +33,8 @@ pub enum SolariDebugView {
     /// BLAS-sharing correctness (green = correct, red = mis-bucketed).
     #[display("geometry check")]
     GeometryCheck,
-    #[display("world position")]
-    WorldPosition,
     #[display("material id")]
     MaterialId,
-    #[display("world normal")]
-    WorldNormal,
     #[display("uv")]
     Uv,
     #[display("motion vectors")]
@@ -81,9 +77,7 @@ impl SolariDebugView {
         Self::Cluster,
         Self::Triangle,
         Self::GeometryCheck,
-        Self::WorldPosition,
         Self::MaterialId,
-        Self::WorldNormal,
         Self::Uv,
         Self::MotionVectors,
         Self::DiWeight,
@@ -122,9 +116,7 @@ impl SolariDebugView {
     pub fn needs_restir(self) -> bool {
         match self {
             Self::Lod | Self::Cluster | Self::Triangle | Self::GeometryCheck => false,
-            Self::WorldPosition
-            | Self::MaterialId
-            | Self::WorldNormal
+            Self::MaterialId
             | Self::Uv
             | Self::MotionVectors
             | Self::DiWeight

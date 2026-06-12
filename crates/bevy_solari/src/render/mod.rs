@@ -23,7 +23,7 @@ pub mod view_cull;
 #[cfg(feature = "dlss")]
 mod dlss;
 
-use bevy_app::{App, Plugin};
+use bevy_app::{App, Plugin, Update};
 use bevy_asset::embedded_asset;
 use bevy_camera::Hdr;
 use bevy_core_pipeline::{
@@ -189,9 +189,13 @@ impl Plugin for SolarRenderPlugin {
         #[cfg(feature = "dlss")]
         if dlss::init_dlss(app) {
             // The mode resource doubles as the main-world "DLSS is active"
-            // signal (the debug UI keys its quality dropdown on it).
+            // signal (the debug UI keys its quality dropdown on it). The
+            // force-off system keeps the three selectors (integrator, debug
+            // view, DLSS mode) representable: anything but restir-no-debug
+            // forces Off.
             app.init_resource::<SolariDlssMode>()
-                .add_plugins(ExtractResourcePlugin::<SolariDlssMode>::default());
+                .add_plugins(ExtractResourcePlugin::<SolariDlssMode>::default())
+                .add_systems(Update, dlss::force_dlss_off_for_non_restir);
             let render_app = app.sub_app_mut(RenderApp);
             // Guide-buffer overlays only make sense (and only have textures)
             // when DLSS is active.
@@ -209,20 +213,21 @@ impl Plugin for SolarRenderPlugin {
                 )
                 .add_systems(
                     Core3d,
+                    // The resolve derives the guide buffers from the G-buffer
+                    // — it also feeds the dlss guide DEBUG views, so it runs
+                    // whenever the restir chain does, DLSS on or off. The
+                    // evaluate skips itself when no `RestirDlssContext`
+                    // exists, and `force_dlss_off_for_non_restir` guarantees
+                    // there is none on pathtrace or debug-view frames — the
+                    // denoiser never runs over a visualization image (it
+                    // hallucinates chroma fringes at every edge).
                     (dlss::restir_dlss_resolve, dlss::restir_dlss)
                         .chain()
-                        // After every overlay (so the viz is upscaled too);
-                        // upscales restir output, so only on restir frames.
                         .after(overlay::SolariDebugOverlay)
                         .in_set(Core3dSystems::EarlyPostProcess)
                         // `restir_dlss_resolve` reads the central pipeline + layout.
-                        // Skipped for the reservoir/grid debug views — running a
-                        // temporal denoiser over false-color output just smears it.
                         .run_if(
                             restir_enabled
-                                .and_then(|state: bevy_ecs::system::Res<SolariViewState>| {
-                                    state.debug.and_then(|view| view.restir_debug_mode()).is_none()
-                                })
                                 .and_then(resource_exists::<SolariResourceManager>)
                                 .and_then(resource_exists::<SolariPipelines>),
                         ),

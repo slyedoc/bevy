@@ -28,22 +28,28 @@ fn debug_overlay(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
     let pixel = global_id.xy;
+    // `selected` may be smaller than the output (the DLSS guide textures stay
+    // at render resolution while debug views render full-res) — nearest-scale
+    // the sample coordinate; identical dims degenerate to `pixel`.
+    let src = vec2<i32>(
+        pixel * textureDimensions(selected) / vec2u(view.main_pass_viewport.zw),
+    );
     var color = vec3(0.0);
 
 #ifdef VIEW_COLOR
-    color = textureLoad(selected, vec2<i32>(pixel), 0).rgb;
+    color = textureLoad(selected, src, 0).rgb;
 #endif
 #ifdef VIEW_GRAYSCALE
-    color = vec3(textureLoad(selected, vec2<i32>(pixel), 0).r);
+    color = vec3(textureLoad(selected, src, 0).r);
 #endif
 #ifdef VIEW_NORMAL
-    color = textureLoad(selected, vec2<i32>(pixel), 0).xyz * 0.5 + 0.5;
+    color = textureLoad(selected, src, 0).xyz * 0.5 + 0.5;
 #endif
 #ifdef VIEW_MOTION
-    color = vec3(abs(textureLoad(selected, vec2<i32>(pixel), 0).xy) * 20.0, 0.0);
+    color = vec3(abs(textureLoad(selected, src, 0).xy) * 20.0, 0.0);
 #endif
 #ifdef VIEW_MATERIAL_ID
-    let id_texel = textureLoad(selected, vec2<i32>(pixel), 0);
+    let id_texel = textureLoad(selected, src, 0);
     if id_texel.w >= 0.0 {
         color = hash_color(u32(id_texel.w));
     }
