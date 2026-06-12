@@ -167,7 +167,7 @@ pub fn prepare_raytracing_scene_bindings(
             ior: material.ior,
             specular_transmission: material.specular_transmission,
             nested_priority: material.nested_priority,
-            _padding: Default::default(),
+            alpha_mask: material.traversal_alpha_cutoff(),
         };
     }
 
@@ -322,7 +322,7 @@ impl<T, I: Eq + Hash> CachedBindingArray<T, I> {
 
 type StorageBufferList<T> = StorageBuffer<Vec<T>>;
 
-#[derive(ShaderType, Clone, Default)]
+#[derive(ShaderType, Clone)]
 struct GpuMaterial {
     normal_map_texture_id: u32,
     base_color_texture_id: u32,
@@ -340,7 +340,30 @@ struct GpuMaterial {
     ior: f32,
     specular_transmission: f32,
     nested_priority: u32,
-    _padding: f32,
+    // Alpha-mask cutoff; negative = opaque (no alpha test during traversal).
+    alpha_mask: f32,
+}
+
+impl Default for GpuMaterial {
+    fn default() -> Self {
+        Self {
+            normal_map_texture_id: 0,
+            base_color_texture_id: 0,
+            emissive_texture_id: 0,
+            metallic_roughness_texture_id: 0,
+            base_color: Vec3::ZERO,
+            perceptual_roughness: 0.0,
+            emissive: Vec3::ZERO,
+            metallic: 0.0,
+            extinction: Vec3::ZERO,
+            reflectance: 0.0,
+            ior: 1.0,
+            specular_transmission: 0.0,
+            nested_priority: 0,
+            // Opaque: freed material slots must not alpha-test in traversal.
+            alpha_mask: -1.0,
+        }
+    }
 }
 
 // `GpuLightSource` + `GpuDirectionalLight` now live in `crate::lights` (the lights

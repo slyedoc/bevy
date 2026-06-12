@@ -31,6 +31,7 @@
 // idempotent — same `instance_index`, same record.
 
 #import bevy_solari::cluster_bindings::cluster_instance_transforms
+#import bevy_solari::instance_mask::{instance_hardware_mask, material_vk_flags}
 
 /// Mirror of `VkPartitionedAccelerationStructureWriteInstanceDataNV`
 /// (104 B). Field order + size must match the Rust side byte-for-byte.
@@ -84,6 +85,22 @@ struct PtlasFillParams {
 // previous-frame buffer). Compared against `cluster_instance_transforms`
 // (this frame's) to detect moved instances GPU-side.
 @group(1) @binding(10) var<storage, read> instance_previous_transforms: array<mat3x4<f32>>;
+// slot-indexed: instance → stable material slot (`MaterialColumn`).
+@group(1) @binding(11) var<storage, read> instance_material_ids: array<u32>;
+// material-slot-indexed traversal flags (`MaterialTraversalFlags`).
+@group(1) @binding(12) var<storage, read> material_traversal_flags: array<u32>;
+// slot-indexed: the `instance_flags` value last WRITTEN into this slot's
+// PTLAS record (persistent). `fill_incremental` re-specifies an instance
+// when its derived flags drift from this — the flags twin of the move
+// compare — which is what lets the opacity flag be derived purely from the
+// MATERIAL: late loads, swaps, and live asset edits all self-heal.
+@group(1) @binding(13) var<storage, read_write> instance_written_flags: array<u32>;
+
+/// The `instance_flags` an instance's record should carry, derived from its
+/// material — not stored per instance anywhere on the CPU.
+fn derived_vk_flags(slot: u32) -> u32 {
+    return material_vk_flags(material_traversal_flags[instance_material_ids[slot]]);
+}
 
 fn make_record(slot: u32, addr: vec2<u32>) -> WriteInstanceData {
     // `cluster_instance_transforms` is bevy_pbr's affine `mat3x4`
@@ -100,14 +117,19 @@ fn make_record(slot: u32, addr: vec2<u32>) -> WriteInstanceData {
     explicit_aabb[0] = 0.0; explicit_aabb[1] = 0.0; explicit_aabb[2] = 0.0;
     explicit_aabb[3] = 0.0; explicit_aabb[4] = 0.0; explicit_aabb[5] = 0.0;
 
+    // Stamp the flags this record carries (side effect — every record write
+    // goes through here, so the mirror tracks exactly what the PTLAS holds).
+    let vk_flags = derived_vk_flags(slot);
+    instance_written_flags[slot] = vk_flags;
+
     return WriteInstanceData(
         transform,
         explicit_aabb,
-        slot,                    // instance_id (presented to hit shaders)
-        instance_masks[slot],    // instance_mask — RenderLayers cull mask
-        0u,                      // hit-group contribution offset
-        0u,                      // instance_flags
-        slot,                    // instance_index — STABLE PTLAS slot
+        slot,                                            // instance_id (presented to hit shaders)
+        instance_hardware_mask(instance_masks[slot]),    // 8-bit RenderLayers cull mask
+        0u,                                              // hit-group contribution offset
+        vk_flags,                                        // alpha-tested material → FORCE_NO_OPAQUE
+        slot,                                            // instance_index — STABLE PTLAS slot
         params.partition_index,
         addr,
     );
@@ -150,7 +172,10 @@ fn fill_incremental(@builtin(global_invocation_id) gid: vec3<u32>) {
         let cur = cluster_instance_transforms[slot];
         let prev = instance_previous_transforms[slot];
         let moved = any(cur[0] != prev[0]) || any(cur[1] != prev[1]) || any(cur[2] != prev[2]);
-        if !moved {
+        // Material-derived flags drifted from the record (material loaded /
+        // swapped / edited since it was written) → re-specify.
+        let flags_changed = derived_vk_flags(slot) != instance_written_flags[slot];
+        if !moved && !flags_changed {
             return;
         }
     }

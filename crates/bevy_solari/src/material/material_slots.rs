@@ -77,3 +77,43 @@ pub fn prepare_material_slots(
         |id| material_assets.get(&id).is_some(),
     );
 }
+
+/// Per-material-slot traversal flags consumed by the PTLAS fill (bit 0 =
+/// the material needs candidate-hit inspection, i.e. it alpha-tests — see
+/// [`SolariMaterial::traversal_alpha_cutoff`]). Slot-aligned with
+/// `materials[]`. The fill derives each instance's `FORCE_NO_OPAQUE` flag
+/// from this **on the GPU** (via the instance's `material_id` column) and
+/// detects changes by comparing against the record it last wrote — so a
+/// late-loading material, a runtime material swap, or a live asset edit all
+/// self-heal without any CPU change tracking.
+#[derive(Resource, Default)]
+pub struct MaterialTraversalFlags {
+    pub buffer: bevy_render::render_resource::StorageBuffer<Vec<u32>>,
+}
+
+/// `Render::Prepare` (after [`prepare_material_slots`]): rebuild the
+/// slot-aligned flag list. O(materials) per frame — materials are few and the
+/// payload is one `u32` each.
+pub fn prepare_material_traversal_flags(
+    mut flags: ResMut<MaterialTraversalFlags>,
+    slots: Option<Res<MaterialSlots>>,
+    material_assets: Res<SolariMaterialAssets>,
+    render_device: Res<bevy_render::renderer::RenderDevice>,
+    render_queue: Res<bevy_render::renderer::RenderQueue>,
+) {
+    let Some(slots) = slots.as_deref() else {
+        return;
+    };
+    // ≥1 element so the PTLAS fill bind group always has a live buffer
+    // (instances can exist before any non-default material does).
+    let len = (slots.len() as usize).max(1);
+    let list = flags.buffer.get_mut();
+    list.clear();
+    list.resize(len, 0);
+    for (asset_id, slot) in slots.iter() {
+        if let Some(material) = material_assets.get(&asset_id) {
+            list[slot as usize] = (material.traversal_alpha_cutoff() >= 0.0) as u32;
+        }
+    }
+    flags.buffer.write_buffer(&render_device, &render_queue);
+}

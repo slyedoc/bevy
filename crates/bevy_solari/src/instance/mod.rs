@@ -19,7 +19,10 @@ use crate::ecs_gpu::GpuColumnPrepareSet;
 // Material-slot allocation lives in `crate::material` now (an asset-keyed
 // `ecs_gpu::SlotPool`); the instance plugin schedules its prepare since the
 // per-instance `MaterialColumn` resolves against it.
-use crate::material::{init_material_slots, prepare_material_slots};
+use crate::material::{
+    init_material_slots, prepare_material_slots, prepare_material_traversal_flags,
+    MaterialTraversalFlags,
+};
 use crate::SolariClusterSystems;
 
 pub mod gpu_instances;
@@ -44,6 +47,7 @@ pub struct InstancePlugin;
 
 impl Plugin for InstancePlugin {
     fn build(&self, app: &mut App) {
+        bevy_shader::load_shader_library!(app, "instance_mask.wgsl");
         app.register_type::<RaytracingMesh3d>();
         // Each per-instance GPU column is its own `GpuColumnPlugin` (parallel
         // prepare + scatter). They schedule into `GpuColumnPrepareSet`, ordered
@@ -65,6 +69,7 @@ impl Plugin for InstancePlugin {
         };
         render_app
             .init_resource::<RtSlotMap>()
+            .init_resource::<MaterialTraversalFlags>()
             .add_systems(
                 RenderStartup,
                 (init_instance_manager, init_material_slots),
@@ -84,6 +89,11 @@ impl Plugin for InstancePlugin {
                 Render,
                 (
                     prepare_material_slots.in_set(RenderSystems::Prepare),
+                    // Slot-aligned alpha-test flags the PTLAS fill derives
+                    // instance opacity from (GPU-side).
+                    prepare_material_traversal_flags
+                        .in_set(RenderSystems::Prepare)
+                        .after(prepare_material_slots),
                     // Resolves `material_id` the `MaterialColumn` reads, so it
                     // must precede every column prepare.
                     resolve_instance_material_ids

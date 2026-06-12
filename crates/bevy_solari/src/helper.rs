@@ -117,6 +117,7 @@ pub fn convert_standard_materials_to_solari(
     std_materials: Res<Assets<StandardMaterial>>,
     mut solari_materials: ResMut<Assets<SolariMaterial>>,
     mut cache: Local<HashMap<AssetId<StandardMaterial>, Handle<SolariMaterial>>>,
+    #[cfg(feature = "gltf")] extras_query: Query<&bevy_gltf::GltfMaterialExtras>,
 ) {
     for (entity, mesh_material) in &query {
         let std_id = mesh_material.0.id();
@@ -126,7 +127,17 @@ pub fn convert_standard_materials_to_solari(
             let Some(std_material) = std_materials.get(std_id) else {
                 continue; // asset not loaded yet — retry next frame
             };
-            let handle = solari_materials.add(SolariMaterial::from(std_material));
+            #[allow(unused_mut)]
+            let mut material = SolariMaterial::from(std_material);
+            // Solari-only authoring with no glTF extension (nested-dielectric
+            // priorities) rides the material's extras — `StandardMaterial`
+            // drops them, but bevy_gltf leaves the raw JSON on the entity.
+            #[cfg(feature = "gltf")]
+            if let Ok(extras) = extras_query.get(entity) {
+                material.nested_priority =
+                    crate::material::nested_priority_from_extras(&extras.value);
+            }
+            let handle = solari_materials.add(material);
             cache.insert(std_id, handle.clone());
             handle
         };

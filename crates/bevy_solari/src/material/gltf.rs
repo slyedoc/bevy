@@ -29,13 +29,9 @@ fn solari_material_from_gltf(
     material: &GltfMaterial,
     gltf_material: Option<&gltf::Material>,
 ) -> SolariMaterial {
-    let extras = gltf_material
+    let nested_priority = gltf_material
         .and_then(|m| m.extras().as_ref())
-        .and_then(|extras| serde_json::from_str::<serde_json::Value>(extras.get()).ok());
-    let nested_priority = extras
-        .as_ref()
-        .and_then(|value| value.get("nested_priority")?.as_u64())
-        .map_or(0, |priority| priority as u32);
+        .map_or(0, |extras| nested_priority_from_extras(extras.get()));
 
     SolariMaterial {
         base_color: material.base_color,
@@ -51,8 +47,21 @@ fn solari_material_from_gltf(
         attenuation_distance: material.attenuation_distance,
         attenuation_color: material.attenuation_color,
         nested_priority,
+        alpha_mode: material.alpha_mode,
         normal_map_texture: material.normal_map_texture.clone(),
     }
+}
+
+/// Parse `nested_priority` out of a material's extras JSON (see
+/// [`SolariMaterial::nested_priority`]) — there is no standard glTF extension
+/// for nested-dielectric priorities, so they travel in `extras`. Used by both
+/// the glTF handler (raw extras at load) and the `StandardMaterial` conversion
+/// helper (the `GltfMaterialExtras` component on spawned mesh entities).
+pub(crate) fn nested_priority_from_extras(extras: &str) -> u32 {
+    serde_json::from_str::<serde_json::Value>(extras)
+        .ok()
+        .and_then(|value| value.get("nested_priority")?.as_u64())
+        .map_or(0, |priority| priority as u32)
 }
 
 #[derive(Default, Clone)]

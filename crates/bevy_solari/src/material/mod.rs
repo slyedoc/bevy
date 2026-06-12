@@ -11,16 +11,22 @@ use bevy_color::{Color, LinearRgba};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{component::Component, prelude::ReflectComponent, template::FromTemplate};
 use bevy_image::{CompressedImageFormats, Image, ImageSampler, ImageType};
+use bevy_material::AlphaMode;
 use bevy_pbr::{DfgLut, StandardMaterial};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_render::RenderApp;
 use derive_more::derive::From;
 
 pub mod material_slots;
-pub use material_slots::{init_material_slots, prepare_material_slots, MaterialSlots};
+pub use material_slots::{
+    init_material_slots, prepare_material_slots, prepare_material_traversal_flags, MaterialSlots,
+    MaterialTraversalFlags,
+};
 
 #[cfg(feature = "gltf")]
 mod gltf;
+#[cfg(feature = "gltf")]
+pub(crate) use gltf::nested_priority_from_extras;
 
 /// A physically-based material consumed by the `bevy_solari` ray tracer. Mirrors
 /// the `StandardMaterial` fields the scene binder reads; see the module docs for
@@ -67,6 +73,13 @@ pub struct SolariMaterial {
     /// wins the overlap region. Read from the glTF material's
     /// `extras.nested_priority`. `0` = no nesting expected.
     pub nested_priority: u32,
+    /// How the base-color texture's alpha channel is applied — bevy's
+    /// [`AlphaMode`]. The ray tracer alpha-tests candidate hits during BVH
+    /// traversal, so cutouts (foliage, fences, grates) hold for shading,
+    /// reflections, refractions, and shadows alike. [`AlphaMode::Mask`] tests
+    /// at its cutoff; every other non-opaque mode is approximated as a 0.5
+    /// cutout (true stochastic alpha blending is not implemented).
+    pub alpha_mode: AlphaMode,
     /// Optional tangent-space normal map.
     pub normal_map_texture: Option<Handle<Image>>,
 }
@@ -78,6 +91,24 @@ impl SolariMaterial {
         Self {
             base_color: color.into(),
             ..Default::default()
+        }
+    }
+
+    /// The alpha cutoff `trace_ray`'s traversal alpha test uses, or a negative
+    /// value for "opaque — commit hits in hardware, never invoke the test".
+    /// [`AlphaMode::Mask`] tests at its cutoff; any other non-opaque mode is
+    /// approximated as a 0.5 cutout (no stochastic alpha blending in the ray
+    /// tracer). Transmissive materials are exempt — refraction owns those
+    /// surfaces, and glass assets commonly keep their authored `Blend` mode
+    /// alongside `KHR_materials_transmission`.
+    pub fn traversal_alpha_cutoff(&self) -> f32 {
+        if self.specular_transmission > 0.0 {
+            return -1.0;
+        }
+        match self.alpha_mode {
+            AlphaMode::Opaque => -1.0,
+            AlphaMode::Mask(cutoff) => cutoff,
+            _ => 0.5,
         }
     }
 }
@@ -100,6 +131,7 @@ impl Default for SolariMaterial {
             attenuation_distance: f32::INFINITY,
             attenuation_color: Color::WHITE,
             nested_priority: 0,
+            alpha_mode: AlphaMode::Opaque,
             normal_map_texture: None,
         }
     }
@@ -126,6 +158,7 @@ impl From<&StandardMaterial> for SolariMaterial {
             attenuation_distance: m.attenuation_distance,
             attenuation_color: m.attenuation_color,
             nested_priority: 0,
+            alpha_mode: m.alpha_mode,
             normal_map_texture: m.normal_map_texture.clone(),
         }
     }

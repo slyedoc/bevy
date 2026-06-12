@@ -50,6 +50,7 @@ pub fn render_layers_to_mask(layers: Option<&RenderLayers>) -> u32 {
     (layers.bits().first().copied().unwrap_or(0) & 0xFF) as u32
 }
 
+
 /// Per-view uniform carrying the camera's RT cull mask + sky (skybox) brightness.
 /// `cull_mask` is `vec4<u32>` (`.x` = mask) for an unambiguous 16-byte alignment;
 /// `environment_brightness` follows. Bound in each pass's group(1); each tracing

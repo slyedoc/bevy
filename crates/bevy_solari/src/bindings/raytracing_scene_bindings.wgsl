@@ -42,7 +42,8 @@ struct Material {
     ior: f32,
     specular_transmission: f32,
     nested_priority: u32,
-    _padding: f32,
+    // Alpha-mask cutoff; negative = opaque (no alpha test during traversal).
+    alpha_mask: f32,
 }
 
 const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
@@ -183,8 +184,41 @@ fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ra
     let ray = RayDesc(ray_flag, view_cull_mask, ray_t_min, ray_t_max, ray_origin, ray_direction);
     var rq: ray_query;
     rayQueryInitialize(&rq, tlas, ray);
-    rayQueryProceed(&rq);
+    // Opaque instances commit in hardware and never enter this loop; only
+    // alpha-masked instances (PTLAS `FORCE_NO_OPAQUE`) surface candidates.
+    // Confirming only mask-passing candidates makes cutouts (foliage,
+    // fences) hold for primary, bounce, AND shadow rays alike.
+    while rayQueryProceed(&rq) {
+        let candidate = rayQueryGetCandidateIntersection(&rq);
+        if candidate.kind == RAY_QUERY_INTERSECTION_TRIANGLE && alpha_test(candidate) {
+            rayQueryConfirmIntersection(&rq);
+        }
+    }
     return rayQueryGetCommittedIntersection(&rq);
+}
+
+// Mask test for a candidate triangle: base-color texture alpha at the hit UV
+// against the material's cutoff. No texture = solid (alpha 1). The base-color
+// FACTOR's alpha is not applied (the binder stores rgb only) — glTF cutouts
+// author the mask in the texture.
+fn alpha_test(hit: RayIntersection) -> bool {
+    let material = materials[material_ids[hit.instance_index]];
+    if material.alpha_mask < 0.0 {
+        return true; // opaque material on a non-opaque instance (stale flag)
+    }
+    let texture_id = material.base_color_texture_id;
+    if texture_id == TEXTURE_MAP_NONE {
+        return material.alpha_mask <= 1.0;
+    }
+    let cluster = clusters[hit.geometry_index];
+    let idx_base = cluster.index_offset + hit.primitive_index * 3u;
+    let uv0 = vertex_uvs[cluster.vertex_offset + cluster_indices[idx_base + 0u]];
+    let uv1 = vertex_uvs[cluster.vertex_offset + cluster_indices[idx_base + 1u]];
+    let uv2 = vertex_uvs[cluster.vertex_offset + cluster_indices[idx_base + 2u]];
+    let barycentrics = vec3(1.0 - hit.barycentrics.x - hit.barycentrics.y, hit.barycentrics);
+    let uv = mat3x2(uv0, uv1, uv2) * barycentrics;
+    let alpha = textureSampleLevel(textures[texture_id], samplers[texture_id], uv, 0.0).a;
+    return alpha >= material.alpha_mask;
 }
 
 fn sample_texture(id: u32, uv: vec2<f32>) -> vec3<f32> {

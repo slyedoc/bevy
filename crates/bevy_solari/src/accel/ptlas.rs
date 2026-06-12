@@ -74,8 +74,9 @@ use wgpu::CommandEncoderDescriptor;
 use crate::bindings::ClusterSceneBindGroup;
 use crate::ecs_gpu::GpuColumn;
 use crate::instance::{
-    GeometryIdColumn, InstanceManager, InstanceMaskColumn, TransformColumn,
+    GeometryIdColumn, InstanceManager, InstanceMaskColumn, MaterialColumn, TransformColumn,
 };
+use crate::material::MaterialTraversalFlags;
 
 use crate::gpu::allocator::{Allocator, SparseBuffer};
 use super::blas_sharing::BlasSharing;
@@ -231,6 +232,16 @@ pub struct Ptlas {
     /// compute pipeline ids live on [`SolariPipelines`], the layout on
     /// [`SolariResourceManager`].
     pub bind_group: Option<BindGroup>,
+
+    /// Per-slot `instance_flags` value last WRITTEN into a PTLAS record
+    /// (persistent). The fill derives each instance's flags from its
+    /// material's traversal flags and re-specifies the instance when they
+    /// differ — GPU change detection, the flags twin of the
+    /// current-vs-previous transform compare. Recreated zeroed on slot
+    /// growth (growth forces a full rebuild, which restamps every slot).
+    pub instance_written_flags: Buffer,
+    /// Slot capacity of [`Self::instance_written_flags`].
+    pub written_flags_capacity: u32,
 }
 
 impl Ptlas {
@@ -317,6 +328,13 @@ pub fn init_ptlas(
     let mut fill_params: UniformBuffer<PtlasFillParamsGpu> = UniformBuffer::default();
     fill_params.set_label(Some("ptlas.fill_params"));
 
+    let instance_written_flags = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ptlas.instance_written_flags"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
     commands.insert_resource(Ptlas {
         storage,
         scratch,
@@ -336,6 +354,8 @@ pub fn init_ptlas(
         op_count: 0,
         full_rebuild: false,
         bind_group: None,
+        instance_written_flags,
+        written_flags_capacity: 1,
     });
 }
 
@@ -376,6 +396,21 @@ pub fn prepare_ptlas_params(
     // full on the very first build (no `src` to carry from).
     let grew = high_water > resources.as_capacity;
     let full_rebuild = !resources.has_built || grew;
+
+    // Grow the per-slot written-flags mirror with the slot space. Fresh
+    // buffer = all zeros, consistent because growth forces a full rebuild
+    // (`force_all` restamps every active slot this frame).
+    if high_water > resources.written_flags_capacity {
+        resources.instance_written_flags =
+            render_device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ptlas.instance_written_flags"),
+                size: high_water as u64 * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+        resources.written_flags_capacity = high_water;
+        debug_assert!(full_rebuild);
+    }
 
     // We can't skip the build on a no-CPU-delta frame: a geometry's
     // shared BLAS can be rebuilt in place at a new LOD level (detected
@@ -578,25 +613,34 @@ pub fn prepare_ptlas_fill_bind_group(
     sharing: Option<Res<BlasSharing>>,
     geometry_ids: Option<Res<GpuColumn<GeometryIdColumn>>>,
     instance_masks: Option<Res<GpuColumn<InstanceMaskColumn>>>,
+    material_ids: Option<Res<GpuColumn<MaterialColumn>>>,
+    material_flags: Res<MaterialTraversalFlags>,
     transforms: Option<Res<GpuColumn<TransformColumn>>>,
     render_device: Res<RenderDevice>,
 ) {
     let Some(ptlas) = ptlas.as_deref_mut() else {
         return;
     };
-    let (Some(resource_manager), Some(sharing), Some(geometry_ids), Some(instance_masks), Some(transforms)) =
-        (resource_manager, sharing, geometry_ids, instance_masks, transforms)
+    let (Some(resource_manager), Some(sharing), Some(geometry_ids), Some(instance_masks), Some(material_ids), Some(transforms)) =
+        (resource_manager, sharing, geometry_ids, instance_masks, material_ids, transforms)
     else {
         ptlas.bind_group = None;
         return;
     };
-    let (Some(params_binding), Some(write_slots), Some(active_to_slot), Some(previous_transforms)) = (
+    let (
+        Some(params_binding),
+        Some(write_slots),
+        Some(active_to_slot),
+        Some(previous_transforms),
+        Some(material_flags),
+    ) = (
         ptlas.fill_params.binding(),
         ptlas.write_slots_cpu.buffer(),
         sharing.active_to_slot.buffer(),
         // `fill_incremental` compares current vs previous to detect moves.
         // `TransformColumn` is `KEEP_PREVIOUS`, so this is always `Some`.
         transforms.previous_buffer(),
+        material_flags.buffer.buffer(),
     ) else {
         // The buffers are populated earlier in Prepare; None here means
         // no instances yet.
@@ -605,6 +649,7 @@ pub fn prepare_ptlas_fill_bind_group(
     };
     let geometry_ids = geometry_ids.buffer().as_entire_binding();
     let instance_masks = instance_masks.buffer().as_entire_binding();
+    let material_ids = material_ids.buffer().as_entire_binding();
 
     let group = render_device.create_bind_group(
         "ptlas_fill_bind_group",
@@ -621,6 +666,9 @@ pub fn prepare_ptlas_fill_bind_group(
             geometry_ids,
             instance_masks,
             previous_transforms.as_entire_binding(),
+            material_ids,
+            material_flags.as_entire_binding(),
+            ptlas.instance_written_flags.as_entire_binding(),
         )),
     );
     ptlas.bind_group = Some(group);
