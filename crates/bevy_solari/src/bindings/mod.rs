@@ -28,6 +28,7 @@ use crate::SolariSetup;
 mod bind_groups;
 mod binder;
 mod extract;
+mod portal;
 mod types;
 
 pub use bind_groups::{
@@ -36,6 +37,7 @@ pub use bind_groups::{
 };
 pub use binder::{prepare_raytracing_scene_bindings, RaytracingSceneBindings};
 pub use extract::SolariMaterialAssets;
+pub use portal::{PortalTable, SolariPortal};
 pub use types::RaytracingMesh3d;
 
 /// Register the cluster scene-bind-group shader library (the `@group(0)`
@@ -67,20 +69,24 @@ impl Plugin for BindingsPlugin {
         register_cluster_shaders(app);
         register_scene_shaders(app);
         app.add_plugins(ExtractResourcePlugin::<SolariMaterialAssets>::default());
+        app.register_type::<SolariPortal>();
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
         render_app
             .init_resource::<ClusterSceneBindGroup>()
+            .init_resource::<PortalTable>()
             .insert_resource(RaytracingSceneBindings::new())
             .add_systems(
                 RenderStartup,
                 init_cluster_scene_bind_group_layout.in_set(SolariSetup),
             )
+            .add_systems(bevy_render::ExtractSchedule, portal::extract_solari_portals)
             .add_systems(
                 Render,
                 (
+                    portal::prepare_solari_portals.in_set(RenderSystems::Prepare),
                     prepare_cluster_scene_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     prepare_raytracing_scene_bindings
                         .in_set(RenderSystems::PrepareBindGroups)

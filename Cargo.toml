@@ -1656,6 +1656,25 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
+name = "solari_portal"
+path = "examples/3d/solari/portal.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_gltf",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_portal]
+name = "Solari (portals)"
+description = "Surfaces that teleport rays mid-traversal - recursive portals, portals in reflections and through glass, walk-through."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
 name = "spherical_area_lights"
 path = "examples/3d/spherical_area_lights.rs"
 doc-scrape-examples = true

@@ -105,6 +105,16 @@ struct DirectionalLight {
 // directional_count]` header, then the active emissive slots, then the active
 // directional slots (strata contiguous for the stratified pick).
 @group(0) @binding(17) var<storage> active_light_list: array<u32>;
+
+// Ray portals (`bindings::portal`): surfaces that teleport rays. Just the
+// instance-slot pairing — the ray map derives on hit from the LIVE GPU
+// transform table (`transforms`), so portals on GPU-propagated / moving
+// parents stay exact. `u32::MAX` slot = dummy keeping the binding valid.
+struct Portal {
+    slot: u32,
+    target_slot: u32,
+}
+@group(0) @binding(18) var<storage> portals: array<Portal>;
 // `directional_lights` is also a scene column (the lights table owns it).
 @group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(3) var<storage> directional_lights: array<DirectionalLight>;
 
@@ -358,6 +368,87 @@ fn affine_transform_point(m: mat3x4<f32>, p: vec3<f32>) -> vec3<f32> {
 // Apply the linear part only (for directions / normals).
 fn affine_transform_direction(m: mat3x4<f32>, v: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(dot(m[0].xyz, v), dot(m[1].xyz, v), dot(m[2].xyz, v));
+}
+
+// Nudge past the exit portal's surface so the continued ray doesn't
+// immediately re-hit it.
+const PORTAL_SURFACE_OFFSET: f32 = 1e-4;
+
+// Inverse of a row-packed affine (mat3x4, column k = the 4x4's row k):
+// 3x3 adjugate for the linear part, `-L⁻¹·t` for the translation.
+fn affine_inverse(m: mat3x4<f32>) -> mat3x4<f32> {
+    // The linear part's COLUMNS (standard math convention).
+    let c0 = vec3(m[0].x, m[1].x, m[2].x);
+    let c1 = vec3(m[0].y, m[1].y, m[2].y);
+    let c2 = vec3(m[0].z, m[1].z, m[2].z);
+    let t = vec3(m[0].w, m[1].w, m[2].w);
+    let inv_det = 1.0 / dot(c0, cross(c1, c2));
+    let r0 = cross(c1, c2) * inv_det;
+    let r1 = cross(c2, c0) * inv_det;
+    let r2 = cross(c0, c1) * inv_det;
+    return mat3x4<f32>(
+        vec4(r0, -dot(r0, t)),
+        vec4(r1, -dot(r1, t)),
+        vec4(r2, -dot(r2, t)),
+    );
+}
+
+// If `hit_instance` is a portal surface, teleport the ray and return true
+// (the caller re-traces instead of shading). The map is
+// `W_target · R_y(π) · W_portal⁻¹` — into portal-local space, a half-turn
+// about local Y (negate x and z: walk in face-first, exit face-first), out
+// through the target's frame — derived from the live `transforms` column.
+// Light is NOT transported: portals carry the view, not next-event
+// estimation, so each side is lit by its own surroundings.
+fn portal_redirect(
+    hit_instance: u32,
+    hit_position: vec3<f32>,
+    ray_origin: ptr<function, vec3<f32>>,
+    ray_direction: ptr<function, vec3<f32>>,
+) -> bool {
+    for (var i = 0u; i < arrayLength(&portals); i += 1u) {
+        if portals[i].slot != hit_instance {
+            continue;
+        }
+        let into_portal = affine_inverse(transforms[portals[i].slot]);
+        let out_of_target = transforms[portals[i].target_slot];
+        var p = affine_transform_point(into_portal, hit_position);
+        var d = affine_transform_direction(into_portal, *ray_direction);
+        p = vec3(-p.x, p.y, -p.z);
+        d = vec3(-d.x, d.y, -d.z);
+        let direction = normalize(affine_transform_direction(out_of_target, d));
+        *ray_origin = affine_transform_point(out_of_target, p)
+            + direction * PORTAL_SURFACE_OFFSET;
+        *ray_direction = direction;
+        return true;
+    }
+    return false;
+}
+
+// `trace_ray`, following portal teleports (≤ 4 crossings): origin/direction
+// are updated in place so the caller's ray state matches the returned
+// intersection (the first NON-portal result). Structured with `let`s only —
+// naga rejects re-assigning a `var` of the special RayIntersection type.
+fn trace_ray_through_portals(
+    ray_origin: ptr<function, vec3<f32>>,
+    ray_direction: ptr<function, vec3<f32>>,
+    ray_t_min: f32,
+    ray_flag: u32,
+) -> RayIntersection {
+    for (var crossing = 0u; crossing < 4u; crossing += 1u) {
+        let ray = trace_ray(
+            *ray_origin,
+            *ray_direction,
+            select(0.0, ray_t_min, crossing == 0u),
+            RAY_T_MAX,
+            ray_flag,
+        );
+        if ray.kind == RAY_QUERY_INTERSECTION_NONE
+            || !portal_redirect(ray.instance_index, *ray_origin + *ray_direction * ray.t, ray_origin, ray_direction) {
+            return ray;
+        }
+    }
+    return trace_ray(*ray_origin, *ray_direction, 0.0, RAY_T_MAX, ray_flag);
 }
 
 fn transform_positions(transform: mat3x4<f32>, vertices: array<Vertex, 3>) -> array<vec3<f32>, 3> {

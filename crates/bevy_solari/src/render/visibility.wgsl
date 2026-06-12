@@ -16,7 +16,7 @@ enable wgpu_ray_query;
 // shade time.
 
 #import bevy_solari::restir_bindings::{view, gbuffer_position, gbuffer_normal, motion_vectors, gbuffer_uv, view_clip_from_world, solari_view}
-#import bevy_solari::scene_bindings::{trace_ray, set_view_cull_mask, resolve_ray_hit_full, material_ids, RAY_T_MAX}
+#import bevy_solari::scene_bindings::{trace_ray, trace_ray_through_portals, set_view_cull_mask, resolve_ray_hit_full, material_ids, RAY_T_MAX}
 
 @compute @workgroup_size(8, 8, 1)
 fn visibility(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -39,10 +39,15 @@ fn visibility(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let pixel_uv = pixel_center / view.main_pass_viewport.zw;
     let pixel_ndc = pixel_uv * 2.0 - 1.0;
     let ray_target = view.world_from_clip * vec4(pixel_ndc.x, -pixel_ndc.y, 1.0, 1.0);
-    let ray_origin = view.world_position;
-    let ray_direction = normalize((ray_target.xyz / ray_target.w) - ray_origin);
+    var ray_origin = view.world_position;
+    var ray_direction = normalize((ray_target.xyz / ray_target.w) - ray_origin);
 
-    let ray = trace_ray(ray_origin, ray_direction, 0.0, RAY_T_MAX, RAY_FLAG_NONE);
+    // Portal surfaces teleport the primary ray: the G-buffer holds the
+    // DESTINATION surface, so lighting, NEE, and temporal reprojection all
+    // operate on what the portal SHOWS. (View-dependent specular at those
+    // pixels uses the camera direction rather than the teleported ray — a
+    // known approximation; the pathtracer is exact.)
+    let ray = trace_ray_through_portals(&ray_origin, &ray_direction, 0.0, RAY_FLAG_NONE);
 
     if ray.kind == RAY_QUERY_INTERSECTION_NONE {
         // Miss: negative w marks "no geometry"; later passes skip it.
