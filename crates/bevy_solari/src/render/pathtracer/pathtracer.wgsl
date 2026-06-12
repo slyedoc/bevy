@@ -1,7 +1,7 @@
 enable wgpu_ray_query;
 
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
-#import bevy_solari::pbr::{rand_f, rand_vec2f}
+#import bevy_solari::pbr::{rand_f, rand_vec2f, rand_range_u}
 #import bevy_render::view::View
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, generate_random_emissive_light_sample, calculate_resolved_light_contribution, trace_light_visibility, emissive_light_count, NULL_LIGHT_ID}
@@ -385,6 +385,10 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 seg_steps[0] = AERIAL_STEPS;
                 seg_count = 1u;
             }
+            var total_steps = 0u;
+            for (var si = 0u; si < seg_count; si += 1u) {
+                total_steps += seg_steps[si];
+            }
             let cos_theta = dot(atmosphere.sun_direction, primary_ray_direction);
             let sun_phase = atmosphere_mie_phase(atmosphere.aerial_phase_g, cos_theta);
             // Sunlight reaching the fog, attenuated by the atmosphere toward the sun
@@ -401,18 +405,30 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let sky_ambient = textureSampleLevel(
                 environment_map, environment_map_sampler, vec3(0.0, 1.0, 0.0), 0.0,
             ).rgb * solari_view.environment_brightness;
+            // Local-light sampling runs at ONE randomly chosen step per
+            // sample, weighted by the step count (unbiased) — accumulation
+            // converges it, and per-step sampling multiplies the march's cost
+            // by the step count.
+            let light_step = rand_range_u(total_steps, &rng);
+            var step_index = 0u;
             var fog_transmittance = 1.0;
             var inscatter = vec3(0.0);
             for (var si = 0u; si < seg_count; si += 1u) {
                 let ds = (seg_bounds[si].y - seg_bounds[si].x) / f32(seg_steps[si]);
                 for (var i = 0u; i < seg_steps[si]; i = i + 1u) {
                     if fog_transmittance < 0.003 { break; } // fog is opaque — nothing more shows through
+                    let fog_step = step_index;
+                    step_index += 1u;
                     // Independent per-step jitter: a shared offset makes the
                     // whole march's error coherent per pixel (blotches);
                     // independent strata read as fine grain and settle faster.
                     let p = camera_position + primary_ray_direction
                         * (seg_bounds[si].x + (f32(i) + rand_f(&rng)) * ds);
                     var s = fog_volumes_sample(p, cos_theta);
+                    // Local-light NEE is gated on FOG-VOLUME scattering (see
+                    // the compose pass) — volumes are the opt-in; the global
+                    // height fog alone takes only sun + sky.
+                    let volume_light_weight = s.phase_weight;
                     if atmosphere.aerial_enabled > 0.0 {
                         let sigma = atmosphere_fog_extinction(atmosphere, p.y);
                         s.sigma_t += sigma;
@@ -436,7 +452,7 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     // scattering-averaged `g`, shadowed by a real visibility
                     // ray. Accumulation converges the single-sample variance;
                     // the realtime compose pass uses the ReGIR grid instead.
-                    if emissive_light_count() > 0u && s.phase_weight > 1e-7 {
+                    if fog_step == light_step && volume_light_weight > 1e-7 && emissive_light_count() > 0u {
                         let light = generate_random_emissive_light_sample(&rng);
                         if light.light_sample.light_id != NULL_LIGHT_ID {
                             let contribution = calculate_resolved_light_contribution(
@@ -446,7 +462,8 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                                 let phase = atmosphere_mie_phase(g_eff, dot(contribution.wi, primary_ray_direction));
                                 let vis = trace_light_visibility(p, light.resolved_light_sample.world_position);
                                 inscatter += fog_transmittance * s.sigma_s
-                                    * (phase * contribution.inverse_pdf * vis) * contribution.radiance * ds;
+                                    * (phase * contribution.inverse_pdf * vis * f32(total_steps))
+                                    * contribution.radiance * ds;
                             }
                         }
                     }

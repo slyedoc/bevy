@@ -78,6 +78,7 @@ fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
         var seg_bounds: array<vec2<f32>, 3>;
         var seg_steps: array<u32, 3>;
         var seg_count = 0u;
+        var total_steps = 0u;
         if atmosphere.aerial_enabled > 0.0 && vol_span.y > vol_span.x {
             let a = clamp(vol_span.x, t_start, t_end);
             let b = clamp(vol_span.y, t_start, t_end);
@@ -99,6 +100,9 @@ fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
             seg_steps[0] = AERIAL_STEPS;
             seg_count = 1u;
         }
+        for (var si = 0u; si < seg_count; si += 1u) {
+            total_steps += seg_steps[si];
+        }
 
         let cos_theta = dot(atmosphere.sun_direction, ray_direction);
         let sun_phase = atmosphere_mie_phase(atmosphere.aerial_phase_g, cos_theta);
@@ -117,18 +121,32 @@ fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         var rng = (global_id.x + global_id.y * u32(view.main_pass_viewport.z))
             + view.frame_count * 5782582u;
+        // Local-light sampling runs at ONE randomly chosen step per pixel,
+        // weighted by the step count (unbiased) — per-step sampling multiplies
+        // the march's whole cost (query + resolve + shadow ray) by the step
+        // count, which is a fps cliff under city-wide global fog. The temporal
+        // pass owns the variance, same contract as the march jitter.
+        let light_step = rand_range_u(total_steps, &rng);
+        var step_index = 0u;
         var fog_transmittance = 1.0;
         var inscatter = vec3(0.0);
         for (var si = 0u; si < seg_count; si += 1u) {
             let ds = (seg_bounds[si].y - seg_bounds[si].x) / f32(seg_steps[si]);
             for (var i = 0u; i < seg_steps[si]; i = i + 1u) {
                 if fog_transmittance < 0.003 { break; } // fog is opaque — nothing more shows through
+                let fog_step = step_index;
+                step_index += 1u;
                 // Independent per-step jitter: a shared offset makes the whole
                 // march's error coherent per pixel (blotches); independent
                 // strata read as fine grain and settle faster.
                 let p = view.world_position + ray_direction
                     * (seg_bounds[si].x + (f32(i) + rand_f(&rng)) * ds);
                 var s = fog_volumes_sample(p, cos_theta);
+                // Local-light NEE is gated on FOG-VOLUME scattering — with
+                // only the global height fog (a whole city of it), paying a
+                // grid query + resolve + shadow ray per pixel buys emissive
+                // glow daylight drowns out. Volumes are the opt-in.
+                let volume_light_weight = s.phase_weight;
                 if atmosphere.aerial_enabled > 0.0 {
                     let sigma = atmosphere_fog_extinction(atmosphere, p.y);
                     s.sigma_t += sigma;
@@ -156,7 +174,7 @@ fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 // is never double-counted. The "normal" handed to the query is
                 // the view ray — its tangent-plane jitter then decorrelates
                 // the two directions the march doesn't already jitter along.
-                if emissive_light_count() > 0u && s.phase_weight > 1e-7 {
+                if fog_step == light_step && volume_light_weight > 1e-7 && emissive_light_count() > 0u {
                     var resolved = ResolvedLightSample(vec4(0.0), vec3(0.0), vec3(0.0), 0.0);
                     var light_valid = false;
                     let cell = regir_query(p, ray_direction, view.world_position, &rng);
@@ -185,7 +203,8 @@ fn compose(@builtin(global_invocation_id) global_id: vec3<u32>) {
                             let phase = atmosphere_mie_phase(g_eff, dot(light.wi, ray_direction));
                             let vis = trace_light_visibility(p, resolved.world_position);
                             inscatter += fog_transmittance * s.sigma_s
-                                * (phase * light.inverse_pdf * vis) * light.radiance * ds;
+                                * (phase * light.inverse_pdf * vis * f32(total_steps))
+                                * light.radiance * ds;
                         }
                     }
                 }
