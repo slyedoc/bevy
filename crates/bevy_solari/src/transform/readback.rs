@@ -268,7 +268,7 @@ pub fn dispatch_transform_readback(
     let Some(bind_group) = readback.bind_group.as_ref() else {
         return;
     };
-    let groups = readback.changed_count.div_ceil(WORKGROUP_SIZE);
+    let groups = crate::ecs_gpu::linear_dispatch(readback.changed_count.div_ceil(WORKGROUP_SIZE));
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let encoder = ctx.command_encoder();
@@ -280,7 +280,7 @@ pub fn dispatch_transform_readback(
     pass.set_bind_group(0, bind_group, &[]);
     // Times the gather + ancestor-walk (the per-node `parent`-chain opt-out scan).
     let d = diagnostics.time_span(&mut pass, "transform_readback");
-    pass.dispatch_workgroups(groups, 1, 1);
+    pass.dispatch_workgroups(groups.0, groups.1, groups.2);
     d.end(&mut pass);
 }
 

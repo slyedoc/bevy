@@ -458,7 +458,7 @@ pub fn dispatch_light_resolve(
     let Some(bind_group) = resolve.bind_group.as_ref() else {
         return;
     };
-    let groups = resolve.light_count.div_ceil(WORKGROUP_SIZE);
+    let groups = crate::ecs_gpu::linear_dispatch(resolve.light_count.div_ceil(WORKGROUP_SIZE));
     let encoder = ctx.command_encoder();
     let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
         label: Some("light_resolve"),
@@ -466,7 +466,7 @@ pub fn dispatch_light_resolve(
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
-    pass.dispatch_workgroups(groups, 1, 1);
+    pass.dispatch_workgroups(groups.0, groups.1, groups.2);
 }
 
 /// Registers [`SolariDirectionLight`], its `gpu_table!` (columns + slot index +

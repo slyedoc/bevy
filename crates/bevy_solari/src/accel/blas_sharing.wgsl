@@ -197,8 +197,12 @@ fn geom_reset(@builtin(global_invocation_id) gid: vec3<u32>) {
 // stash the geometry's static descriptor.
 // =====================================================================
 @compute @workgroup_size(64)
-fn classify(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let d = gid.x;
+fn classify(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    // Flat index across a 2D-split dispatch (X capped at 65535, rest in Y).
+    let d = gid.x + gid.y * num_workgroups.x * 64u;
     if d >= params.active_count {
         return;
     }
@@ -258,8 +262,12 @@ fn finalize_count() {
 // across frames unless the instance's geometry changes.
 // =====================================================================
 @compute @workgroup_size(64)
-fn assign_address(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let d = gid.x;
+fn assign_address(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    // Flat index across a 2D-split dispatch (X capped at 65535, rest in Y).
+    let d = gid.x + gid.y * num_workgroups.x * 64u;
     if d >= params.active_count {
         return;
     }

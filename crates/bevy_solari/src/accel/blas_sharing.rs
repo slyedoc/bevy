@@ -514,7 +514,11 @@ pub fn dispatch_blas_sharing(
         p.set_bind_group(0, scene_bg, &[]);
         p.set_bind_group(1, sharing_bg, &[view_offset]);
         p.set_pipeline(pipeline);
-        p.dispatch_workgroups(groups, 1, 1);
+        // Per-instance passes (classify / assign_address) 2D-split past 65535
+        // workgroups; the geometry passes stay 1D (no-op). The shaders that can
+        // exceed the limit reconstruct the flat index from `num_workgroups`.
+        let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(groups);
+        p.dispatch_workgroups(gx, gy, gz);
     }
     d.end(encoder);
 }

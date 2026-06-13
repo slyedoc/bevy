@@ -177,8 +177,12 @@ fn make_record(slot: u32, addr: vec2<u32>) -> WriteInstanceData {
 
 /// CPU-seeded delta records: added ∪ moved ∪ disabled.
 @compute @workgroup_size(64)
-fn fill_seed(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn fill_seed(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    // Flat index across a 2D-split dispatch (X capped at 65535, rest in Y).
+    let i = gid.x + gid.y * num_workgroups.x * 64u;
     if i >= params.cpu_count {
         return;
     }
@@ -196,8 +200,12 @@ fn fill_seed(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// for any instance that moved this frame or whose BLAS address changed (or
 /// all, on full rebuild).
 @compute @workgroup_size(64)
-fn fill_incremental(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let d = gid.x;
+fn fill_incremental(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    // Flat index across a 2D-split dispatch (X capped at 65535, rest in Y).
+    let d = gid.x + gid.y * num_workgroups.x * 64u;
     if d >= params.active_count {
         return;
     }

@@ -25,8 +25,12 @@ struct ScatterParams {
 @group(0) @binding(3) var<storage, read_write> previous: array<u32>;
 
 @compute @workgroup_size(64)
-fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn scatter(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    // Flat index across a 2D-split dispatch (X capped at 65535, rest in Y).
+    let i = gid.x + gid.y * num_workgroups.x * 64u;
     if i >= params.count {
         return;
     }
@@ -44,8 +48,12 @@ fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
 // separate "previous" column would just be telling it something it has. On a
 // grown buffer there is no history, so `previous = new` (zero motion).
 @compute @workgroup_size(64)
-fn scatter_with_history(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn scatter_with_history(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    // Flat index across a 2D-split dispatch (X capped at 65535, rest in Y).
+    let i = gid.x + gid.y * num_workgroups.x * 64u;
     if i >= params.count {
         return;
     }

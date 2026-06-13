@@ -29,8 +29,12 @@ struct ResolveParams {
 @group(0) @binding(3) var<uniform> params: ResolveParams;
 
 @compute @workgroup_size(64)
-fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn resolve(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    // Flat index across a 2D-split dispatch (X capped at 65535, rest in Y).
+    let i = gid.x + gid.y * num_workgroups.x * 64u;
     if i >= params.light_count {
         return;
     }

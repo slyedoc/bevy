@@ -568,7 +568,9 @@ fn dispatch_column<C: GpuColumnDesc>(
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         let d = diagnostics.time_span(&mut pass, C::LABEL);
-        pass.dispatch_workgroups(column.pending.div_ceil(SCATTER_WORKGROUP_SIZE), 1, 1);
+        let (gx, gy, gz) =
+            super::linear_dispatch(column.pending.div_ceil(SCATTER_WORKGROUP_SIZE));
+        pass.dispatch_workgroups(gx, gy, gz);
         d.end(&mut pass);
         // Delta is now consumed — clear so a later empty frame doesn't re-scatter
         // it (and so `prepare_column`'s "retain un-scattered delta" guard

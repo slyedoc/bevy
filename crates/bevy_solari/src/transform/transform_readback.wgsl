@@ -55,8 +55,12 @@ fn opted_out(start: u32) -> bool {
 }
 
 @compute @workgroup_size(64)
-fn readback(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let k = gid.x;
+fn readback(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    // Flat index across a 2D-split dispatch (X capped at 65535, rest in Y).
+    let k = gid.x + gid.y * num_workgroups.x * 64u;
     if k >= params.changed_count {
         return;
     }

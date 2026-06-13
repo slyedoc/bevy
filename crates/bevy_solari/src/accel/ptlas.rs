@@ -873,7 +873,8 @@ pub fn dispatch_ptlas(
             pass.set_bind_group(0, scene_bg, &[]);
             pass.set_bind_group(1, fill_bg, &[]);
             pass.set_pipeline(seed_pipe);
-            pass.dispatch_workgroups(resources.cpu_count.div_ceil(64), 1, 1);
+            let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(resources.cpu_count.div_ceil(64));
+            pass.dispatch_workgroups(gx, gy, gz);
         }
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -883,7 +884,8 @@ pub fn dispatch_ptlas(
             pass.set_bind_group(0, scene_bg, &[]);
             pass.set_bind_group(1, fill_bg, &[]);
             pass.set_pipeline(incremental_pipe);
-            pass.dispatch_workgroups(active_count.div_ceil(64), 1, 1);
+            let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(active_count.div_ceil(64));
+            pass.dispatch_workgroups(gx, gy, gz);
         }
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {

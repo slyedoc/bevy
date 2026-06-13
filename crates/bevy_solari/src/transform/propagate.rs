@@ -302,7 +302,11 @@ pub fn dispatch_transform_propagate(
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
                 let d = diagnostics.time_span(&mut pass, "transform_propagate");
-                pass.dispatch_workgroups(groups, 1, 1);
+                // 2D-split to stay under the 65535 per-dimension dispatch limit
+                // (node_count / 64 exceeds it past ~4.2M nodes); the shader
+                // reconstructs the flat index from `gid` + `num_workgroups`.
+                let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(groups);
+                pass.dispatch_workgroups(gx, gy, gz);
                 d.end(&mut pass);
                 walked = true;
             }

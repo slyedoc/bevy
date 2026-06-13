@@ -79,8 +79,13 @@ fn load_local(node: u32) -> Mat3x4 {
 }
 
 @compute @workgroup_size(64)
-fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let k = gid.x;
+fn propagate(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    // Flat thread index across a 2D-split dispatch (X capped at the 65535
+    // per-dimension limit, the rest spilled into Y). `* 64u` = the X workgroup size.
+    let k = gid.x + gid.y * num_workgroups.x * 64u;
     if k >= params.count {
         return;
     }

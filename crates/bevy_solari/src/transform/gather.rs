@@ -166,7 +166,7 @@ pub fn dispatch_transform_gather(
     let Some(bind_group) = gather.bind_group.as_ref() else {
         return;
     };
-    let groups = gather.instance_count.div_ceil(WORKGROUP_SIZE);
+    let groups = crate::ecs_gpu::linear_dispatch(gather.instance_count.div_ceil(WORKGROUP_SIZE));
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let encoder = ctx.command_encoder();
@@ -177,6 +177,6 @@ pub fn dispatch_transform_gather(
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
     let d = diagnostics.time_span(&mut pass, "transform_gather");
-    pass.dispatch_workgroups(groups, 1, 1);
+    pass.dispatch_workgroups(groups.0, groups.1, groups.2);
     d.end(&mut pass);
 }
