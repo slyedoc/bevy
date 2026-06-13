@@ -4,7 +4,7 @@ enable wgpu_ray_query;
 #import bevy_solari::pbr::{rand_f, rand_vec2f, rand_range_u}
 #import bevy_render::view::View
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf, dispersive_ior, spectral_rgb_weight, sample_hero_wavelength}
-#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, generate_random_emissive_light_sample, calculate_resolved_light_contribution, trace_light_visibility, emissive_light_count, NULL_LIGHT_ID}
+#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, generate_random_emissive_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_light_transmittance, emissive_light_count, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, offset_ray_origin, directional_lights, light_sources, active_light_list, fog_volumes_sample, fog_volumes_range, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 #import bevy_solari::atmosphere::{Atmosphere, atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
 
@@ -461,10 +461,13 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         s.phase_weight += 3.0 * sigma;
                     }
                     if s.sigma_t < 1e-7 { continue; } // empty step — no scattering, skip the shadow ray
-                    var sun_vis = 0.0;
+                    // Tinted sun visibility: the shadow ray toward the sun
+                    // accumulates colored Beer-Lambert through any stained glass
+                    // it crosses, so the in-scattered shafts take the window's
+                    // color instead of being hard-cut at the glass.
+                    var sun_vis = vec3(0.0);
                     if sun_lit {
-                        let sun_ray = trace_ray(p, atmosphere.sun_direction, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
-                        sun_vis = f32(sun_ray.kind == RAY_QUERY_INTERSECTION_NONE);
+                        sun_vis = trace_light_transmittance(p, vec4(atmosphere.sun_direction, 0.0));
                     }
                     let in_scatter = sun_radiance * (sun_vis * s.sun_scatter) + sky_ambient * s.sigma_s;
                     inscatter += fog_transmittance * in_scatter * ds;

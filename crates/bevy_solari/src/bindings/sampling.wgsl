@@ -5,7 +5,7 @@ enable wgpu_ray_query;
 #import bevy_solari::pbr::D_GGX
 #import bevy_solari::pbr::{rand_f, rand_vec2f, rand_u, rand_range_u}
 #import bevy_render::maths::{PI_2, orthonormalize}
-#import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, active_light_list, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD, clusters, instance_cluster_ranges}
+#import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, active_light_list, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, resolve_ray_hit_full, offset_ray_origin, materials, material_ids, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD, clusters, instance_cluster_ranges}
 
 fn power_heuristic(f: f32, g: f32) -> f32 {
     return balance_heuristic(f * f, g * g);
@@ -134,7 +134,9 @@ fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rn
         return LightContribution(vec3(0.0), 0.0, vec3(0.0, 1.0, 0.0), false);
     }
     var light_contribution = calculate_resolved_light_contribution(sample.resolved_light_sample, ray_origin, origin_world_normal);
-    light_contribution.radiance *= trace_light_visibility(ray_origin, sample.resolved_light_sample.world_position);
+    // Tinted visibility: stained glass between the surface and the light colors
+    // the light instead of blocking it, so sunlit floors pool with window color.
+    light_contribution.radiance *= trace_light_transmittance(ray_origin, sample.resolved_light_sample.world_position);
     return light_contribution;
 }
 
@@ -339,6 +341,72 @@ fn trace_light_visibility(ray_origin: vec3<f32>, light_sample_world_position: ve
 
     let ray_hit = trace_ray(ray_origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
     return f32(ray_hit.kind == RAY_QUERY_INTERSECTION_NONE);
+}
+
+// Number of transmissive boundary crossings a visibility ray tracks before
+// giving up. Each colored-glass pane is two crossings (front + back face), so
+// this caps the march at four stacked panes between a point and the light.
+const MAX_TRANSMISSION_HITS = 8u;
+
+// Like `trace_light_visibility`, but transmissive surfaces (stained glass) tint
+// the ray instead of hard-blocking it. Returns a per-channel transmittance:
+// `1` fully lit, `0` shadowed by an opaque caster, or a color for light that
+// reached the point through colored glass.
+//
+// The tint is Beer-Lambert (`exp(-extinction * thickness)`) accumulated over
+// each pane's TRUE thickness — the same absorption the path tracer applies to a
+// camera ray crossing that glass (pathtracer.wgsl, `medium_extinction`) — so
+// tinted floor pools and colored sun shafts match the glass they pass through.
+// The march goes straight (no refraction bend): correct for the soft tint, but
+// it does NOT focus caustics — that needs the photon-grid path.
+fn trace_light_transmittance(ray_origin: vec3<f32>, light_sample_world_position: vec4<f32>) -> vec3<f32> {
+    var ray_direction = light_sample_world_position.xyz;
+    var ray_t_max = RAY_T_MAX;
+
+    if light_sample_world_position.w == 1.0 {
+        let ray = ray_direction - ray_origin;
+        let dist = length(ray);
+        ray_direction = ray / dist;
+        ray_t_max = dist - RAY_T_MIN;
+    }
+
+    if ray_t_max < RAY_T_MIN { return vec3(0.0); }
+
+    var transmittance = vec3(1.0);
+    var origin = ray_origin;
+    // Absorption of the volume the ray is currently inside (air = 0).
+    var medium_extinction = vec3(0.0);
+    for (var i = 0u; i < MAX_TRANSMISSION_HITS; i += 1u) {
+        let hit = trace_ray(origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_NONE);
+
+        // Attenuate over the segment just travelled through the active medium
+        // (air contributes nothing; the interior of a glass pane tints).
+        let segment = select(ray_t_max, hit.t, hit.kind != RAY_QUERY_INTERSECTION_NONE);
+        transmittance *= exp(-medium_extinction * segment);
+        if hit.kind == RAY_QUERY_INTERSECTION_NONE { break; } // reached the light
+
+        // Cheap opaque test before resolving: a non-transmissive surface is a
+        // hard shadow caster, so the point is fully occluded.
+        let material = materials[material_ids[hit.instance_index]];
+        if material.specular_transmission < 0.5 { return vec3(0.0); }
+
+        // Transmissive boundary: flip the active medium (entering glass → its
+        // extinction, exiting → air), keyed on the geometric normal's sign to
+        // match the path tracer's `entering` test.
+        let resolved = resolve_ray_hit_full(hit);
+        let facing = dot(ray_direction, resolved.geometric_world_normal);
+        let entering = facing < 0.0;
+        medium_extinction = select(vec3(0.0), resolved.material.extinction, entering);
+
+        // Continue from just past the surface, on the side the ray is heading.
+        let go_normal = select(-resolved.geometric_world_normal, resolved.geometric_world_normal, facing > 0.0);
+        origin = offset_ray_origin(resolved.world_position, go_normal);
+        ray_t_max -= hit.t;
+        if ray_t_max < RAY_T_MIN { break; }
+        if all(transmittance < vec3(0.003)) { return vec3(0.0); } // fully absorbed
+    }
+
+    return transmittance;
 }
 
 fn trace_point_visibility(ray_origin: vec3<f32>, point: vec3<f32>) -> f32 {
