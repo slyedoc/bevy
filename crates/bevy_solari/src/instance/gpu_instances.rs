@@ -15,7 +15,8 @@ use bevy_math::{Affine3, Affine3A, Affine3Ext, Vec4};
 use bevy_render::render_resource::PipelineCache;
 use bytemuck::{Pod, Zeroable};
 
-use crate::ecs_gpu::{GpuColumn, GpuColumnDesc, GpuColumnPlugin, GpuTable};
+use crate::ecs_gpu::{GpuColumn, GpuColumnDesc, GpuColumnPlugin, GpuTable, Presence};
+use crate::transform::StaticColumn;
 use super::instance_manager::{InstanceLodInputGpu, InstanceManager};
 
 /// The per-instance columns all live in the [`InstanceManager`] table; its slot
@@ -193,7 +194,16 @@ pub struct InstanceColumns<'w> {
 /// Gating with `run_if` (rather than an in-body early return) preserves the
 /// `Added<RaytracingMesh3d>` change-ticks across the cold-pipeline frames, so no
 /// instance is missed once the gate opens.
-pub fn cluster_columns_ready(columns: InstanceColumns, cache: Res<PipelineCache>) -> bool {
+pub fn cluster_columns_ready(
+    columns: InstanceColumns,
+    // The `TransformStatic` presence flag the PTLAS reads to place an instance.
+    // Gate binding on it too: an instance placed before its static flag can
+    // scatter would be stuck in the global partition (the flag flips later, but
+    // a static instance is never re-written). `Option` (None = column not up yet
+    // → not ready) keeps this safe on a non-solari device.
+    static_flags: Option<Res<GpuColumn<Presence<StaticColumn>>>>,
+    cache: Res<PipelineCache>,
+) -> bool {
     columns.transforms.scatter_pipeline_ready(&cache)
         && columns.material_ids.scatter_pipeline_ready(&cache)
         && columns.group_bases.scatter_pipeline_ready(&cache)
@@ -201,6 +211,7 @@ pub fn cluster_columns_ready(columns: InstanceColumns, cache: Res<PipelineCache>
         && columns.geometry_ids.scatter_pipeline_ready(&cache)
         && columns.instance_masks.scatter_pipeline_ready(&cache)
         && columns.node_slots.scatter_pipeline_ready(&cache)
+        && static_flags.is_some_and(|c| c.scatter_pipeline_ready(&cache))
 }
 
 /// Registers every per-instance GPU column as its own `GpuColumnPlugin` —

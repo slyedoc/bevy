@@ -19,7 +19,7 @@ use bevy_render::{renderer::RenderGraph, Render, RenderApp, RenderStartup, Rende
 use bevy_transform::systems::{propagate_transforms_for, sync_simple_transforms};
 use bevy_ui::Node;
 
-use crate::ecs_gpu::GpuColumnPrepareSet;
+use crate::ecs_gpu::{GpuColumnPrepareSet, GpuPresenceColumnPlugin};
 use crate::pipelines::SolariPipelines;
 use crate::{SolariClusterSystems, SolariSetup};
 
@@ -33,8 +33,8 @@ pub use gather::{
     prepare_transform_gather_bind_group, transform_gather_bind_group_layout, TransformGather,
 };
 pub use graph::{
-    extract_transform_graph, LocalColumn, ParentColumn, TransformGraph, TransformStatic,
-    TransformTablePlugin, ROOT_PARENT,
+    extract_transform_graph, LocalColumn, ParentColumn, StaticColumn, TransformGraph,
+    TransformStatic, TransformTablePlugin, ROOT_PARENT,
 };
 pub use propagate::{
     dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,
@@ -63,6 +63,9 @@ impl Plugin for SolariTransformPlugin {
         // co-located with their `SolariPipelines` builds.
         // Columns, slot index, extract, and Cleanup clear — all generated.
         app.add_plugins(TransformTablePlugin)
+        // The TransformStatic presence flag (node-slot indexed) the PTLAS fill
+        // reads to choose an instance's partition. Observer-fed, zero per-frame cost.
+        .add_plugins(GpuPresenceColumnPlugin::<StaticColumn>::default())
         // TODO: handle few few transforms locally, not sending to gpu, might not need anymore
         .add_systems(
             PostUpdate,

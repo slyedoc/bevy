@@ -79,6 +79,18 @@ crate::gpu_table! {
 #[derive(Component, Default)]
 pub struct TransformStatic;
 
+/// Presence column tracking [`TransformStatic`] over the transform table's nodes
+/// — the GPU flag the PTLAS fill reads (via an instance's node slot) to route a
+/// static instance to a spatial-grid partition and a mover to the global
+/// partition. Observer-fed (zero per-frame cost); the flag buffer is node-slot
+/// indexed. Read it via `Res<GpuColumn<Presence<StaticColumn>>>`.
+pub struct StaticColumn;
+impl crate::ecs_gpu::GpuPresenceColumn for StaticColumn {
+    type SlotTable = TransformGraph;
+    type Marker = TransformStatic;
+    const LABEL: &'static str = "transform.static";
+}
+
 /// Spatial entities whose local transform or parentage changed (or just appeared).
 /// `&GpuSlot<TransformGraph>` in the fetch means only already-slotted entities are
 /// seen — true the same frame, since the assign system runs in `PostUpdate`.

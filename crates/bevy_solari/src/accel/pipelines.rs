@@ -86,6 +86,9 @@ pub fn ptlas_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_read_only_sized(false, None), // 11 instance_material_ids
                 storage_buffer_read_only_sized(false, None), // 12 material_traversal_flags
                 storage_buffer_sized(false, None),           // 13 instance_written_flags
+                storage_buffer_read_only_sized(false, None), // 14 node_slots (instance → node)
+                storage_buffer_read_only_sized(false, None), // 15 static_flags (node-indexed)
+                storage_buffer_sized(false, None),           // 16 instance_written_partition
             ),
         ),
     )

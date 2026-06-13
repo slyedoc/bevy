@@ -15,11 +15,15 @@
 //! [`crate::instance`] (the per-`RaytracingMesh3d` columns).
 
 pub mod column;
+pub mod presence;
 pub mod scene_columns;
 pub mod slot;
 pub mod table;
 
 pub use column::{GpuColumn, GpuColumnDesc, GpuColumnPlugin, GpuColumnPrepareSet, GpuTable};
+pub use presence::{
+    GpuPresenceColumn, GpuPresenceColumnPlugin, Presence, PresenceEvents, PresenceTable,
+};
 pub use scene_columns::{SceneColumns, SceneColumnsPlugin, SCENE_COLUMNS_GROUP_DEF};
 pub use slot::{
     assign_gpu_slots, free_gpu_slot, push_record, GpuSlot, GpuSlotAllocator, GpuSlotTable, SlotPool,

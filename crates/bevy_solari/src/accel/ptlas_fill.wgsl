@@ -56,8 +56,15 @@ struct PtlasFillParams {
     /// 1 → write every active instance (full rebuild); 0 → only
     /// instances of geometries rebuilt this frame.
     force_all: u32,
-    partition_index: u32,
+    /// Regular (static) partition count the spatial hash wraps into.
+    partition_count: u32,
+    /// World-space partition cell edge length.
+    cell_size: f32,
 }
+
+/// The NV global-partition sentinel
+/// (`VK_PARTITIONED_ACCELERATION_STRUCTURE_PARTITION_INDEX_GLOBAL_NV`).
+const PTLAS_GLOBAL_PARTITION: u32 = 0xffffffffu;
 
 // slot-indexed: instance → its current BLAS device address (from
 // `blas_sharing::assign_address`).
@@ -95,6 +102,37 @@ struct PtlasFillParams {
 // compare — which is what lets the opacity flag be derived purely from the
 // MATERIAL: late loads, swaps, and live asset edits all self-heal.
 @group(1) @binding(13) var<storage, read_write> instance_written_flags: array<u32>;
+// slot-indexed: instance → its transform-table node slot (`NodeSlotColumn`).
+@group(1) @binding(14) var<storage, read> node_slots: array<u32>;
+// node-indexed: 1 if the node's entity is `TransformStatic`
+// (`Presence<StaticColumn>`). Read via the instance's node slot.
+@group(1) @binding(15) var<storage, read> static_flags: array<u32>;
+// slot-indexed: the partition last WRITTEN into this slot's PTLAS record
+// (persistent). `fill_incremental` re-specifies an instance when its resolved
+// partition drifts from this — the partition twin of the `instance_written_flags`
+// self-heal. Closes the window where an instance is placed (e.g. in global)
+// before its `TransformStatic` flag has scattered: once the flag lands, the
+// drift re-writes it into its spatial cell.
+@group(1) @binding(16) var<storage, read_write> instance_written_partition: array<u32>;
+
+/// The PTLAS partition this instance belongs to. A static instance (its node
+/// tagged `TransformStatic`) hashes into a spatial-grid regular partition by
+/// world cell, so it's written once and then carried from `src` untouched. A
+/// mover (or any untagged / node-less instance) goes to the global partition,
+/// which NV builds per-instance — so a moved mover never dirties a static cell.
+fn resolve_partition(slot: u32) -> u32 {
+    let node = node_slots[slot];
+    // No transform node (defensive) or not static → global.
+    if node == PTLAS_GLOBAL_PARTITION || static_flags[node] == 0u {
+        return PTLAS_GLOBAL_PARTITION;
+    }
+    let m = cluster_instance_transforms[slot];
+    let pos = vec3<f32>(m[0].w, m[1].w, m[2].w);
+    let cell = vec3<i32>(floor(pos / params.cell_size));
+    // Teschner spatial hash → a regular partition index.
+    let h = (u32(cell.x) * 73856093u) ^ (u32(cell.y) * 19349663u) ^ (u32(cell.z) * 83492791u);
+    return h % params.partition_count;
+}
 
 /// The `instance_flags` an instance's record should carry, derived from its
 /// material — not stored per instance anywhere on the CPU.
@@ -117,10 +155,12 @@ fn make_record(slot: u32, addr: vec2<u32>) -> WriteInstanceData {
     explicit_aabb[0] = 0.0; explicit_aabb[1] = 0.0; explicit_aabb[2] = 0.0;
     explicit_aabb[3] = 0.0; explicit_aabb[4] = 0.0; explicit_aabb[5] = 0.0;
 
-    // Stamp the flags this record carries (side effect — every record write
-    // goes through here, so the mirror tracks exactly what the PTLAS holds).
+    // Stamp the flags + partition this record carries (side effect — every record
+    // write goes through here, so the mirrors track exactly what the PTLAS holds).
     let vk_flags = derived_vk_flags(slot);
     instance_written_flags[slot] = vk_flags;
+    let part = resolve_partition(slot);
+    instance_written_partition[slot] = part;
 
     return WriteInstanceData(
         transform,
@@ -130,7 +170,7 @@ fn make_record(slot: u32, addr: vec2<u32>) -> WriteInstanceData {
         0u,                                              // hit-group contribution offset
         vk_flags,                                        // alpha-tested material → FORCE_NO_OPAQUE
         slot,                                            // instance_index — STABLE PTLAS slot
-        params.partition_index,
+        part,
         addr,
     );
 }
@@ -175,7 +215,12 @@ fn fill_incremental(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Material-derived flags drifted from the record (material loaded /
         // swapped / edited since it was written) → re-specify.
         let flags_changed = derived_vk_flags(slot) != instance_written_flags[slot];
-        if !moved && !flags_changed {
+        // Partition drifted: the instance was placed before its `TransformStatic`
+        // flag scattered (so it sits in global), and the flag has since landed →
+        // migrate it into its spatial cell. Settled instances compute the same
+        // partition they hold, so this is false and they're carried from `src`.
+        let partition_changed = resolve_partition(slot) != instance_written_partition[slot];
+        if !moved && !flags_changed && !partition_changed {
             return;
         }
     }
