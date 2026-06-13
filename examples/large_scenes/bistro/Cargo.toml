@@ -9,8 +9,12 @@ license = "MIT OR Apache-2.0"
 bevy = { path = "../../../", features = [
   "bevy_camera_controller",
   "free_camera",
-  "bevy_feathers",  
+  "bevy_feathers",
   "bevy_dev_tools",
+  # Transcode the GLB's ETC1S/UASTC KTX2 textures (KHR_texture_basisu) to BC7
+  # on the GPU. Without it the basisu textures fail to load. `ktx2` + `zstd_rust`
+  # are already in bevy's default 3D feature set.
+  "basis-universal",
 ] }
 mipmap_generator = { path = "../mipmap_generator" }
 

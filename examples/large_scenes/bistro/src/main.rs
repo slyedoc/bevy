@@ -248,33 +248,15 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
 
     // Combined BistroExterior + BistroInterior_Wine, produced by
     // `prepare_bistro.py` (scales/positions reconciled, duplicate building
-    // shell removed, entrance doors split and opened).
-    let bistro = asset_server.load("bistro/Bistro.glb#Scene0");
+    // shell removed, entrance doors split and opened), then texture-compressed
+    // to UASTC KTX2 (`KHR_texture_basisu`) with mip chains + alpha modes
+    // restored (`reclassify_alpha.py`) — BC7 on the GPU instead of uncompressed
+    // RGBA8. See the README for the pipeline.
+    let bistro = asset_server.load("bistro/Bistro_ktx2.glb#Scene0");
     commands
         .spawn((WorldAssetRoot(bistro.clone()), Spin))
         .observe(proc_scene);
 
-    // Transmission test props in the middle of the road, in front of the
-    // spawn camera: the refraction example's glassware + the Khronos
-    // DragonAttenuation (backdrop and all). The street at the spawn spot
-    // sits above world y = 0 — lift the props onto it.
-    const STREET_Y: f32 = 0.5;
-    commands.spawn((
-        WorldAssetRoot(
-            asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/refraction.glb")),
-        ),
-        Transform::from_xyz(0.0, STREET_Y, 0.0),
-    ));
-    commands.spawn((
-        WorldAssetRoot(
-            asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/DragonAttenuation.glb")),
-        ),
-        // The asset's origin is not at the dragon's feet: the Dragon node
-        // sits at y = -0.7306 (standing on its backdrop cloth).
-        Transform::from_xyz(-4.0, STREET_Y + 0.7306 * 0.5, 0.0)
-            .with_scale(Vec3::splat(0.5))
-            .with_rotation(Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2)),
-    ));
 
     let mut count = 0;
     if args.count > 1 {
