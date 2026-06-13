@@ -50,15 +50,18 @@
 //! Partitioning
 //! ------------
 //! Static instances (tagged `TransformStatic`, surfaced GPU-side by the
-//! `Presence<StaticColumn>` flag) hash into a spatial grid of regular
-//! partitions by world position; movers go to the **global** partition,
-//! which NV builds per-instance ("treated as if in individual
-//! partitions") — so a moved instance rebuilds only its own global
-//! entry, never a whole static partition. The static cells are written
-//! once and then carried from `src` untouched, so they never rebuild.
-//! This is the spec's recommended layout (frequent updates → global;
-//! stable bulk → spatially-optimized regular partitions). The per-cell
-//! hash + flag read lives in `ptlas_fill.wgsl::resolve_partition`.
+//! `Presence<StaticColumn>` flag) go to a single regular partition; movers
+//! go to the **global** partition, which NV builds per-instance ("treated
+//! as if in individual partitions") — so a moved instance rebuilds only its
+//! own global entry, never the static partition. The static instances are
+//! written once and then carried from `src` untouched, so they never
+//! rebuild. This is the spec's recommended layout (frequent updates →
+//! global; stable bulk → a regular partition). A spatial grid of regular
+//! partitions was tried and reverted: hashing statics across many partitions
+//! gave each partition a scene-spanning AABB, and the overlap inflated
+//! ray-traversal cost far more than the cheaper per-cell rebuilds saved. One
+//! regular partition keeps the driver's BVH coherent. The static/mover split
+//! lives in `ptlas_fill.wgsl::resolve_partition`.
 
 use ash::vk::{self, TaggedStructure};
 use bevy_ecs::{
@@ -116,8 +119,7 @@ const WRITE_INSTANCE_DATA_SIZE: u64 = 104;
 
 /// Maximum partitioned-AS operations the `src_infos` buffer is sized
 /// for. Currently a single `WRITE_INSTANCE` op (the delta); the second
-/// slot is reserved for a future `WRITE_PARTITION_TRANSLATION` op when
-/// spatial partitioning lands.
+/// slot is reserved headroom for a future op.
 const MAX_OPS: u64 = 2;
 
 /// `write_slots_cpu` null flag: this slot is disabled this frame → the
@@ -151,33 +153,11 @@ pub struct PtlasWritePair {
     null_flag: u32,
 }
 
-/// PTLAS spatial grid — world-space edge length of a partition cell. A static
-/// instance's regular partition is a hash of `floor(world_pos / PTLAS_CELL_SIZE)`,
-/// so a moved mover only ever dirties the global partition and never a static
-/// cell. Tunable; larger cells = fewer/bigger partitions (slower per-cell rebuild,
-/// better trace coherence), smaller = the reverse.
-pub const PTLAS_CELL_SIZE: f32 = 32.0;
-
-/// Desired number of regular (static) partitions — static instances hash into
-/// `[0, partition_count)`. Clamped to the device `maxPartitionCount` at build.
-/// Collisions only merge spatially-distant cells into one partition, and the
-/// static side is built once, so collisions cost nothing at steady state.
-pub const PTLAS_PARTITION_COUNT: u32 = 4096;
-
-/// The static grid's regular-partition count: [`PTLAS_PARTITION_COUNT`] clamped to
-/// the device `maxPartitionCount` (`ClusterExtensionFns::max_partition_count`).
-/// A `max` of 0 means the limit wasn't queried (extension absent), so assume the
-/// desired count is fine. Both the sizing query and the build must use this same
-/// value, so it's a shared helper.
-#[inline]
-fn clamp_partition_count(max_partition_count: u32) -> u32 {
-    if max_partition_count == 0 {
-        PTLAS_PARTITION_COUNT
-    } else {
-        PTLAS_PARTITION_COUNT.min(max_partition_count)
-    }
-    .max(1)
-}
+/// Regular (static) partition count. Statics share one regular partition;
+/// movers live in the global partition (built per-instance), so a moved mover
+/// never dirties the static partition. A spatial grid of many regular
+/// partitions was tried and reverted — see the `Partitioning` module note.
+pub const PTLAS_PARTITION_COUNT: u32 = 1;
 
 /// Uniform layout shared with `ptlas_fill.wgsl::PtlasFillParams`.
 #[repr(C)]
@@ -186,10 +166,6 @@ pub struct PtlasFillParamsGpu {
     pub active_count: u32,
     pub cpu_count: u32,
     pub force_all: u32,
-    /// Regular-partition count the static hash wraps into (≤ device max).
-    pub partition_count: u32,
-    /// World-space partition cell edge ([`PTLAS_CELL_SIZE`]).
-    pub cell_size: f32,
 }
 
 /// Render-world resource for the incremental partitioned-TLAS pass.
@@ -549,16 +525,10 @@ pub fn prepare_ptlas_params(
         .write_data
         .commit(0..(max_records.max(1)) * WRITE_INSTANCE_DATA_SIZE);
 
-    // Static-grid partition count, clamped to the device max (0 = unqueried →
-    // assume the desired count is supported).
-    let partition_count = clamp_partition_count(fns.max_partition_count);
-
     *resources.fill_params.get_mut() = PtlasFillParamsGpu {
         active_count,
         cpu_count,
         force_all: full_rebuild as u32,
-        partition_count,
-        cell_size: PTLAS_CELL_SIZE,
     };
     resources
         .fill_params
@@ -567,14 +537,14 @@ pub fn prepare_ptlas_params(
     // ── Size + commit + AS handle for the storage buffer — must happen
     //    before the binder reads `current_tlas()` in PrepareBindGroups. ──
     let capacity = high_water;
-    // `partition_count` regular partitions plus the global partition. Maxima stay
-    // at `capacity` (safe) until classification + a GPU occupancy histogram let us
-    // bound them; a tighter cap faults the build if real occupancy exceeds it.
+    // One regular (static) partition plus the global (mover) partition. Maxima
+    // stay at `capacity` (safe) until a GPU occupancy histogram lets us bound
+    // them; a tighter cap faults the build if real occupancy exceeds it.
     let size_input = vk::PartitionedAccelerationStructureInstancesInputNV::default()
         .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
         .instance_count(capacity)
         .max_instance_per_partition_count(capacity)
-        .partition_count(partition_count)
+        .partition_count(PTLAS_PARTITION_COUNT)
         .max_instance_in_global_partition_count(capacity);
     let mut sizes_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
     // SAFETY: size_input populated; partitioned fn table loaded.
@@ -810,13 +780,12 @@ pub fn dispatch_ptlas(
     // The instances input for the build. Sizing, sparse commits, and
     // the AS handle were all done in `prepare_ptlas_params` (before the
     // binder); this is just the build's `input` descriptor. `partition_count`
-    // must match the sizing query's (clamped to the device max).
-    let partition_count = clamp_partition_count(fns.max_partition_count);
+    // must match the sizing query's.
     let size_input = vk::PartitionedAccelerationStructureInstancesInputNV::default()
         .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
         .instance_count(capacity)
         .max_instance_per_partition_count(capacity)
-        .partition_count(partition_count)
+        .partition_count(PTLAS_PARTITION_COUNT)
         .max_instance_in_global_partition_count(capacity);
 
     let scratch_base = resources.scratch.address;

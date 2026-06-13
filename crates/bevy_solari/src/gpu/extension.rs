@@ -179,10 +179,6 @@ pub struct ClusterExtensionFns {
     /// ray-tracing features are requested; loading the function
     /// table here matches the pattern used for the NV extensions.
     pub acceleration_structure: khr::acceleration_structure::Device,
-    /// `VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV::maxPartitionCount`
-    /// — the cap the PTLAS spatial grid clamps its regular-partition count to.
-    /// 0 if the partitioned-AS extension wasn't enabled (no props to query).
-    pub max_partition_count: u32,
 }
 
 impl ClusterExtensionFns {
@@ -218,31 +214,6 @@ impl ClusterExtensionFns {
         let acceleration_structure =
             khr::acceleration_structure::Device::load(raw_instance, raw_device);
 
-        // The PTLAS grid needs the device's `maxPartitionCount`. Query it here
-        // (where the physical device is already in hand) only when the
-        // partitioned-AS extension is enabled — otherwise the props chain is
-        // meaningless and 0 signals "unavailable" to the PTLAS builder.
-        let max_partition_count = if has_partitioned {
-            // SAFETY: physical device is valid; the props2 chain holds only the
-            // NV partitioned-AS props struct, whose extension is enabled.
-            let physical_device = hal_device.raw_physical_device();
-            let mut props_nv =
-                vk::PhysicalDevicePartitionedAccelerationStructurePropertiesNV::default();
-            // Chain via raw `p_next` (ash doesn't impl the `Extends` trait for this
-            // NV props struct on `PhysicalDeviceProperties2`). `props_nv` outlives
-            // the call below.
-            let mut props2 = vk::PhysicalDeviceProperties2::default();
-            props2.p_next = &mut props_nv as *mut _ as *mut core::ffi::c_void;
-            unsafe { raw_instance.get_physical_device_properties2(physical_device, &mut props2) };
-            props_nv.max_partition_count
-        } else {
-            0
-        };
-        tracing::debug!(
-            target: "bevy_solari.init",
-            "PTLAS device maxPartitionCount = {max_partition_count} (has_partitioned = {has_partitioned})"
-        );
-
         Self {
             cluster: has_cluster.then(|| {
                 nv::cluster_acceleration_structure::Device::load(raw_instance, raw_device)
@@ -251,7 +222,6 @@ impl ClusterExtensionFns {
                 nv::partitioned_acceleration_structure::Device::load(raw_instance, raw_device)
             }),
             acceleration_structure,
-            max_partition_count,
         }
     }
 }

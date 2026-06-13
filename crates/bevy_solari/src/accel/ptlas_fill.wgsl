@@ -56,10 +56,6 @@ struct PtlasFillParams {
     /// 1 → write every active instance (full rebuild); 0 → only
     /// instances of geometries rebuilt this frame.
     force_all: u32,
-    /// Regular (static) partition count the spatial hash wraps into.
-    partition_count: u32,
-    /// World-space partition cell edge length.
-    cell_size: f32,
 }
 
 /// The NV global-partition sentinel
@@ -112,26 +108,21 @@ const PTLAS_GLOBAL_PARTITION: u32 = 0xffffffffu;
 // partition drifts from this — the partition twin of the `instance_written_flags`
 // self-heal. Closes the window where an instance is placed (e.g. in global)
 // before its `TransformStatic` flag has scattered: once the flag lands, the
-// drift re-writes it into its spatial cell.
+// drift migrates it into the static partition.
 @group(1) @binding(16) var<storage, read_write> instance_written_partition: array<u32>;
 
 /// The PTLAS partition this instance belongs to. A static instance (its node
-/// tagged `TransformStatic`) hashes into a spatial-grid regular partition by
-/// world cell, so it's written once and then carried from `src` untouched. A
-/// mover (or any untagged / node-less instance) goes to the global partition,
-/// which NV builds per-instance — so a moved mover never dirties a static cell.
+/// tagged `TransformStatic`) goes to the single regular partition, so it's
+/// written once and then carried from `src` untouched. A mover (or any untagged
+/// / node-less instance) goes to the global partition, which NV builds
+/// per-instance — so a moved mover never dirties the static partition.
 fn resolve_partition(slot: u32) -> u32 {
     let node = node_slots[slot];
     // No transform node (defensive) or not static → global.
     if node == PTLAS_GLOBAL_PARTITION || static_flags[node] == 0u {
         return PTLAS_GLOBAL_PARTITION;
     }
-    let m = cluster_instance_transforms[slot];
-    let pos = vec3<f32>(m[0].w, m[1].w, m[2].w);
-    let cell = vec3<i32>(floor(pos / params.cell_size));
-    // Teschner spatial hash → a regular partition index.
-    let h = (u32(cell.x) * 73856093u) ^ (u32(cell.y) * 19349663u) ^ (u32(cell.z) * 83492791u);
-    return h % params.partition_count;
+    return 0u;
 }
 
 /// The `instance_flags` an instance's record should carry, derived from its
@@ -225,7 +216,7 @@ fn fill_incremental(
         let flags_changed = derived_vk_flags(slot) != instance_written_flags[slot];
         // Partition drifted: the instance was placed before its `TransformStatic`
         // flag scattered (so it sits in global), and the flag has since landed →
-        // migrate it into its spatial cell. Settled instances compute the same
+        // migrate it into the static partition. Settled instances compute the same
         // partition they hold, so this is false and they're carried from `src`.
         let partition_changed = resolve_partition(slot) != instance_written_partition[slot];
         if !moved && !flags_changed && !partition_changed {
