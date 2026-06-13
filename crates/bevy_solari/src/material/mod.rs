@@ -102,19 +102,19 @@ impl SolariMaterial {
 
     /// The alpha cutoff `trace_ray`'s traversal alpha test uses, or a negative
     /// value for "opaque — commit hits in hardware, never invoke the test".
-    /// [`AlphaMode::Mask`] tests at its cutoff; any other non-opaque mode is
-    /// approximated as a 0.5 cutout (no stochastic alpha blending in the ray
-    /// tracer). Transmissive materials are exempt — refraction owns those
-    /// surfaces, and glass assets commonly keep their authored `Blend` mode
-    /// alongside `KHR_materials_transmission`.
+    /// Only [`AlphaMode::Mask`] (a genuine cutout) is alpha-tested, at its
+    /// cutoff. Everything else — opaque, and alpha-`Blend` (a binary any-hit
+    /// test can't express blending) — traverses as opaque; forcing non-opaque
+    /// traversal on every `Blend` material is a large, needless any-hit cost.
+    /// Transmissive materials are likewise opaque to traversal (refraction owns
+    /// those surfaces).
     pub fn traversal_alpha_cutoff(&self) -> f32 {
         if self.specular_transmission > 0.0 {
             return -1.0;
         }
         match self.alpha_mode {
-            AlphaMode::Opaque => -1.0,
             AlphaMode::Mask(cutoff) => cutoff,
-            _ => 0.5,
+            _ => -1.0,
         }
     }
 }
