@@ -176,11 +176,12 @@ fn setup_camera_and_light(mut commands: Commands) {
         Bloom::NATURAL,
         Hdr,
         SolariCamera,
-        SolariAtmosphere {
-            aerial_visibility: 1200.0,
-            aerial_fog_height: 5.5,
-            aerial_fog_base: 0.0,
+        SolariAtmosphere::default(),
+        SolariGlobalFog {
+            visibility: 1200.0,
+            fog_height: 5.5,
+            fog_base: 0.0,
             ..default()
-        }
+        },
     ));
 }

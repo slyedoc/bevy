@@ -119,7 +119,7 @@ pub mod prelude {
         bindings::RaytracingMesh3d, bindings::SolariBlackHole, bindings::SolariFogVolume,
         bindings::SolariPortal,
         render::CameraReset, render::SolariCamera,
-        render::atmosphere::SolariAtmosphere,
+        render::atmosphere::{SolariAtmosphere, SolariGlobalFog},
         SolariInitPlugin, SolariPlugin,
         geometry::ClusterMesh,
         transform::{NoGpuGlobalTransformReadback, TransformStatic},

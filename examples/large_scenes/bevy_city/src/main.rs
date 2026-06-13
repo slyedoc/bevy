@@ -66,7 +66,7 @@ pub struct Args {
     /// spawn emissive street lamps along the roads (two per block — a
     /// many-lights stress source for the solari ReSTIR path); on by default,
     /// pass `--lights false` to disable
-    #[argh(option, default = "true")]
+    #[argh(option, default = "false")]
     lights: bool,
 }
 
@@ -275,16 +275,11 @@ fn camera() -> impl Scene {
         // Self-contained single-scattering sky, baked to a cube each frame and
         // sampled on a ray miss (background + IBL). Sun = the `SolariDirectionLight`.
         // Low-lying fog matching the raster path's `spawn_atmosphere`: ~12 km
-        // ground-level Koschmieder visibility (~660 units at this scene's ~18 m/unit)
-        // and a 100 m-tall fog layer (~5.5 units) at ground (y = 0). The elevated
-        // camera shoots over the fog, so the foreground stays crisp and the haze
-        // builds along distant near-ground paths (the far skyline fades).
-        template_value(SolariAtmosphere {
-            aerial_visibility: 1200.0,
-            aerial_fog_height: 5.5,
-            aerial_fog_base: 0.0,
-            ..default()
-        })
+        template_value(SolariAtmosphere::default())
+        // Global height fog + god rays are opt-in (and view-dependent cost: a
+        // ground-level camera traces a sun shadow ray per march step). Uncomment
+        // for ~660-unit ground visibility + a ~5.5-unit fog layer at y = 0.
+        // template_value(SolariGlobalFog { visibility: 1200.0, fog_height: 5.5, fog_base: 0.0, ..default() })
         template_value(ClusterConfig::None)
         template_value(CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING))        
           

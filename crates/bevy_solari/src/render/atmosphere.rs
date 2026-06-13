@@ -66,23 +66,48 @@ pub struct SolariAtmosphere {
     pub mie_phase_g: f32,
     /// Camera altitude above the surface (km).
     pub camera_altitude: f32,
-    /// Aerial-perspective **ground-level visibility** in WORLD units (Koschmieder
-    /// meteorological range): the view distance at which a surface *in the densest
-    /// fog* fades to ~2 % contrast. Lower ⇒ haze closer/thicker; higher ⇒ clearer.
-    /// `0.0` (or non-finite) disables the global height fog entirely — the sky and
-    /// sun keep working, and local
-    /// [`SolariFogVolume`](crate::bindings::SolariFogVolume)s still march.
-    pub aerial_visibility: f32,
+}
+
+/// Opt-in **global height fog** — the volumetric near-ground haze + sun shafts
+/// (god rays) the path tracer marches along each primary ray. Add it to a
+/// [`SolariCamera`](crate::SolariCamera) that also has a [`SolariAtmosphere`]
+/// (the fog is lit by the atmosphere's sun + sky). **Absent ⇒ the aerial march
+/// is skipped entirely**, so a scene pays nothing for it — the sky, sun, and
+/// local [`SolariFogVolume`](crate::bindings::SolariFogVolume)s keep working.
+///
+/// Cost scales with how much of the view sits inside the fog layer: a camera
+/// down in the fog traces a sun shadow ray per march step, so a ground-level
+/// view is far more expensive than one shooting over the fog.
+#[derive(Component, Clone, Debug, Reflect)]
+#[reflect(Default, Clone)]
+pub struct SolariGlobalFog {
+    /// **Ground-level visibility** in WORLD units (Koschmieder meteorological
+    /// range): the view distance at which a surface *in the densest fog* fades to
+    /// ~2 % contrast. Lower ⇒ haze closer/thicker; higher ⇒ clearer. `0.0` (or
+    /// non-finite) is treated as the fog being off.
+    pub visibility: f32,
     /// Fog-layer **scale height** in WORLD units: density falls off as
-    /// `exp(-(y - fog_base) / fog_height)`, so the haze is densest at the ground and
-    /// thins with altitude (a low-lying fog the camera shoots over). Larger ⇒ the
-    /// fog reaches higher.
-    pub aerial_fog_height: f32,
+    /// `exp(-(y - fog_base) / fog_height)`, so the haze is densest at the ground
+    /// and thins with altitude (a low-lying fog the camera shoots over).
+    pub fog_height: f32,
     /// World-space Y of the densest fog (ground level).
-    pub aerial_fog_base: f32,
+    pub fog_base: f32,
     /// Henyey-Greenstein asymmetry `g` in `(-1, 1)` for the volumetric sun shafts
     /// (god rays): higher ⇒ a tighter, brighter glow concentrated toward the sun.
-    pub aerial_phase_g: f32,
+    pub phase_g: f32,
+}
+
+impl Default for SolariGlobalFog {
+    fn default() -> Self {
+        // Generic defaults for a metres-scale world: ~12 km ground visibility, a
+        // 100 m-tall fog layer at y = 0. Set to your scene's units.
+        Self {
+            visibility: 12000.0,
+            fog_height: 100.0,
+            fog_base: 0.0,
+            phase_g: 0.4,
+        }
+    }
 }
 
 impl Default for SolariAtmosphere {
@@ -98,12 +123,6 @@ impl Default for SolariAtmosphere {
             mie_scale_height: 1.2,
             mie_phase_g: 0.8,
             camera_altitude: 0.2,
-            // Generic defaults for a metres-scale world: ~12 km ground visibility,
-            // a 100 m-tall fog layer at y = 0. Set to your scene's units.
-            aerial_visibility: 12000.0,
-            aerial_fog_height: 100.0,
-            aerial_fog_base: 0.0,
-            aerial_phase_g: 0.4,
         }
     }
 }
@@ -194,7 +213,9 @@ pub(crate) fn atmosphere_bind_group_layout() -> BindGroupLayoutDescriptor {
 /// `ExtractSchedule`: gather the primary `SolariAtmosphere` + the primary sun into
 /// the GPU uniform, mark atmosphere views, and clear the enable flag otherwise.
 pub fn extract_solari_atmosphere(
-    cameras: Extract<Query<(RenderEntity, &SolariAtmosphere), With<SolariCamera>>>,
+    cameras: Extract<
+        Query<(RenderEntity, &SolariAtmosphere, Option<&SolariGlobalFog>), With<SolariCamera>>,
+    >,
     suns: Extract<Query<(&GlobalTransform, &SolariDirectionLight)>>,
     mut gpu: ResMut<SolariAtmosphereGpu>,
     mut commands: Commands,
@@ -209,9 +230,13 @@ pub fn extract_solari_atmosphere(
 
     let mut any = false;
     let mut next = GpuSolariAtmosphere::default();
-    for (render_entity, atmosphere) in &cameras {
+    for (render_entity, atmosphere, global_fog) in &cameras {
         any = true;
         commands.entity(render_entity).insert(SolariAtmosphereView);
+        // Global height fog is opt-in via `SolariGlobalFog`. Absent (or zero
+        // visibility) = `aerial_enabled = 0` → the path tracer skips the aerial
+        // march entirely; the sun + optical depths still light local fog volumes.
+        let fog = global_fog.filter(|f| f.visibility > 0.0 && f.visibility.is_finite());
         next = GpuSolariAtmosphere {
             bottom_radius: atmosphere.bottom_radius,
             top_radius: atmosphere.top_radius,
@@ -224,19 +249,11 @@ pub fn extract_solari_atmosphere(
             sun_direction,
             sun_illuminance,
             camera_altitude: atmosphere.camera_altitude,
-            aerial_visibility: atmosphere.aerial_visibility,
-            aerial_fog_height: atmosphere.aerial_fog_height,
-            aerial_fog_base: atmosphere.aerial_fog_base,
-            aerial_phase_g: atmosphere.aerial_phase_g,
-            // Zero/non-finite visibility = no global height fog; the rest of
-            // the uniform (sun, optical depths) still lights fog volumes.
-            aerial_enabled: if atmosphere.aerial_visibility > 0.0
-                && atmosphere.aerial_visibility.is_finite()
-            {
-                1.0
-            } else {
-                0.0
-            },
+            aerial_visibility: fog.map_or(0.0, |f| f.visibility),
+            aerial_fog_height: fog.map_or(0.0, |f| f.fog_height),
+            aerial_fog_base: fog.map_or(0.0, |f| f.fog_base),
+            aerial_phase_g: fog.map_or(0.0, |f| f.phase_g),
+            aerial_enabled: f32::from(fog.is_some()),
         };
     }
     // No atmosphere view: a disabled (default) uniform keeps the pathtracer's

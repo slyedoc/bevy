@@ -81,7 +81,8 @@ impl Plugin for SolarRenderPlugin {
         // systems match nothing and nothing renders.
         .add_plugins(ExtractComponentPlugin::<SolariCamera>::default())
         .register_type::<SolariViewState>()
-        .register_type::<atmosphere::SolariAtmosphere>();
+        .register_type::<atmosphere::SolariAtmosphere>()
+        .register_type::<atmosphere::SolariGlobalFog>();
            
 
         let render_app = app.sub_app_mut(RenderApp);
