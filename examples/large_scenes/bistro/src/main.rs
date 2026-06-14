@@ -208,6 +208,10 @@ pub fn main() {
             ),
         );
 
+    // Under `solari` the GLB ships KTX2 textures with their own mip chains and
+    // its materials are `SolariMaterial`, so the `StandardMaterial` runtime
+    // mip generator is pure overhead — skip it entirely.
+    #[cfg(not(feature = "solari"))]
     if !args.no_mip_generation {
         app.add_plugins((MipmapGeneratorPlugin, MipmapGeneratorDebugTextPlugin))
             // Generating mipmaps takes a minute
