@@ -63,6 +63,9 @@ pub struct SolariPipelines {
     pub ptlas_incremental: CachedComputePipelineId,
     pub ptlas_finalize: CachedComputePipelineId,
 
+    /// Appends hair instances to the PTLAS WRITE stream (`hair/ptlas_hair_write.wgsl`).
+    pub ptlas_hair_write: CachedComputePipelineId,
+
     pub restir_visibility: CachedComputePipelineId,
     pub restir_presample: CachedComputePipelineId,
     pub restir_regir_decay: CachedComputePipelineId,
@@ -97,6 +100,7 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "accel/selector.wgsl");
     embedded_asset!(app, "accel/blas_sharing.wgsl");
     embedded_asset!(app, "accel/ptlas_fill.wgsl");
+    embedded_asset!(app, "hair/ptlas_hair_write.wgsl");
     embedded_asset!(app, "render/visibility.wgsl");
     embedded_asset!(app, "render/presample.wgsl");
     embedded_asset!(app, "render/restir_pt.wgsl");
@@ -279,6 +283,18 @@ pub fn init_solari_pipelines(
     let ptlas_incremental = ptlas_make("fill_incremental");
     let ptlas_finalize = ptlas_make("finalize");
 
+    // Hair PTLAS-write — a single self-contained `@group(0)` (no scene group).
+    let ptlas_hair_write = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("ptlas_hair_write".into()),
+        layout: vec![resource_manager.ptlas_hair_write.clone()],
+        shader: load_embedded_asset!(asset_server.as_ref(), "hair/ptlas_hair_write.wgsl"),
+        shader_defs: vec![],
+        entry_point: Some("hair_write".into()),
+        immediate_size: 0,
+        zero_initialize_workgroup_memory: false,
+        constants: vec![],
+    });
+
     // ── ReSTIR realtime path: scene-bindings group + restir `@group(1)` + columns. ──
     let restir_columns = scene_columns
         .layout()
@@ -377,6 +393,7 @@ pub fn init_solari_pipelines(
         ptlas_seed,
         ptlas_incremental,
         ptlas_finalize,
+        ptlas_hair_write,
         restir_visibility,
         restir_presample,
         restir_regir_decay,

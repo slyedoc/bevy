@@ -33,6 +33,15 @@ pub struct RaytracingSceneBindings {
     pub bind_group_layout: BindGroupLayoutDescriptor,
 }
 
+/// Hair scene-group dependencies, bundled so the binder stays under the 16
+/// system-param limit. Each is `Option` (absent on non-solari devices).
+#[derive(bevy_ecs::system::SystemParam)]
+pub struct HairSceneDeps<'w> {
+    manager: Option<Res<'w, crate::hair::HairManager>>,
+    instances: Option<Res<'w, crate::hair::HairInstances>>,
+    propagate: Option<Res<'w, crate::transform::TransformPropagate>>,
+}
+
 pub fn prepare_raytracing_scene_bindings(
     lights: Res<LightSources>,
     
@@ -48,6 +57,7 @@ pub fn prepare_raytracing_scene_bindings(
     render_device: Res<RenderDevice>,
     pipeline_cache: Res<PipelineCache>,
     render_queue: Res<RenderQueue>,
+    hair: HairSceneDeps,
     mut raytracing_scene_bindings: ResMut<RaytracingSceneBindings>,
 ) {
     raytracing_scene_bindings.bind_group = None;
@@ -76,6 +86,21 @@ pub fn prepare_raytracing_scene_bindings(
     // created unconditionally in `RenderStartup`, so this is present whenever the
     // cluster pipeline is.
     let Some(deform) = deform else {
+        return;
+    };
+    // Hair scene data (segments + instance records + index range). Both are
+    // created in `RenderStartup` whenever the cluster pipeline is, so this is
+    // present on any solari-capable device; the buffers are empty when there's
+    // no hair (the path tracer gates reads on the hair instance count).
+    let (Some(hair_manager), Some(hair_instances), Some(transform_propagate)) =
+        (hair.manager, hair.instances, hair.propagate)
+    else {
+        return;
+    };
+    let Some(hair_params) = hair_instances.params.binding() else {
+        return;
+    };
+    let Some(hair_instance_buffer) = hair_instances.buffer.buffer() else {
         return;
     };
 
@@ -248,6 +273,12 @@ pub fn prepare_raytracing_scene_bindings(
             deform.animated_table().as_entire_binding(),
             deform.tangents.as_entire_binding(),
             active_light_list.binding().unwrap(),
+            // Hair: per-segment `{p0,r0, p1,r1}` records, per-instance records, range,
+            // and the transform-table world buffer (instance world matrices).
+            hair_manager.segments.buffer().as_entire_binding(),
+            hair_instance_buffer.as_entire_binding(),
+            hair_params,
+            transform_propagate.current_world().as_entire_binding(),
         )),
     ));
 }
@@ -288,6 +319,11 @@ impl RaytracingSceneBindings {
                         storage_buffer_read_only_sized(false, None), // 15: instance_animated
                         storage_buffer_read_only_sized(false, None), // 16: deform_tangents
                         storage_buffer_read_only_sized(false, None), // 17: active_light_list
+                        // Hair
+                        storage_buffer_read_only_sized(false, None), // 18: hair_segments
+                        storage_buffer_read_only_sized(false, None), // 19: hair_instances
+                        storage_buffer_read_only_sized(false, None), // 20: hair_params
+                        storage_buffer_read_only_sized(false, None), // 21: hair_world (transform table)
                     ),
                 ),
             ),

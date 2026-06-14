@@ -1562,6 +1562,24 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
+name = "solari_hair"
+path = "examples/3d/solari/hair.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "cluster_processor",
+    "free_camera",
+    "bevy_dev_tools",
+    "bevy_feathers",
+]
+
+[package.metadata.example.solari_hair]
+name = "Solari (hair)"
+description = "Ray-traced hair via NV linear swept spheres — a procedural fur ball shaded with a Chiang fiber BSDF (Bevy Solari). Requires an RTX 50-series GPU."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
 name = "solari_animation"
 path = "examples/3d/solari/animation.rs"
 doc-scrape-examples = true

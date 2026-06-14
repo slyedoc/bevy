@@ -66,6 +66,8 @@ pub struct SolariResourceManager {
     pub selector: BindGroupLayoutDescriptor,
     pub blas_sharing: BindGroupLayoutDescriptor,
     pub ptlas: BindGroupLayoutDescriptor,
+    /// The hair PTLAS-write `@group(0)` layout.
+    pub ptlas_hair_write: BindGroupLayoutDescriptor,
     /// The ReSTIR `@group(1)` layout (shared by all six realtime passes).
     pub restir: BindGroupLayoutDescriptor,
     /// The fullscreen gizmo depth-write `@group(0)` layout.
@@ -95,6 +97,7 @@ pub fn init_solari_resource_manager(mut commands: Commands, allocator: Option<Re
         selector: selector_bind_group_layout(),
         blas_sharing: blas_sharing_bind_group_layout(),
         ptlas: ptlas_bind_group_layout(),
+        ptlas_hair_write: crate::hair::ptlas_hair::ptlas_hair_write_bind_group_layout(),
         restir: restir_bind_group_layout(),
         gizmo_depth: gizmo_depth_bind_group_layout(),
         #[cfg(feature = "dlss")]

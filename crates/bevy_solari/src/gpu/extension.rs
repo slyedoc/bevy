@@ -61,6 +61,17 @@ pub struct ClusterAccelerationStructureFeature;
 /// Marker type for `VK_NV_partitioned_acceleration_structure`.
 pub struct PartitionedAccelerationStructureFeature;
 
+/// Marker type registered in [`AdditionalVulkanFeatures`] when
+/// `VK_NV_ray_tracing_linear_swept_spheres` is enabled on the device.
+/// The hair pipeline (LSS BLAS build + shading) checks
+/// `additional_features.has::<LinearSweptSpheresFeature>()` to know
+/// whether ray-traced hair is usable on the current adapter (Blackwell /
+/// RTX 50-series + driver ≥ 572.63). The extension adds no new commands —
+/// LSS geometry is built through the standard `khr::acceleration_structure`
+/// path and intersected from the existing compute `rayQuery` traversal —
+/// so there is no per-device function table to load.
+pub struct LinearSweptSpheresFeature;
+
 /// Register the cluster-AS + partitioned-AS Vulkan device-creation
 /// callback. Called by `SolariInitPlugin::build` — apps using
 /// `DefaultPlugins` get this wiring automatically.
@@ -151,6 +162,26 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 let features = Box::leak(Box::new(
                     vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV::default()
                         .partitioned_acceleration_structure(true),
+                ));
+                *args.create_info = core::mem::take(args.create_info).push(features);
+            }
+
+            // Ray-traced hair via linear swept spheres. Blackwell-only; on
+            // older adapters the extension simply isn't advertised and the
+            // hair pipeline stays disabled. Enables `linearSweptSpheres` (the
+            // capped-cylinder hair primitive) and `spheres` (the point
+            // primitive) so both geometry types can be built. Intersection
+            // works from the inline `rayQuery` the path tracer already uses —
+            // the extension shares the `rayTracing`/`rayQuery` features chained
+            // by wgpu; no ray-tracing pipeline is required.
+            if supports(nv::ray_tracing_linear_swept_spheres::NAME) {
+                args.extensions
+                    .push(nv::ray_tracing_linear_swept_spheres::NAME);
+                additional.insert::<LinearSweptSpheresFeature>();
+                let features = Box::leak(Box::new(
+                    vk::PhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV::default()
+                        .linear_swept_spheres(true)
+                        .spheres(true),
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
             }
@@ -374,6 +405,47 @@ pub unsafe fn cmd_global_as_barrier(
                     .dst_access_mask(dst_access)],
                 &[],
                 &[],
+            );
+        });
+    }
+}
+
+/// Issue `vkCmdBuildAccelerationStructuresKHR` against the active Vulkan
+/// command buffer underlying `encoder` — the standard KHR build path,
+/// used by the hair pipeline to build linear-swept-sphere BLASes (the NV
+/// LSS extension adds no commands of its own; LSS geometry is fed through
+/// the normal `VkAccelerationStructureGeometryKHR` with a chained
+/// `VkAccelerationStructureGeometryLinearSweptSpheresDataNV`).
+///
+/// `build_info`'s `dst_acceleration_structure` must be a created handle,
+/// its `scratch_data` a committed device address, and its geometry's
+/// vertex/radius/index device addresses must point at committed buffers.
+/// `range_infos[i]` gives the primitive count for `build_info`'s geometry.
+///
+/// # Safety
+///
+/// Caller must uphold every Vulkan rule of
+/// `vkCmdBuildAccelerationStructuresKHR`: the dst handle, scratch, and all
+/// geometry input addresses valid and sized, and surrounding barriers
+/// emitted (this path is invisible to wgpu's tracker).
+pub unsafe fn cmd_build_acceleration_structures(
+    encoder: &mut wgpu::CommandEncoder,
+    fns: &ClusterExtensionFns,
+    build_info: &vk::AccelerationStructureBuildGeometryInfoKHR<'_>,
+    range_infos: &[vk::AccelerationStructureBuildRangeInfoKHR],
+) {
+    let _span = tracing::info_span!("vk.build_acceleration_structures").entered();
+    let as_fns = &fns.acceleration_structure;
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder
+                .expect("cmd_build_acceleration_structures requires Vulkan backend");
+            let command_buffer = hal_encoder.raw_handle();
+            // One build-geometry-info, one slice of range infos for it.
+            as_fns.cmd_build_acceleration_structures(
+                command_buffer,
+                core::slice::from_ref(build_info),
+                &[Some(range_infos)],
             );
         });
     }

@@ -5,7 +5,9 @@ enable wgpu_ray_query;
 #import bevy_render::view::View
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf, dispersive_ior, spectral_rgb_weight, sample_hero_wavelength}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, generate_random_emissive_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_light_transmittance, emissive_light_count, NULL_LIGHT_ID}
-#import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, resolve_ray_hit_full_lod, offset_ray_origin, directional_lights, light_sources, active_light_list, fog_volumes_sample, fog_volumes_range, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, resolve_ray_hit_full_lod, offset_ray_origin, directional_lights, light_sources, active_light_list, fog_volumes_sample, fog_volumes_range, is_hair_instance, resolve_hair_hit, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::hair::sample_hair_bsdf
+#import bevy_solari::hair_shade::hair_direct_lighting
 #import bevy_solari::atmosphere::{Atmosphere, atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
 
 @group(1) @binding(0) var accumulation_texture: texture_storage_2d<rgba32float, read_write>;
@@ -137,6 +139,41 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             break;
         }
         if ray.kind != RAY_QUERY_INTERSECTION_NONE {
+            // Hair (linear swept spheres): a separate primitive type. The ray
+            // query exposes no NV LSS getters here, so reconstruct the fiber
+            // tangent from the hit segment's endpoints and shade with the Chiang
+            // fiber BSDF (no surface normal, no textures, no cone LOD).
+            if is_hair_instance(ray.instance_index) {
+                let world_position = ray_origin + ray_direction * ray.t;
+                throughput *= exp(-medium_extinction * ray.t);
+                if p_bounce == 0.0 {
+                    primary_distance = length(world_position - camera_position);
+                }
+                let hair = resolve_hair_hit(ray.instance_index, ray.primitive_index, world_position);
+                let wo = -ray_direction;
+
+                // Direct lighting (NEE) — shared with the realtime path.
+                radiance += throughput * hair_direct_lighting(world_position, wo, hair, &rng);
+
+                // Next bounce from the fiber BSDF.
+                let next = sample_hair_bsdf(wo, hair.tangent, hair.sigma_a,
+                    hair.beta_m, hair.beta_n, hair.alpha, hair.ior, &rng);
+                if next.pdf == 0.0 { break; }
+                ray_direction = next.wi;
+                // Hair has no surface normal — nudge the origin along the new
+                // direction to avoid re-hitting the same segment.
+                ray_origin = world_position + next.wi * 1e-3;
+                ray_t_min = 0.0;
+                p_bounce = next.pdf;
+                throughput *= next.throughput;
+
+                let p = min(luminance(throughput), 0.95);
+                if rand_f(&rng) > p { break; }
+                throughput /= p;
+                bounces += 1u;
+                if bounces >= MAX_BOUNCES { break; }
+                continue;
+            }
             // Grow the cone over the segment just travelled, then resolve this
             // hit's textures at the cone's mip.
             cone_width += cone_spread * ray.t;

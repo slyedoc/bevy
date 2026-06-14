@@ -8,7 +8,7 @@ How we capture, how to read it, and what we've found. Scene = `bevy_city`
 
 Pipelined. With `PipelinedRenderingPlugin` (default), the main world's frame
 N+1 runs concurrently with the render world's frame N, and the GPU runs async
-behind the render thread's submits. So frame time is
+behind the render thraead's submits. So frame time is
 `max(main-thread, render-thread, GPU) + extract-sync`, NOT the sum.
 
 > **Status (2026-06-08, size 100):** ~250–280 fps **uninstrumented**, ~5.3 ms

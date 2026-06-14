@@ -134,6 +134,94 @@ struct AnimatedInstance {
 @group(0) @binding(15) var<storage> instance_animated: array<AnimatedInstance>;
 @group(0) @binding(16) var<storage> deform_tangents: array<vec4<f32>>; // xyz + w bitangent sign
 
+// ── Hair (linear swept spheres) ──
+// Per-instance record (mirrors `GpuHairInstance`, Rust). The path tracer reads
+// it when a ray hits a hair instance (PTLAS index in `[base, base+count)`). The
+// world transform isn't stored — it lives in the GPU transform table (`hair_world`)
+// at `transform_slot`, like directional lights.
+struct GpuHairInstance {
+    sigma_a: vec3<f32>,             // absorption from melanin (+ dye), CPU-derived
+    transform_slot: u32,            // index into `hair_world` (×3 rows)
+    segment_base: u32,              // base into `hair_segments`
+    beta_m: f32,
+    beta_n: f32,
+    alpha: f32,
+    ior: f32,
+    blas_address_lo: u32,
+    blas_address_hi: u32,
+    mask: u32,
+}
+// Per swept segment: the two capped-cylinder endpoints + radii, local space.
+struct HairSegment {
+    p0: vec4<f32>, // xyz position, w radius
+    p1: vec4<f32>,
+}
+struct HairSceneParams {
+    base: u32,  // PTLAS instance_index of hair instance 0
+    count: u32,
+    pad0: u32,
+    pad1: u32,
+}
+@group(0) @binding(18) var<storage> hair_segments: array<HairSegment>;
+@group(0) @binding(19) var<storage> hair_instances: array<GpuHairInstance>;
+@group(0) @binding(20) var<storage> hair_params: HairSceneParams;
+// GPU transform table: 3 `vec4` rows (mat3x4) per node, indexed `slot*3 + k`.
+@group(0) @binding(21) var<storage> hair_world: array<vec4<f32>>;
+
+/// A hit's PTLAS `instance_index` lands in the hair range.
+fn is_hair_instance(instance_index: u32) -> bool {
+    return hair_params.count > 0u
+        && instance_index >= hair_params.base
+        && instance_index < hair_params.base + hair_params.count;
+}
+
+/// Transform a local point by a transform-table node's world matrix (3 rows).
+fn hair_world_point(transform_slot: u32, p: vec3<f32>) -> vec3<f32> {
+    let s = transform_slot * 3u;
+    let r0 = hair_world[s];
+    let r1 = hair_world[s + 1u];
+    let r2 = hair_world[s + 2u];
+    return vec3<f32>(
+        dot(r0.xyz, p) + r0.w,
+        dot(r1.xyz, p) + r1.w,
+        dot(r2.xyz, p) + r2.w,
+    );
+}
+
+/// Resolved hair hit: world position, fiber tangent, and the instance record
+/// (color + fiber params). Reconstructed from the hit segment's two endpoints —
+/// the path tracer's ray query doesn't expose the NV LSS curve getters, so the
+/// fiber axis comes from the segment, the surface point from the ray distance.
+struct ResolvedHairHit {
+    world_position: vec3<f32>,
+    tangent: vec3<f32>,
+    sigma_a: vec3<f32>,
+    beta_m: f32,
+    beta_n: f32,
+    alpha: f32,
+    ior: f32,
+}
+
+fn resolve_hair_hit(
+    instance_index: u32,
+    primitive_index: u32,
+    world_position: vec3<f32>,
+) -> ResolvedHairHit {
+    let h = hair_instances[instance_index - hair_params.base];
+    let seg = hair_segments[h.segment_base + primitive_index];
+    let wp0 = hair_world_point(h.transform_slot, seg.p0.xyz);
+    let wp1 = hair_world_point(h.transform_slot, seg.p1.xyz);
+    var hit: ResolvedHairHit;
+    hit.world_position = world_position;
+    hit.tangent = normalize(wp1 - wp0);
+    hit.sigma_a = h.sigma_a;
+    hit.beta_m = h.beta_m;
+    hit.beta_n = h.beta_n;
+    hit.alpha = h.alpha;
+    hit.ior = h.ior;
+    return hit;
+}
+
 // Per-instance LOD inputs, slot-indexed. This is the SAME buffer the
 // cluster path binds as `cluster_instance_lod_inputs` (16 B stride:
 // cluster_base, cluster_count, group_base, root_group) — the RT path

@@ -389,6 +389,7 @@ pub fn prepare_ptlas_params(
     allocator: Option<Res<Allocator>>,
     fns: Option<Res<ClusterExtensionFns>>,
     deform: Option<Res<super::deform::Deform>>,
+    hair_instances: Option<Res<crate::hair::HairInstances>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
@@ -402,16 +403,24 @@ pub fn prepare_ptlas_params(
         return;
     };
 
-    let high_water = instances.slot_high_water();
+    // Hair instances occupy PTLAS indices `[cluster_high_water, +hair_count)`
+    // above the cluster slots, written by `ptlas_hair_write` each frame. They
+    // expand the PTLAS instance space but use none of the cluster fill state.
+    let hair_count = hair_instances.as_ref().map(|h| h.count).unwrap_or(0);
+
+    let cluster_high_water = instances.slot_high_water();
+    // Total PTLAS instance space (cluster slots + hair).
+    let high_water = cluster_high_water + hair_count;
     if high_water == 0 {
         resources.op_count = 0;
         return;
     }
     let active_count = instances.active_count() as u32;
 
-    // Build kind. `slot_high_water` only grows; growth needs a bigger
-    // AS, which can't be an in-place update — so a full rebuild. Also
-    // full on the very first build (no `src` to carry from).
+    // Build kind. The PTLAS instance space only grows; growth needs a bigger
+    // AS, which can't be an in-place update — so a full rebuild. Also full on
+    // the very first build (no `src` to carry from). A change in hair count
+    // also grows/shrinks the space and is folded into `high_water`.
     let grew = high_water > resources.as_capacity;
     let full_rebuild = !resources.has_built || grew;
 
@@ -519,8 +528,9 @@ pub fn prepare_ptlas_params(
     let op_count = 1u32;
 
     // Worst-case record count = CPU delta + every active instance whose
-    // geometry rebuilt this frame. Commit `write_data` for it.
-    let max_records = cpu_count as u64 + active_count as u64;
+    // geometry rebuilt this frame + every hair instance (re-specified each
+    // frame). Commit `write_data` for it.
+    let max_records = cpu_count as u64 + active_count as u64 + hair_count as u64;
     resources
         .write_data
         .commit(0..(max_records.max(1)) * WRITE_INSTANCE_DATA_SIZE);
@@ -740,6 +750,8 @@ pub fn dispatch_ptlas(
     scene_bind_group: Res<ClusterSceneBindGroup>,
     pipeline_cache: Res<PipelineCache>,
     instances: Option<Res<InstanceManager>>,
+    hair_instances: Option<Res<crate::hair::HairInstances>>,
+    hair_write: Option<Res<crate::hair::ptlas_hair::HairPtlasWrite>>,
     mut ctx: RenderContext,
 ) {
     let (Some(allocator), Some(fns), Some(resources), Some(instances)) = (
@@ -759,7 +771,8 @@ pub fn dispatch_ptlas(
     if resources.op_count == 0 {
         return;
     }
-    let capacity = instances.slot_high_water();
+    let hair_count = hair_instances.as_ref().map(|h| h.count).unwrap_or(0);
+    let capacity = instances.slot_high_water() + hair_count;
     if capacity == 0 {
         return;
     }
@@ -855,6 +868,23 @@ pub fn dispatch_ptlas(
             pass.set_pipeline(incremental_pipe);
             let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(active_count.div_ceil(64));
             pass.dispatch_workgroups(gx, gy, gz);
+        }
+        // Hair: append hair instances to the WRITE stream (same `write_count`),
+        // after the cluster movers and before `finalize` publishes the count.
+        if hair_count > 0 {
+            if let (Some(hair_bg), Some(hair_pipe)) = (
+                hair_write.as_ref().and_then(|w| w.bind_group.as_ref()),
+                pipeline_cache.get_compute_pipeline(pipelines.ptlas_hair_write),
+            ) {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("ptlas.hair_write"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(hair_pipe);
+                pass.set_bind_group(0, hair_bg, &[]);
+                let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(hair_count.div_ceil(64));
+                pass.dispatch_workgroups(gx, gy, gz);
+            }
         }
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {

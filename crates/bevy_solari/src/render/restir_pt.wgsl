@@ -203,6 +203,11 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if any(global_id.xy >= vec2u(view.main_pass_viewport.zw)) {
         return;
     }
+    // Hair pixels (`w = -3` sentinel) self-shaded inline in the visibility pass —
+    // the surface-reservoir path can't resample a fiber BSDF. Leave them untouched.
+    if textureLoad(gbuffer_position, global_id.xy).w < -2.5 {
+        return;
+    }
     let pixel = global_id.xy;
     let index = reservoir_index(pixel);
 

@@ -15,8 +15,13 @@ enable wgpu_ray_query;
 // material slot id is stored, to be refetched from the scene bindings at
 // shade time.
 
-#import bevy_solari::restir_bindings::{view, gbuffer_position, gbuffer_normal, motion_vectors, gbuffer_uv, view_clip_from_world, solari_view}
-#import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, material_ids, RAY_T_MAX}
+#import bevy_solari::restir_bindings::{view, view_output, gbuffer_position, gbuffer_normal, motion_vectors, gbuffer_uv, view_clip_from_world, solari_view}
+#import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, resolve_hair_hit, is_hair_instance, material_ids, RAY_T_MAX}
+#import bevy_solari::hair_shade::shade_hair_path
+
+/// Hair strand-strand bounces for the realtime path (the pathtracer uses its own
+/// budget). Few bounces — temporal/DLSS denoises the rest.
+const HAIR_MAX_BOUNCES = 4u;
 
 @compute @workgroup_size(8, 8, 1)
 fn visibility(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -69,6 +74,36 @@ fn visibility(@builtin(global_invocation_id) global_id: vec3<u32>) {
         textureStore(gbuffer_normal, global_id.xy, vec4(0.0));
         textureStore(motion_vectors, global_id.xy, vec4(0.0));
         textureStore(gbuffer_uv, global_id.xy, vec4(0.0));
+        return;
+    }
+
+    // Hair: shade it inline (the surface-reservoir path can't), tag the G-buffer
+    // with the `w = -3` hair sentinel so the diffuse shade pass leaves it alone,
+    // and write motion + the fiber tangent (as the normal) for the temporal/DLSS
+    // resolve. `compose` exposes + fogs it like any pixel.
+    if is_hair_instance(ray.instance_index) {
+        var rng = (global_id.x + global_id.y * u32(view.main_pass_viewport.z))
+            + view.frame_count * 5782582u;
+        let world_position = ray_origin + ray_direction * ray.t;
+        let hair = resolve_hair_hit(ray.instance_index, ray.primitive_index, world_position);
+        let radiance = shade_hair_path(
+            ray_origin, ray_direction,
+            ray.t, ray.instance_index, ray.primitive_index,
+            HAIR_MAX_BOUNCES, &rng,
+        );
+        textureStore(view_output, global_id.xy, vec4(radiance, 1.0));
+        textureStore(gbuffer_position, global_id.xy, vec4(world_position, -3.0));
+        textureStore(gbuffer_normal, global_id.xy, vec4(hair.tangent, 0.0));
+        textureStore(gbuffer_uv, global_id.xy, vec4(0.0));
+        let prev_parity = (view.frame_count & 1u) ^ 1u;
+        let current_clip = view.unjittered_clip_from_world * vec4(world_position, 1.0);
+        let previous_clip = view_clip_from_world[prev_parity] * vec4(world_position, 1.0);
+        var motion = vec2(0.0);
+        if current_clip.w > 0.0 && previous_clip.w > 0.0 {
+            motion = (current_clip.xy / current_clip.w - previous_clip.xy / previous_clip.w)
+                * vec2(0.5, -0.5);
+        }
+        textureStore(motion_vectors, global_id.xy, vec4(motion, 0.0, 0.0));
         return;
     }
 

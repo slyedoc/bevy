@@ -49,6 +49,7 @@ pub mod lights;
 pub mod instance;
 pub mod render;
 pub mod transform;
+pub mod hair;
 
 #[cfg(feature = "cluster_processor")]
 pub mod helper;
@@ -63,6 +64,7 @@ use bevy_log::warn;
 
 use crate::accel::AccelPlugin;
 use crate::bindings::BindingsPlugin;
+use crate::hair::HairPlugin;
 use crate::ecs_gpu::SceneColumnsPlugin;
 use crate::geometry::GeometryPlugin;
 use crate::instance::InstancePlugin;
@@ -125,6 +127,7 @@ pub mod prelude {
         transform::{NoGpuGlobalTransformReadback, TransformStatic},
         material::{SolariMaterial, SolariMaterial3d},
         lights::SolariDirectionLight,
+        hair::{Hair, HairMaterial, HairAsset, HairStrand},
     };
 
     #[cfg(feature = "cluster_processor")]
@@ -189,6 +192,8 @@ impl Plugin for SolariPlugin {
             SolariTransformPlugin,
             SolariMaterialPlugin,
             SolariLightsPlugin,
+
+            HairPlugin,
         ));
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
