@@ -47,6 +47,9 @@ struct Material {
     alpha_mask: f32,
     // Chromatic dispersion (20/Abbe, `KHR_materials_dispersion`); 0 = none.
     dispersion: f32,
+    // `0.5·log2(w·h)` of the base-color texture — the texture-size term of the
+    // ray-cone LOD, baked CPU-side so no per-hit `textureDimensions` query.
+    texel_lod_bias: f32,
 }
 
 const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
@@ -267,8 +270,20 @@ fn alpha_test(hit: RayIntersection) -> bool {
     return alpha >= material.alpha_mask;
 }
 
+// A `partial_lod` at or below this means "sample mip 0" — used by callers that
+// don't track a ray cone (NEE visibility, ReStIR, DLSS resolve).
+const TEXTURE_LOD_MIP0: f32 = -1000.0;
+
 fn sample_texture(id: u32, uv: vec2<f32>) -> vec3<f32> {
-    return textureSampleLevel(textures[id], samplers[id], uv, 0.0).rgb; // TODO: Mipmap
+    return textureSampleLevel(textures[id], samplers[id], uv, 0.0).rgb;
+}
+
+// As `sample_texture`, but at an explicit ray-cone LOD (the texture's
+// `0.5·log2(w·h)` is already folded in by the caller via `Material.texel_lod_bias`,
+// so this never queries `textureDimensions`). `lod <= TEXTURE_LOD_MIP0` ⇒ mip 0.
+fn sample_texture_lod(id: u32, uv: vec2<f32>, lod: f32) -> vec3<f32> {
+    let level = max(lod, 0.0); // sentinel & cone-magnification both clamp to mip 0
+    return textureSampleLevel(textures[id], samplers[id], uv, level).rgb;
 }
 
 struct ResolvedMaterial {
@@ -300,16 +315,22 @@ struct ResolvedRayHitFull {
 }
 
 fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
+    return resolve_material_lod(material, uv, TEXTURE_LOD_MIP0);
+}
+
+fn resolve_material_lod(material: Material, uv: vec2<f32>, partial_lod: f32) -> ResolvedMaterial {
     var m: ResolvedMaterial;
+    // Fold in this material's texture-size term (mip-0 sentinel stays < 0).
+    let lod = partial_lod + material.texel_lod_bias;
 
     m.base_color = material.base_color.rgb;
     if material.base_color_texture_id != TEXTURE_MAP_NONE {
-        m.base_color *= sample_texture(material.base_color_texture_id, uv);
+        m.base_color *= sample_texture_lod(material.base_color_texture_id, uv, lod);
     }
 
     m.emissive = material.emissive.rgb;
     if material.emissive_texture_id != TEXTURE_MAP_NONE {
-        m.emissive *= sample_texture(material.emissive_texture_id, uv);
+        m.emissive *= sample_texture_lod(material.emissive_texture_id, uv, lod);
     }
 
     m.reflectance = material.reflectance;
@@ -317,7 +338,7 @@ fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
     m.perceptual_roughness = material.perceptual_roughness;
     m.metallic = material.metallic;
     if material.metallic_roughness_texture_id != TEXTURE_MAP_NONE {
-        let metallic_roughness = sample_texture(material.metallic_roughness_texture_id, uv);
+        let metallic_roughness = sample_texture_lod(material.metallic_roughness_texture_id, uv, lod);
         m.perceptual_roughness *= metallic_roughness.g;
         m.metallic *= metallic_roughness.b;
     }
@@ -389,6 +410,22 @@ fn resolve_ray_hit_full(ray_hit: RayIntersection) -> ResolvedRayHitFull {
         ray_hit.geometry_index,
         ray_hit.primitive_index,
         barycentrics,
+    );
+}
+
+// As `resolve_ray_hit_full`, but selects texture mips from a ray cone:
+// `cone_width` is the cone diameter at this hit (spread angle × path length so
+// far). `ray_direction` is currently unused — reserved for re-adding the
+// grazing-angle (1/cosθ) LOD term if the register budget allows.
+fn resolve_ray_hit_full_lod(ray_hit: RayIntersection, cone_width: f32, ray_direction: vec3<f32>) -> ResolvedRayHitFull {
+    let barycentrics = vec3(1.0 - ray_hit.barycentrics.x - ray_hit.barycentrics.y, ray_hit.barycentrics);
+    return resolve_triangle_data_full_cone(
+        ray_hit.instance_index,
+        ray_hit.geometry_index,
+        ray_hit.primitive_index,
+        barycentrics,
+        cone_width,
+        ray_direction,
     );
 }
 
@@ -714,6 +751,18 @@ fn resolve_triangle_data_full(
     triangle_id: u32,
     barycentrics: vec3<f32>,
 ) -> ResolvedRayHitFull {
+    // No ray cone (cone_width < 0) → every texture samples mip 0.
+    return resolve_triangle_data_full_cone(instance_id, cluster_global_id, triangle_id, barycentrics, -1.0, vec3(0.0));
+}
+
+fn resolve_triangle_data_full_cone(
+    instance_id: u32,
+    cluster_global_id: u32,
+    triangle_id: u32,
+    barycentrics: vec3<f32>,
+    cone_width: f32,
+    ray_direction: vec3<f32>,
+) -> ResolvedRayHitFull {
     let material_id = material_ids[instance_id];
     let material = materials[material_id];
 
@@ -768,16 +817,31 @@ fn resolve_triangle_data_full(
         geometric_world_normal = -geometric_world_normal;
     }
 
+    // Ray-cone texture LOD (Akenine-Möller et al., Ray Tracing Gems ch.20). The
+    // texture-size-INDEPENDENT term: the triangle's texel density (UV area vs
+    // world area) plus the cone footprint at this hit; `Material.texel_lod_bias`
+    // adds each texture's own `0.5·log2(w·h)`. The grazing-angle (1/cosθ) term is
+    // omitted to keep this off the megakernel's register-pressure path. A
+    // negative `cone_width` (non-path-tracer callers) keeps the mip-0 sentinel.
+    var partial_lod = TEXTURE_LOD_MIP0;
+    if cone_width >= 0.0 {
+        let uv_edge0 = vertices[1].uv - vertices[0].uv;
+        let uv_edge1 = vertices[2].uv - vertices[0].uv;
+        let uv_area = 0.5 * abs(uv_edge0.x * uv_edge1.y - uv_edge0.y * uv_edge1.x);
+        partial_lod = 0.5 * log2(max(uv_area, 1e-12) / max(triangle_area, 1e-8))
+            + log2(max(cone_width, 1e-6));
+    }
+
     if material.normal_map_texture_id != TEXTURE_MAP_NONE {
         let TBN = calculate_tbn_mikktspace(world_normal, world_tangent);
         let T = TBN[0];
         let B = TBN[1];
         let N = TBN[2];
-        let Nt = sample_texture(material.normal_map_texture_id, uv);
+        let Nt = sample_texture_lod(material.normal_map_texture_id, uv, partial_lod + material.texel_lod_bias);
         world_normal = normalize(Nt.x * T + Nt.y * B + Nt.z * N);
     }
 
-    let resolved_material = resolve_material(material, uv);
+    let resolved_material = resolve_material_lod(material, uv, partial_lod);
 
     return ResolvedRayHitFull(
         world_position,

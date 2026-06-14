@@ -5,7 +5,7 @@ enable wgpu_ray_query;
 #import bevy_render::view::View
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal, sample_glass_bsdf, dispersive_ior, spectral_rgb_weight, sample_hero_wavelength}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, generate_random_emissive_light_sample, calculate_resolved_light_contribution, trace_light_visibility, trace_light_transmittance, emissive_light_count, NULL_LIGHT_ID}
-#import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, offset_ray_origin, directional_lights, light_sources, active_light_list, fog_volumes_sample, fog_volumes_range, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::scene_bindings::{trace_ray, trace_ray_traversal, set_view_cull_mask, resolve_ray_hit_full, resolve_ray_hit_full_lod, offset_ray_origin, directional_lights, light_sources, active_light_list, fog_volumes_sample, fog_volumes_range, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 #import bevy_solari::atmosphere::{Atmosphere, atmosphere_fog_extinction, atmosphere_mie_phase, atmosphere_sun_optical_depth}
 
 @group(1) @binding(0) var accumulation_texture: texture_storage_2d<rgba32float, read_write>;
@@ -91,6 +91,15 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let primary_ray_direction = ray_direction;
     var primary_distance = -1.0;
 
+    // Ray-cone texture LOD: the cone's diameter `cone_width` grows by the pixel's
+    // angular footprint (`2·tan(fovY/2)/height`, from `clip_from_view[1][1] =
+    // 1/tan(fovY/2)`) over each segment's length, so distant and indirect hits
+    // sample coarser mips. `cone_spread` is a loop-invariant constant (no
+    // per-bounce roughness widening) to keep the path loop's live state minimal —
+    // distance alone already coarsens deep bounces. Only `cone_width` persists.
+    let cone_spread = 2.0 / (view.clip_from_view[1].y * view.viewport.w);
+    var cone_width = 0.0;
+
     var radiance = vec3(0.0);
     var throughput = vec3(1.0);
     var p_bounce = 0.0;
@@ -128,7 +137,10 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             break;
         }
         if ray.kind != RAY_QUERY_INTERSECTION_NONE {
-            let ray_hit = resolve_ray_hit_full(ray);
+            // Grow the cone over the segment just travelled, then resolve this
+            // hit's textures at the cone's mip.
+            cone_width += cone_spread * ray.t;
+            let ray_hit = resolve_ray_hit_full_lod(ray, cone_width, ray_direction);
             throughput *= exp(-medium_extinction * length(ray_hit.world_position - ray_origin));
             if p_bounce == 0.0 { // Primary hit — distance for aerial perspective.
                 primary_distance = length(ray_hit.world_position - camera_position);

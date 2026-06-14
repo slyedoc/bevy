@@ -135,6 +135,18 @@ pub fn prepare_raytracing_scene_bindings(
             continue;
         };
 
+        // Texture-size term of the ray-cone LOD, from the base-color texture
+        // (representative of the material's maps). 0 ⇒ no base-color texture.
+        let texel_lod_bias = material
+            .base_color_texture
+            .as_ref()
+            .and_then(|handle| texture_assets.get(handle.id()))
+            .map(|image| {
+                let size = image.texture_descriptor.size;
+                0.5 * ((size.width * size.height) as f32).log2()
+            })
+            .unwrap_or(0.0);
+
         let emissive_vec3 = material.emissive.to_vec3();
 
         // Beer–Lambert: attenuation_color remains after attenuation_distance,
@@ -169,6 +181,7 @@ pub fn prepare_raytracing_scene_bindings(
             nested_priority: material.nested_priority,
             alpha_mask: material.traversal_alpha_cutoff(),
             dispersion: material.dispersion.max(0.0),
+            texel_lod_bias,
         };
     }
 
@@ -345,6 +358,12 @@ struct GpuMaterial {
     alpha_mask: f32,
     // Chromatic dispersion (20/Abbe, `KHR_materials_dispersion`); 0 = none.
     dispersion: f32,
+    // `0.5·log2(width·height)` of the base-color texture — the texture-size
+    // term of the ray-cone texture LOD, baked here so the path tracer doesn't
+    // query `textureDimensions` per hit (a bindless descriptor fetch that
+    // crushed warp occupancy). Shared across the material's maps (they're
+    // near-always the same resolution).
+    texel_lod_bias: f32,
 }
 
 impl Default for GpuMaterial {
@@ -366,6 +385,7 @@ impl Default for GpuMaterial {
             // Opaque: freed material slots must not alpha-test in traversal.
             alpha_mask: -1.0,
             dispersion: 0.0,
+            texel_lod_bias: 0.0,
         }
     }
 }
