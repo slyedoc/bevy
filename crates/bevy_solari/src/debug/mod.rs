@@ -1,0 +1,41 @@
+mod ui;
+
+use bevy_app::{App, Plugin, Update};
+use bevy_feathers::FeathersCorePlugin;
+
+/// Plugin that adds the in-engine debug-view selector: one Feathers dropdown
+/// per [`SolariCamera`](crate::render::SolariCamera), each in its own viewport.
+/// Picking a view sets that camera's
+/// [`SolariViewState`](crate::render::view::SolariViewState).
+///
+/// Replaces the old `Tab`/`Shift+Tab` hotkey, which collided with Feathers' tab
+/// navigation — the dropdown is a focusable widget in a `TabGroup`, so `Tab`
+/// navigates it instead.
+pub struct SolariDebugPlugin;
+
+impl Plugin for SolariDebugPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            (
+                ui::spawn_debug_panels,
+                ui::update_view_label,
+                ui::spawn_render_debug_panels,
+                ui::update_render_debug_label,
+                #[cfg(feature = "dlss")]
+                ui::spawn_dlss_panel,
+                #[cfg(feature = "dlss")]
+                ui::update_dlss_label,
+                #[cfg(feature = "dlss")]
+                ui::append_dlss_guide_items,
+            ),
+        );
+    }
+
+    fn finish(&self, app: &mut App) {
+        assert!(
+            app.is_plugin_added::<FeathersCorePlugin>(),
+            "SolariDebugPlugin requires `FeathersCorePlugin` to be added to the app.",
+        );
+    }
+}

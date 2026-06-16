@@ -40,6 +40,8 @@ plugin_group! {
         bevy_winit:::WinitPlugin,
         #[custom(cfg(all(feature = "dlss", not(feature = "force_disable_dlss"))))]
         bevy_anti_alias::dlss:::DlssInitPlugin,
+        #[cfg(feature = "bevy_solari")]
+        bevy_solari:::SolariInitPlugin,
         #[cfg(feature = "bevy_render")]
         bevy_render:::RenderPlugin,
         // NOTE: Load this after renderer initialization so that it knows about the supported

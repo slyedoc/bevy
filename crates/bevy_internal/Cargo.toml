@@ -25,6 +25,7 @@ trace = [
 trace_chrome = ["bevy_log/tracing-chrome"]
 trace_tracy = ["bevy_render?/tracing-tracy", "bevy_log/tracing-tracy"]
 trace_tracy_memory = ["bevy_log/trace_tracy_memory", "trace", "trace_tracy"]
+trace_tracy_ondemand = ["trace_tracy", "bevy_log/trace_tracy_ondemand"]
 detailed_trace = ["bevy_ecs/detailed_trace", "bevy_render?/detailed_trace"]
 
 sysinfo_plugin = ["bevy_diagnostic/sysinfo_plugin"]
@@ -96,6 +97,15 @@ force_disable_dlss = [
   "bevy_anti_alias?/force_disable_dlss",
   "bevy_solari?/force_disable_dlss",
 ]
+
+# Enables baking bevy_mesh::Mesh into bevy_solari::cluster::ClusterMesh.
+# Pulls in meshopt (C library) — offline tools only.
+cluster_processor = ["bevy_solari?/cluster_processor"]
+
+# Enables the in-engine debug-view dropdown for bevy_solari
+# (`SolariDebugPlugin`). Pulls in bevy_feathers + the UI widget stack
+# — examples / tools only.
+bevy_solari_debug = ["bevy_solari?/bevy_solari_debug", "bevy_feathers"]
 
 # Audio format support (vorbis is enabled by default)
 flac = ["bevy_audio/flac"]
@@ -273,7 +283,7 @@ bevy_ui_render = ["dep:bevy_ui_render", "bevy_sprite_render", "bevy_ui"]
 bevy_solari = ["dep:bevy_solari", "bevy_pbr"]
 bevy_gizmos = ["dep:bevy_gizmos", "bevy_camera", "bevy_light?/bevy_gizmos"]
 bevy_gizmos_render = ["dep:bevy_gizmos_render", "bevy_gizmos"]
-bevy_gltf = ["dep:bevy_gltf", "bevy_world_serialization", "bevy_pbr?/bevy_gltf"]
+bevy_gltf = ["dep:bevy_gltf", "bevy_world_serialization", "bevy_pbr?/bevy_gltf", "bevy_solari?/gltf"]
 
 # Used to disable code that is unsupported when Bevy is dynamically linked
 dynamic_linking = ["bevy_diagnostic/dynamic_linking"]

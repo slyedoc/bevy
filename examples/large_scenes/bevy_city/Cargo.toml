@@ -5,6 +5,14 @@ edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
 
+[features]
+solari = [
+  "bevy/bevy_solari",
+  "bevy/cluster_processor",
+  "bevy/bevy_solari_debug",
+]
+dlss = ["bevy/dlss"]
+
 [dependencies]
 bevy = { path = "../../../", features = [
   "https",

@@ -52,6 +52,10 @@ gltf = { version = "1.4.0", default-features = false, features = [
   "KHR_materials_unlit",
   "KHR_materials_emissive_strength",
   "KHR_texture_transform",
+  # `KHR_texture_basisu` stores its KTX2 image under the extension and omits the
+  # standard `texture.source`; `allow_empty_texture` makes that pass validation
+  # (the loader then reads the basisu source).
+  "allow_empty_texture",
   "extras",
   "extensions",
   "names",

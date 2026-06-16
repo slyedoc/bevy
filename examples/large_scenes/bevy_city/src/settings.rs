@@ -3,18 +3,49 @@ use bevy::{
     camera_controller::free_camera::FreeCameraState,
     feathers::{
         self,
-        controls::{FeathersButton, FeathersCheckbox},
-        theme::{ThemeBackgroundColor, ThemedText},
+        controls::{FeathersButton, FeathersCheckbox, FeathersSlider},
+        theme::{ThemeBackgroundColor, ThemeTextColor, ThemedText},
     },
     pbr::wireframe::WireframeConfig,
     prelude::*,
     ui::Checked,
-    ui_widgets::{checkbox_self_update, Activate, ValueChange},
+    ui_widgets::{
+        checkbox_self_update, slider_self_update, Activate, SliderPrecision, SliderStep,
+        ValueChange,
+    },
 };
 use rand::RngExt;
 
 use crate::assets::CityAssets;
-use crate::generate_city::{spawn_city, CityRoot};
+use crate::generate_city::{spawn_city, CityRoot, LampAssets};
+
+/// Smallest / largest city the regenerate slider offers (blocks per side).
+pub const CITY_SIZE_RANGE: (u32, u32) = (3, 150);
+
+/// On the scene-info line under "Regenerate City"; [`update_city_info`] keeps
+/// it current.
+#[derive(Component, Default, Clone)]
+pub struct CityInfoText;
+
+/// Keep the scene counts current. Counting is cheap (dense-query size hints),
+/// and skipping the write when unchanged avoids re-laying-out the text.
+pub fn update_city_info(
+    entities: Query<()>,
+    cars: Query<(), With<crate::Car>>,
+    mut text: Query<&mut Text, With<CityInfoText>>,
+) {
+    let Ok(mut text) = text.single_mut() else {
+        return;
+    };
+    let want = format!(
+        "Entities: {}\nMoving: {}",
+        entities.iter().count(),
+        cars.iter().count(),
+    );
+    if text.0 != want {
+        text.0 = want;
+    }
+}
 
 #[derive(Resource)]
 pub struct Settings {
@@ -23,6 +54,8 @@ pub struct Settings {
     pub contact_shadows_enabled: bool,
     pub wireframe_enabled: bool,
     pub cpu_culling: bool,
+    /// Blocks per side for "Regenerate City"; seeded from `--size` at startup.
+    pub city_size: u32,
 }
 
 impl Default for Settings {
@@ -33,11 +66,12 @@ impl Default for Settings {
             contact_shadows_enabled: true,
             wireframe_enabled: false,
             cpu_culling: true,
+            city_size: 32,
         }
     }
 }
 
-pub fn settings_ui() -> impl Scene {
+pub fn settings_ui(city_size: u32) -> impl Scene {
     bsn! {
         Node {
             position_type: PositionType::Absolute,
@@ -146,6 +180,24 @@ pub fn settings_ui() -> impl Scene {
                     )
                 ),
                 (
+                    Text("Size")
+                    TextFont { font_size: FontSize::Px(14.0) }
+                    ThemeTextColor(feathers::tokens::CHECKBOX_TEXT)
+                ),
+                (
+                    @FeathersSlider {
+                        @min: {CITY_SIZE_RANGE.0 as f32},
+                        @max: {CITY_SIZE_RANGE.1 as f32},
+                        @value: {city_size as f32},
+                    }
+                    SliderStep(1.0)
+                    SliderPrecision(0)
+                    on(slider_self_update)
+                    on(|change: On<ValueChange<f32>>, mut settings: ResMut<Settings>| {
+                        settings.city_size = change.value.round() as u32;
+                    })
+                ),
+                (
                     @FeathersButton {
                         @caption: bsn! { Text("Regenerate City") ThemedText }
                     }
@@ -153,15 +205,29 @@ pub fn settings_ui() -> impl Scene {
                         |_activate: On<Activate>,
                          mut commands: Commands,
                          city_root: Single<Entity, With<CityRoot>>,
-                         assets: Res<CityAssets>| {
+                         assets: Res<CityAssets>,
+                         lamps: Option<Res<LampAssets>>,
+                         settings: Res<Settings>| {
                             commands.entity(*city_root).despawn();
 
                             let mut rng = rand::rng();
                             let seed = rng.random::<u64>();
                             println!("new seed: {seed}");
-                            spawn_city(&mut commands, &assets, seed, 32);
+                            spawn_city(
+                                &mut commands,
+                                &assets,
+                                lamps.as_deref(),
+                                seed,
+                                settings.city_size,
+                            );
                         }
                     )
+                ),
+                (
+                    CityInfoText
+                    Text("")
+                    TextFont { font_size: FontSize::Px(14.0) }
+                    ThemeTextColor(feathers::tokens::CHECKBOX_TEXT)
                 ),
             ]
         )]

@@ -584,6 +584,14 @@ impl ViewClusterBindings {
         }
     }
 
+    /// Whether these bindings carry no clusters or indices — the state of a
+    /// view that opted out of clustering (`ClusterConfig::None`). Lets the GPU
+    /// clustering prepare step reuse an already-built empty binding across
+    /// frames instead of reallocating it.
+    pub fn is_empty(&self) -> bool {
+        self.n_indices == 0 && self.n_offsets == 0
+    }
+
     pub fn clear(&mut self) {
         match &mut self.buffers {
             ViewClusterBuffers::Uniform {

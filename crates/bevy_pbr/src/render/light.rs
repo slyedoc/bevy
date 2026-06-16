@@ -2070,6 +2070,12 @@ pub fn prepare_lights(
                         light_entity: *light_entity,
                         cascade_index,
                     },
+                    // Shadow caster collection filters meshes against THIS
+                    // view's `RenderLayers`; without one the view defaults to
+                    // layer 0, so a directional light on another layer casts no
+                    // shadows for its own meshes. Inherit the light's layers.
+                    // See https://github.com/bevyengine/bevy/issues/16658.
+                    light.render_layers.clone(),
                 ));
 
                 if !matches!(gpu_preprocessing_mode, GpuPreprocessingMode::Culling) {

@@ -329,6 +329,14 @@ bevy_scene = ["bevy_internal/bevy_scene"]
 # Provides raytraced lighting (experimental)
 bevy_solari = ["bevy_internal/bevy_solari"]
 
+# Enables baking bevy_mesh::Mesh into bevy_solari::cluster::ClusterMesh
+# (offline tool feature; pulls in meshopt).
+cluster_processor = ["bevy_solari", "bevy_internal/cluster_processor"]
+
+# Enables the in-engine bevy_solari debug-view dropdown
+# (`SolariDebugPlugin`). Pulls in bevy_feathers + the UI widget stack.
+bevy_solari_debug = ["bevy_solari", "bevy_internal/bevy_solari_debug"]
+
 # Provides sprite functionality
 bevy_sprite = ["bevy_internal/bevy_sprite"]
 
@@ -434,6 +442,7 @@ trace_tracy = ["trace", "bevy_internal/trace_tracy", "debug"]
 
 # Tracing support, with memory profiling, exposing a port for Tracy
 trace_tracy_memory = ["bevy_internal/trace_tracy_memory"]
+trace_tracy_ondemand = ["trace_tracy", "bevy_internal/trace_tracy_ondemand"]
 
 # Tracing support
 trace = ["bevy_internal/trace", "dep:tracing"]
@@ -1534,14 +1543,209 @@ category = "3D Rendering"
 wasm = true
 
 [[example]]
-name = "solari"
-path = "examples/3d/solari.rs"
+name = "solari_pica_pica"
+path = "examples/3d/solari/pica_pica.rs"
 doc-scrape-examples = true
-required-features = ["bevy_solari", "https", "free_camera"]
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "https",
+    "free_camera",
+    "bevy_dev_tools",
+]
 
-[package.metadata.example.solari]
-name = "Solari"
-description = "Demonstrates realtime dynamic raytraced lighting using Bevy Solari."
+[package.metadata.example.solari_pica_pica]
+name = "Solari (pica_pica)"
+description = "Realtime ray-traced lighting on the pica_pica diorama (Bevy Solari), with the `SolariDebugPlugin` overlay."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_hair"
+path = "examples/3d/solari/hair.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "cluster_processor",
+    "free_camera",
+    "bevy_dev_tools",
+    "bevy_feathers",
+]
+
+[package.metadata.example.solari_hair]
+name = "Solari (hair)"
+description = "Ray-traced hair via NV linear swept spheres — a procedural fur ball shaded with a Chiang fiber BSDF (Bevy Solari). Requires an RTX 50-series GPU."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_animation"
+path = "examples/3d/solari/animation.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_animation",
+    "bevy_gltf",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_animation]
+name = "Solari (skeletal animation)"
+description = "Ray-traced skeletal cluster animation — a skinned glTF fox deformed on the GPU and rendered with Bevy Solari."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_many_lights"
+path = "examples/3d/solari/many_lights.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_many_lights]
+name = "Solari (many lights stress test)"
+description = "400 emissive sphere lights over 8000 cubes — Bevy Solari scaling stress test, with the `SolariDebugPlugin` overlay."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_split_screen"
+path = "examples/3d/solari/split_screen.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "bevy_dev_tools",
+    "cluster_processor",
+    "free_camera",
+]
+
+[package.metadata.example.solari_split_screen]
+name = "Solari (split screen)"
+description = "The same scene side by side: Solari ray tracing vs the standard Bevy rasterizer, separated by `RenderLayers`."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_refraction"
+path = "examples/3d/solari/refraction.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_gltf",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_refraction]
+name = "Solari (refraction)"
+description = "Transmissive glass: a Bistro wine bottle and glass path-traced with refraction, TIR, and Beer-Lambert absorption."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_scope"
+path = "examples/3d/solari/scope.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_gltf",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_scope]
+name = "Solari (scope)"
+description = "A working 4x Galilean telescope built from real lens geometry - magnification emerges from refraction."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_portal"
+path = "examples/3d/solari/portal.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_gltf",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_portal]
+name = "Solari (portals)"
+description = "Surfaces that teleport rays mid-traversal - recursive portals, portals in reflections and through glass, walk-through."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_black_hole"
+path = "examples/3d/solari/black_hole.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_gltf",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_black_hole]
+name = "Solari (black hole)"
+description = "Gravitationally lensed rays - Einstein ring, photon ring, and a light-wrapped accretion disk emerge from a Schwarzschild bend."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_fog_volumes"
+path = "examples/3d/solari/fog_volumes.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_gltf",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_fog_volumes]
+name = "Solari (fog volumes)"
+description = "Local participating media - a mist pool and a smoke column sliced into god rays by per-step shadow rays."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_cathedral"
+path = "examples/3d/solari/cathedral.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_gltf",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_cathedral]
+name = "Solari (stained-glass cathedral)"
+description = "Colored sunlight through transmissive glass - tinted shadow rays paint window-colored floor pools and fog god-rays."
 category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
@@ -5577,3 +5781,18 @@ name = "Light Probe Blending"
 description = "Demonstrates blending between multiple reflection probes"
 category = "3D Rendering"
 wasm = false
+
+# Patch wgpu (and friends) to slyedoc/wgpu#solari-pt — wgpu v29.0.3
+# adapted to ash master (Vulkan 1.4 prep) so cluster_AS / partitioned_AS
+# bindings (only on ash master via PRs #1033, #1035) can be used in
+# downstream consumers via `Adapter::open_with_callback` + `as_hal_mut`.
+# No cluster_AS-specific surface added to wgpu itself.
+[patch.crates-io]
+wgpu             = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
+wgpu-core        = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
+wgpu-hal         = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
+wgpu-types       = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
+wgpu-naga-bridge = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
+naga             = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
+ash              = { git = "https://github.com/ash-rs/ash.git", branch = "master" }
+gpu-allocator    = { git = "https://github.com/slyedoc/gpu-allocator.git", branch = "ash-push-rename" }
