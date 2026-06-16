@@ -1,0 +1,143 @@
+//! Bridges the ReSTIR primary-hit G-buffer into the hardware depth buffer so
+//! rasterized overlays (gizmos drawn in the `Transparent3d` phase) depth-test
+//! against the ray-traced scene.
+//!
+//! Solari's passes are compute and write storage textures; a depth-format
+//! texture can only be written by the fixed-function depth unit in a raster
+//! pass. [`solari_gizmo_depth`] is that raster pass — a fullscreen triangle
+//! whose fragment shader reads the primary-hit world position and emits NDC
+//! depth via `@builtin(frag_depth)`. Ordered after `main_opaque_pass_3d`
+//! (depth cleared to far) and before `main_transparent_pass_3d` (gizmos).
+
+use crate::pipelines::SolariPipelines;
+use crate::render::{prepare::RestirResources, SolariCamera};
+use crate::resource_manager::SolariResourceManager;
+use bevy_asset::{load_embedded_asset, AssetServer};
+use bevy_core_pipeline::{core_3d::CORE_3D_DEPTH_FORMAT, FullscreenShader};
+use bevy_diagnostic::FrameCount;
+use bevy_ecs::prelude::*;
+use bevy_render::{
+    camera::ExtractedCamera,
+    render_resource::{
+        binding_types::{texture_2d, uniform_buffer},
+        BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
+        CachedRenderPipelineId, CompareFunction, DepthBiasState, DepthStencilState, FragmentState,
+        PipelineCache, RenderPassDescriptor, RenderPipelineDescriptor, ShaderStages, StencilState,
+        StoreOp, TextureSampleType,
+    },
+    renderer::{RenderContext, RenderDevice, ViewQuery},
+    view::{ViewDepthTexture, ViewUniform, ViewUniformOffset, ViewUniforms},
+};
+use bevy_utils::default;
+
+/// The fullscreen depth-write `@group(0)` layout. Owned by
+/// [`SolariResourceManager`](crate::resource_manager::SolariResourceManager).
+pub fn gizmo_depth_bind_group_layout() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
+        "solari_gizmo_depth_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                // 0: primary-hit world position (xyz) + material id / miss (w).
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                // 1: view uniform (clip_from_world).
+                uniform_buffer::<ViewUniform>(true),
+            ),
+        ),
+    )
+}
+
+/// Queue the fullscreen depth-write render pipeline. Called by
+/// [`init_solari_pipelines`](crate::pipelines::init_solari_pipelines) — the render
+/// pipeline's bulky descriptor (fullscreen vertex + depth state) stays here with
+/// its imports; only the id lands in `SolariPipelines`. The view's depth texture
+/// is single-sampled — Solari is a per-pixel compute path, so its camera is
+/// expected to be `Msaa::Off` (as the examples set it).
+pub fn gizmo_depth_pipeline(
+    pipeline_cache: &PipelineCache,
+    fullscreen_shader: &FullscreenShader,
+    asset_server: &AssetServer,
+    layout: BindGroupLayoutDescriptor,
+) -> CachedRenderPipelineId {
+    pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("solari_gizmo_depth_pipeline".into()),
+        layout: vec![layout],
+        vertex: fullscreen_shader.to_vertex_state(),
+        fragment: Some(FragmentState {
+            shader: load_embedded_asset!(asset_server, "gizmo_depth.wgsl"),
+            entry_point: Some("fragment".into()),
+            // Depth-only pass: no color targets.
+            targets: vec![],
+            ..default()
+        }),
+        depth_stencil: Some(DepthStencilState {
+            format: CORE_3D_DEPTH_FORMAT,
+            // Overwrite the opaque pass's cleared far-plane depth with RT depth.
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::Always),
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        ..default()
+    })
+}
+
+/// Fullscreen pass: reconstruct NDC depth from the ReSTIR primary-hit G-buffer
+/// and write it into the view's hardware depth texture, so the `Transparent3d`
+/// phase (gizmos) occludes against the ray-traced scene.
+pub fn solari_gizmo_depth(
+    view: ViewQuery<
+        (
+            &RestirResources,
+            &ViewDepthTexture,
+            &ExtractedCamera,
+            &ViewUniformOffset,
+        ),
+        With<SolariCamera>,
+    >,
+    pipelines: Res<SolariPipelines>,
+    resource_manager: Res<SolariResourceManager>,
+    pipeline_cache: Res<PipelineCache>,
+    view_uniforms: Res<ViewUniforms>,
+    frame_count: Res<FrameCount>,
+    render_device: Res<RenderDevice>,
+    mut ctx: RenderContext,
+) {
+    let (resources, depth, camera, view_uniform_offset) = view.into_inner();
+
+    let (Some(render_pipeline), Some(view_uniforms_binding)) = (
+        pipeline_cache.get_render_pipeline(pipelines.gizmo_depth),
+        view_uniforms.uniforms.binding(),
+    ) else {
+        return;
+    };
+
+    // Same frame parity the restir node just wrote this frame's G-buffer into.
+    let curr = (frame_count.0 & 1) as usize;
+
+    let bind_group = render_device.create_bind_group(
+        "solari_gizmo_depth_bind_group",
+        &pipeline_cache.get_bind_group_layout(&resource_manager.gizmo_depth),
+        &BindGroupEntries::sequential((&resources.world_position[curr], view_uniforms_binding)),
+    );
+
+    let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("solari_gizmo_depth"),
+        color_attachments: &[],
+        // Load (the opaque pass already cleared); we overwrite via Always-compare.
+        // If the opaque pass was skipped, this consumes the pending clear instead
+        // — either way the texture ends with RT depth where there was a hit.
+        depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+
+    if let Some(viewport) = camera.viewport.as_ref() {
+        pass.set_camera_viewport(viewport);
+    }
+
+    pass.set_render_pipeline(render_pipeline);
+    pass.set_bind_group(0, &bind_group, &[view_uniform_offset.offset]);
+    pass.draw(0..3, 0..1);
+}

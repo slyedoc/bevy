@@ -15,6 +15,9 @@ use bevy_ecs::{
 };
 use bevy_picking::Pickable;
 use bevy_reflect::Reflect;
+use bevy_render::diagnostic::{
+    FrameTimeBreakdownPlugin, RenderDiagnosticsPlugin, EXTRACT_CPU, MAIN_CPU, RENDER_CPU,
+};
 use bevy_render::storage::ShaderBuffer;
 use bevy_text::{RemSize, TextColor, TextFont, TextSpan};
 use bevy_time::common_conditions::on_timer;
@@ -74,6 +77,21 @@ impl Plugin for FpsOverlayPlugin {
 
         if !app.is_plugin_added::<FrameTimeGraphPlugin>() {
             app.add_plugins(FrameTimeGraphPlugin);
+        }
+
+        // The overlay surfaces GPU (and per-pass CPU) timings, which are produced
+        // by `RenderDiagnosticsPlugin` and synced to the main-world
+        // `DiagnosticsStore`. It's otherwise only added under the
+        // `render_diagnostics` feature (implied by `tracing-tracy`), so ensure
+        // it's present here — like the `FrameTime*` plugins above.
+        if !app.is_plugin_added::<RenderDiagnosticsPlugin>() {
+            app.add_plugins(RenderDiagnosticsPlugin);
+        }
+
+        // The CPU-side frame breakdown (`cpu/main`, `cpu/extract`, `cpu/render`)
+        // that complements the GPU pass timings above.
+        if !app.is_plugin_added::<FrameTimeBreakdownPlugin>() {
+            app.add_plugins(FrameTimeBreakdownPlugin);
         }
 
         if self.config.refresh_interval < MIN_SAFE_INTERVAL {
@@ -201,6 +219,16 @@ fn setup(
             Pickable::IGNORE,
         ))
         .with_children(|p| {
+            // One root `Text` with alternating static-label / dynamic-value
+            // spans, newline-separated into one line per metric. `update_text`
+            // writes the value spans (odd indices); the labels (even indices)
+            // are static. `Frame` is the total; `Main` is the main thread's
+            // serial cost (main-world schedule + the full extract step, both on
+            // the main thread — `Main` ≈ `Frame` means main-thread-bound);
+            // `Render` runs on the render thread (parallel under pipelining);
+            // `GPU` is the summed pass time. Index map: 0 "FPS: ", 1 fps,
+            // 2 "\nFrame: ", 3 frame_time, 4 "\nMain: ", 5 cpu/main + cpu/extract,
+            // 6 "\nRender: ", 7 cpu/render, 8 "\nGPU: ", 9 gpu.
             p.spawn((
                 Text::new("FPS: "),
                 overlay_config.text_config.clone(),
@@ -208,6 +236,20 @@ fn setup(
                 FpsText,
                 Pickable::IGNORE,
             ))
+            .with_child((TextSpan::default(), overlay_config.text_config.clone()))
+            .with_child((
+                TextSpan::new("\nFrame: "),
+                overlay_config.text_config.clone(),
+            ))
+            .with_child((TextSpan::default(), overlay_config.text_config.clone()))
+            .with_child((TextSpan::new("\nMain: "), overlay_config.text_config.clone()))
+            .with_child((TextSpan::default(), overlay_config.text_config.clone()))
+            .with_child((
+                TextSpan::new("\nRender: "),
+                overlay_config.text_config.clone(),
+            ))
+            .with_child((TextSpan::default(), overlay_config.text_config.clone()))
+            .with_child((TextSpan::new("\nGPU: "), overlay_config.text_config.clone()))
             .with_child((TextSpan::default(), overlay_config.text_config.clone()));
 
             #[cfg(all(target_arch = "wasm32", not(feature = "webgpu")))]
@@ -259,12 +301,55 @@ fn update_text(
     query: Query<Entity, With<FpsText>>,
     mut writer: TextUiWriter,
 ) {
-    if let Ok(entity) = query.single()
-        && let Some(fps) = diagnostic.get(&FrameTimeDiagnosticsPlugin::FPS)
-        && let Some(value) = fps.smoothed()
+    let Ok(entity) = query.single() else {
+        return;
+    };
+
+    if let Some(value) = diagnostic
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|fps| fps.smoothed())
     {
         *writer.text(entity, 1) = format!("{value:.2}");
     }
+
+    // Total frame time, then the render thread's cost (`Render` overlaps the
+    // main thread under pipelined rendering). See `FrameTimeBreakdownPlugin`.
+    for (span, path) in [
+        (3, &FrameTimeDiagnosticsPlugin::FRAME_TIME),
+        (7, &RENDER_CPU),
+    ] {
+        if let Some(value) = diagnostic.get(path).and_then(|d| d.smoothed()) {
+            *writer.text(entity, span) = format!("{value:.2} ms");
+        }
+    }
+
+    // `Main` is the main thread's serial per-frame cost: the main-world schedule
+    // plus the full extract step. Both run on the main thread (extract is the
+    // recv-wait + `ExtractSchedule` + render hand-off), so they count against
+    // the main thread, not the parallel render thread. `Main` ≈ `Frame` means
+    // main-thread-bound. `cpu/extract` stays a separate diagnostic for when the
+    // schedule-vs-extract split matters.
+    let main_ms: f64 = [&MAIN_CPU, &EXTRACT_CPU]
+        .into_iter()
+        .filter_map(|path| diagnostic.get(path).and_then(|d| d.smoothed()))
+        .sum();
+    *writer.text(entity, 5) = format!("{main_ms:.2} ms");
+
+    // Sum every per-pass GPU span (`render/<name…>/elapsed_gpu`).
+    // `RenderDiagnosticsPlugin`'s passes are flat siblings (each node/dispatch
+    // opens one span; pass names like `restir/visibility` or `cluster/scatter`
+    // contain `/` but are still depth-1), so a plain sum is the right total.
+    // This would over-count only if GPU spans were *nested* (a parent span
+    // wrapping children, whose time the parent already includes) — which this
+    // codebase doesn't do. A live HUD figure, not an exact frame-graph cost.
+    // Note: raw-Vulkan work (e.g. cluster acceleration-structure builds) is
+    // invisible to wgpu timestamp queries, so it is not included here.
+    let gpu_ms: f64 = diagnostic
+        .iter()
+        .filter(|d| d.path().as_str().ends_with("/elapsed_gpu"))
+        .filter_map(|d| d.smoothed())
+        .sum();
+    *writer.text(entity, 9) = format!("{gpu_ms:.2} ms");
 }
 
 fn customize_overlay(

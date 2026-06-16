@@ -108,6 +108,11 @@ pub enum GltfError {
     #[error("invalid image mime type: {0}")]
     #[from(ignore)]
     InvalidImageMimeType(String),
+    /// A texture has no resolvable image source — neither a standard `source`
+    /// nor a supported texture-source extension (e.g. `KHR_texture_basisu`).
+    #[error("texture {0} has no image source")]
+    #[from(ignore)]
+    MissingImageSource(usize),
     /// Error when loading a texture. Might be due to a disabled image file format feature.
     #[error("You may need to add the feature for the file format: {0}")]
     ImageError(#[from] TextureError),
@@ -629,8 +634,11 @@ impl GltfLoader {
         let mut texture_handles = Vec::new();
         if gltf.textures().len() == 1 || cfg!(target_arch = "wasm32") {
             for texture in gltf.textures() {
+                let source = texture_source_image(&gltf, &texture)
+                    .ok_or(GltfError::MissingImageSource(texture.index()))?;
                 let image = load_image(
                     texture.clone(),
+                    source,
                     &buffer_data,
                     &linear_textures,
                     load_context.path(),
@@ -655,9 +663,13 @@ impl GltfLoader {
                         let asset_path = load_context.path().clone();
                         let linear_textures = &linear_textures;
                         let buffer_data = &buffer_data;
+                        let source = texture_source_image(&gltf, &gltf_texture);
                         scope.spawn(async move {
+                            let source = source
+                                .ok_or(GltfError::MissingImageSource(gltf_texture.index()))?;
                             load_image(
                                 gltf_texture,
+                                source,
                                 buffer_data,
                                 linear_textures,
                                 &asset_path,
@@ -1202,9 +1214,24 @@ impl AssetLoader for GltfLoader {
     }
 }
 
+/// Resolves the image backing a glTF texture, honoring `KHR_texture_basisu`
+/// (whose KTX2 image replaces the standard `source`, which is then absent).
+fn texture_source_image<'a>(
+    gltf: &'a gltf::Gltf,
+    texture: &gltf::Texture<'a>,
+) -> Option<gltf::image::Image<'a>> {
+    if let Some(basisu) = texture.extension_value("KHR_texture_basisu") {
+        if let Some(index) = basisu.get("source").and_then(|source| source.as_u64()) {
+            return gltf.images().nth(index as usize);
+        }
+    }
+    texture.source()
+}
+
 /// Loads a glTF texture as a bevy [`Image`] and returns it together with its label.
 async fn load_image<'a, 'b>(
     gltf_texture: gltf::Texture<'a>,
+    source: gltf::image::Image<'a>,
     buffer_data: &[Vec<u8>],
     linear_textures: &HashSet<usize>,
     gltf_path: &'b AssetPath<'b>,
@@ -1219,7 +1246,7 @@ async fn load_image<'a, 'b>(
         texture_sampler(&gltf_texture, default_sampler)
     };
 
-    match gltf_texture.source().source() {
+    match source.source() {
         Source::View { view, mime_type } => {
             let start = view.offset();
             let end = view.offset() + view.length();

@@ -377,7 +377,7 @@ impl Plugin for RenderPlugin {
             GpuReadbackPlugin::default(),
             OcclusionCullingPlugin,
             SparseBufferPlugin,
-            #[cfg(feature = "tracing-tracy")]
+            #[cfg(feature = "render_diagnostics")]
             diagnostic::RenderDiagnosticsPlugin,
         ));
 
