@@ -279,7 +279,7 @@ fn camera() -> impl Scene {
         // Global height fog + god rays are opt-in (and view-dependent cost: a
         // ground-level camera traces a sun shadow ray per march step). Uncomment
         // for ~660-unit ground visibility + a ~5.5-unit fog layer at y = 0.
-        template_value(SolariGlobalFog { visibility: 1200.0, fog_height: 5.5, fog_base: 0.0, ..default() })
+        //template_value(SolariGlobalFog { visibility: 1200.0, fog_height: 5.5, fog_base: 0.0, ..default() })
         template_value(ClusterConfig::None)
         template_value(CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING))        
           
