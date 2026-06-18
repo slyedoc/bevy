@@ -6,6 +6,10 @@
 //! we want to use a large number of features so that pathological paths
 //! are caught during development, rather than by end users.
 
+// Under `solari` the raster-only camera variant (TAA, contact shadows, atmosphere
+// env map) is gated out, leaving those imports conditionally unused.
+#![cfg_attr(feature = "solari", allow(unused_imports))]
+
 use argh::FromArgs;
 use assets::{load_assets, CityAssets};
 use bevy::{
@@ -13,6 +17,8 @@ use bevy::{
     camera::{visibility::NoCpuCulling, Exposure, Hdr},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     color::palettes::css::WHITE,
+    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
+    diagnostic::FrameTimeDiagnosticsPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     light::{
         atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm},
@@ -29,10 +35,21 @@ use bevy::{
     world_serialization::WorldInstanceReady,
 };
 
+#[cfg(feature = "solari")]
+use bevy::{
+    camera::CameraMainTextureUsages,
+    mesh::Indices,
+    render::render_resource::TextureUsages,
+    solari::prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
+};
+
+#[cfg(all(feature = "solari", feature = "dlss"))]
+use bevy::anti_alias::dlss::{Dlss, DlssRayReconstructionFeature, DlssRayReconstructionSupported};
+
 use crate::generate_city::spawn_city;
 use crate::{
     assets::{merge_car_meshes, strip_base_url},
-    settings::{settings_ui, Settings},
+    settings::{settings_ui, update_city_info, Settings, CITY_SIZE_MIN, CITY_SIZE_MAX},
 };
 
 mod assets;
@@ -47,7 +64,7 @@ pub struct Args {
     seed: u64,
 
     /// size
-    #[argh(option, default = "30")]
+    #[argh(option, default = "100")]
     size: u32,
 
     /// adds NoCpuCulling to all meshes
@@ -58,8 +75,17 @@ pub struct Args {
 fn main() {
     let args: Args = argh::from_env();
 
-    App::new()
-        .add_plugins((
+    let mut app = App::new();
+
+    // DLSS reads its project id during render init, which happens while
+    // `DefaultPlugins` builds the renderer — so the resource must exist first.
+    // Generate your own UUID; don't copy-paste this one.
+    #[cfg(feature = "dlss")]
+    app.insert_resource(bevy::anti_alias::dlss::DlssProjectId(
+        bevy::asset::uuid::uuid!("a0e6c8d2-1f3b-4c5a-9e7d-2b4f6a8c0e1d"),
+    ));
+
+    app.add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "bevy_city".into(),
@@ -73,11 +99,27 @@ fn main() {
             FreeCameraPlugin,
             FeathersPlugins,
             WireframePlugin::default(),
+            FrameTimeDiagnosticsPlugin::default(),
+            FpsOverlayPlugin {
+                config: FpsOverlayConfig {
+                    frame_time_graph_config: FrameTimeGraphConfig {
+                        enabled: true,
+                        target_fps: 240.0,
+                        min_fps: 60.0,
+                    },
+                    ..default()
+                },
+            },
+            #[cfg(feature = "solari")]
+            SolariPlugins,
         ))
         .insert_resource(args.clone())
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(WinitSettings::continuous())
-        .init_resource::<Settings>()
+        .insert_resource(Settings {
+            city_size: args.size.clamp(CITY_SIZE_MIN, CITY_SIZE_MAX),
+            ..default()
+        })
         .insert_resource(UiTheme(create_dark_theme()))
         .insert_resource(WireframeConfig {
             global: false,
@@ -90,16 +132,31 @@ fn main() {
         .add_message::<CityAssetsLoaded>()
         .add_message::<CityAssetsReady>()
         .add_message::<CitySpawned>()
+        .init_resource::<CaptureReady>()
         .add_systems(Startup, (scene.spawn(), spawn_atmosphere, load_assets))
         .add_systems(
             Update,
             (
                 simulate_cars,
+                update_city_info,
+                #[cfg(feature = "solari")]
+                add_raytracing_meshes,
+                #[cfg(all(feature = "solari", feature = "dlss"))]
+                add_dlss_ray_reconstruction,
                 update_loading_screen,
                 process_assets.run_if(on_message::<CityAssetsLoaded>),
                 on_city_assets_ready.run_if(on_message::<CityAssetsReady>),
-                (add_no_cpu_culling, on_city_spawned, settings_ui.spawn())
+                (
+                    add_no_cpu_culling,
+                    on_city_spawned,
+                    {
+                        let city_size = args.size.clamp(CITY_SIZE_MIN, CITY_SIZE_MAX);
+                        (move || settings_ui(city_size)).spawn()
+                    },
+                    arm_capture_ready,
+                )
                     .run_if(on_message::<CitySpawned>),
+                signal_capture_ready,
             ),
         )
         .add_observer(add_no_cpu_culling_on_scene_ready)
@@ -110,6 +167,7 @@ fn scene() -> impl SceneList {
     bsn_list![camera(), sun(), loading_screen()]
 }
 
+#[cfg(not(feature = "solari"))]
 fn camera() -> impl Scene {
     bsn! {
         Camera3d
@@ -133,6 +191,24 @@ fn camera() -> impl Scene {
         Msaa::Off
         TemporalAntiAliasing
         ContactShadows
+    }
+}
+
+// Solari requires `Msaa::Off` and `CameraMainTextureUsages` with `STORAGE_BINDING`.
+// The realtime ReSTIR path does its own denoising, so no TAA; lighting/IBL come
+// from Solari rather than the raster atmosphere env map.
+#[cfg(feature = "solari")]
+fn camera() -> impl Scene {
+    bsn! {
+        Camera3d
+        Hdr
+        template_value(Transform::from_xyz(15.0, 10.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y))
+        FreeCamera
+        Exposure::OVERCAST
+        Bloom::NATURAL
+        Msaa::Off
+        template_value(SolariLighting::default())
+        template_value(CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING))
     }
 }
 
@@ -176,11 +252,25 @@ fn loading_screen() -> impl Scene {
     }
 }
 
+#[cfg(not(feature = "solari"))]
 fn sun() -> impl Scene {
     bsn! {
         DirectionalLight {
             shadow_maps_enabled: {Settings::default().shadow_maps_enabled},
             contact_shadows_enabled: {Settings::default().contact_shadows_enabled},
+            illuminance: light_consts::lux::RAW_SUNLIGHT,
+        }
+        template_value(Transform::from_xyz(1.0, 0.15, 1.0).looking_at(Vec3::ZERO, Vec3::Y))
+    }
+}
+
+// Solari replaces shadow mapping, so the sun casts no raster shadows.
+#[cfg(feature = "solari")]
+fn sun() -> impl Scene {
+    bsn! {
+        DirectionalLight {
+            shadow_maps_enabled: false,
+            contact_shadows_enabled: false,
             illuminance: light_consts::lux::RAW_SUNLIGHT,
         }
         template_value(Transform::from_xyz(1.0, 0.15, 1.0).looking_at(Vec3::ZERO, Vec3::Y))
@@ -335,6 +425,47 @@ struct Road {
     end: Vec3,
 }
 
+/// Detects when the scene has finished spawning + streaming so profiling
+/// captures measure the settled frame, not the (very long, at size 100) spawn
+/// spike. `capture.sh` waits for the `CAPTURE_READY` log line.
+#[derive(Resource, Default)]
+struct CaptureReady {
+    /// Set once the city's spawn commands have been issued; entities + streamed
+    /// scenes still settle over the following frames.
+    armed: bool,
+    last_count: usize,
+    stable_frames: u32,
+    done: bool,
+}
+
+/// Arm the detector when the city is spawned (commands issued).
+fn arm_capture_ready(mut ready: ResMut<CaptureReady>) {
+    ready.armed = true;
+}
+
+/// Once the spatial-entity count has plateaued for 3 frames after spawn, log
+/// `CAPTURE_READY` (once). Car movement changes transforms, not entity counts,
+/// so the count is stable in steady state.
+fn signal_capture_ready(
+    spatial: Query<(), With<GlobalTransform>>,
+    mut ready: ResMut<CaptureReady>,
+) {
+    if ready.done || !ready.armed {
+        return;
+    }
+    let count = spatial.iter().count();
+    if count > 0 && count == ready.last_count {
+        ready.stable_frames += 1;
+        if ready.stable_frames >= 3 {
+            info!("CAPTURE_READY (settled at {count} spatial entities)");
+            ready.done = true;
+        }
+    } else {
+        ready.last_count = count;
+        ready.stable_frames = 0;
+    }
+}
+
 #[derive(Component)]
 struct Car {
     offset: Vec3,
@@ -373,6 +504,69 @@ fn simulate_cars(
             let progress = car.distance_traveled / road_len;
             car_transform.translation = (road.start + car.offset) + direction * road_len * progress;
         }
+    }
+}
+
+/// Tags every rendered mesh with [`RaytracingMesh3d`] so Solari includes it in
+/// the BLAS/TLAS. Runs every frame but is archetype-filtered by
+/// `Without<RaytracingMesh3d>`, so it idles to zero once the scene has streamed
+/// in. Meshes are left with their `Mesh3d` too: the realtime path still
+/// rasterizes a G-buffer. Ensures each mesh has the UV0 + tangent + U32-index
+/// attributes Solari needs (retries until the asset finishes loading).
+#[cfg(feature = "solari")]
+fn add_raytracing_meshes(
+    mut commands: Commands,
+    query: Query<(Entity, &Mesh3d), Without<RaytracingMesh3d>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    for (entity, Mesh3d(handle)) in &query {
+        // Wait until the mesh asset is loaded so the fixup below applies.
+        let Some(mut mesh) = meshes.get_mut(handle) else {
+            continue;
+        };
+
+        if !mesh.contains_attribute(Mesh::ATTRIBUTE_UV_0) {
+            let vertex_count = mesh.count_vertices();
+            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0, 0.0]; vertex_count]);
+        }
+        if !mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT) {
+            let _ = mesh.generate_tangents();
+        }
+        let u32_indices = match mesh.indices() {
+            Some(Indices::U16(u16_indices)) => {
+                Some(u16_indices.iter().map(|i| *i as u32).collect::<Vec<_>>())
+            }
+            _ => None,
+        };
+        if let Some(u32_indices) = u32_indices {
+            mesh.insert_indices(Indices::U32(u32_indices));
+        }
+
+        commands
+            .entity(entity)
+            .insert(RaytracingMesh3d(handle.clone()));
+    }
+}
+
+/// Inserts DLSS Ray Reconstruction on the Solari camera once support is known.
+/// DLSS-RR denoises (and upscales) the noisy ReSTIR output and is highly
+/// recommended with Solari. Idles to zero via the `Without<Dlss<..>>` filter,
+/// and no-ops on hardware without DLSS-RR support.
+#[cfg(all(feature = "solari", feature = "dlss"))]
+fn add_dlss_ray_reconstruction(
+    mut commands: Commands,
+    camera: Query<Entity, (With<SolariLighting>, Without<Dlss<DlssRayReconstructionFeature>>)>,
+    dlss_rr_supported: Option<Res<DlssRayReconstructionSupported>>,
+) {
+    if dlss_rr_supported.is_none() {
+        return;
+    }
+    for entity in &camera {
+        commands.entity(entity).insert(Dlss::<DlssRayReconstructionFeature> {
+            perf_quality_mode: Default::default(),
+            reset: Default::default(),
+            _phantom_data: Default::default(),
+        });
     }
 }
 

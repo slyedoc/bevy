@@ -435,6 +435,9 @@ trace_tracy = ["trace", "bevy_internal/trace_tracy", "debug"]
 # Tracing support, with memory profiling, exposing a port for Tracy
 trace_tracy_memory = ["bevy_internal/trace_tracy_memory"]
 
+# Tracing support, with Tracy in on-demand mode (only records while a profiler is connected)
+trace_tracy_ondemand = ["trace_tracy", "bevy_internal/trace_tracy_ondemand"]
+
 # Tracing support
 trace = ["bevy_internal/trace", "dep:tracing"]
 

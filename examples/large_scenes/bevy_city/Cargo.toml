@@ -5,6 +5,13 @@ edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
 
+[features]
+# Render the city with Bevy Solari's realtime raytraced lighting instead of the
+# rasterized PBR path. Used to baseline the unified-restir branch's perf.
+solari = ["bevy/bevy_solari"]
+# DLSS Ray Reconstruction denoising/upscaling (highly recommended with solari).
+dlss = ["bevy/dlss"]
+
 [dependencies]
 bevy = { path = "../../../", features = [
   "https",
