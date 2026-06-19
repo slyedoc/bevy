@@ -14,6 +14,8 @@ use bevy::{
         ValueChange,
     },
 };
+#[cfg(feature = "solari")]
+use bevy::solari::prelude::RaytracingMesh3d;
 use rand::RngExt;
 
 use crate::assets::CityAssets;
@@ -30,7 +32,9 @@ pub struct CityInfoText;
 /// Keep the scene counts current. Counting is cheap (dense-query size hints),
 /// and skipping the write when unchanged avoids re-laying-out the text.
 pub fn update_city_info(
-    entities: Query<()>,
+    transforms: Query<(), With<Transform>>,
+    #[cfg(feature = "solari")] meshes: Query<(), With<RaytracingMesh3d>>,
+    #[cfg(not(feature = "solari"))] meshes: Query<(), With<Mesh3d>>,
     cars: Query<(), With<crate::Car>>,
     mut text: Query<&mut Text, With<CityInfoText>>,
 ) {
@@ -38,8 +42,9 @@ pub fn update_city_info(
         return;
     };
     let want = format!(
-        "Entities: {}\nMoving: {}",
-        entities.iter().count(),
+        "Transforms: {}\nMeshes: {}\nMoving: {}",
+        transforms.iter().count(),
+        meshes.iter().count(),
         cars.iter().count(),
     );
     if text.0 != want {
