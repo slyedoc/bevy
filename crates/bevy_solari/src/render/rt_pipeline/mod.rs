@@ -33,7 +33,8 @@ use crate::ecs_gpu::SceneColumns;
 use crate::material::MaterialSlots;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::extension::RayTracingPipelineFeature;
-use crate::gpu::rt_pipeline::{RtCamera, RtPipeline, RtViewBindings};
+use crate::gpu::rt_pipeline::{RtCamera, RtGeometryAddresses, RtPipeline, RtViewBindings};
+use crate::geometry::ClusterMeshManager;
 use crate::render::atmosphere::{AtmosphereSky, SolariAtmosphereView};
 use crate::render::view_cull::SolariEnvironmentMap;
 use crate::render::SolariCamera;
@@ -76,6 +77,14 @@ fn raw_image_view(
 fn raw_image(texture: &bevy_render::render_resource::Texture) -> Option<vk::Image> {
     // SAFETY: Vulkan-backed; we read the image handle, never destroy it.
     unsafe { texture.as_hal::<VkApi>() }.map(|t| unsafe { t.raw_handle() })
+}
+
+/// Bundled env-image resources, grouped into one [`SystemParam`] to keep the
+/// dispatch under bevy's 16-system-param limit.
+#[derive(bevy_ecs::system::SystemParam)]
+pub(crate) struct RtEnvImages<'w> {
+    texture_assets: Res<'w, RenderAssets<GpuImage>>,
+    fallback_image: Res<'w, FallbackImage>,
 }
 
 /// The wgpu compute pipeline + layout copying the RT output buffer to the view.
@@ -169,7 +178,7 @@ pub fn prepare_rt_output(
 /// into the view. Lazily builds the RT pipeline on the first frame the scene +
 /// columns bind groups (and their layouts) are ready — its layout must match
 /// wgpu's exact descriptor set layouts, which only exist once those are built.
-pub fn rt_pipeline(
+pub(crate) fn rt_pipeline(
     view: ViewQuery<(
         &ExtractedView,
         &ExtractedCamera,
@@ -185,10 +194,10 @@ pub fn rt_pipeline(
     additional: Res<AdditionalVulkanFeatures>,
     scene_bindings: Res<RaytracingSceneBindings>,
     scene_columns: Res<SceneColumns>,
+    cluster_mesh_manager: Option<Res<ClusterMeshManager>>,
     material_slots: Res<MaterialSlots>,
     atmosphere_sky: Option<Res<AtmosphereSky>>,
-    texture_assets: Res<RenderAssets<GpuImage>>,
-    fallback_image: Res<FallbackImage>,
+    env_images: RtEnvImages,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     mut frame_counter: Local<u32>,
@@ -209,9 +218,9 @@ pub fn rt_pipeline(
             Some(sky) => (&sky.cube_view, raw_image(&sky.texture)),
             None => {
                 let view = environment_map
-                    .and_then(|env| texture_assets.get(&env.image))
+                    .and_then(|env| env_images.texture_assets.get(&env.image))
                     .map(|image| &image.texture_view)
-                    .unwrap_or(&fallback_image.cube.texture_view);
+                    .unwrap_or(&env_images.fallback_image.cube.texture_view);
                 (view, None)
             }
         };
@@ -346,6 +355,20 @@ pub fn rt_pipeline(
     };
     *frame_counter = frame_counter.wrapping_add(1);
     view_bindings.set_camera(&camera_inputs);
+
+    // Bindless geometry addresses for the chit's `physical_load` resolve: the
+    // interleaved packed-vertex pool's device address (stable across frames unless
+    // the sparse pool grows; refreshed each frame regardless).
+    if let (Some(allocator), Some(cluster_mesh_manager)) =
+        (allocator.as_deref(), cluster_mesh_manager.as_deref())
+    {
+        let vertex_packed =
+            allocator.wgpu_buffer_device_address(cluster_mesh_manager.vertex_packed.buffer());
+        view_bindings.set_geometry_addresses(&RtGeometryAddresses {
+            vertex_packed,
+            _pad: 0,
+        });
+    }
 
     // The raw cmd_trace_rays must go in its OWN command buffer — wgpu-core
     // panics if a single encoder mixes wgpu passes (the blit) with raw

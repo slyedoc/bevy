@@ -31,6 +31,7 @@ const BINDING_OUTPUT: u32 = 0; // storage buffer, vec4<f32> per pixel (raygen wr
 const BINDING_CAMERA: u32 = 1; // uniform buffer (ray gen inputs)
 const BINDING_ENV_MAP: u32 = 2; // environment/skybox cube (miss samples)
 const BINDING_ENV_SAMPLER: u32 = 3; // sampler for the environment cube
+const BINDING_GEOMETRY: u32 = 4; // uniform: bindless geometry buffer-device-addresses (chit reads)
 
 /// Per-frame camera inputs the raygen shader reads — std140-compatible
 /// (mat4 + vec4). `inverse_view_proj` reconstructs a world-space ray per pixel;
@@ -46,6 +47,17 @@ pub struct RtCamera {
     /// `.x` = sky/environment brightness (raw cd/m²; 0 ⇒ no skybox, miss stays
     /// at the clear color in `.yzw`).
     pub sky: [f32; 4],
+}
+
+/// Bindless geometry buffer-device-addresses the closest-hit reads via
+/// `physical_load` (set 1, binding 4). `_pad` rounds to a 16-byte std140 slot.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RtGeometryAddresses {
+    /// Base device address of the interleaved [`PackedVertex`] pool
+    /// (`ClusterMeshManager::vertex_packed`).
+    pub vertex_packed: u64,
+    pub _pad: u64,
 }
 
 /// A raw host-visible buffer kept with its memory + mapping, for the SBT and the
@@ -108,6 +120,9 @@ pub struct RtViewBindings {
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
     camera: MappedBuffer,
+    /// Bindless geometry addresses (set 1, binding 4); contents refreshed per
+    /// frame via the mapping (`set_geometry_addresses`).
+    geometry: MappedBuffer,
     /// This view's own linear env-cube sampler (destroyed on drop). Owned here, not
     /// on `RtPipeline`, so the per-view set survives a pipeline rebuild — the set
     /// is compatible-by-content with the rebuilt set-1 layout and references
@@ -237,6 +252,12 @@ impl RtPipeline {
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::MISS_KHR),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_GEOMETRY)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                // The closest-hit's geometry resolve reads the packed-vertex address.
+                .stage_flags(vk::ShaderStageFlags::CLOSEST_HIT_KHR),
         ];
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         // SAFETY: well-formed create info; device live.
@@ -427,7 +448,7 @@ impl RtPipeline {
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1),
+                .descriptor_count(2), // camera + geometry addresses
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(1),
@@ -461,6 +482,11 @@ impl RtPipeline {
             size_of::<RtCamera>() as u64,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
         )?;
+        let geometry = alloc_mapped_buffer(
+            allocator,
+            size_of::<RtGeometryAddresses>() as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+        )?;
 
         // This view's own linear env-cube sampler (we own it rather than reaching
         // into wgpu's Sampler, which has no raw accessor). Clamp-to-edge is fine
@@ -492,6 +518,10 @@ impl RtPipeline {
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let env_sampler_info =
             [vk::DescriptorImageInfo::default().sampler(env_map_sampler)];
+        let geometry_info = [vk::DescriptorBufferInfo::default()
+            .buffer(geometry.buffer)
+            .offset(0)
+            .range(geometry.size)];
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
@@ -513,6 +543,11 @@ impl RtPipeline {
                 .dst_binding(BINDING_ENV_SAMPLER)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .image_info(&env_sampler_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_GEOMETRY)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&geometry_info),
         ];
         // SAFETY: targets the freshly-allocated set; buffers + image/sampler live.
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
@@ -522,6 +557,7 @@ impl RtPipeline {
             descriptor_pool,
             descriptor_set,
             camera,
+            geometry,
             env_map_sampler,
             env_map_image,
             output_buffer,
@@ -694,6 +730,19 @@ impl RtViewBindings {
     pub fn output_buffer(&self) -> vk::Buffer {
         self.output_buffer
     }
+
+    /// Upload this frame's bindless geometry addresses (host-visible, coherent).
+    pub fn set_geometry_addresses(&self, addresses: &RtGeometryAddresses) {
+        // SAFETY: `geometry.mapped` is a valid HOST_VISIBLE|COHERENT mapping of at
+        // least size_of::<RtGeometryAddresses>() bytes; the struct is Pod.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytemuck::bytes_of(addresses).as_ptr(),
+                self.geometry.mapped,
+                size_of::<RtGeometryAddresses>(),
+            );
+        }
+    }
 }
 
 impl Drop for RtViewBindings {
@@ -708,6 +757,8 @@ impl Drop for RtViewBindings {
             self.device.destroy_sampler(self.env_map_sampler, None);
             self.device.destroy_buffer(self.camera.buffer, None);
             self.device.free_memory(self.camera.memory, None);
+            self.device.destroy_buffer(self.geometry.buffer, None);
+            self.device.free_memory(self.geometry.memory, None);
         }
     }
 }
@@ -789,11 +840,20 @@ fn compile_rt_wgsl(source: &str, file_path: &str) -> Option<Vec<u32>> {
     register!("../bindings/sampling.wgsl"); // -> pbr, scene_bindings, maths
     register!("../bindings/brdf.wgsl"); // -> pbr, sampling, scene_bindings, maths
 
-    let shader_defs = [(
+    let shader_defs = [
         // The scene-columns bind-group index the scene bindings are written with.
-        "SOLARI_SCENE_COLUMNS_GROUP".to_string(),
-        ShaderDefValue::UInt(2),
-    )]
+        (
+            "SOLARI_SCENE_COLUMNS_GROUP".to_string(),
+            ShaderDefValue::UInt(2),
+        ),
+        // The RT-pipeline path resolves geometry via bindless `physical_load` from
+        // the interleaved packed-vertex pool (set 1, binding 4) — the megakernel
+        // (no def) keeps the bound SoA pools.
+        (
+            "SOLARI_PHYSICAL_GEOMETRY".to_string(),
+            ShaderDefValue::Bool(true),
+        ),
+    ]
     .into_iter()
     .collect();
 

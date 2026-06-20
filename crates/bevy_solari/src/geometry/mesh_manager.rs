@@ -1,5 +1,6 @@
 use super::asset::{
     Cluster, ClusterBloatAabb, ClusterBvhNode, ClusterLodGroup, ClusterMesh, ClusterMeshAabb,
+    PackedVertex,
 };
 use super::indices::{ClusterIndex, GroupIndex, NodeIndex};
 use crate::gpu::allocator::Allocator;
@@ -129,6 +130,12 @@ pub struct ClusterMeshManager {
     pub vertex_normals: PersistentGpuBuffer<Arc<[u32]>>,
     pub vertex_tangents: PersistentGpuBuffer<Arc<[Vec4]>>,
     pub vertex_uvs: PersistentGpuBuffer<Arc<[Vec2]>>,
+    /// Interleaved (AoS) copy of the four vertex streams above, parallel to
+    /// `vertex_positions` (same global vertex index). One contiguous 40-byte
+    /// [`PackedVertex`] per vertex for the bindless RT-pipeline resolve's
+    /// cache-friendly `physical_load`; the SoA pools stay for the megakernel,
+    /// CLAS build, and deform.
+    pub vertex_packed: PersistentGpuBuffer<Arc<[PackedVertex]>>,
     pub indices: PersistentGpuBuffer<Arc<[u32]>>,
     pub child_table: PersistentGpuBuffer<Arc<[u32]>>,
     pub clusters: PersistentGpuBuffer<Arc<[Cluster]>>,
@@ -168,6 +175,7 @@ pub fn init_cluster_mesh_manager(
         vertex_normals: PersistentGpuBuffer::new("cluster_vertex_normals", &render_device, &allocator),
         vertex_tangents: PersistentGpuBuffer::new("cluster_vertex_tangents", &render_device, &allocator),
         vertex_uvs: PersistentGpuBuffer::new("cluster_vertex_uvs", &render_device, &allocator),
+        vertex_packed: PersistentGpuBuffer::new("cluster_vertex_packed", &render_device, &allocator),
         indices: PersistentGpuBuffer::new("cluster_indices", &render_device, &allocator),
         child_table: PersistentGpuBuffer::new("cluster_child_table", &render_device, &allocator),
         clusters: PersistentGpuBuffer::new("clusters", &render_device, &allocator),
@@ -238,6 +246,20 @@ impl ClusterMeshManager {
         let vertex_uvs = self
             .vertex_uvs
             .queue_write(Arc::clone(&mesh.vertex_uvs), ());
+        // Interleaved AoS copy for the bindless RT resolve. Built parallel to the
+        // SoA streams above; since every pool gets exactly one bump-allocated
+        // append per mesh in the same order, the packed pool's element base equals
+        // `vertex_base` (asserted below), so the resolve indexes it with the same
+        // global vertex index.
+        let packed: Arc<[PackedVertex]> = (0..mesh.vertex_positions.len())
+            .map(|i| PackedVertex {
+                position: mesh.vertex_positions[i].to_array(),
+                normal: mesh.vertex_normals[i],
+                tangent: mesh.vertex_tangents[i].to_array(),
+                uv: mesh.vertex_uvs[i].to_array(),
+            })
+            .collect();
+        let vertex_packed = self.vertex_packed.queue_write(packed, ());
         let indices = self.indices.queue_write(Arc::clone(&mesh.indices), ());
         // `child_table` is empty for current bakes (interior-node
         // tree isn't built yet); guard against the zero-byte
@@ -250,6 +272,14 @@ impl ClusterMeshManager {
         };
 
         let vertex_base = (vertex_positions.start / size_of::<Vec3>() as u64) as u32;
+        // The packed pool must share the SoA global vertex index (the resolve uses
+        // one index for both). Holds while both pools bump-allocate one append per
+        // mesh in lockstep.
+        debug_assert_eq!(
+            vertex_base,
+            (vertex_packed.start / size_of::<PackedVertex>() as u64) as u32,
+            "vertex_packed pool diverged from vertex_positions indexing",
+        );
         let index_base = (indices.start / size_of::<u32>() as u64) as u32;
         let child_table_base = (child_table.start / size_of::<u32>() as u64) as u32;
 
@@ -484,6 +514,9 @@ pub fn perform_pending_cluster_mesh_writes(
         .perform_writes(&render_queue);
     manager
         .vertex_uvs
+        .perform_writes(&render_queue);
+    manager
+        .vertex_packed
         .perform_writes(&render_queue);
     manager.indices.perform_writes(&render_queue);
     manager

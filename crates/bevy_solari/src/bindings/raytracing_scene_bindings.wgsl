@@ -442,12 +442,38 @@ fn resolve_material_lod(material: Material, uv: vec2<f32>, partial_lod: f32) -> 
     return m;
 }
 
+#ifdef SOLARI_PHYSICAL_GEOMETRY
+// Bindless geometry addresses (set 1, binding 4) for the RT-pipeline path. The
+// interleaved `PackedVertex` pool is reached by buffer-device-address via
+// `physical_load` — one contiguous 40-byte record per vertex (pos@0, normal@12,
+// tangent@16, uv@32) instead of four separate SoA pool fetches.
+struct SolariGeometryAddresses {
+    vertex_packed: u64,
+    _pad: u64,
+}
+@group(1) @binding(4) var<uniform> geometry_addresses: SolariGeometryAddresses;
+
+// Decode one PackedVertex at a global vertex index from the bindless pool.
+fn load_packed_vertex(vertex_index: u32) -> Vertex {
+    var v: Vertex;
+    let base = geometry_addresses.vertex_packed + u64(vertex_index) * u64(40u);
+    v.position = physical_load<vec3<f32>>(base);
+    v.normal = octahedral_decode_signed(unpack2x16snorm(physical_load<u32>(base + u64(12u))));
+    v.tangent = physical_load<vec4<f32>>(base + u64(16u));
+    v.uv = physical_load<vec2<f32>>(base + u64(32u));
+    return v;
+}
+#endif
+
 /// Load one vertex from the cluster pool. `vertex_index` is a global
-/// pool slot (post-rebase by `ClusterMeshManager`). Vertex positions
-/// are stored as a packed `array<f32>` with stride 3 (12 B per
-/// vertex); other streams are parallel arrays indexed by the same
-/// `vertex_index`.
+/// pool slot (post-rebase by `ClusterMeshManager`). The default (megakernel)
+/// path reads the four parallel SoA streams; the RT-pipeline path
+/// (`SOLARI_PHYSICAL_GEOMETRY`) reads one interleaved `PackedVertex` by
+/// buffer-device-address for cache locality.
 fn load_cluster_vertex(vertex_index: u32) -> Vertex {
+#ifdef SOLARI_PHYSICAL_GEOMETRY
+    return load_packed_vertex(vertex_index);
+#else
     var v: Vertex;
     let base = vertex_index * 3u;
     v.position = vec3<f32>(
@@ -459,6 +485,7 @@ fn load_cluster_vertex(vertex_index: u32) -> Vertex {
     v.uv = vertex_uvs[vertex_index];
     v.tangent = vertex_tangents[vertex_index];
     return v;
+#endif
 }
 
 /// As [`load_cluster_vertex`], but reads position + normal from the per-instance
@@ -477,18 +504,18 @@ fn load_cluster_vertex_animated(vertex_index: u32, anim: AnimatedInstance) -> Ve
         );
         v.normal = octahedral_decode_signed(unpack2x16snorm(deform_normals[di]));
         v.tangent = deform_tangents[di];
-    } else {
-        let base = vertex_index * 3u;
-        v.position = vec3<f32>(
-            vertex_positions[base],
-            vertex_positions[base + 1u],
-            vertex_positions[base + 2u],
+        // UV is deform-invariant — read it from the static source.
+#ifdef SOLARI_PHYSICAL_GEOMETRY
+        v.uv = physical_load<vec2<f32>>(
+            geometry_addresses.vertex_packed + u64(vertex_index) * u64(40u) + u64(32u),
         );
-        v.normal = octahedral_decode_signed(unpack2x16snorm(vertex_normals[vertex_index]));
-        v.tangent = vertex_tangents[vertex_index];
+#else
+        v.uv = vertex_uvs[vertex_index];
+#endif
+        return v;
     }
-    v.uv = vertex_uvs[vertex_index]; // UV is deform-invariant
-    return v;
+    // Non-deformed vertex: same source as the static path.
+    return load_cluster_vertex(vertex_index);
 }
 
 fn resolve_ray_hit_full(ray_hit: RayIntersection) -> ResolvedRayHitFull {

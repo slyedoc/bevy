@@ -197,6 +197,26 @@ impl ClusterMesh {
     }
 }
 
+/// Interleaved (AoS) vertex record for the bindless RT-pipeline resolve: all of
+/// one vertex's shading attributes in one contiguous 40-byte slot, so a
+/// closest-hit loads a single cache line per vertex instead of touching the four
+/// separate SoA pools (`vertex_positions`/`normals`/`tangents`/`uvs`). Reached by
+/// buffer-device-address via `physical_load` (field-by-field, so no std430
+/// padding — exact 40 B: position@0, normal@12, tangent@16, uv@32). Built parallel
+/// to `vertex_positions` (same global vertex index).
+#[derive(Copy, Clone, Pod, Zeroable, Debug, Default)]
+#[repr(C)]
+pub struct PackedVertex {
+    /// Object-space position (matches `vertex_positions`).
+    pub position: [f32; 3],
+    /// Octahedral-encoded normal (2×16snorm packed, matches `vertex_normals`).
+    pub normal: u32,
+    /// Tangent xyz + bitangent sign in w (matches `vertex_tangents`).
+    pub tangent: [f32; 4],
+    /// Texture coordinates (matches `vertex_uvs`).
+    pub uv: [f32; 2],
+}
+
 /// A single cluster — the unit of CLAS build. Mirrors what an NV
 /// per-cluster build descriptor needs (vertex range + index range)
 /// plus runtime selection / shading metadata.

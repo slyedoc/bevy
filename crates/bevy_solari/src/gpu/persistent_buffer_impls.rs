@@ -1,4 +1,4 @@
-use crate::geometry::asset::{Cluster, ClusterBloatAabb, ClusterBvhNode, ClusterLodGroup};
+use crate::geometry::asset::{Cluster, ClusterBloatAabb, ClusterBvhNode, ClusterLodGroup, PackedVertex};
 use crate::geometry::ClusterIndex;
 use super::persistent_buffer::PersistentGpuBufferable;
 use alloc::sync::Arc;
@@ -11,6 +11,23 @@ impl PersistentGpuBufferable for Arc<[u32]> {
 
     fn size_in_bytes(&self) -> usize {
         self.len() * size_of::<u32>()
+    }
+
+    fn write_bytes_le(
+        &self,
+        _: Self::Metadata,
+        mut buffer_slice: WriteOnly<[u8]>,
+        _: BufferAddress,
+    ) {
+        buffer_slice.copy_from_slice(bytemuck::cast_slice(self));
+    }
+}
+
+impl PersistentGpuBufferable for Arc<[PackedVertex]> {
+    type Metadata = ();
+
+    fn size_in_bytes(&self) -> usize {
+        self.len() * size_of::<PackedVertex>()
     }
 
     fn write_bytes_le(
