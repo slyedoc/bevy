@@ -402,10 +402,6 @@ struct ResolvedRayHitFull {
     material_id: u32,
 }
 
-fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
-    return resolve_material_lod(material, uv, TEXTURE_LOD_MIP0);
-}
-
 fn resolve_material_lod(material: Material, uv: vec2<f32>, partial_lod: f32) -> ResolvedMaterial {
     var m: ResolvedMaterial;
     // Fold in this material's texture-size term (mip-0 sentinel stays < 0).
@@ -507,22 +503,6 @@ fn resolve_ray_hit_full(ray_hit: RayIntersection) -> ResolvedRayHitFull {
         ray_hit.geometry_index,
         ray_hit.primitive_index,
         barycentrics,
-    );
-}
-
-// As `resolve_ray_hit_full`, but selects texture mips from a ray cone:
-// `cone_width` is the cone diameter at this hit (spread angle × path length so
-// far). `ray_direction` is currently unused — reserved for re-adding the
-// grazing-angle (1/cosθ) LOD term if the register budget allows.
-fn resolve_ray_hit_full_lod(ray_hit: RayIntersection, cone_width: f32, ray_direction: vec3<f32>) -> ResolvedRayHitFull {
-    let barycentrics = vec3(1.0 - ray_hit.barycentrics.x - ray_hit.barycentrics.y, ray_hit.barycentrics);
-    return resolve_triangle_data_full_cone(
-        ray_hit.instance_index,
-        ray_hit.geometry_index,
-        ray_hit.primitive_index,
-        barycentrics,
-        cone_width,
-        ray_direction,
     );
 }
 
@@ -782,52 +762,6 @@ fn nearest_black_hole_entry(origin: vec3<f32>, direction: vec3<f32>, max_t: f32,
         best = i;
     }
     return best;
-}
-
-// `trace_ray`, following portal teleports and black-hole bends (≤ 6 hops):
-// origin/direction are updated in place so the caller's ray state matches
-// the returned intersection. Accretion-disk radiance accumulates into
-// `*emitted` (scale by throughput and add); `*captured` is set when the ray
-// fell into a horizon — the caller must show BLACK, not the sky, and ignore
-// the returned (stale) intersection. Structured with `let`s only — naga
-// rejects re-assigning a `var` of the special RayIntersection type.
-fn trace_ray_traversal(
-    ray_origin: ptr<function, vec3<f32>>,
-    ray_direction: ptr<function, vec3<f32>>,
-    ray_t_min: f32,
-    ray_flag: u32,
-    emitted: ptr<function, vec3<f32>>,
-    captured: ptr<function, u32>,
-) -> RayIntersection {
-    *captured = 0u;
-    for (var hop = 0u; hop < 6u; hop += 1u) {
-        let ray = trace_ray(
-            *ray_origin,
-            *ray_direction,
-            select(0.0, ray_t_min, hop == 0u),
-            RAY_T_MAX,
-            ray_flag,
-        );
-        let scene_t = select(1e30, ray.t, ray.kind != RAY_QUERY_INTERSECTION_NONE);
-
-        // A black-hole region before the scene hit bends the ray first.
-        var entry_t = scene_t;
-        let hole = nearest_black_hole_entry(*ray_origin, *ray_direction, scene_t, &entry_t);
-        if hole != 0xFFFFFFFFu {
-            *ray_origin += *ray_direction * entry_t;
-            if black_hole_march(hole, ray_origin, ray_direction, emitted) {
-                *captured = 1u;
-                return ray;
-            }
-            continue; // re-trace from the region exit
-        }
-
-        if ray.kind == RAY_QUERY_INTERSECTION_NONE
-            || !portal_redirect(ray.instance_index, *ray_origin + *ray_direction * ray.t, ray_origin, ray_direction) {
-            return ray;
-        }
-    }
-    return trace_ray(*ray_origin, *ray_direction, 0.0, RAY_T_MAX, ray_flag);
 }
 
 fn transform_positions(transform: mat3x4<f32>, vertices: array<Vertex, 3>) -> array<vec3<f32>, 3> {
