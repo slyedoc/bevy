@@ -442,11 +442,10 @@ fn resolve_material_lod(material: Material, uv: vec2<f32>, partial_lod: f32) -> 
     return m;
 }
 
-#ifdef SOLARI_PHYSICAL_GEOMETRY
-// Bindless geometry addresses (set 1, binding 4) for the RT-pipeline path. The
-// interleaved `PackedVertex` pool is reached by buffer-device-address via
+// Bindless geometry addresses (set 1, binding 4). The interleaved `PackedVertex`
+// pool + the materials buffer are reached by buffer-device-address via
 // `physical_load` — one contiguous 40-byte record per vertex (pos@0, normal@12,
-// tangent@16, uv@32) instead of four separate SoA pool fetches.
+// tangent@16, uv@32), and the whole material struct in one cache-coherent load.
 struct SolariGeometryAddresses {
     vertex_packed: u64,
     materials: u64,
@@ -456,16 +455,16 @@ struct SolariGeometryAddresses {
 @group(1) @binding(4) var<uniform> geometry_addresses: SolariGeometryAddresses;
 
 // Bindless material fetch: load the whole Material struct by buffer-device-address
-// (one cache-coherent load, uniform across the warp after SER) instead of the
-// bound `materials` array.
+// (uniform across the warp after SER).
 fn load_material_bindless(material_id: u32) -> Material {
     let addr = geometry_addresses.materials
         + u64(material_id) * u64(geometry_addresses.material_stride);
     return physical_load<Material>(addr);
 }
 
-// Decode one PackedVertex at a global vertex index from the bindless pool.
-fn load_packed_vertex(vertex_index: u32) -> Vertex {
+/// Load (decode) one interleaved `PackedVertex` at a global vertex index from the
+/// bindless pool — one contiguous record instead of four parallel SoA fetches.
+fn load_cluster_vertex(vertex_index: u32) -> Vertex {
     var v: Vertex;
     let base = geometry_addresses.vertex_packed + u64(vertex_index) * u64(40u);
     v.position = physical_load<vec3<f32>>(base);
@@ -473,30 +472,6 @@ fn load_packed_vertex(vertex_index: u32) -> Vertex {
     v.tangent = physical_load<vec4<f32>>(base + u64(16u));
     v.uv = physical_load<vec2<f32>>(base + u64(32u));
     return v;
-}
-#endif
-
-/// Load one vertex from the cluster pool. `vertex_index` is a global
-/// pool slot (post-rebase by `ClusterMeshManager`). The default (megakernel)
-/// path reads the four parallel SoA streams; the RT-pipeline path
-/// (`SOLARI_PHYSICAL_GEOMETRY`) reads one interleaved `PackedVertex` by
-/// buffer-device-address for cache locality.
-fn load_cluster_vertex(vertex_index: u32) -> Vertex {
-#ifdef SOLARI_PHYSICAL_GEOMETRY
-    return load_packed_vertex(vertex_index);
-#else
-    var v: Vertex;
-    let base = vertex_index * 3u;
-    v.position = vec3<f32>(
-        vertex_positions[base],
-        vertex_positions[base + 1u],
-        vertex_positions[base + 2u],
-    );
-    v.normal = octahedral_decode_signed(unpack2x16snorm(vertex_normals[vertex_index]));
-    v.uv = vertex_uvs[vertex_index];
-    v.tangent = vertex_tangents[vertex_index];
-    return v;
-#endif
 }
 
 /// As [`load_cluster_vertex`], but reads position + normal from the per-instance
@@ -515,14 +490,10 @@ fn load_cluster_vertex_animated(vertex_index: u32, anim: AnimatedInstance) -> Ve
         );
         v.normal = octahedral_decode_signed(unpack2x16snorm(deform_normals[di]));
         v.tangent = deform_tangents[di];
-        // UV is deform-invariant — read it from the static source.
-#ifdef SOLARI_PHYSICAL_GEOMETRY
+        // UV is deform-invariant — read it from the static packed pool.
         v.uv = physical_load<vec2<f32>>(
             geometry_addresses.vertex_packed + u64(vertex_index) * u64(40u) + u64(32u),
         );
-#else
-        v.uv = vertex_uvs[vertex_index];
-#endif
         return v;
     }
     // Non-deformed vertex: same source as the static path.
@@ -934,11 +905,7 @@ fn resolve_triangle_data_full_cone_mat(
     cone_width: f32,
     ray_direction: vec3<f32>,
 ) -> ResolvedRayHitFull {
-#ifdef SOLARI_PHYSICAL_GEOMETRY
     let material = load_material_bindless(material_id);
-#else
-    let material = materials[material_id];
-#endif
 
     let previous_frame_transform = previous_frame_transforms[instance_id];
 

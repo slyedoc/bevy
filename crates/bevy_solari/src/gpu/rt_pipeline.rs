@@ -844,20 +844,11 @@ fn compile_rt_wgsl(source: &str, file_path: &str) -> Option<Vec<u32>> {
     register!("../bindings/sampling.wgsl"); // -> pbr, scene_bindings, maths
     register!("../bindings/brdf.wgsl"); // -> pbr, sampling, scene_bindings, maths
 
-    let shader_defs = [
+    let shader_defs = [(
         // The scene-columns bind-group index the scene bindings are written with.
-        (
-            "SOLARI_SCENE_COLUMNS_GROUP".to_string(),
-            ShaderDefValue::UInt(2),
-        ),
-        // The RT-pipeline path resolves geometry via bindless `physical_load` from
-        // the interleaved packed-vertex pool (set 1, binding 4) — the megakernel
-        // (no def) keeps the bound SoA pools.
-        (
-            "SOLARI_PHYSICAL_GEOMETRY".to_string(),
-            ShaderDefValue::Bool(true),
-        ),
-    ]
+        "SOLARI_SCENE_COLUMNS_GROUP".to_string(),
+        ShaderDefValue::UInt(2),
+    )]
     .into_iter()
     .collect();
 
