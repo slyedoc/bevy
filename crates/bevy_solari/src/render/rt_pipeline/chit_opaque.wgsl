@@ -49,10 +49,21 @@ fn chit_opaque(
     // ClusterIDNV).
     @builtin(primitive_index) primitive_index: u32,
     @builtin(world_ray_direction) ray_direction: vec3<f32>,
+    // The instance's object→world transform straight from the TLAS hit — no need
+    // to read `transforms[instance_id]` (the acceleration structure already holds
+    // it). `ObjectToWorldKHR` is mat4x3 (4 columns × 3 rows); convert to the
+    // resolve's row-form mat3x4 below.
+    @builtin(object_to_world) object_to_world: mat4x3<f32>,
 ) {
     var rng = payload.rng;
     let barycentrics = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
-    let ray_hit = resolve_triangle_data_full_mat(instance_id, sbt.material_id, cluster_id, primitive_index, barycentrics);
+    // Row-form affine (m[r] = (basis_row_r, translation_r)) the resolve expects.
+    let transform = mat3x4<f32>(
+        vec4<f32>(object_to_world[0].x, object_to_world[1].x, object_to_world[2].x, object_to_world[3].x),
+        vec4<f32>(object_to_world[0].y, object_to_world[1].y, object_to_world[2].y, object_to_world[3].y),
+        vec4<f32>(object_to_world[0].z, object_to_world[1].z, object_to_world[2].z, object_to_world[3].z),
+    );
+    let ray_hit = resolve_triangle_data_full_mat(instance_id, sbt.material_id, transform, cluster_id, primitive_index, barycentrics);
 
     let wo = -ray_direction;
     // Bend the smooth shading normal into the view hemisphere so silhouette

@@ -886,11 +886,12 @@ fn resolve_triangle_data_full(
 fn resolve_triangle_data_full_mat(
     instance_id: u32,
     material_id: u32,
+    transform: mat3x4<f32>,
     cluster_global_id: u32,
     triangle_id: u32,
     barycentrics: vec3<f32>,
 ) -> ResolvedRayHitFull {
-    return resolve_triangle_data_full_cone_mat(instance_id, material_id, cluster_global_id, triangle_id, barycentrics, -1.0, vec3(0.0));
+    return resolve_triangle_data_full_cone_mat(instance_id, material_id, transform, cluster_global_id, triangle_id, barycentrics, -1.0, vec3(0.0));
 }
 
 fn resolve_triangle_data_full_cone(
@@ -906,6 +907,7 @@ fn resolve_triangle_data_full_cone(
     return resolve_triangle_data_full_cone_mat(
         instance_id,
         material_ids[instance_id],
+        transforms[instance_id],
         cluster_global_id,
         triangle_id,
         barycentrics,
@@ -922,6 +924,10 @@ fn resolve_triangle_data_full_cone(
 fn resolve_triangle_data_full_cone_mat(
     instance_id: u32,
     material_id: u32,
+    // Object→world affine (row-form). The megakernel passes `transforms[instance_id]`;
+    // the RT closest-hit passes the TLAS hit's `ObjectToWorld` builtin directly (the
+    // acceleration structure already holds it — no buffer read needed).
+    transform: mat3x4<f32>,
     cluster_global_id: u32,
     triangle_id: u32,
     barycentrics: vec3<f32>,
@@ -934,7 +940,6 @@ fn resolve_triangle_data_full_cone_mat(
     let material = materials[material_id];
 #endif
 
-    let transform = transforms[instance_id];
     let previous_frame_transform = previous_frame_transforms[instance_id];
 
     let cluster = clusters[cluster_global_id];
