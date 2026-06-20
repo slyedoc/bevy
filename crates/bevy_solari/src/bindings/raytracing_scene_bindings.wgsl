@@ -843,6 +843,18 @@ fn resolve_triangle_data_full(
     return resolve_triangle_data_full_cone(instance_id, cluster_global_id, triangle_id, barycentrics, -1.0, vec3(0.0));
 }
 
+/// Mip-0, material-explicit resolve (see `resolve_triangle_data_full_cone_mat`):
+/// the closest-hit passes the material id from its SBT shader record.
+fn resolve_triangle_data_full_mat(
+    instance_id: u32,
+    material_id: u32,
+    cluster_global_id: u32,
+    triangle_id: u32,
+    barycentrics: vec3<f32>,
+) -> ResolvedRayHitFull {
+    return resolve_triangle_data_full_cone_mat(instance_id, material_id, cluster_global_id, triangle_id, barycentrics, -1.0, vec3(0.0));
+}
+
 fn resolve_triangle_data_full_cone(
     instance_id: u32,
     cluster_global_id: u32,
@@ -851,7 +863,33 @@ fn resolve_triangle_data_full_cone(
     cone_width: f32,
     ray_direction: vec3<f32>,
 ) -> ResolvedRayHitFull {
-    let material_id = material_ids[instance_id];
+    // Default material binding: the `material_ids[instance_id]` indirection. The
+    // inline-rayQuery (megakernel) path resolves material this way.
+    return resolve_triangle_data_full_cone_mat(
+        instance_id,
+        material_ids[instance_id],
+        cluster_global_id,
+        triangle_id,
+        barycentrics,
+        cone_width,
+        ray_direction,
+    );
+}
+
+/// Material-explicit variant: the caller supplies `material_id` directly instead
+/// of the `material_ids[instance_id]` indirection — e.g. a closest-hit reading it
+/// from its per-material SBT shader record (uniform per warp after SER, the
+/// canonical RT material binding). Geometry still resolves from `instance_id` /
+/// `cluster_global_id` / `triangle_id`.
+fn resolve_triangle_data_full_cone_mat(
+    instance_id: u32,
+    material_id: u32,
+    cluster_global_id: u32,
+    triangle_id: u32,
+    barycentrics: vec3<f32>,
+    cone_width: f32,
+    ray_direction: vec3<f32>,
+) -> ResolvedRayHitFull {
     let material = materials[material_id];
 
     let transform = transforms[instance_id];

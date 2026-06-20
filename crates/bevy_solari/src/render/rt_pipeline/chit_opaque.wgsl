@@ -15,12 +15,25 @@ enable primitive_index;
 #import bevy_solari::pbr::rand_f
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic}
-#import bevy_solari::scene_bindings::{resolve_triangle_data_full, offset_ray_origin, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat, offset_ray_origin, MIRROR_ROUGHNESS_THRESHOLD}
 
 var<incoming_ray_payload> payload: RtPayload;
 // Driver-provided triangle barycentrics (GLSL `hitAttributeEXT vec2`) — the
 // fixed-function triangle intersection writes (u, v); w = 1 - u - v.
 var<hit_attribute> bary: vec2<f32>;
+
+// Per-material SBT shader record: each hit record bakes its material id (the
+// record index = the material slot, set as `instance_contribution_to_hit_group_index`
+// in ptlas_fill). Reading material identity from here — rather than the
+// `material_ids[instance_id]` indirection — is the canonical NVIDIA path: the
+// value is uniform per shader-record, so after SER reorders the warp by hit
+// (the hit object carries this same SBT record index), `materials[material_id]`
+// and the texture-array fetches become uniform, sidestepping non-uniform
+// descriptor divergence.
+struct SbtRecord {
+    material_id: u32,
+}
+var<shader_record> sbt: SbtRecord;
 
 @closest_hit
 @incoming_payload(payload)
@@ -39,7 +52,7 @@ fn chit_opaque(
 ) {
     var rng = payload.rng;
     let barycentrics = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
-    let ray_hit = resolve_triangle_data_full(instance_id, cluster_id, primitive_index, barycentrics);
+    let ray_hit = resolve_triangle_data_full_mat(instance_id, sbt.material_id, cluster_id, primitive_index, barycentrics);
 
     let wo = -ray_direction;
     // Bend the smooth shading normal into the view hemisphere so silhouette

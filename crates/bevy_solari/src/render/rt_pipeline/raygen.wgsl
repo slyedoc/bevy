@@ -77,11 +77,16 @@ fn raygen(
         payload.bounce = 0u;
         payload.rng = rng;
         payload.p_bounce = p_bounce;
-        // Shader Execution Reordering: trace into a hit object, reorder the warp by
-        // hit (SBT record = material with per-material routing) so divergent rays
-        // cohere per material, then run the selected closest-hit. Coherent warps
-        // make the per-material data + texture index uniform → no descriptor-array
-        // divergence, the whole point of the per-material SBT.
+        // Shader Execution Reordering: trace into a hit object, reorder the warp,
+        // then run the selected closest-hit. `reorderThread(hit)` keys on the hit
+        // object's full sort key — which INCLUDES the SBT record index — and with
+        // per-material records (instance_contribution_to_hit_group_index = material
+        // slot) that record index IS the material, so the warp coheres per
+        // material with no explicit hint. Coherent warps make the chit's
+        // shader-record material id + the texture-array fetches uniform → no
+        // descriptor-array divergence, the whole point of the per-material SBT.
+        // (An explicit reorderThread(hit, hint, bits) would only matter for a
+        // coarser/cheaper key than per-record — a future perf knob.)
         var hit: hit_object;
         hitObjectTraceRay(
             &hit,

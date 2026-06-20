@@ -293,22 +293,26 @@ impl RtPipeline {
         // lazily in `create_view_bindings` (one per `SolariCamera`).
 
         // --- SBT: raygen(1) + miss(1) + hit(ONE RECORD PER MATERIAL) ----------
-        // Three regions, each base-aligned. The hit region holds one bare-handle
-        // record per material slot; an instance's
-        // `instance_contribution_to_hit_group_index` = its material slot selects
-        // its record. Distinct per-material records give Shader Execution
-        // Reordering a per-material key (warps cohere by material) and a slot for
-        // future per-class handles (glass/hair). Records carry NO data — the chit
-        // resolves the real material from the hit itself (instance_id + cluster_id
-        // → resolve_triangle_data_full), so a baked material id would be redundant.
+        // Three regions, each base-aligned. The hit region holds one record per
+        // material slot; an instance's `instance_contribution_to_hit_group_index`
+        // = its material slot selects its record. Each HIT record is
+        // [shader group handle | shader-record data]; the data slot holds the
+        // material id (= record index), which `chit_opaque`'s `var<shader_record>`
+        // reads as the canonical material binding (uniform per record → uniform
+        // per warp after SER). Distinct per-material records also give SER a
+        // per-material reorder key and a slot for future per-class handles.
         const GROUP_COUNT: u32 = 5; // raygen, miss, opaque, glass, hair
+        const HIT_RECORD_DATA: u64 = 4; // bytes of shader-record data (u32 material id)
         const RECORD_HEADROOM: u32 = 64; // absorb a little material growth post-build
         let record_capacity = material_count + RECORD_HEADROOM;
         let handle_stride = align_up(handle_size, handle_align);
+        // Hit records carry the material-id data slot, so they're wider than a
+        // bare handle.
+        let hit_record_stride = align_up(handle_size + HIT_RECORD_DATA, handle_align);
         let raygen_offset = 0u64;
         let miss_offset = align_up(handle_stride, base_align);
         let hit_offset = align_up(miss_offset + handle_stride, base_align);
-        let sbt_size = hit_offset + record_capacity as u64 * handle_stride;
+        let sbt_size = hit_offset + record_capacity as u64 * hit_record_stride;
         let sbt = alloc_mapped_buffer(
             allocator,
             sbt_size,
@@ -337,18 +341,24 @@ impl RtPipeline {
                 );
             }
         }
-        // One record per material slot. For now every record uses the OPAQUE
-        // closest-hit (group 2); glass/hair per-material handles are a follow-up
-        // (the chit resolves the real material either way).
+        // One record per material slot: [opaque handle | material id]. Every
+        // record uses the OPAQUE closest-hit (group 2) for now; glass/hair
+        // per-material handles are a follow-up. The data slot = the record index =
+        // the material id the instance routes to, read back via `var<shader_record>`.
         let opaque_handle = handle(2);
         for record in 0..record_capacity as u64 {
-            let rec_off = hit_offset + record * handle_stride;
-            // SAFETY: rec_off + handle_size within the record.
+            let rec_off = hit_offset + record * hit_record_stride;
+            // SAFETY: rec_off + handle_size + 4 within the record.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     opaque_handle.as_ptr(),
                     sbt.mapped.add(rec_off as usize),
                     handle_size as usize,
+                );
+                core::ptr::copy_nonoverlapping(
+                    (record as u32).to_le_bytes().as_ptr(),
+                    sbt.mapped.add((rec_off + handle_size) as usize),
+                    4,
                 );
             }
         }
@@ -365,8 +375,8 @@ impl RtPipeline {
         // slot indexes them.
         let hit_region = vk::StridedDeviceAddressRegionKHR::default()
             .device_address(sbt.device_address + hit_offset)
-            .stride(handle_stride)
-            .size(record_capacity as u64 * handle_stride);
+            .stride(hit_record_stride)
+            .size(record_capacity as u64 * hit_record_stride);
         let callable_region = vk::StridedDeviceAddressRegionKHR::default();
 
         let out = Self {
