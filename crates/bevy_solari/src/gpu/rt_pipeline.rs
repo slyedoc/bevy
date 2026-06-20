@@ -13,6 +13,7 @@
 
 use ash::khr;
 use ash::vk::{self, TaggedStructure};
+use bevy_ecs::component::Component;
 use bevy_ecs::resource::Resource;
 use core::ffi::CStr;
 use wgpu::naga;
@@ -58,7 +59,12 @@ struct MappedBuffer {
     device_address: vk::DeviceAddress,
 }
 
-/// Render-world resource owning the ray-tracing pipeline + SBT + descriptor set.
+/// Render-world resource owning the **view-independent** ray-tracing pipeline +
+/// SBT + the set-1 descriptor *layout* and the shared env sampler. The per-view
+/// resources (set-1 descriptor set, camera UBO, output-buffer binding, env cube)
+/// live in [`RtViewBindings`], a component, so multiple views (split-screen) each
+/// trace into their own output with their own camera/env.
+///
 /// Present only when `RayTracingPipelineFeature` is enabled; absence means the
 /// inline-`rayQuery` compute path is the only shading path.
 #[derive(Resource)]
@@ -69,31 +75,58 @@ pub struct RtPipeline {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     descriptor_set_layout: vk::DescriptorSetLayout,
-    descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
 
     sbt: MappedBuffer,
     raygen_region: vk::StridedDeviceAddressRegionKHR,
     miss_region: vk::StridedDeviceAddressRegionKHR,
     hit_region: vk::StridedDeviceAddressRegionKHR,
     callable_region: vk::StridedDeviceAddressRegionKHR,
+    /// Number of per-material hit records the SBT holds. An instance routes to
+    /// record = its material slot, so once the live material count exceeds this
+    /// the pipeline must be rebuilt (the dispatch checks [`Self::capacity`]).
+    record_capacity: u32,
 
-    camera: MappedBuffer,
-    /// Our own linear sampler for the environment cube (destroyed on drop).
-    env_map_sampler: vk::Sampler,
-    /// `Some` ⇒ the env cube is the storage atmosphere cube (GENERAL); transition
-    /// it around each trace. `None` ⇒ already a read-optimal wgpu-sampled texture.
-    env_map_image: Option<vk::Image>,
     /// Shader modules retained for the pipeline's lifetime (destroyed on drop).
     modules: Vec<vk::ShaderModule>,
 }
 
-// SAFETY: the only interior raw pointers are the persistent host-visible
-// mappings in `MappedBuffer`; they are written solely from the single
-// render-schedule dispatch system (via `&self` + coherent memory) and never
-// shared across threads. All other fields are plain Vulkan handles.
+// SAFETY: all fields are plain Vulkan handles owned by this resource; the only
+// interior raw pointers (host-visible mappings) moved to RtViewBindings. Used
+// solely from the single render-schedule dispatch system.
 unsafe impl Send for RtPipeline {}
 unsafe impl Sync for RtPipeline {}
+
+/// Per-view ray-tracing resources: the set-1 descriptor set (output buffer @0,
+/// camera UBO @1, env cube @2, env sampler @3), the camera UBO it points at, and
+/// the env image to transition around the trace. One per [`SolariCamera`] view,
+/// so split-screen views don't share an output buffer or camera. Built from
+/// [`RtPipeline::create_view_bindings`]; rebuilt when the view's output buffer is
+/// reallocated (viewport resize).
+#[derive(Component)]
+pub struct RtViewBindings {
+    device: ash::Device,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    camera: MappedBuffer,
+    /// This view's own linear env-cube sampler (destroyed on drop). Owned here, not
+    /// on `RtPipeline`, so the per-view set survives a pipeline rebuild — the set
+    /// is compatible-by-content with the rebuilt set-1 layout and references
+    /// nothing the rebuilt pipeline owns.
+    env_map_sampler: vk::Sampler,
+    /// `Some` ⇒ the env cube is the storage atmosphere cube (GENERAL); transition
+    /// it around each trace. `None` ⇒ already a read-optimal wgpu-sampled texture.
+    env_map_image: Option<vk::Image>,
+    /// The output `VkBuffer` baked into binding 0. The dispatch rebuilds this
+    /// component if the view's output buffer changes (resize) — the descriptor is
+    /// written once and never updated (updating an in-flight set device-losts).
+    output_buffer: vk::Buffer,
+}
+
+// SAFETY: the host-visible camera mapping is written only from the single
+// render-schedule dispatch (via `&self` + coherent memory), never shared across
+// threads. All other fields are plain Vulkan handles.
+unsafe impl Send for RtViewBindings {}
+unsafe impl Sync for RtViewBindings {}
 
 impl RtPipeline {
     /// Build the RT pipeline (raygen + miss + opaque/glass/hair closest-hit).
@@ -107,14 +140,7 @@ impl RtPipeline {
         allocator: &Allocator,
         scene_layout: vk::DescriptorSetLayout,
         columns_layout: vk::DescriptorSetLayout,
-        output_buffer: vk::Buffer,
-        output_size: u64,
         material_count: u32,
-        env_map_view: vk::ImageView,
-        // `Some` when the env image is the storage-written atmosphere cube (in
-        // `GENERAL`): we transition it to `SHADER_READ_ONLY_OPTIMAL` around the
-        // trace. `None` when it's a wgpu-sampled texture (already read-optimal).
-        env_map_image: Option<vk::Image>,
     ) -> Option<Self> {
         let device = allocator.device().clone();
         let instance = allocator.instance();
@@ -263,61 +289,26 @@ impl RtPipeline {
             }
         };
 
-        // --- Descriptor pool + set (set 1: output + camera) -------------------
-        let pool_sizes = [
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1),
-        ];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .pool_sizes(&pool_sizes)
-            .max_sets(1);
-        // SAFETY: well-formed; device live.
-        let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None) }.ok()?;
-        // Allocate ONLY our own set (set 1); the scene/columns sets are owned by
-        // wgpu. Reusing the 3-element pipeline `set_layouts` here would try to
-        // allocate the giant scene set from this tiny pool (OUT_OF_POOL_MEMORY).
-        let own_set_layouts = [descriptor_set_layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(&own_set_layouts);
-        // SAFETY: pool + layout live.
-        let descriptor_set = match unsafe { device.allocate_descriptor_sets(&alloc_info) } {
-            Ok(sets) => sets.into_iter().next()?,
-            Err(e) => {
-                bevy_log::error!("rt_pipeline: allocate_descriptor_sets failed: {e:?}");
-                return None;
-            }
-        };
+        // The set-1 descriptor set + camera UBO + env binding are per-view, built
+        // lazily in `create_view_bindings` (one per `SolariCamera`).
 
         // --- SBT: raygen(1) + miss(1) + hit(ONE RECORD PER MATERIAL) ----------
-        // Three regions, each base-aligned. The hit region holds one record per
-        // material slot; an instance's `instance_contribution_to_hit_group_index`
-        // = its material slot selects its record. Distinct per-material records
-        // give Shader Execution Reordering a per-material key (warps cohere by
-        // material). Each HIT record is [shader group handle | shader-record data];
-        // the data slot carries the material id (= record index) for the eventual
-        // `var<shader_record>` read.
+        // Three regions, each base-aligned. The hit region holds one bare-handle
+        // record per material slot; an instance's
+        // `instance_contribution_to_hit_group_index` = its material slot selects
+        // its record. Distinct per-material records give Shader Execution
+        // Reordering a per-material key (warps cohere by material) and a slot for
+        // future per-class handles (glass/hair). Records carry NO data — the chit
+        // resolves the real material from the hit itself (instance_id + cluster_id
+        // → resolve_triangle_data_full), so a baked material id would be redundant.
         const GROUP_COUNT: u32 = 5; // raygen, miss, opaque, glass, hair
-        const HIT_RECORD_DATA: u64 = 16; // bytes of shader-record data per hit record
         const RECORD_HEADROOM: u32 = 64; // absorb a little material growth post-build
         let record_capacity = material_count + RECORD_HEADROOM;
         let handle_stride = align_up(handle_size, handle_align);
-        // Hit records carry data, so they're wider than a bare handle.
-        let hit_record_stride = align_up(handle_size + HIT_RECORD_DATA, handle_align);
         let raygen_offset = 0u64;
         let miss_offset = align_up(handle_stride, base_align);
         let hit_offset = align_up(miss_offset + handle_stride, base_align);
-        let sbt_size = hit_offset + record_capacity as u64 * hit_record_stride;
+        let sbt_size = hit_offset + record_capacity as u64 * handle_stride;
         let sbt = alloc_mapped_buffer(
             allocator,
             sbt_size,
@@ -348,21 +339,16 @@ impl RtPipeline {
         }
         // One record per material slot. For now every record uses the OPAQUE
         // closest-hit (group 2); glass/hair per-material handles are a follow-up
-        // (the chit resolves the real material either way). Data slot = material id.
+        // (the chit resolves the real material either way).
         let opaque_handle = handle(2);
         for record in 0..record_capacity as u64 {
-            let rec_off = hit_offset + record * hit_record_stride;
-            // SAFETY: rec_off + handle_size + 4 within the record.
+            let rec_off = hit_offset + record * handle_stride;
+            // SAFETY: rec_off + handle_size within the record.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     opaque_handle.as_ptr(),
                     sbt.mapped.add(rec_off as usize),
                     handle_size as usize,
-                );
-                core::ptr::copy_nonoverlapping(
-                    (record as u32).to_le_bytes().as_ptr(),
-                    sbt.mapped.add((rec_off + handle_size) as usize),
-                    4,
                 );
             }
         }
@@ -379,20 +365,96 @@ impl RtPipeline {
         // slot indexes them.
         let hit_region = vk::StridedDeviceAddressRegionKHR::default()
             .device_address(sbt.device_address + hit_offset)
-            .stride(hit_record_stride)
-            .size(record_capacity as u64 * hit_record_stride);
+            .stride(handle_stride)
+            .size(record_capacity as u64 * handle_stride);
         let callable_region = vk::StridedDeviceAddressRegionKHR::default();
 
-        // --- Camera UBO -------------------------------------------------------
+        let out = Self {
+            device,
+            rt,
+            pipeline,
+            pipeline_layout,
+            descriptor_set_layout,
+            sbt,
+            raygen_region,
+            miss_region,
+            hit_region,
+            callable_region,
+            record_capacity,
+            modules,
+        };
+        Some(out)
+    }
+
+    /// Per-material hit-record count the SBT was built for. The dispatch rebuilds
+    /// the pipeline once the live material count exceeds this (an instance routes
+    /// to `record = material slot`, so a slot past the end would read OOB).
+    pub fn capacity(&self) -> u32 {
+        self.record_capacity
+    }
+
+    /// Build the per-view set-1 resources (descriptor set + camera UBO) for one
+    /// view: a fresh pool, a set allocated from the shared set-1 layout, a camera
+    /// UBO, and the descriptor written ONCE (output buffer @0, camera @1, env cube
+    /// @2, shared sampler @3). The set is never updated again — updating one while
+    /// a prior frame's command buffer still binds it is illegal and device-losts;
+    /// the camera *contents* change per frame via the mapping (`set_camera`), and
+    /// the output buffer is stable (the dispatch rebuilds this whole component if
+    /// the view's output buffer is reallocated). `env_map_image` is `Some` when the
+    /// env cube is the storage atmosphere cube (transitioned around the trace).
+    pub fn create_view_bindings(
+        &self,
+        allocator: &Allocator,
+        output_buffer: vk::Buffer,
+        output_size: u64,
+        env_map_view: vk::ImageView,
+        env_map_image: Option<vk::Image>,
+    ) -> Option<RtViewBindings> {
+        // One pool per view, sized for exactly this view's single set-1 set.
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1),
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(1);
+        // SAFETY: well-formed; device live.
+        let descriptor_pool =
+            unsafe { self.device.create_descriptor_pool(&pool_info, None) }.ok()?;
+        let own_set_layouts = [self.descriptor_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&own_set_layouts);
+        // SAFETY: pool + layout live.
+        let descriptor_set = match unsafe { self.device.allocate_descriptor_sets(&alloc_info) } {
+            Ok(sets) => sets.into_iter().next()?,
+            Err(e) => {
+                bevy_log::error!("rt_pipeline: allocate_descriptor_sets failed: {e:?}");
+                // SAFETY: pool just created, no sets in use.
+                unsafe { self.device.destroy_descriptor_pool(descriptor_pool, None) };
+                return None;
+            }
+        };
+
         let camera = alloc_mapped_buffer(
             allocator,
             size_of::<RtCamera>() as u64,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
         )?;
 
-        // Linear sampler for the environment cube (we own this one rather than
-        // reaching into wgpu's Sampler, which has no raw accessor). Clamp-to-edge
-        // is fine for a cube.
+        // This view's own linear env-cube sampler (we own it rather than reaching
+        // into wgpu's Sampler, which has no raw accessor). Clamp-to-edge is fine
+        // for a cube.
         let sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -402,61 +464,75 @@ impl RtPipeline {
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .max_lod(vk::LOD_CLAMP_NONE);
         // SAFETY: well-formed; device live.
-        let env_map_sampler = unsafe { device.create_sampler(&sampler_info, None) }.ok()?;
+        let env_map_sampler = unsafe { self.device.create_sampler(&sampler_info, None) }.ok()?;
 
-        let mut out = Self {
-            device,
-            rt,
-            pipeline,
-            pipeline_layout,
-            descriptor_set_layout,
+        let output_info = [vk::DescriptorBufferInfo::default()
+            .buffer(output_buffer)
+            .offset(0)
+            .range(output_size)];
+        let camera_info = [vk::DescriptorBufferInfo::default()
+            .buffer(camera.buffer)
+            .offset(0)
+            .range(camera.size)];
+        // `trace()` transitions the atmosphere cube to SHADER_READ_ONLY_OPTIMAL
+        // around the dispatch (skybox/fallback are already in this layout), so the
+        // descriptor always sees read-optimal.
+        let env_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(env_map_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let env_sampler_info =
+            [vk::DescriptorImageInfo::default().sampler(env_map_sampler)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_OUTPUT)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&output_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_CAMERA)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&camera_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_ENV_MAP)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&env_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_ENV_SAMPLER)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&env_sampler_info),
+        ];
+        // SAFETY: targets the freshly-allocated set; buffers + image/sampler live.
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+        Some(RtViewBindings {
+            device: self.device.clone(),
             descriptor_pool,
             descriptor_set,
-            sbt,
-            raygen_region,
-            miss_region,
-            hit_region,
-            callable_region,
             camera,
             env_map_sampler,
             env_map_image,
-            modules,
-        };
-        // Write set 1 (output buffer + camera UBO) ONCE. Both handles are stable
-        // for the pipeline's life, so we never touch this set again — updating a
-        // descriptor set while a prior frame's command buffer still binds it (with
-        // pipelined rendering) is illegal and device-losts. The camera *contents*
-        // change per frame via the persistent mapping (`set_camera`), not the
-        // descriptor.
-        out.write_set1(output_buffer, output_size, env_map_view, out.env_map_sampler);
-        Some(out)
-    }
-
-    /// Upload this frame's camera inputs (host-visible, coherent).
-    pub fn set_camera(&self, camera: &RtCamera) {
-        // SAFETY: `camera.mapped` is a valid HOST_VISIBLE|COHERENT mapping of at
-        // least size_of::<RtCamera>() bytes; RtCamera is Pod.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytemuck::bytes_of(camera).as_ptr(),
-                self.camera.mapped,
-                size_of::<RtCamera>(),
-            );
-        }
+            output_buffer,
+        })
     }
 
     /// Record bind + `cmd_trace_rays` into `command_buffer` for a `width`×`height`
-    /// dispatch, writing the per-pixel output storage buffer. `scene_set` /
-    /// `columns_set` are the raw `VkDescriptorSet`s of wgpu's scene + columns
-    /// bind groups (sets 0 and 2), from `BindGroup::raw_descriptor_set`.
+    /// dispatch, writing this view's per-pixel output storage buffer. `scene_set` /
+    /// `columns_set` are the raw `VkDescriptorSet`s of wgpu's scene + columns bind
+    /// groups (sets 0 and 2), from `BindGroup::raw_descriptor_set`; `view` carries
+    /// the per-view set 1 + env image to transition.
     ///
     /// # Safety
     /// `command_buffer` must be recording; the scene/columns sets must be valid
-    /// and match the layouts the pipeline was built with.
+    /// and match the layouts the pipeline was built with; `view` must have been
+    /// built by `self.create_view_bindings`.
     pub unsafe fn trace(
         &self,
         command_buffer: vk::CommandBuffer,
         scene_set: vk::DescriptorSet,
+        view: &RtViewBindings,
         columns_set: vk::DescriptorSet,
         width: u32,
         height: u32,
@@ -502,7 +578,7 @@ impl RtPipeline {
                 base_array_layer: 0,
                 layer_count: 6,
             };
-            if let Some(env_image) = self.env_map_image {
+            if let Some(env_image) = view.env_map_image {
                 let to_read = vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ)
@@ -533,7 +609,7 @@ impl RtPipeline {
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 self.pipeline_layout,
                 0,
-                &[scene_set, self.descriptor_set, columns_set],
+                &[scene_set, view.descriptor_set, columns_set],
                 &[],
             );
             self.rt.cmd_trace_rays(
@@ -564,7 +640,7 @@ impl RtPipeline {
             );
 
             // Restore the env cube to GENERAL so wgpu's tracked layout stays valid.
-            if let Some(env_image) = self.env_map_image {
+            if let Some(env_image) = view.env_map_image {
                 let to_general = vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_READ)
                     .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -587,78 +663,62 @@ impl RtPipeline {
         }
     }
 
-    /// Write set 1 (output storage buffer @0, camera UBO @1) once at build. Both
-    /// buffers are stable for the pipeline's life, so the set is never updated
-    /// again (avoids the update-while-in-flight device loss).
-    fn write_set1(
-        &mut self,
-        output_buffer: vk::Buffer,
-        output_size: u64,
-        env_map_view: vk::ImageView,
-        env_map_sampler: vk::Sampler,
-    ) {
-        let output_info = [vk::DescriptorBufferInfo::default()
-            .buffer(output_buffer)
-            .offset(0)
-            .range(output_size)];
-        let camera_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.camera.buffer)
-            .offset(0)
-            .range(self.camera.size)];
-        // `trace()` transitions the atmosphere cube to SHADER_READ_ONLY_OPTIMAL
-        // around the dispatch (skybox/fallback are already in this layout), so the
-        // descriptor always sees read-optimal.
-        let env_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(env_map_view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let env_sampler_info = [vk::DescriptorImageInfo::default().sampler(env_map_sampler)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(BINDING_OUTPUT)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&output_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(BINDING_CAMERA)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(&camera_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(BINDING_ENV_MAP)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .image_info(&env_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_set)
-                .dst_binding(BINDING_ENV_SAMPLER)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .image_info(&env_sampler_info),
-        ];
-        // SAFETY: targets our own freshly-allocated set; buffers + image/sampler live.
-        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+}
+
+impl RtViewBindings {
+    /// Upload this frame's camera inputs for this view (host-visible, coherent).
+    pub fn set_camera(&self, camera: &RtCamera) {
+        // SAFETY: `camera.mapped` is a valid HOST_VISIBLE|COHERENT mapping of at
+        // least size_of::<RtCamera>() bytes; RtCamera is Pod.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytemuck::bytes_of(camera).as_ptr(),
+                self.camera.mapped,
+                size_of::<RtCamera>(),
+            );
+        }
+    }
+
+    /// The output `VkBuffer` baked into binding 0. The dispatch compares this to
+    /// the view's current output buffer to detect a resize-driven reallocation.
+    pub fn output_buffer(&self) -> vk::Buffer {
+        self.output_buffer
+    }
+}
+
+impl Drop for RtViewBindings {
+    fn drop(&mut self) {
+        // SAFETY: the pool + camera buffer were created for this view and are
+        // unused at teardown (the dispatch drains the GPU before rebuilding, and
+        // the render world is otherwise idle at shutdown). Destroying the pool
+        // frees its descriptor set.
+        unsafe {
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device.destroy_sampler(self.env_map_sampler, None);
+            self.device.destroy_buffer(self.camera.buffer, None);
+            self.device.free_memory(self.camera.memory, None);
+        }
     }
 }
 
 impl Drop for RtPipeline {
     fn drop(&mut self) {
         // SAFETY: all handles were created by this resource and are unused at
-        // teardown (render world shutting down).
+        // teardown (render world shutting down). The set-1 layout outlives the
+        // per-view pools/sets allocated from it (destroying a layout with live
+        // sets is legal), and those sets are dropped with their RtViewBindings.
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-            self.device.destroy_sampler(self.env_map_sampler, None);
             for m in &self.modules {
                 self.device.destroy_shader_module(*m, None);
             }
             self.device.destroy_buffer(self.sbt.buffer, None);
             self.device.free_memory(self.sbt.memory, None);
-            self.device.destroy_buffer(self.camera.buffer, None);
-            self.device.free_memory(self.camera.memory, None);
         }
     }
 }

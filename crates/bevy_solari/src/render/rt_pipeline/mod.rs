@@ -33,7 +33,7 @@ use crate::ecs_gpu::SceneColumns;
 use crate::material::MaterialSlots;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::extension::RayTracingPipelineFeature;
-use crate::gpu::rt_pipeline::{RtCamera, RtPipeline};
+use crate::gpu::rt_pipeline::{RtCamera, RtPipeline, RtViewBindings};
 use crate::render::atmosphere::{AtmosphereSky, SolariAtmosphereView};
 use crate::render::view_cull::SolariEnvironmentMap;
 use crate::render::SolariCamera;
@@ -175,6 +175,7 @@ pub fn rt_pipeline(
         &ExtractedCamera,
         &ViewTarget,
         &RtOutputBuffer,
+        Option<&RtViewBindings>,
         Option<&SolariAtmosphereView>,
         Option<&SolariEnvironmentMap>,
     )>,
@@ -194,7 +195,8 @@ pub fn rt_pipeline(
     mut commands: Commands,
     mut ctx: RenderContext,
 ) {
-    let (view, camera, view_target, output, atmosphere_view, environment_map) =
+    let view_entity = view.entity();
+    let (view, camera, view_target, output, view_bindings, atmosphere_view, environment_map) =
         view.into_inner();
 
     // Environment cube the miss shader samples (same priority as the megakernel):
@@ -234,37 +236,77 @@ pub fn rt_pipeline(
         return;
     };
 
-    // Lazily build the RT pipeline once the scene + columns layouts exist (its
-    // pipeline layout bakes in their raw VkDescriptorSetLayouts). Inserted via
-    // commands → live next frame.
+    // Lazily build the view-independent RT pipeline once the scene + columns
+    // layouts exist (its pipeline layout bakes in their raw VkDescriptorSetLayouts)
+    // and materials are present (the SBT sizes one hit record per material slot).
+    // The per-view set 1 (output/camera/env) is built separately below. Inserted
+    // via commands → live next frame.
     let Some(rt) = rt else {
-        // Wait for materials (the SBT sizes one hit record per material slot) AND,
-        // if this view uses the atmosphere, its baked cube — the env view is baked
-        // into set 1 once at build, so building before the cube exists would freeze
-        // the fallback cube in as the sky.
-        let env_ready = atmosphere_view.is_none() || atmosphere_sky.is_some();
-        if additional.has::<RayTracingPipelineFeature>() && material_slots.len() > 0 && env_ready {
-            if let (Some(allocator), Some(scene_layout), Some(columns_layout), Some(env_view)) = (
+        if additional.has::<RayTracingPipelineFeature>() && material_slots.len() > 0 {
+            if let (Some(allocator), Some(scene_layout), Some(columns_layout)) = (
                 allocator.as_deref(),
                 raw_bgl(&pipeline_cache, &scene_bindings.bind_group_layout),
                 raw_bgl(&pipeline_cache, columns_layout_desc),
-                raw_image_view(environment_map_view),
             ) {
-                if let Some(built) = RtPipeline::new(
-                    allocator,
-                    scene_layout,
-                    columns_layout,
-                    output.raw,
-                    output.size,
-                    material_slots.len(),
-                    env_view,
-                    environment_map_image,
-                ) {
+                if let Some(built) =
+                    RtPipeline::new(allocator, scene_layout, columns_layout, material_slots.len())
+                {
                     commands.insert_resource(built);
                 }
             }
         }
         return;
+    };
+
+    // Materials can stream in after the pipeline was first built (the SBT bakes
+    // one hit record per material slot at build time + headroom). If the live
+    // count has outgrown those records, an instance routing to a slot past the
+    // hit region would read out of bounds — rebuild at the larger count. Drain
+    // the GPU first so dropping the old pipeline (when this frame's `remove`
+    // command applies) can't free a `VkPipeline` a still-executing trace uses.
+    if material_slots.len() > rt.capacity() {
+        let _ = render_device
+            .wgpu_device()
+            .poll(wgpu::PollType::wait_indefinitely());
+        commands.remove_resource::<RtPipeline>();
+        return;
+    }
+
+    // Build/rebuild THIS view's set-1 bindings (output buffer @0, camera UBO @1,
+    // env cube @2). Per-view so split-screen views each trace into their own
+    // output with their own camera/env. Built lazily once the env cube is ready
+    // (baked into the set once — building before it exists would freeze the
+    // fallback cube in as the sky) and rebuilt if the view's output buffer was
+    // reallocated (viewport resize), since the set is written once, never updated.
+    let view_bindings = match view_bindings {
+        Some(vb) if vb.output_buffer() == output.raw => vb,
+        existing => {
+            let env_ready = atmosphere_view.is_none() || atmosphere_sky.is_some();
+            if env_ready {
+                if let (Some(allocator), Some(env_view)) =
+                    (allocator.as_deref(), raw_image_view(environment_map_view))
+                {
+                    // Resize rebuild: the old bindings point at a freed output
+                    // buffer (RtOutputBuffer realloc'd). Drain the GPU so dropping
+                    // the stale component can't free an in-flight set/camera UBO.
+                    if existing.is_some() {
+                        let _ = render_device
+                            .wgpu_device()
+                            .poll(wgpu::PollType::wait_indefinitely());
+                    }
+                    if let Some(built) = rt.create_view_bindings(
+                        allocator,
+                        output.raw,
+                        output.size,
+                        env_view,
+                        environment_map_image,
+                    ) {
+                        commands.entity(view_entity).insert(built);
+                    }
+                }
+            }
+            return;
+        }
     };
 
     let (Some(viewport), Some(blit_pipeline)) = (
@@ -295,7 +337,7 @@ pub fn rt_pipeline(
         sky: [environment_brightness, 0.0, 0.0, 0.0],
     };
     *frame_counter = frame_counter.wrapping_add(1);
-    rt.set_camera(&camera_inputs);
+    view_bindings.set_camera(&camera_inputs);
 
     // The raw cmd_trace_rays must go in its OWN command buffer — wgpu-core
     // panics if a single encoder mixes wgpu passes (the blit) with raw
@@ -311,7 +353,14 @@ pub fn rt_pipeline(
         trace_encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
             let hal_encoder = hal_encoder.expect("rt_pipeline requires the Vulkan backend");
             let command_buffer = hal_encoder.raw_handle();
-            rt.trace(command_buffer, scene_set, columns_set, viewport.x, viewport.y);
+            rt.trace(
+                command_buffer,
+                scene_set,
+                view_bindings,
+                columns_set,
+                viewport.x,
+                viewport.y,
+            );
         });
     }
     ctx.add_command_buffer(trace_encoder.finish());
