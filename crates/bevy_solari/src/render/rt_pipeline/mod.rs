@@ -332,7 +332,15 @@ pub fn rt_pipeline(
         // .xyz = ray origin; .w = camera exposure (raygen scales final radiance by
         // it, like the megakernel's `radiance *= view.exposure`).
         camera_position: view.world_from_view.translation().extend(camera.exposure).to_array(),
-        frame: [*frame_counter, 0, 0, 0],
+        // .x = frame index (RNG seed); .y = SER material-hint bits =
+        // ceil(log2(material_count)), the number of low bits of the SBT-record-index
+        // hint reorderThread should sort by (driver clamps to its own max).
+        frame: [
+            *frame_counter,
+            (u32::BITS - material_slots.len().max(1).leading_zeros()),
+            0,
+            0,
+        ],
         // .x = sky brightness; .yzw = clear color (black for bevy_city).
         sky: [environment_brightness, 0.0, 0.0, 0.0],
     };

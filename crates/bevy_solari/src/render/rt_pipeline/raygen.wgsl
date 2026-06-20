@@ -77,16 +77,17 @@ fn raygen(
         payload.bounce = 0u;
         payload.rng = rng;
         payload.p_bounce = p_bounce;
-        // Shader Execution Reordering: trace into a hit object, reorder the warp,
-        // then run the selected closest-hit. `reorderThread(hit)` keys on the hit
-        // object's full sort key — which INCLUDES the SBT record index — and with
-        // per-material records (instance_contribution_to_hit_group_index = material
-        // slot) that record index IS the material, so the warp coheres per
-        // material with no explicit hint. Coherent warps make the chit's
-        // shader-record material id + the texture-array fetches uniform → no
-        // descriptor-array divergence, the whole point of the per-material SBT.
-        // (An explicit reorderThread(hit, hint, bits) would only matter for a
-        // coarser/cheaper key than per-record — a future perf knob.)
+        // Shader Execution Reordering: trace into a hit object, regroup the warp
+        // by MATERIAL, then run the selected closest-hit. With per-material SBT
+        // records (instance_contribution_to_hit_group_index = material slot), the
+        // hit object's SBT record index IS the material id — read it back and feed
+        // it as an explicit coherence hint. Every record runs the same opaque
+        // closest-hit, so the default `reorderThread(hit)` (which keys on the
+        // shader to run) would NOT separate materials; the explicit hint does, and
+        // it scales — huge scenes reuse a few materials across millions of
+        // instances, so this packs each warp with one material → uniform
+        // `materials[id]` + texture-array fetches, no descriptor divergence.
+        // `camera.frame.y` carries ceil(log2(material_count)) hint bits.
         var hit: hit_object;
         hitObjectTraceRay(
             &hit,
@@ -94,7 +95,8 @@ fn raygen(
             RayDesc(RAY_FLAG_NONE, 0xffu, 0.001, 1.0e9, origin, direction),
             &payload,
         );
-        reorderThread(&hit);
+        let material_hint = hitObjectGetSbtRecordIndex(&hit);
+        reorderThread(&hit, material_hint, camera.frame.y);
         hitObjectExecuteShader(&hit, &payload);
         rng = payload.rng;
 
