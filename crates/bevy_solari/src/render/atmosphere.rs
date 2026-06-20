@@ -185,6 +185,9 @@ pub struct SolariAtmosphereView;
 pub struct AtmosphereSky {
     pub cube_view: TextureView,
     array_view: TextureView,
+    /// The backing storage texture (kept so consumers can transition its layout
+    /// — it's written as a STORAGE image so wgpu leaves it in `GENERAL`).
+    pub texture: bevy_render::render_resource::Texture,
 }
 
 /// Render-world resource: the bake's per-frame bind group. The bind-group layout
@@ -320,6 +323,7 @@ pub fn prepare_atmosphere_sky(
     commands.insert_resource(AtmosphereSky {
         cube_view,
         array_view,
+        texture,
     });
 }
 

@@ -2,13 +2,20 @@ enable wgpu_ray_query;
 
 #define_import_path bevy_solari::brdf
 
-#import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
 #import bevy_solari::pbr::{D_GGX, V_SmithGGXCorrelated, specular_multiscatter}
 #import bevy_solari::pbr::calculate_F0_dielectric
 #import bevy_solari::pbr::{rand_f, sample_cosine_hemisphere}
 #import bevy_render::maths::{PI, orthonormalize}
 #import bevy_solari::sampling::{sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid}
 #import bevy_solari::scene_bindings::{ResolvedMaterial, MIRROR_ROUGHNESS_THRESHOLD, brdf_dfg_lut, brdf_dfg_lut_sampler}
+
+// Rec. 709 luma. Inlined from `bevy_core_pipeline::tonemapping` so this module's
+// import graph stays within solari + bevy_render (the RT-pipeline composer
+// registers a small, self-contained module set; the megakernel composes this
+// identically).
+fn luminance(v: vec3<f32>) -> f32 {
+    return dot(v, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
 
 struct EvaluateAndSampleBrdfResult {
     wi: vec3<f32>,

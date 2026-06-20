@@ -89,6 +89,11 @@ bevy_log = { path = "../bevy_log", version = "0.20.0-dev" }
 # today, mirroring whatever bevy does for DLSS+DX12 when that lands).
 ash = { version = "0.38", features = ["provisional"] }
 wgpu = { version = "29.0.3", default-features = false }
+# Shader composition for the raw-VK RT-pipeline shaders: they `#import` solari's
+# scene-binding / BRDF / sampling modules, which need naga_oil's composer (raw
+# naga::parse_str can't resolve `#import`). Patched to the SER-aware fork.
+naga_oil = { version = "0.22", default-features = false }
+naga = { version = "29", features = ["wgsl-in", "spv-out"] }
 # DLSS Ray Reconstruction for the `restir` path — used directly (not via
 # bevy_anti_alias's `Dlss` component) so the self-contained RT path needs no
 # raster prepass. Only pulled in by the `dlss` feature.

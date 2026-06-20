@@ -85,7 +85,7 @@ fn hair_write(
         explicit_aabb,
         inst,           // instance_id (presented to the hit shader as instance_index)
         h.mask,         // 8-bit cull mask (hair visible to all view masks)
-        0u,             // hit-group contribution
+        2u,             // hit-group contribution — HIT_GROUP_HAIR (RT-pipeline path)
         0u,             // instance_flags — opaque LSS geometry, no force-no-opaque
         inst,           // instance_index — PTLAS slot
         PTLAS_GLOBAL_PARTITION,

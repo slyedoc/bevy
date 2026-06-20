@@ -62,7 +62,12 @@ impl SceneColumns {
             .iter()
             .map(|e| BindGroupLayoutEntry {
                 binding: e.binding,
-                visibility: ShaderStages::COMPUTE | ShaderStages::FRAGMENT,
+                visibility: ShaderStages::COMPUTE
+                    | ShaderStages::FRAGMENT
+                    | ShaderStages::RAY_GENERATION
+                    | ShaderStages::CLOSEST_HIT
+                    | ShaderStages::ANY_HIT
+                    | ShaderStages::MISS,
                 ty: BindingType::Buffer {
                     ty: BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,

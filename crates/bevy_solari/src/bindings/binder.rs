@@ -23,7 +23,7 @@ use bevy_render::{
 };
 use core::{hash::Hash, num::NonZeroU32, ops::Deref};
 
-const MAX_TEXTURE_COUNT: NonZeroU32 = NonZeroU32::new(5_000).unwrap();
+pub(crate) const MAX_TEXTURE_COUNT: NonZeroU32 = NonZeroU32::new(5_000).unwrap();
 
 const TEXTURE_MAP_NONE: u32 = u32::MAX;
 
@@ -293,7 +293,14 @@ impl RaytracingSceneBindings {
                 // `directional_lights` / `instance_cluster_ranges` are GPU columns,
                 // now bound from the shared `ecs_gpu::SceneColumns` group — not here.
                 &BindGroupLayoutEntries::sequential(
-                    ShaderStages::COMPUTE,
+                    // COMPUTE for the megakernel/restir path; the RT-pipeline
+                    // stages so the same bind group is visible to raygen + the
+                    // hit/miss shaders when bound into the raw RT pipeline.
+                    ShaderStages::COMPUTE
+                        | ShaderStages::RAY_GENERATION
+                        | ShaderStages::CLOSEST_HIT
+                        | ShaderStages::ANY_HIT
+                        | ShaderStages::MISS,
                     (
                         // Cluster mesh pool (shared across instances)
                         storage_buffer_read_only_sized(false, None), // 0: vertex_positions (array<f32>)

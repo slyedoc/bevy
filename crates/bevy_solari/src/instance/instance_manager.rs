@@ -279,6 +279,20 @@ impl InstanceManager {
         self.active_slots.len()
     }
 
+    /// Reusable slot indices currently on the free-list (despawned, not yet
+    /// re-allocated). Exposed for the slot-ratchet diagnostic.
+    #[inline]
+    pub fn free_count(&self) -> usize {
+        self.free_slots.len()
+    }
+
+    /// Slots released (despawned) this frame, before [`Self::clear_deltas`]
+    /// runs. Exposed for the slot-ratchet diagnostic.
+    #[inline]
+    pub fn released_count(&self) -> usize {
+        self.released_slots.len()
+    }
+
     /// Iterator over this frame's active slots, in extract order.
     #[inline]
     pub fn active_slots(&self) -> &[GpuEntity] {
@@ -808,6 +822,33 @@ pub fn free_cluster_slot(
         manager.despawn_slot(slot.0);
     }
     slot_map.0.remove(&remove.entity);
+}
+
+/// TEMP DIAGNOSTIC (slot-ratchet investigation): print the slot allocator's
+/// `high_water / active / free` whenever it changes, with this frame's
+/// `+added / -released`. Runs at the end of `ExtractSchedule` (after the
+/// flush), so a Regenerate click leaves a clean before→after trace: if
+/// `high_water` jumps while `free` stays 0, the new city allocated *before*
+/// the old city freed (the overlap ratchet); if `free` spikes then drains
+/// with `high_water` flat, reuse is clean and the decay is a shrink.
+pub fn log_slot_ratchet(
+    manager: Res<InstanceManager>,
+    mut last: Local<Option<(u32, usize, usize)>>,
+) {
+    let now = (
+        manager.slot_high_water(),
+        manager.active_count(),
+        manager.free_count(),
+    );
+    if *last != Some(now) {
+        let (hw, active, free) = now;
+        println!(
+            "[SLOT] high_water={hw} active={active} free={free} | +{} -{}",
+            manager.added_slots().len(),
+            manager.released_count(),
+        );
+        *last = Some(now);
+    }
 }
 
 /// `Render::Prepare` (after `prepare_material_slots`, before

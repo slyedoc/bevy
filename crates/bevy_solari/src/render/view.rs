@@ -11,9 +11,13 @@ pub enum SolariLighting {
     #[default]
     #[display("pathtrace")]
     Pathtracer,
-    /// Realtime ReSTIR path.    
+    /// Realtime ReSTIR path.
     #[display("restir")]
     Restir,
+    /// Ray-tracing-pipeline (SBT, per-material hit shaders) path — the
+    /// multi-material shading path. Milestone: primary visibility only.
+    #[display("rt_pipeline")]
+    RtPipeline,
 }
 
 /// Debug visualization, selected in [`SolariViewState`]. The overlay overwrites
@@ -168,6 +172,11 @@ impl SolariViewState {
     pub fn pathtracer_runs(&self) -> bool {
         self.debug.is_none() && self.lighting == SolariLighting::Pathtracer
     }
+
+    /// Whether the RT-pipeline path runs this frame.
+    pub fn rt_pipeline_runs(&self) -> bool {
+        self.debug.is_none() && self.lighting == SolariLighting::RtPipeline
+    }
 }
 
 /// Run condition: the restir chain produces output this frame (lit color or
@@ -179,6 +188,11 @@ pub fn restir_enabled(state: Res<SolariViewState>) -> bool {
 /// Run condition: the reference path tracer lights the frame.
 pub fn pathtracer_enabled(state: Res<SolariViewState>) -> bool {
     state.pathtracer_runs()
+}
+
+/// Run condition: the RT-pipeline path lights the frame (and the resource exists).
+pub fn rt_pipeline_enabled(state: Res<SolariViewState>) -> bool {
+    state.rt_pipeline_runs()
 }
 
 /// Run condition: `target` is the selected debug view. Gates each

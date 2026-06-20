@@ -106,6 +106,14 @@ impl<T: GpuSlotTable> GpuSlotAllocator<T> {
         self.next
     }
 
+    /// Reusable slot indices currently on the free-list (freed, not yet
+    /// re-allocated). Live slots == `high_water() - free_count()`. Exposed for
+    /// the slot-ratchet diagnostic.
+    #[inline]
+    pub fn free_count(&self) -> u32 {
+        self.free.len() as u32
+    }
+
     /// The entity that currently owns `slot`, or `None` if out of range. Stale
     /// for freed-and-not-yet-reused slots — only trustworthy for live slots.
     #[inline]

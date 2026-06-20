@@ -230,7 +230,12 @@ impl ClasArena {
             let global_id = cluster_base.0.wrapping_add(local_id as u32);
 
             descriptors.push(vk::ClusterAccelerationStructureBuildTriangleClusterInfoNV {
-                cluster_id: local_id as u32,
+                // Global cluster id so the RT-pipeline hit shader's
+                // `@builtin(cluster_id)` (ClusterIDNV) indexes `clusters[]`
+                // directly. The ray-query path uses the baked `base_geometry_index`
+                // instead, so this is free for it. (Static path — the animated
+                // template path in clas_template.rs matches.)
+                cluster_id: global_id,
                 cluster_flags: vk::ClusterAccelerationStructureClusterFlagsNV::default(),
                 triangle_cluster_info_packed: vk::Packed9_9_6_4_4::new(
                     triangle_count,

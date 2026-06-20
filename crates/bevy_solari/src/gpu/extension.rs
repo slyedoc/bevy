@@ -72,6 +72,20 @@ pub struct PartitionedAccelerationStructureFeature;
 /// so there is no per-device function table to load.
 pub struct LinearSweptSpheresFeature;
 
+/// Marker registered in [`AdditionalVulkanFeatures`] when
+/// `VK_KHR_ray_tracing_pipeline` is enabled on the device. The
+/// RT-pipeline shading path (raygen / closest-hit / miss / any-hit +
+/// SBT + `cmd_trace_rays`) gates on
+/// `additional_features.has::<RayTracingPipelineFeature>()`; on an
+/// adapter without it, only the inline-`rayQuery` compute path runs.
+pub struct RayTracingPipelineFeature;
+
+/// Marker registered when `VK_NV_ray_tracing_invocation_reorder` is enabled —
+/// Shader Execution Reordering (SER). The RT-pipeline raygen reorders by
+/// hit/material (`hitObjectTraceRay` → `reorderThread` → `hitObjectExecuteShader`)
+/// for shading coherence; without it the raygen falls back to plain `traceRay`.
+pub struct RayTracingInvocationReorderFeature;
+
 /// Register the cluster-AS + partitioned-AS Vulkan device-creation
 /// callback. Called by `SolariInitPlugin::build` — apps using
 /// `DefaultPlugins` get this wiring automatically.
@@ -182,6 +196,37 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                     vk::PhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV::default()
                         .linear_swept_spheres(true)
                         .spheres(true),
+                ));
+                *args.create_info = core::mem::take(args.create_info).push(features);
+            }
+
+            // Ray-tracing PIPELINE (raygen / closest-hit / miss / any-hit + SBT
+            // + cmd_trace_rays), for the multi-material SBT shading path. Distinct
+            // from `rayQuery` (inline, which wgpu already enables): this is the
+            // `VK_KHR_ray_tracing_pipeline` extension + `rayTracingPipeline`
+            // feature. `VK_KHR_acceleration_structure` is already enabled by wgpu
+            // for the ray-query feature, and SPIR-V 1.4 is core in Vulkan 1.2+.
+            if supports(khr::ray_tracing_pipeline::NAME) {
+                args.extensions.push(khr::ray_tracing_pipeline::NAME);
+                additional.insert::<RayTracingPipelineFeature>();
+                let features = Box::leak(Box::new(
+                    vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
+                        .ray_tracing_pipeline(true),
+                ));
+                *args.create_info = core::mem::take(args.create_info).push(features);
+            }
+
+            // Shader Execution Reordering (SER) — reorders RT-pipeline invocations
+            // by hit/material for shading coherence (the big win for a divergent
+            // multi-material path tracer). NV-only; the raygen's
+            // hitObjectTraceRay/reorderThread/hitObjectExecuteShader path needs it.
+            if supports(nv::ray_tracing_invocation_reorder::NAME) {
+                args.extensions
+                    .push(nv::ray_tracing_invocation_reorder::NAME);
+                additional.insert::<RayTracingInvocationReorderFeature>();
+                let features = Box::leak(Box::new(
+                    vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV::default()
+                        .ray_tracing_invocation_reorder(true),
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
             }

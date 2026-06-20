@@ -31,7 +31,7 @@
 // idempotent — same `instance_index`, same record.
 
 #import bevy_solari::cluster_bindings::cluster_instance_transforms
-#import bevy_solari::instance_mask::{instance_hardware_mask, material_vk_flags}
+#import bevy_solari::instance_mask::{instance_hardware_mask, material_vk_flags, material_hit_group}
 
 /// Mirror of `VkPartitionedAccelerationStructureWriteInstanceDataNV`
 /// (104 B). Field order + size must match the Rust side byte-for-byte.
@@ -131,6 +131,16 @@ fn derived_vk_flags(slot: u32) -> u32 {
     return material_vk_flags(material_traversal_flags[instance_material_ids[slot]]);
 }
 
+/// The RT-pipeline SBT hit record this cluster instance selects: one record PER
+/// MATERIAL (index = material slot), not just per class. This gives Shader
+/// Execution Reordering a per-material key so warps cohere by material → material
+/// + texture data is uniform per dispatch (no descriptor-array divergence). The
+/// record's shader handle still encodes the class. Ignored by the inline-rayQuery
+/// path.
+fn derived_hit_group(slot: u32) -> u32 {
+    return instance_material_ids[slot];
+}
+
 fn make_record(slot: u32, addr: vec2<u32>) -> WriteInstanceData {
     // `cluster_instance_transforms` is bevy_pbr's affine `mat3x4`
     // (column k = the standard 4x4's row k). NV `TransformMatrixKHR`
@@ -158,7 +168,7 @@ fn make_record(slot: u32, addr: vec2<u32>) -> WriteInstanceData {
         explicit_aabb,
         slot,                                            // instance_id (presented to hit shaders)
         instance_hardware_mask(instance_masks[slot]),    // 8-bit RenderLayers cull mask
-        0u,                                              // hit-group contribution offset
+        derived_hit_group(slot),                         // SBT hit-group offset (opaque/glass)
         vk_flags,                                        // alpha-tested material → FORCE_NO_OPAQUE
         slot,                                            // instance_index — STABLE PTLAS slot
         part,

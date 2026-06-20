@@ -97,6 +97,7 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "accel/instantiate.wgsl");
     embedded_asset!(app, "render/atmosphere_bake.wgsl");
     embedded_asset!(app, "render/pathtracer/pathtracer.wgsl");
+    embedded_asset!(app, "render/rt_pipeline/blit.wgsl");
     embedded_asset!(app, "accel/selector.wgsl");
     embedded_asset!(app, "accel/blas_sharing.wgsl");
     embedded_asset!(app, "accel/ptlas_fill.wgsl");

@@ -12,6 +12,7 @@
 
 
 pub mod pathtracer;
+pub mod rt_pipeline;
 pub mod atmosphere;
 mod node;
 mod gizmo_depth;
@@ -45,7 +46,9 @@ use bevy_render::{
     extract_resource::ExtractResourcePlugin,
 };
 use bevy_shader::load_shader_library;
-use crate::{pipelines::SolariPipelines, resource_manager::SolariResourceManager, render::view::{pathtracer_enabled, restir_enabled, SolariViewState}};
+use crate::{pipelines::SolariPipelines, resource_manager::SolariResourceManager, render::view::{pathtracer_enabled, restir_enabled, rt_pipeline_enabled, SolariViewState}};
+use crate::bindings::RaytracingSceneBindings;
+use crate::ecs_gpu::SceneColumns;
 pub use reset::CameraReset;
 use overlay::register_overlays;
 use node::{prepare_restir_jitter, restir};
@@ -90,6 +93,7 @@ impl Plugin for SolarRenderPlugin {
             .init_resource::<view_cull::SolariViewUniforms>()
             .init_resource::<atmosphere::SolariAtmosphereGpu>()
             .add_systems(RenderStartup, atmosphere::init_atmosphere_pipeline)
+            .add_systems(RenderStartup, rt_pipeline::init_rt_blit)
             .add_systems(
                 ExtractSchedule,
                 (
@@ -110,6 +114,7 @@ impl Plugin for SolarRenderPlugin {
                 Render,
                 (
                     pathtracer::prepare_pathtracer_accumulation_texture,
+                    rt_pipeline::prepare_rt_output,
                     view_cull::prepare_solari_view_uniforms,
                     atmosphere::prepare_atmosphere_sky,
                 )
@@ -140,6 +145,20 @@ impl Plugin for SolarRenderPlugin {
                         pathtracer_enabled
                             .and_then(resource_exists::<SolariResourceManager>)
                             .and_then(resource_exists::<SolariPipelines>),
+                    ),
+            )
+            .add_systems(
+                Core3d,
+                rt_pipeline::rt_pipeline
+                    .after(Core3dSystems::MainPass)
+                    .before(tonemapping)
+                    // No `resource_exists::<RtPipeline>` gate — the system
+                    // lazily builds it on the first ready frame.
+                    .run_if(
+                        rt_pipeline_enabled
+                            .and_then(resource_exists::<rt_pipeline::RtBlit>)
+                            .and_then(resource_exists::<RaytracingSceneBindings>)
+                            .and_then(resource_exists::<SceneColumns>),
                     ),
             );
 

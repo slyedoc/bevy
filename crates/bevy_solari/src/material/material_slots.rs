@@ -112,7 +112,11 @@ pub fn prepare_material_traversal_flags(
     list.resize(len, 0);
     for (asset_id, slot) in slots.iter() {
         if let Some(material) = material_assets.get(&asset_id) {
-            list[slot as usize] = (material.traversal_alpha_cutoff() >= 0.0) as u32;
+            // bit 0: alpha-tested (FORCE_NO_OPAQUE during traversal).
+            // bit 1: glass/transmissive — selects the glass RT-pipeline hit group.
+            let alpha = (material.traversal_alpha_cutoff() >= 0.0) as u32;
+            let glass = (material.specular_transmission > 0.0) as u32;
+            list[slot as usize] = alpha | (glass << 1);
         }
     }
     flags.buffer.write_buffer(&render_device, &render_queue);

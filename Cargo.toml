@@ -5805,17 +5805,19 @@ description = "Demonstrates blending between multiple reflection probes"
 category = "3D Rendering"
 wasm = false
 
-# Patch wgpu (and friends) to slyedoc/wgpu#solari-pt — wgpu v29.0.3
-# adapted to ash master (Vulkan 1.4 prep) so cluster_AS / partitioned_AS
-# bindings (only on ash master via PRs #1033, #1035) can be used in
-# downstream consumers via `Adapter::open_with_callback` + `as_hal_mut`.
-# No cluster_AS-specific surface added to wgpu itself.
+# Patch wgpu (and friends) to slyedoc/wgpu#solari-rt-naga — solari-pt + naga
+# #9085 RT-pipeline SPIR-V backend (so naga can emit raygen/closest-hit/miss +
+# traceRay + ray-payload SPIR-V). The dependency #9450's wgpu RT-pipeline API
+# builds on; also unblocks bevy_solari's raw-VK RT pipeline.
 [patch.crates-io]
-wgpu             = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
-wgpu-core        = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
-wgpu-hal         = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
-wgpu-types       = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
-wgpu-naga-bridge = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
-naga             = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-pt" }
+wgpu             = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
+wgpu-core        = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
+wgpu-hal         = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
+wgpu-types       = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
+wgpu-naga-bridge = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
+naga             = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
+# naga_oil matches naga's TypeInner exhaustively; the fork adds the SER
+# `HitObject` arm so it compiles against the naga RT/SER fork above.
+naga_oil         = { git = "https://github.com/slyedoc/naga_oil.git", branch = "solari-ser" }
 ash              = { git = "https://github.com/ash-rs/ash.git", branch = "master" }
 gpu-allocator    = { git = "https://github.com/slyedoc/gpu-allocator.git", branch = "ash-push-rename" }

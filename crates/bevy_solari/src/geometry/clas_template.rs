@@ -188,7 +188,11 @@ impl ClusterTemplateArena {
 
             descriptors.push(
                 vk::ClusterAccelerationStructureBuildTriangleClusterTemplateInfoNV {
-                    cluster_id: local_id as u32,
+                    // Global cluster id so the RT-pipeline hit shader's
+                    // `@builtin(cluster_id)` (ClusterIDNV) indexes `clusters[]`
+                    // directly. The ray-query path uses the baked
+                    // `base_geometry_index` instead, so this is free for it.
+                    cluster_id: global_id,
                     cluster_flags: vk::ClusterAccelerationStructureClusterFlagsNV::default(),
                     // 9_9_6_4_4: tris(9), verts(9), truncate(6), index_type(4), omm(4).
                     triangle_cluster_info_packed: vk::Packed9_9_6_4_4::new(

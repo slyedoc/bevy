@@ -118,6 +118,7 @@ pub fn spawn_debug_panels(
                         Children [
                             lighting_item(SolariLighting::Pathtracer),
                             lighting_item(SolariLighting::Restir),
+                            lighting_item(SolariLighting::RtPipeline),
                         ]
                     )
                 ]

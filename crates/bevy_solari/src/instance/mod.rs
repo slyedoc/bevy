@@ -35,9 +35,9 @@ pub use gpu_instances::{
 };
 pub use instance_manager::{
     clear_instance_deltas, flush_cluster_instances, free_cluster_slot, init_instance_manager,
-    mark_instance_added, mark_instance_layers_changed, mark_instance_material_changed,
-    resolve_instance_material_ids, InstanceManager, RaytracingGpuEntity, RtInstanceChanges,
-    RtSlotMap,
+    log_slot_ratchet, mark_instance_added, mark_instance_layers_changed,
+    mark_instance_material_changed, resolve_instance_material_ids, InstanceManager,
+    RaytracingGpuEntity, RtInstanceChanges, RtSlotMap,
 };
 
 /// Instance domain plugin: per-`RaytracingMesh3d` slot tracking, the
@@ -82,7 +82,12 @@ impl Plugin for InstancePlugin {
             // when the flush runs), so no bind is missed.
             .add_systems(
                 ExtractSchedule,
-                flush_cluster_instances.run_if(cluster_columns_ready),
+                (
+                    flush_cluster_instances.run_if(cluster_columns_ready),
+                    // TEMP slot-ratchet diagnostic — runs after the flush so it
+                    // logs post-allocate state. Remove once the decay is fixed.
+                    log_slot_ratchet.after(flush_cluster_instances),
+                ),
             )
             .add_observer(free_cluster_slot)
             .add_systems(
