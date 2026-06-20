@@ -18,16 +18,8 @@ impl Plugin for SolariDebugPlugin {
         app.add_systems(
             Update,
             (
-                ui::spawn_debug_panels,
-                ui::update_view_label,
                 ui::spawn_render_debug_panels,
                 ui::update_render_debug_label,
-                #[cfg(feature = "dlss")]
-                ui::spawn_dlss_panel,
-                #[cfg(feature = "dlss")]
-                ui::update_dlss_label,
-                #[cfg(feature = "dlss")]
-                ui::append_dlss_guide_items,
             ),
         );
     }

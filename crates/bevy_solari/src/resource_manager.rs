@@ -32,9 +32,6 @@ use crate::accel::{
 use crate::gpu::allocator::Allocator;
 use crate::lights::light_resolve_bind_group_layout;
 use crate::render::atmosphere::atmosphere_bind_group_layout;
-use crate::render::gizmo_depth_bind_group_layout;
-use crate::render::pathtracer::pipelines::pathtracer_bind_group_layout;
-use crate::render::restir_bind_group_layout;
 use crate::transform::{
     transform_gather_bind_group_layout, transform_propagate_bind_group_layout,
     transform_readback_bind_group_layout,
@@ -57,10 +54,6 @@ pub struct SolariResourceManager {
     pub deform: BindGroupLayoutDescriptor,
     pub animated_blas: BindGroupLayoutDescriptor,
     pub atmosphere: BindGroupLayoutDescriptor,
-    /// The pathtracer's `@group(1)` layout only; its full pipeline layout is the
-    /// composite of the scene-bindings group + this + the scene-columns group,
-    /// assembled in [`crate::pipelines::init_solari_pipelines`].
-    pub pathtracer: BindGroupLayoutDescriptor,
     // AS passes — each is the `@group(1)` layout; the full pipeline layout pairs it
     // with the cluster-scene group (composited in `init_solari_pipelines`).
     pub selector: BindGroupLayoutDescriptor,
@@ -68,13 +61,6 @@ pub struct SolariResourceManager {
     pub ptlas: BindGroupLayoutDescriptor,
     /// The hair PTLAS-write `@group(0)` layout.
     pub ptlas_hair_write: BindGroupLayoutDescriptor,
-    /// The ReSTIR `@group(1)` layout (shared by all six realtime passes).
-    pub restir: BindGroupLayoutDescriptor,
-    /// The fullscreen gizmo depth-write `@group(0)` layout.
-    pub gizmo_depth: BindGroupLayoutDescriptor,
-    /// The DLSS-guide-resolve `@group(1)` layout.
-    #[cfg(feature = "dlss")]
-    pub dlss_resolve: BindGroupLayoutDescriptor,
 }
 
 /// `RenderStartup` (after `SolariSetup`): build every pass's bind-group layout.
@@ -93,14 +79,9 @@ pub fn init_solari_resource_manager(mut commands: Commands, allocator: Option<Re
         deform: deform_bind_group_layout(),
         animated_blas: animated_blas_bind_group_layout(),
         atmosphere: atmosphere_bind_group_layout(),
-        pathtracer: pathtracer_bind_group_layout(),
         selector: selector_bind_group_layout(),
         blas_sharing: blas_sharing_bind_group_layout(),
         ptlas: ptlas_bind_group_layout(),
         ptlas_hair_write: crate::hair::ptlas_hair::ptlas_hair_write_bind_group_layout(),
-        restir: restir_bind_group_layout(),
-        gizmo_depth: gizmo_depth_bind_group_layout(),
-        #[cfg(feature = "dlss")]
-        dlss_resolve: crate::render::restir_dlss_resolve_bind_group_layout(),
     });
 }

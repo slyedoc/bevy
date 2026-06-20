@@ -203,7 +203,6 @@ pub fn extract_solari_skybox(mut main_world: ResMut<MainWorld>, mut commands: Co
 /// into the dynamic uniform buffer and record each view's offset.
 pub fn prepare_solari_view_uniforms(
     mut uniforms: ResMut<SolariViewUniforms>,
-    state: Res<crate::render::view::SolariViewState>,
     views: Query<
         (
             Entity,
@@ -220,10 +219,9 @@ pub fn prepare_solari_view_uniforms(
     render_queue: Res<RenderQueue>,
     mut commands: Commands,
 ) {
-    let debug_mode = state
-        .debug
-        .and_then(|view| view.restir_debug_mode())
-        .unwrap_or(0);
+    // The in-uniform debug mode drove the (removed) restir-reservoir debug shader;
+    // the surviving cluster-family debug views render as their own overlay passes.
+    let debug_mode = 0u32;
     uniforms.uniforms.clear();
     for (entity, mask, clear_color, environment_map, atmosphere_view, lens, extracted_view) in
         &views
