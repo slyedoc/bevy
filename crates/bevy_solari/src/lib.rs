@@ -243,5 +243,8 @@ impl SolariPlugin {
             | WgpuFeatures::TEXTURE_BINDING_ARRAY
             | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
             | WgpuFeatures::PARTIALLY_BOUND_BINDING_ARRAY
+            // 64-bit ints for buffer-device-address arithmetic in the RT-pipeline
+            // bindless geometry path (`physical_load<T>(addr: u64)`).
+            | WgpuFeatures::SHADER_INT64
     }
 }

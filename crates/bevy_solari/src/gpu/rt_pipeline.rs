@@ -743,6 +743,9 @@ fn rt_capabilities() -> naga::valid::Capabilities {
         | naga::valid::Capabilities::RAY_TRACING_PIPELINE
         | naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY
         | naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY_NON_UNIFORM_INDEXING
+        // 64-bit ints for buffer-device-address arithmetic in the bindless
+        // geometry path (`physical_load<T>(addr: u64)`).
+        | naga::valid::Capabilities::SHADER_INT64
 }
 
 /// Compile a WGSL ray-tracing-stage shader to SPIR-V (1.4, RT capabilities) via
