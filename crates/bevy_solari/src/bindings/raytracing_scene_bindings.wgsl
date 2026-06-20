@@ -449,9 +449,20 @@ fn resolve_material_lod(material: Material, uv: vec2<f32>, partial_lod: f32) -> 
 // tangent@16, uv@32) instead of four separate SoA pool fetches.
 struct SolariGeometryAddresses {
     vertex_packed: u64,
-    _pad: u64,
+    materials: u64,
+    material_stride: u32,
+    _pad: u32,
 }
 @group(1) @binding(4) var<uniform> geometry_addresses: SolariGeometryAddresses;
+
+// Bindless material fetch: load the whole Material struct by buffer-device-address
+// (one cache-coherent load, uniform across the warp after SER) instead of the
+// bound `materials` array.
+fn load_material_bindless(material_id: u32) -> Material {
+    let addr = geometry_addresses.materials
+        + u64(material_id) * u64(geometry_addresses.material_stride);
+    return physical_load<Material>(addr);
+}
 
 // Decode one PackedVertex at a global vertex index from the bindless pool.
 fn load_packed_vertex(vertex_index: u32) -> Vertex {
@@ -917,7 +928,11 @@ fn resolve_triangle_data_full_cone_mat(
     cone_width: f32,
     ray_direction: vec3<f32>,
 ) -> ResolvedRayHitFull {
+#ifdef SOLARI_PHYSICAL_GEOMETRY
+    let material = load_material_bindless(material_id);
+#else
     let material = materials[material_id];
+#endif
 
     let transform = transforms[instance_id];
     let previous_frame_transform = previous_frame_transforms[instance_id];

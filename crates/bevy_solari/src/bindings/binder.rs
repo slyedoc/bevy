@@ -31,6 +31,10 @@ const TEXTURE_MAP_NONE: u32 = u32::MAX;
 pub struct RaytracingSceneBindings {
     pub bind_group: Option<BindGroup>,
     pub bind_group_layout: BindGroupLayoutDescriptor,
+    /// The materials storage buffer (this frame), exposed so the RT-pipeline path
+    /// can reach it by buffer-device-address (`physical_load<Material>`) instead of
+    /// the bound `materials` array. `None` until the first bind-group build.
+    pub materials_buffer: Option<Buffer>,
 }
 
 /// Hair scene-group dependencies, bundled so the binder stays under the 16
@@ -234,6 +238,9 @@ pub fn prepare_raytracing_scene_bindings(
     light_sources.write_buffer(&render_device, &render_queue);
     active_light_list.write_buffer(&render_device, &render_queue);
 
+    // Expose the materials buffer for the RT-pipeline's bindless `physical_load`.
+    raytracing_scene_bindings.materials_buffer = materials.buffer().cloned();
+
     // PTLAS is built by `ptlas::dispatch_ptlas`; no TLAS build here.
 
     let (dfg_view, dfg_sampler) = texture_assets
@@ -287,6 +294,7 @@ impl RaytracingSceneBindings {
     pub fn new() -> Self {
         Self {
             bind_group: None,
+            materials_buffer: None,
             bind_group_layout: BindGroupLayoutDescriptor::new(
                 "raytracing_scene_bind_group_layout",
                 // `transforms` / `previous_frame_transforms` / `material_ids` /
@@ -378,6 +386,14 @@ impl<T, I: Eq + Hash> CachedBindingArray<T, I> {
 }
 
 type StorageBufferList<T> = StorageBuffer<Vec<T>>;
+
+/// Byte stride of one [`GpuMaterial`] record — the RT-pipeline's
+/// `physical_load<Material>` indexes the materials buffer by `material_id * this`.
+/// This is the `ShaderType` (std430) size encase writes records at — NOT the Rust
+/// `size_of`, which differs (the `vec3` fields pad to 16 in std430). Equals the
+/// bound `array<Material>` element stride the megakernel reads with.
+pub(crate) const GPU_MATERIAL_SIZE: u32 =
+    <GpuMaterial as ShaderSize>::SHADER_SIZE.get() as u32;
 
 #[derive(ShaderType, Clone)]
 struct GpuMaterial {

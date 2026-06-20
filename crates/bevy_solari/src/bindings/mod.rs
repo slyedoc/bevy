@@ -38,7 +38,7 @@ pub use bind_groups::{
     ClusterSceneBindGroupLayout,
 };
 pub use binder::{prepare_raytracing_scene_bindings, RaytracingSceneBindings};
-pub(crate) use binder::MAX_TEXTURE_COUNT;
+pub(crate) use binder::{GPU_MATERIAL_SIZE, MAX_TEXTURE_COUNT};
 pub use black_hole::{SolariBlackHole, SolariBlackHoles, SolariBlackHolesTablePlugin};
 pub use extract::SolariMaterialAssets;
 pub use fog_volume::{SolariFogVolume, SolariFogVolumes, SolariFogVolumesTablePlugin};

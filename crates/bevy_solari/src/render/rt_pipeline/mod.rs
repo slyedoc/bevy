@@ -364,8 +364,14 @@ pub(crate) fn rt_pipeline(
     {
         let vertex_packed =
             allocator.wgpu_buffer_device_address(cluster_mesh_manager.vertex_packed.buffer());
+        let materials = scene_bindings
+            .materials_buffer
+            .as_ref()
+            .map_or(0, |b| allocator.wgpu_buffer_device_address(b));
         view_bindings.set_geometry_addresses(&RtGeometryAddresses {
             vertex_packed,
+            materials,
+            material_stride: crate::bindings::GPU_MATERIAL_SIZE,
             _pad: 0,
         });
     }

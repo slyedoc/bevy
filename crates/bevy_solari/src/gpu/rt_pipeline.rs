@@ -57,7 +57,11 @@ pub struct RtGeometryAddresses {
     /// Base device address of the interleaved [`PackedVertex`] pool
     /// (`ClusterMeshManager::vertex_packed`).
     pub vertex_packed: u64,
-    pub _pad: u64,
+    /// Base device address of the materials storage buffer.
+    pub materials: u64,
+    /// Byte stride of one material record (`GPU_MATERIAL_SIZE`).
+    pub material_stride: u32,
+    pub _pad: u32,
 }
 
 /// A raw host-visible buffer kept with its memory + mapping, for the SBT and the
