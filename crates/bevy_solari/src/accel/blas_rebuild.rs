@@ -258,7 +258,7 @@ pub fn dispatch_blas_rebuild(
         // `geometry_dst_addresses`, `dirty_build_count`, `args_buf`, and
         // `selected_clas_refs`. A global barrier (submission-order
         // dependency on the same queue) makes those visible as build input.
-        crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device);
+        crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
         crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
             &mut encoder,
             &fns,
@@ -267,7 +267,7 @@ pub fn dispatch_blas_rebuild(
         // POST-build barrier: BUILD → SHADER_READ + BUILD_INPUT_READ so
         // the PTLAS fill compute sees fresh BLAS addresses and the PTLAS
         // build sees fresh BLAS payload bytes.
-        crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device);
+        crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
     }
     ctx.add_command_buffer(encoder.finish());
 }

@@ -90,8 +90,7 @@ struct SharingParams {
 // read by elect_dirty (which is per-geometry and has no instance handle).
 @group(1) @binding(13) var<storage, read_write> geometry_desc: array<vec4<u32>>;
 // slot → per-instance object-space error budget (`e_ideal`, unbanded). Written by
-// `classify`; the animated instantiate reuses it for its own per-instance DAG cut
-// (animated instances can't share a bucket BLAS, but the cut is pose-independent).
+// `classify` and consumed by the shared-BLAS per-instance DAG cut.
 @group(1) @binding(14) var<storage, read_write> instance_e_build: array<f32>;
 
 // ---------------------------------------------------------------------
@@ -164,7 +163,7 @@ fn classify_level(slot: u32, root_group: u32) -> u32 {
     let surface_dist = max(params.near_distance, center_dist - world_radius);
     let denom = max(scale * focal_px, 1e-12);
     let e_ideal = params.pixel_error_threshold * surface_dist / denom;
-    // Reused by the animated instantiate's per-instance DAG cut (unbanded budget).
+    // Unbanded budget for the shared-BLAS per-instance DAG cut.
     instance_e_build[slot] = e_ideal;
     let band_f = floor((log2(max(e_ideal, 1e-12)) - params.e_min_log2) * params.inv_log2_ratio);
     let band_max_geom = floor(

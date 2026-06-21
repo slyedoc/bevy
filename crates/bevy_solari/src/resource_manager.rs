@@ -26,8 +26,7 @@ use bevy_ecs::{
 use bevy_render::render_resource::BindGroupLayoutDescriptor;
 
 use crate::accel::{
-    animated_blas_bind_group_layout, blas_sharing_bind_group_layout, deform_bind_group_layout,
-    ptlas_bind_group_layout, selector_bind_group_layout,
+    blas_sharing_bind_group_layout, ptlas_bind_group_layout, selector_bind_group_layout,
 };
 use crate::gpu::allocator::Allocator;
 use crate::lights::light_resolve_bind_group_layout;
@@ -39,7 +38,7 @@ use crate::transform::{
 
 /// Every solari pass bind-group layout, built once at `RenderStartup`. Field names
 /// mirror [`SolariPipelines`](crate::pipelines::SolariPipelines) 1:1, so a pass's
-/// id (`pipelines.deform`) and its layout (`resource_manager.deform`) share a key.
+/// id (`pipelines.selector`) and its layout (`resource_manager.selector`) share a key.
 ///
 /// Absent on devices lacking the cluster support solari needs (the builder gates
 /// on the [`Allocator`], exactly as the pass resources do), so the pipelines that
@@ -51,8 +50,6 @@ pub struct SolariResourceManager {
     pub transform_gather: BindGroupLayoutDescriptor,
     pub transform_readback: BindGroupLayoutDescriptor,
     pub light_resolve: BindGroupLayoutDescriptor,
-    pub deform: BindGroupLayoutDescriptor,
-    pub animated_blas: BindGroupLayoutDescriptor,
     pub atmosphere: BindGroupLayoutDescriptor,
     // AS passes — each is the `@group(1)` layout; the full pipeline layout pairs it
     // with the cluster-scene group (composited in `init_solari_pipelines`).
@@ -76,8 +73,6 @@ pub fn init_solari_resource_manager(mut commands: Commands, allocator: Option<Re
         transform_gather: transform_gather_bind_group_layout(),
         transform_readback: transform_readback_bind_group_layout(),
         light_resolve: light_resolve_bind_group_layout(),
-        deform: deform_bind_group_layout(),
-        animated_blas: animated_blas_bind_group_layout(),
         atmosphere: atmosphere_bind_group_layout(),
         selector: selector_bind_group_layout(),
         blas_sharing: blas_sharing_bind_group_layout(),

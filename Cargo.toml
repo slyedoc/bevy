@@ -1580,26 +1580,6 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
-name = "solari_animation"
-path = "examples/3d/solari/animation.rs"
-doc-scrape-examples = true
-required-features = [
-    "bevy_solari",
-    "bevy_solari_debug",
-    "cluster_processor",
-    "free_camera",
-    "bevy_animation",
-    "bevy_gltf",
-    "bevy_dev_tools",
-]
-
-[package.metadata.example.solari_animation]
-name = "Solari (skeletal animation)"
-description = "Ray-traced skeletal cluster animation — a skinned glTF fox deformed on the GPU and rendered with Bevy Solari."
-category = "3D Rendering"
-wasm = false                                                                        # Raytracing is not supported on the web
-
-[[example]]
 name = "solari_many_lights"
 path = "examples/3d/solari/many_lights.rs"
 doc-scrape-examples = true
@@ -1670,44 +1650,6 @@ required-features = [
 [package.metadata.example.solari_scope]
 name = "Solari (scope)"
 description = "A working 4x Galilean telescope built from real lens geometry - magnification emerges from refraction."
-category = "3D Rendering"
-wasm = false                                                                        # Raytracing is not supported on the web
-
-[[example]]
-name = "solari_portal"
-path = "examples/3d/solari/portal.rs"
-doc-scrape-examples = true
-required-features = [
-    "bevy_solari",
-    "bevy_solari_debug",
-    "cluster_processor",
-    "free_camera",
-    "bevy_gltf",
-    "bevy_dev_tools",
-]
-
-[package.metadata.example.solari_portal]
-name = "Solari (portals)"
-description = "Surfaces that teleport rays mid-traversal - recursive portals, portals in reflections and through glass, walk-through."
-category = "3D Rendering"
-wasm = false                                                                        # Raytracing is not supported on the web
-
-[[example]]
-name = "solari_black_hole"
-path = "examples/3d/solari/black_hole.rs"
-doc-scrape-examples = true
-required-features = [
-    "bevy_solari",
-    "bevy_solari_debug",
-    "cluster_processor",
-    "free_camera",
-    "bevy_gltf",
-    "bevy_dev_tools",
-]
-
-[package.metadata.example.solari_black_hole]
-name = "Solari (black hole)"
-description = "Gravitationally lensed rays - Einstein ring, photon ring, and a light-wrapped accretion disk emerge from a Schwarzschild bend."
 category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 

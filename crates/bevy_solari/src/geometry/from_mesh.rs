@@ -29,9 +29,7 @@ use meshopt::{
 use thiserror::Error;
 use tracing::debug_span;
 
-use super::asset::{
-    Cluster, ClusterBloatAabb, ClusterLodGroup, ClusterMesh, ClusterMeshAabb, MAX_JOINTS_PER_MESH,
-};
+use super::asset::{Cluster, ClusterLodGroup, ClusterMesh, ClusterMeshAabb};
 
 /// Max vertices per cluster. 128 is comfortably below NV's per-CLAS
 /// cap (256) while letting meshopt produce dense clusters.
@@ -52,12 +50,12 @@ pub const MERGE_PREV_FACTOR: f32 = 1.1;
 pub const MERGE_ADDITIVE_FACTOR: f32 = 0.05;
 /// Cap LOD recursion depth — safety against pathological meshes.
 pub const MAX_LOD_LEVELS: u32 = 12;
-/// Per-cluster bloat factor applied to the rest-pose AABB before
-/// storing in [`ClusterMesh::cluster_bloat_aabbs`]. NV's
-/// `instantiationBoundingBoxLimit` treats this as a hard envelope:
-/// deformed vertices that exceed it cause silent rendering artifacts.
-pub const DEFAULT_TEMPLATE_BBOX_BLOAT: f32 = 0.30;
 
+// Process a [`Mesh`] into a [`ClusterMesh`]. Very slow — meant to run
+// offline (gated on the `cluster_processor` feature), not at runtime.
+// The input mesh must use `PrimitiveTopology::TriangleList` with indices
+// and carry `{POSITION, NORMAL, UV_0}`; `TANGENT` is generated via
+// mikktspace on a local clone when missing (the input is not mutated).
 impl TryFrom<&Mesh> for ClusterMesh {
     type Error = MeshToClusterMeshConversionError;
 
@@ -89,16 +87,6 @@ impl TryFrom<&Mesh> for ClusterMesh {
             None => (0..mesh_positions.len() as u32).collect(),
         };
 
-        let (mesh_joint_indices, mesh_joint_weights) =
-            match mesh.attribute(Mesh::ATTRIBUTE_JOINT_INDEX.id) {
-                Some(_) => (
-                    Some(extract_joint_indices(mesh)?),
-                    Some(extract_joint_weights(mesh)?),
-                ),
-                None => (None, None),
-            };
-        let is_animated = mesh_joint_indices.is_some();
-
         // meshopt VertexDataAdapter wants the position buffer as a `&[u8]`
         // with explicit stride. Vec3 is `#[repr(C)]` with 12 B size, no
         // padding — bytemuck slice cast is direct.
@@ -118,29 +106,15 @@ impl TryFrom<&Mesh> for ClusterMesh {
         let position_remap = generate_position_remap(&vert_adapter);
 
         let aabb = mesh_aabb(&mesh_positions);
-        let half = Vec3::new(aabb.half_extent[0], aabb.half_extent[1], aabb.half_extent[2]);
-        let mesh_diag = (half * 2.0).length();
-        let bloat_pad = mesh_diag * DEFAULT_TEMPLATE_BBOX_BLOAT;
 
         let mut out_positions: Vec<Vec3> = Vec::with_capacity(mesh_positions.len() * 2);
         let mut out_normals: Vec<u32> = Vec::with_capacity(mesh_normals.len() * 2);
         let mut out_tangents: Vec<Vec4> = Vec::with_capacity(mesh_tangents.len() * 2);
         let mut out_uvs: Vec<Vec2> = Vec::with_capacity(mesh_uvs.len() * 2);
-        let mut out_joint_indices: Vec<[u16; 4]> = if is_animated {
-            Vec::with_capacity(mesh_positions.len() * 2)
-        } else {
-            Vec::new()
-        };
-        let mut out_joint_weights: Vec<Vec4> = if is_animated {
-            Vec::with_capacity(mesh_positions.len() * 2)
-        } else {
-            Vec::new()
-        };
         let mut out_indices: Vec<u32> = Vec::with_capacity(mesh_indices.len() * 2);
         let mut out_clusters: Vec<Cluster> = Vec::new();
         let mut out_groups: Vec<ClusterLodGroup> = Vec::new();
         let mut out_cluster_to_group: Vec<u32> = Vec::new();
-        let mut out_bloat_aabbs: Vec<ClusterBloatAabb> = Vec::new();
 
         let mut current_indices: Vec<u32> = mesh_indices.clone();
         let mut prev_level_max_error: f32 = 0.0;
@@ -297,10 +271,6 @@ impl TryFrom<&Mesh> for ClusterMesh {
                         out_normals.push(pack2x16snorm(octahedral_encode(mesh_normals[v])));
                         out_tangents.push(mesh_tangents[v]);
                         out_uvs.push(mesh_uvs[v]);
-                        if is_animated {
-                            out_joint_indices.push(mesh_joint_indices.as_ref().unwrap()[v]);
-                            out_joint_weights.push(mesh_joint_weights.as_ref().unwrap()[v]);
-                        }
                     }
 
                     // NV CLAS expects 32-bit indices; widen from meshopt's u8 locals.
@@ -311,23 +281,6 @@ impl TryFrom<&Mesh> for ClusterMesh {
                     let cluster_positions =
                         mlet.vertices.iter().map(|&v| mesh_positions[v as usize]);
                     let (center, radius) = bounding_sphere(cluster_positions);
-
-                    if is_animated {
-                        let mut amin = Vec3::splat(f32::INFINITY);
-                        let mut amax = Vec3::splat(f32::NEG_INFINITY);
-                        for &v in mlet.vertices {
-                            let p = mesh_positions[v as usize];
-                            amin = amin.min(p);
-                            amax = amax.max(p);
-                        }
-                        let bloat = Vec3::splat(bloat_pad);
-                        let min = amin - bloat;
-                        let max = amax + bloat;
-                        out_bloat_aabbs.push(ClusterBloatAabb {
-                            min: [min.x, min.y, min.z, 0.0],
-                            max: [max.x, max.y, max.z, 0.0],
-                        });
-                    }
 
                     out_clusters.push(Cluster {
                         vertex_offset,
@@ -590,51 +543,8 @@ impl TryFrom<&Mesh> for ClusterMesh {
             root_group_id,
             root_node_id: u32::MAX,
             lod_levels: lod_level + 1,
-            vertex_joint_indices: out_joint_indices.into(),
-            vertex_joint_weights: out_joint_weights.into(),
-            cluster_bloat_aabbs: out_bloat_aabbs.into(),
-            inverse_bind_count: 0,
         })
 
-    }
-}
-impl ClusterMesh {
-    /// Process a [`Mesh`] to generate a [`ClusterMesh`].
-    ///
-    /// This process is very slow, and should be done ahead of time,
-    /// and not at runtime.
-    ///
-    /// # Requirements
-    ///
-    /// This function requires the `cluster_processor` cargo feature.
-    ///
-    /// The input mesh must:
-    /// 1. Use [`bevy_render::render_resource::PrimitiveTopology::TriangleList`]
-    /// 2. Use indices
-    /// 3. Carry the following vertex attributes:
-    ///    `{POSITION, NORMAL, UV_0}`. `TANGENT` is generated
-    ///    automatically via mikktspace on a local clone when
-    ///    missing — the input mesh is not mutated.
-    ///
-    /// # Skinning
-    ///
-    /// `JOINT_INDEX` + `JOINT_WEIGHT` are optional. When present,
-    /// the bake emits per-vertex joint streams + per-cluster bloat
-    /// AABBs for the deform path; when absent, animation slices stay
-    /// empty and the output describes a static mesh.
-    ///
-    
-
-    /// Stamp the inverse-bind-pose count for the rig this mesh
-    /// targets. Call this before serializing an animated mesh —
-    /// [`ClusterMesh::from_mesh`] can't see the parallel
-    /// `SkinnedMeshInverseBindposes` asset on its own.
-    pub fn set_inverse_bind_count(&mut self, count: u32) {
-        assert!(
-            count <= MAX_JOINTS_PER_MESH,
-            "rig has {count} joints, exceeds MAX_JOINTS_PER_MESH = {MAX_JOINTS_PER_MESH}",
-        );
-        self.inverse_bind_count = count;
     }
 }
 
@@ -790,29 +700,5 @@ fn extract_vec2(
         Some(VertexAttributeValues::Float32x2(v)) => Ok(v.iter().map(|&a| Vec2::from(a)).collect()),
         Some(_) => Err(MeshToClusterMeshConversionError::BadAttributeFormat(name)),
         None => Err(MeshToClusterMeshConversionError::MissingAttribute(name)),
-    }
-}
-
-fn extract_joint_indices(mesh: &Mesh) -> Result<Vec<[u16; 4]>, MeshToClusterMeshConversionError> {
-    match mesh.attribute(Mesh::ATTRIBUTE_JOINT_INDEX.id) {
-        Some(VertexAttributeValues::Uint16x4(v)) => Ok(v.clone()),
-        Some(_) => Err(MeshToClusterMeshConversionError::BadAttributeFormat(
-            "JOINT_INDEX",
-        )),
-        None => Err(MeshToClusterMeshConversionError::MissingAttribute(
-            "JOINT_INDEX",
-        )),
-    }
-}
-
-fn extract_joint_weights(mesh: &Mesh) -> Result<Vec<Vec4>, MeshToClusterMeshConversionError> {
-    match mesh.attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT.id) {
-        Some(VertexAttributeValues::Float32x4(v)) => Ok(v.iter().map(|&a| Vec4::from(a)).collect()),
-        Some(_) => Err(MeshToClusterMeshConversionError::BadAttributeFormat(
-            "JOINT_WEIGHT",
-        )),
-        None => Err(MeshToClusterMeshConversionError::MissingAttribute(
-            "JOINT_WEIGHT",
-        )),
     }
 }

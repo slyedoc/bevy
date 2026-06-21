@@ -498,7 +498,7 @@ pub fn dispatch_hair_blas(
     // SAFETY: encoder open + Vulkan-backed. Make the built BLASes visible to
     // the PTLAS build's instance reads + the traversal.
     unsafe {
-        crate::gpu::extension::cmd_global_as_barrier(encoder, &render_device);
+        crate::gpu::extension::cmd_global_as_barrier(encoder, &render_device, false);
     }
 }
 

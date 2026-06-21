@@ -15,9 +15,18 @@ struct RtPayload {
     bounce: u32,               // 1 = continue, 0 = terminate (miss / absorb)
     rng: u32,                  // PCG state, advanced by the hit shader's sampling
     // pdf of the BRDF sample that generated the ray INTO this vertex (0 on the
-    // primary ray). Threaded out by a hit shader so the NEXT vertex can weight
-    // its emissive against next-event estimation (the BSDF-vs-NEE MIS pair).
+    // primary ray). Threaded out by a hit shader so the NEXT vertex can MIS-weight
+    // its emissive against next-event estimation (the BSDF-vs-NEE pair).
     p_bounce: f32,
+}
+
+// Shadow / visibility-ray payload — just an occlusion flag. The closest-hit sets
+// `occluded = 1` before tracing a `traceRay` toward the light (with
+// SKIP_CLOSEST_HIT + TERMINATE_ON_FIRST_HIT, miss index = the shadow miss); the
+// dedicated `miss_shadow` program clears it to 0 when the ray reaches the light
+// unobstructed. Tiny on purpose — fixed-function traversal keeps the chit lean.
+struct ShadowPayload {
+    occluded: u32,
 }
 
 struct RtCamera {

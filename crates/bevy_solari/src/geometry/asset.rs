@@ -24,12 +24,7 @@ const CLUSTER_MESH_ASSET_MAGIC: u64 = u64::from_le_bytes(*b"CLUSTERS");
 
 /// Current version of the [`ClusterMesh`] asset format. Bump on
 /// incompatible struct-layout changes.
-pub const CLUSTER_MESH_ASSET_VERSION: u64 = 1;
-
-/// Maximum joint count the runtime deform path can address per
-/// mesh. Matches Bevy's `MAX_JOINTS` in `bevy_pbr::skin`. Bake
-/// asserts the rig's inverse-bind-pose count fits under this.
-pub const MAX_JOINTS_PER_MESH: u32 = 256;
+pub const CLUSTER_MESH_ASSET_VERSION: u64 = 2;
 
 /// A mesh pre-processed into a DAG of clusters for hardware
 /// ray-traced LOD selection.
@@ -91,23 +86,6 @@ pub struct ClusterMesh {
     pub(crate) root_node_id: u32,
     /// Max LOD level present (== bake recursion depth).
     pub(crate) lod_levels: u32,
-    /// Per-vertex joint indices (`[u16; 4]`, up to 4 influences
-    /// per vertex). Empty for static meshes. Parallel to
-    /// `vertex_positions` when non-empty.
-    pub(crate) vertex_joint_indices: Arc<[[u16; 4]]>,
-    /// Per-vertex joint weights (`[f32; 4]`). Should sum ≈ 1.0
-    /// per vertex. Empty for static meshes; parallel to
-    /// `vertex_positions` when non-empty.
-    pub(crate) vertex_joint_weights: Arc<[Vec4]>,
-    /// Per-cluster instantiation-envelope AABB consumed by NV's
-    /// `instantiationBoundingBoxLimit` field. The driver assumes
-    /// deformed vertices stay inside this AABB — silent artifacts
-    /// otherwise. Empty for static meshes.
-    pub(crate) cluster_bloat_aabbs: Arc<[ClusterBloatAabb]>,
-    /// Inverse-bind-matrix count expected by this mesh (== joint
-    /// count in the rig). Runtime asserts the bound
-    /// `SkinnedMeshInverseBindposes` matches. 0 for static meshes.
-    pub(crate) inverse_bind_count: u32,
 }
 
 impl ClusterMesh {
@@ -171,39 +149,17 @@ impl ClusterMesh {
     pub fn lod_levels(&self) -> u32 {
         self.lod_levels
     }
-    #[inline]
-    pub fn vertex_joint_indices(&self) -> &[[u16; 4]] {
-        &self.vertex_joint_indices
-    }
-    #[inline]
-    pub fn vertex_joint_weights(&self) -> &[Vec4] {
-        &self.vertex_joint_weights
-    }
-    #[inline]
-    pub fn cluster_bloat_aabbs(&self) -> &[ClusterBloatAabb] {
-        &self.cluster_bloat_aabbs
-    }
-    #[inline]
-    pub fn inverse_bind_count(&self) -> u32 {
-        self.inverse_bind_count
-    }
-    /// True when this mesh carries per-vertex joint data — the
-    /// runtime routes animated meshes through the deform-compute
-    /// + template-instantiate pipeline; static meshes go through
-    /// the pre-built CLAS arena.
-    #[inline]
-    pub fn is_animated(&self) -> bool {
-        !self.vertex_joint_indices.is_empty()
-    }
 }
 
 /// Interleaved (AoS) vertex record for the bindless RT-pipeline resolve: all of
-/// one vertex's shading attributes in one contiguous 40-byte slot, so a
-/// closest-hit loads a single cache line per vertex instead of touching the four
-/// separate SoA pools (`vertex_positions`/`normals`/`tangents`/`uvs`). Reached by
-/// buffer-device-address via `physical_load` (field-by-field, so no std430
-/// padding — exact 40 B: position@0, normal@12, tangent@16, uv@32). Built parallel
-/// to `vertex_positions` (same global vertex index).
+/// one vertex's shading attributes in one contiguous 28-byte slot, so a
+/// closest-hit touches one cache line per vertex instead of the four separate SoA
+/// pools (`vertex_positions`/`normals`/`tangents`/`uvs`). Reached by
+/// buffer-device-address via `physical_load` (field-by-field, no std430 padding —
+/// exact 28 B: position@0, normal@12, tangent@16, uv@20). Compact on purpose: a
+/// path-tracer fetches 3 of these per hit at scattered addresses, so a smaller
+/// record packs more vertices per cache line → higher L1 hit. Built at upload,
+/// parallel to `vertex_positions` (same global vertex index).
 #[derive(Copy, Clone, Pod, Zeroable, Debug, Default)]
 #[repr(C)]
 pub struct PackedVertex {
@@ -211,10 +167,23 @@ pub struct PackedVertex {
     pub position: [f32; 3],
     /// Octahedral-encoded normal (2×16snorm packed, matches `vertex_normals`).
     pub normal: u32,
-    /// Tangent xyz + bitangent sign in w (matches `vertex_tangents`).
-    pub tangent: [f32; 4],
-    /// Texture coordinates (matches `vertex_uvs`).
+    /// Tangent direction + bitangent sign packed into one `u32`: xyz in 10 bits
+    /// each (unorm of the [-1,1] direction) + the sign in bit 30. 10-bit tangent
+    /// precision is ample for normal mapping; the shader renormalizes on decode.
+    pub tangent: u32,
+    /// Texture coordinates (matches `vertex_uvs`). Kept full `f32` — UVs tile past
+    /// [0,1], so f16 would lose texel precision.
     pub uv: [f32; 2],
+}
+
+/// Pack a `(xyz, sign)` tangent into [`PackedVertex::tangent`]: 10 bits per
+/// direction component (unorm of `[-1,1]`) + the bitangent sign in bit 30.
+#[inline]
+pub fn pack_tangent(tangent: Vec4) -> u32 {
+    let dir = Vec3::new(tangent.x, tangent.y, tangent.z).normalize_or_zero();
+    let q = |c: f32| -> u32 { (((c * 0.5 + 0.5).clamp(0.0, 1.0) * 1023.0) + 0.5) as u32 & 0x3ff };
+    let sign = u32::from(tangent.w < 0.0);
+    q(dir.x) | (q(dir.y) << 10) | (q(dir.z) << 20) | (sign << 30)
 }
 
 /// A single cluster — the unit of CLAS build. Mirrors what an NV
@@ -327,16 +296,6 @@ pub struct ClusterMeshAabb {
     pub half_extent: [f32; 4],
 }
 
-/// Per-cluster bloated AABB consumed by NV's
-/// `instantiationBoundingBoxLimit` at template-build time. Same
-/// `[f32; 4]` layout as [`ClusterMeshAabb`] for shader uniformity.
-#[derive(Copy, Clone, Default, Pod, Zeroable, Debug)]
-#[repr(C)]
-pub struct ClusterBloatAabb {
-    pub min: [f32; 4],
-    pub max: [f32; 4],
-}
-
 /// Synchronous writer for offline CLI tools — same wire format as
 /// [`ClusterMeshSaver`], but bypasses bevy_asset's async I/O so
 /// bake binaries can stream directly to a [`std::io::Write`].
@@ -353,7 +312,6 @@ pub fn write_cluster_mesh_sync<W: Write>(
     writer.write_all(&asset.root_group_id.to_le_bytes())?;
     writer.write_all(&asset.root_node_id.to_le_bytes())?;
     writer.write_all(&asset.lod_levels.to_le_bytes())?;
-    writer.write_all(&asset.inverse_bind_count.to_le_bytes())?;
 
     let mut encoder = FrameEncoder::new(writer);
     write_slice(&asset.vertex_positions, &mut encoder)?;
@@ -366,9 +324,6 @@ pub fn write_cluster_mesh_sync<W: Write>(
     write_slice(&asset.nodes, &mut encoder)?;
     write_slice(&asset.child_table, &mut encoder)?;
     write_slice(&asset.cluster_to_group, &mut encoder)?;
-    write_slice(&asset.vertex_joint_indices, &mut encoder)?;
-    write_slice(&asset.vertex_joint_weights, &mut encoder)?;
-    write_slice(&asset.cluster_bloat_aabbs, &mut encoder)?;
     encoder.finish()?;
     Ok(())
 }
@@ -404,9 +359,6 @@ impl AssetSaver for ClusterMeshSaver {
         writer.write_all(&asset.root_group_id.to_le_bytes()).await?;
         writer.write_all(&asset.root_node_id.to_le_bytes()).await?;
         writer.write_all(&asset.lod_levels.to_le_bytes()).await?;
-        writer
-            .write_all(&asset.inverse_bind_count.to_le_bytes())
-            .await?;
 
         let mut writer = FrameEncoder::new(AsyncWriteSyncAdapter(writer));
         write_slice(&asset.vertex_positions, &mut writer)?;
@@ -419,9 +371,6 @@ impl AssetSaver for ClusterMeshSaver {
         write_slice(&asset.nodes, &mut writer)?;
         write_slice(&asset.child_table, &mut writer)?;
         write_slice(&asset.cluster_to_group, &mut writer)?;
-        write_slice(&asset.vertex_joint_indices, &mut writer)?;
-        write_slice(&asset.vertex_joint_weights, &mut writer)?;
-        write_slice(&asset.cluster_bloat_aabbs, &mut writer)?;
         writer.finish()?;
 
         Ok(())
@@ -460,7 +409,6 @@ impl AssetLoader for ClusterMeshLoader {
         let root_group_id = u32::from_le_bytes(async_read_4(reader).await?);
         let root_node_id = u32::from_le_bytes(async_read_4(reader).await?);
         let lod_levels = u32::from_le_bytes(async_read_4(reader).await?);
-        let inverse_bind_count = u32::from_le_bytes(async_read_4(reader).await?);
 
         let reader = &mut FrameDecoder::new(AsyncReadSyncAdapter(reader));
         let vertex_positions = read_slice(reader)?;
@@ -473,9 +421,6 @@ impl AssetLoader for ClusterMeshLoader {
         let nodes = read_slice(reader)?;
         let child_table = read_slice(reader)?;
         let cluster_to_group = read_slice(reader)?;
-        let vertex_joint_indices = read_slice(reader)?;
-        let vertex_joint_weights = read_slice(reader)?;
-        let cluster_bloat_aabbs = read_slice(reader)?;
 
         Ok(ClusterMesh {
             vertex_positions,
@@ -493,10 +438,6 @@ impl AssetLoader for ClusterMeshLoader {
             root_group_id,
             root_node_id,
             lod_levels,
-            vertex_joint_indices,
-            vertex_joint_weights,
-            cluster_bloat_aabbs,
-            inverse_bind_count,
         })
     }
 

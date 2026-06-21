@@ -75,7 +75,7 @@ use bevy_render::{
         Buffer, ComputePassDescriptor, CreateTlasDescriptor, PipelineCache, RawBufferVec,
         ShaderType, Tlas, UniformBuffer,
     },
-    renderer::{RenderContext, RenderDevice, RenderQueue},
+    renderer::{raw_vulkan_init::AdditionalVulkanFeatures, RenderContext, RenderDevice, RenderQueue},
 };
 use wgpu::hal::api::Vulkan as VkApi;
 use bytemuck::{Pod, Zeroable};
@@ -94,7 +94,7 @@ use crate::gpu::allocator::{Allocator, SparseBuffer};
 use super::blas_sharing::BlasSharing;
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
-use crate::gpu::extension::ClusterExtensionFns;
+use crate::gpu::extension::{ClusterExtensionFns, RayTracingPipelineFeature};
 
 /// Virtual address space for the PTLAS storage buffer — 4 GB.
 /// Sparse-backed.
@@ -388,7 +388,6 @@ pub fn prepare_ptlas_params(
     instances: Option<Res<InstanceManager>>,
     allocator: Option<Res<Allocator>>,
     fns: Option<Res<ClusterExtensionFns>>,
-    deform: Option<Res<super::deform::Deform>>,
     hair_instances: Option<Res<crate::hair::HairInstances>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -485,19 +484,6 @@ pub fn prepare_ptlas_params(
                 slot: slot.0,
                 null_flag: PAIR_NULL,
             });
-        }
-        // Animated instances must be re-specified every frame: their per-instance
-        // BLAS is rebuilt in place each frame (same stable address, new deformed
-        // content), and `fill_incremental` can't detect that (geometry isn't dirty,
-        // and a still instance doesn't "move"). Seed them as normal rewrites so the
-        // partition re-reads the rebuilt BLAS. Idempotent with added/rewrite above.
-        if let Some(deform) = deform.as_ref() {
-            for s in deform.active_slots() {
-                resources.write_slots_cpu.push(PtlasWritePair {
-                    slot: s.instance_slot,
-                    null_flag: PAIR_NORMAL,
-                });
-            }
         }
     }
     let cpu_count = resources.write_slots_cpu.len() as u32;
@@ -752,8 +738,13 @@ pub fn dispatch_ptlas(
     instances: Option<Res<InstanceManager>>,
     hair_instances: Option<Res<crate::hair::HairInstances>>,
     hair_write: Option<Res<crate::hair::ptlas_hair::HairPtlasWrite>>,
+    additional: Res<AdditionalVulkanFeatures>,
     mut ctx: RenderContext,
 ) {
+    // The shading path is the RT pipeline (`vkCmdTraceRays`), so the post-build
+    // barrier must publish AS writes to `RAY_TRACING_SHADER_KHR` — but only when
+    // that feature is enabled (else the stage flag is illegal → device lost).
+    let rt_pipeline = additional.has::<RayTracingPipelineFeature>();
     let (Some(allocator), Some(fns), Some(resources), Some(instances)) = (
         allocator,
         fns,
@@ -814,6 +805,13 @@ pub fn dispatch_ptlas(
     // equal src/dst, so the driver updates the structure in place instead of
     // copying the whole thing into a fresh buffer every frame). Full rebuild
     // keeps `src = 0` (built from scratch into the same buffer).
+    //
+    // EXPECTED VALIDATION NOISE: the in-place case trips
+    // `VUID-vkCmdBuildPartitionedAccelerationStructuresNV-pBuildInfo-10549`
+    // ("dst intersects src") every incremental frame. That VUID is the generic
+    // KHR-AS no-overlap rule; the NV partitioned-AS extension explicitly allows
+    // src == dst for in-place update, so it's a validation-layer false positive
+    // here, not a bug. Do not "fix" it by ping-ponging buffers.
     let storage_addr = resources.storage.address;
     let src_acceleration_structure_data = if resources.full_rebuild {
         0
@@ -907,17 +905,17 @@ pub fn dispatch_ptlas(
     unsafe {
         // PRE-build barrier: SHADER_WRITE → AS_BUILD_INPUT_READ so
         // the build sees the fill-compute's freshly-written
-        // WriteInstanceData records.
-        crate::gpu::extension::cmd_global_as_barrier(&mut build_encoder, &render_device);
+        // WriteInstanceData records. (Compute → build; no RT stage needed.)
+        crate::gpu::extension::cmd_global_as_barrier(&mut build_encoder, &render_device, false);
         crate::gpu::extension::cmd_build_partitioned_acceleration_structures(
             &mut build_encoder,
             &fns,
             &build_info,
         );
-        // POST-build barrier: AS_WRITE → RAY_TRACING_SHADER_READ so
-        // the path-tracer sees fresh PTLAS contents. Without this,
-        // traversal reads stale / undefined AS data.
-        crate::gpu::extension::cmd_global_as_barrier(&mut build_encoder, &render_device);
+        // POST-build barrier: AS_WRITE → RAY_TRACING_SHADER_READ so the RT-pipeline
+        // trace sees fresh PTLAS contents. Without the RT stage here, the trace
+        // races the build and reads an empty AS → every ray misses.
+        crate::gpu::extension::cmd_global_as_barrier(&mut build_encoder, &render_device, rt_pipeline);
     }
     ctx.add_command_buffer(build_encoder.finish());
 

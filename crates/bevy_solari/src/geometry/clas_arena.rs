@@ -233,8 +233,7 @@ impl ClasArena {
                 // Global cluster id so the RT-pipeline hit shader's
                 // `@builtin(cluster_id)` (ClusterIDNV) indexes `clusters[]`
                 // directly. The ray-query path uses the baked `base_geometry_index`
-                // instead, so this is free for it. (Static path — the animated
-                // template path in clas_template.rs matches.)
+                // instead, so this is free for it.
                 cluster_id: global_id,
                 cluster_flags: vk::ClusterAccelerationStructureClusterFlagsNV::default(),
                 triangle_cluster_info_packed: vk::Packed9_9_6_4_4::new(
@@ -456,7 +455,7 @@ impl ClasArena {
             // wgpu's tracker can't insert this because the build
             // happened via raw VK on a buffer wgpu only sees as
             // STORAGE.
-            crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device);
+            crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
         }
         let build_idx = render_queue.submit([encoder.finish()]);
         // Block the CPU until the raw-VK cluster build finishes so the

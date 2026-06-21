@@ -6,7 +6,7 @@
 //! (ids) + `ResourceManager` (layouts).
 //!
 //! Field names mirror [`SolariResourceManager`] 1:1, so a pass's id
-//! (`pipelines.deform`) and its layout (`resource_manager.deform`) share a key:
+//! (`pipelines.selector`) and its layout (`resource_manager.selector`) share a key:
 //! [`init_solari_pipelines`] reads each layout from the manager to queue the matching
 //! pipeline.
 //!
@@ -39,8 +39,6 @@ pub struct SolariPipelines {
     pub transform_gather: CachedComputePipelineId,
     pub transform_readback: CachedComputePipelineId,
     pub light_resolve: CachedComputePipelineId,
-    pub deform: CachedComputePipelineId,
-    pub animated_blas: CachedComputePipelineId,
     pub atmosphere: CachedComputePipelineId,
 
     pub selector_reset: CachedComputePipelineId,
@@ -69,8 +67,6 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "transform/transform_gather.wgsl");
     embedded_asset!(app, "transform/transform_readback.wgsl");
     embedded_asset!(app, "lights/light_resolve.wgsl");
-    embedded_asset!(app, "accel/deform.wgsl");
-    embedded_asset!(app, "accel/instantiate.wgsl");
     embedded_asset!(app, "render/atmosphere_bake.wgsl");
     embedded_asset!(app, "render/rt_pipeline/blit.wgsl");
     embedded_asset!(app, "accel/selector.wgsl");
@@ -131,26 +127,6 @@ pub fn init_solari_pipelines(
         shader: load_embedded_asset!(asset_server.as_ref(), "lights/light_resolve.wgsl"),
         shader_defs: vec![],
         entry_point: Some("resolve".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
-    let deform = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("deform".into()),
-        layout: vec![resource_manager.deform.clone()],
-        shader: load_embedded_asset!(asset_server.as_ref(), "accel/deform.wgsl"),
-        shader_defs: vec![],
-        entry_point: Some("deform".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
-    let animated_blas = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("animated_instantiate".into()),
-        layout: vec![resource_manager.animated_blas.clone()],
-        shader: load_embedded_asset!(asset_server.as_ref(), "accel/instantiate.wgsl"),
-        shader_defs: vec![],
-        entry_point: Some("instantiate".into()),
         immediate_size: 0,
         zero_initialize_workgroup_memory: false,
         constants: vec![],
@@ -247,8 +223,6 @@ pub fn init_solari_pipelines(
         transform_gather,
         transform_readback,
         light_resolve,
-        deform,
-        animated_blas,
         atmosphere,
         selector_reset,
         selector_main,

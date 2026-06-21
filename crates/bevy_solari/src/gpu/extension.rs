@@ -410,6 +410,7 @@ pub unsafe fn cmd_build_cluster_acceleration_structures_indirect(
 pub unsafe fn cmd_global_as_barrier(
     encoder: &mut wgpu::CommandEncoder,
     render_device: &RenderDevice,
+    rt_pipeline: bool,
 ) {
     // Raw `vkCmdPipelineBarrier` — invisible to wgpu's profiler. Span
     // it so the AS-build barriers show on the Tracy CPU timeline.
@@ -420,15 +421,23 @@ pub unsafe fn cmd_global_as_barrier(
         | vk::AccessFlags::SHADER_READ
         | vk::AccessFlags::TRANSFER_WRITE;
     let dst_access = src_access | vk::AccessFlags::MEMORY_READ;
-    // No RAY_TRACING_SHADER_KHR: that stage requires the
-    // rayTracingPipeline feature (we only enable rayQuery). Ray
-    // queries are evaluated inside the COMPUTE_SHADER stage that
-    // already appears here. Including it without the feature trips
-    // VUID-vkCmdPipelineBarrier-dstStageMask-07949 and on NV
-    // results in ERROR_DEVICE_LOST.
+    // The shading path traverses the freshly-built AS in the ray-tracing-pipeline
+    // stage (`vkCmdTraceRays`), so the post-build barrier MUST make AS writes
+    // visible to `RAY_TRACING_SHADER_KHR` — otherwise the trace races the build
+    // and reads an empty AS (every ray misses). That stage is only legal when the
+    // `rayTracingPipeline` feature is enabled; including it without the feature
+    // trips VUID-vkCmdPipelineBarrier-dstStageMask-07949 (ERROR_DEVICE_LOST on
+    // NV), hence the gate. `COMPUTE_SHADER` stays for the AS-pass compute that
+    // also reads/writes these buffers (selector, fill, etc.).
+    let rt_stage = if rt_pipeline {
+        vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR
+    } else {
+        vk::PipelineStageFlags::empty()
+    };
     let src_stage = vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
         | vk::PipelineStageFlags::COMPUTE_SHADER
-        | vk::PipelineStageFlags::TRANSFER;
+        | vk::PipelineStageFlags::TRANSFER
+        | rt_stage;
     let dst_stage = src_stage;
     unsafe {
         let hal_device = render_device

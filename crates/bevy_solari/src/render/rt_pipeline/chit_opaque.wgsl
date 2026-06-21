@@ -1,26 +1,34 @@
-// Opaque-surface closest-hit: emissive (MIS-weighted), next-event estimation,
-// and a BRDF-sampled continuation ray. The register-isolated counterpart of the
-// megakernel's opaque branch (pathtracer.wgsl) — the raygen driver owns the
-// bounce loop + throughput; this shader fills the payload with the radiance
-// contributed at this vertex and the next ray to trace.
-//
-// Shadow / light-visibility rays use inline `rayQuery` *inside* this closest-hit
-// (sample_random_light → trace_light_visibility) — valid in any stage, so NEE
-// needs no separate shadow miss/SBT program.
+// Opaque-surface closest-hit: emissive (MIS-weighted) + next-event estimation +
+// a BRDF-sampled continuation ray. Direct illumination follows the NVIDIA-canonical
+// structure: NEE samples a light and tests visibility with a `traceRay` shadow ray
+// (SKIP_CLOSEST_HIT + TERMINATE_ON_FIRST_HIT, routed to the dedicated `miss_shadow`
+// program via an explicit miss index). The fixed-function traversal keeps the
+// shadow query OFF the chit's register file — unlike an inline `rayQuery`, which is
+// what previously blew this shader's occupancy. The raygen driver owns the bounce
+// loop + throughput; this shader fills the payload with the radiance at this vertex
+// and the next ray to trace.
 enable wgpu_ray_tracing_pipeline;
-enable wgpu_ray_query;
 enable primitive_index;
 
-#import bevy_solari::rt_payload::RtPayload
-#import bevy_solari::pbr::rand_f
+#import bevy_solari::rt_payload::{RtPayload, ShadowPayload}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
-#import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic}
-#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat, offset_ray_origin, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::sampling::{generate_random_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, power_heuristic, NULL_LIGHT_ID}
+#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 
 var<incoming_ray_payload> payload: RtPayload;
+// Outgoing payload for the NEE shadow ray (see `miss_shadow`).
+var<ray_payload> shadow_payload: ShadowPayload;
 // Driver-provided triangle barycentrics (GLSL `hitAttributeEXT vec2`) — the
 // fixed-function triangle intersection writes (u, v); w = 1 - u - v.
 var<hit_attribute> bary: vec2<f32>;
+
+// SBT miss index of `miss_shadow` (miss 0 = miss_primary, miss 1 = miss_shadow).
+const SHADOW_MISS_INDEX: u32 = 1u;
+// Shadow rays skip the closest-hit (we only need occlusion), stop at the first
+// hit, and force-opaque so no any-hit is needed (alpha geometry casts solid
+// shadows — a follow-up could add an alpha any-hit for cutouts).
+const SHADOW_RAY_FLAGS: u32 =
+    RAY_FLAG_TERMINATE_ON_FIRST_HIT | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_FORCE_OPAQUE;
 
 // Per-material SBT shader record: each hit record bakes its material id (the
 // record index = the material slot, set as `instance_contribution_to_hit_group_index`
@@ -81,18 +89,57 @@ fn chit_opaque(
     var emitted = mis_weight * ray_hit.material.emissive;
 
     // Next-event estimation (skip on mirror-like surfaces — a delta lobe can't be
-    // importance-sampled by area light NEE).
+    // importance-sampled by area-light NEE).
     let is_perfectly_specular =
         ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
     if !is_perfectly_specular {
-        let direct_lighting = sample_random_light(ray_hit.world_position, world_normal, &rng);
-        var nee_mis = 1.0;
-        if direct_lighting.brdf_rays_can_hit {
-            let pdf_of_bounce = brdf_pdf(wo, direct_lighting.wi, world_normal, ray_hit.material, F_ab);
-            nee_mis = power_heuristic(1.0 / direct_lighting.inverse_pdf, pdf_of_bounce);
+        let sample = generate_random_light_sample(&rng);
+        if sample.light_sample.light_id != NULL_LIGHT_ID {
+            let lc = calculate_resolved_light_contribution(
+                sample.resolved_light_sample,
+                ray_hit.world_position,
+                world_normal,
+            );
+            if lc.inverse_pdf > 0.0 {
+                // Build the shadow ray toward the sampled light (positional w==1 →
+                // finite range to the light; directional w==0 → far miss).
+                let shadow_origin =
+                    offset_ray_origin(ray_hit.world_position, ray_hit.geometric_world_normal);
+                let light_pos = sample.resolved_light_sample.world_position;
+                var shadow_dir = light_pos.xyz;
+                var shadow_tmax = RAY_T_MAX;
+                if light_pos.w == 1.0 {
+                    let to_light = shadow_dir - shadow_origin;
+                    let dist = length(to_light);
+                    shadow_dir = to_light / dist;
+                    shadow_tmax = dist - RAY_T_MIN;
+                }
+                var visible = false;
+                if shadow_tmax >= RAY_T_MIN {
+                    // Assume occluded; `miss_shadow` clears this iff the ray reaches
+                    // the light. Fixed-function traversal → no register cost here.
+                    shadow_payload.occluded = 1u;
+                    traceRay(
+                        tlas,
+                        RayDesc(SHADOW_RAY_FLAGS, 0xffu, RAY_T_MIN, shadow_tmax, shadow_origin, shadow_dir),
+                        0u,
+                        0u,
+                        SHADOW_MISS_INDEX,
+                        &shadow_payload,
+                    );
+                    visible = shadow_payload.occluded == 0u;
+                }
+                if visible {
+                    var nee_mis = 1.0;
+                    if lc.brdf_rays_can_hit {
+                        let pdf_of_bounce = brdf_pdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
+                        nee_mis = power_heuristic(1.0 / lc.inverse_pdf, pdf_of_bounce);
+                    }
+                    let direct_brdf = evaluate_brdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
+                    emitted += nee_mis * lc.radiance * lc.inverse_pdf * direct_brdf;
+                }
+            }
         }
-        let direct_brdf = evaluate_brdf(wo, direct_lighting.wi, world_normal, ray_hit.material, F_ab);
-        emitted += nee_mis * direct_lighting.radiance * direct_lighting.inverse_pdf * direct_brdf;
     }
 
     payload.emitted = emitted;

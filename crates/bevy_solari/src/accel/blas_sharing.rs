@@ -130,8 +130,7 @@ pub struct BlasSharing {
     /// slot-indexed: instance → BLAS device address (PTLAS reads this).
     pub instance_blas_address: SparseBuffer,
     /// slot-indexed: instance → per-instance object-space LOD error budget,
-    /// written by `classify`. The animated instantiate reads it to run the same
-    /// DAG cut as the static path (the cut is pose-independent).
+    /// written by `classify` and consumed by the shared-BLAS DAG cut.
     pub instance_e_build: SparseBuffer,
     /// dense active index → real `GpuEntity`. Re-uploaded only when
     /// the active set changes.

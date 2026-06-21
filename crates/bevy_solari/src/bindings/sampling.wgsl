@@ -5,7 +5,7 @@ enable wgpu_ray_query;
 #import bevy_solari::pbr::D_GGX
 #import bevy_solari::pbr::{rand_f, rand_vec2f, rand_u, rand_range_u}
 #import bevy_render::maths::{PI_2, orthonormalize}
-#import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, active_light_list, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, resolve_ray_hit_full, offset_ray_origin, materials, material_ids, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD, clusters, instance_cluster_ranges}
+#import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, active_light_list, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, resolve_ray_hit_full, offset_ray_origin, load_material_bindless, material_ids, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD, clusters, instance_cluster_ranges}
 
 fn power_heuristic(f: f32, g: f32) -> f32 {
     return balance_heuristic(f * f, g * g);
@@ -387,7 +387,7 @@ fn trace_light_transmittance(ray_origin: vec3<f32>, light_sample_world_position:
 
         // Cheap opaque test before resolving: a non-transmissive surface is a
         // hard shadow caster, so the point is fully occluded.
-        let material = materials[material_ids[hit.instance_index]];
+        let material = load_material_bindless(material_ids[hit.instance_index]);
         if material.specular_transmission < 0.5 { return vec3(0.0); }
 
         // Transmissive boundary: flip the active medium (entering glass → its

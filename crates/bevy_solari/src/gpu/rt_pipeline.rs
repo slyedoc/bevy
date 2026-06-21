@@ -202,12 +202,21 @@ impl RtPipeline {
             &device,
             &compile_rt_wgsl(include_str!("../render/rt_pipeline/chit_hair.wgsl"), "chit_hair.wgsl")?,
         )?;
+        // Dedicated shadow miss for NEE visibility rays (miss index 1).
+        let miss_shadow_mod = create_shader_module(
+            &device,
+            &compile_rt_wgsl(
+                include_str!("../render/rt_pipeline/miss_shadow.wgsl"),
+                "miss_shadow.wgsl",
+            )?,
+        )?;
         let modules = vec![
             raygen_mod,
             miss_mod,
             chit_opaque_mod,
             chit_glass_mod,
             chit_hair_mod,
+            miss_shadow_mod,
         ];
 
         // naga emits each entry point under its WGSL function name.
@@ -217,18 +226,20 @@ impl RtPipeline {
             shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_opaque_mod, c"chit_opaque"),
             shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_glass_mod, c"chit_glass"),
             shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_hair_mod, c"chit_hair"),
+            shader_stage(vk::ShaderStageFlags::MISS_KHR, miss_shadow_mod, c"miss_shadow"),
         ];
 
-        // Group 0 = raygen, 1 = miss (both general), 2/3/4 = the opaque/glass/hair
-        // triangle hit groups — their order in the hit region IS the SBT offset
-        // (HIT_GROUP_OPAQUE=0, _GLASS=1, _HAIR=2) routed in ptlas_fill /
-        // ptlas_hair_write.
+        // Group 0 = raygen, 1 = primary miss (both general), 2/3/4 = the
+        // opaque/glass/hair triangle hit groups (their order in the hit region IS
+        // the SBT offset HIT_GROUP_OPAQUE=0/_GLASS=1/_HAIR=2 routed in ptlas_fill /
+        // ptlas_hair_write), 5 = shadow miss (miss index 1, general).
         let groups = [
             general_group(0),
             general_group(1),
             hit_group(2),
             hit_group(3),
             hit_group(4),
+            general_group(5),
         ];
 
         // --- Descriptor set layout (set 1: output + camera) --------------------
@@ -293,7 +304,10 @@ impl RtPipeline {
         let mut pipeline_info = vk::RayTracingPipelineCreateInfoKHR::default()
             .stages(&stages)
             .groups(&groups)
-            .max_pipeline_ray_recursion_depth(1)
+            // Depth 2: raygen's hit object executes the closest-hit (1), which
+            // traces a NEE shadow ray (2). Shadow rays skip the closest-hit, so the
+            // chain bottoms out there.
+            .max_pipeline_ray_recursion_depth(2)
             .layout(pipeline_layout);
         pipeline_info.p_next =
             (&cluster_info as *const vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV)
@@ -326,7 +340,8 @@ impl RtPipeline {
         // reads as the canonical material binding (uniform per record → uniform
         // per warp after SER). Distinct per-material records also give SER a
         // per-material reorder key and a slot for future per-class handles.
-        const GROUP_COUNT: u32 = 5; // raygen, miss, opaque, glass, hair
+        const GROUP_COUNT: u32 = 6; // raygen, primary miss, opaque, glass, hair, shadow miss
+        const MISS_COUNT: u64 = 2; // miss index 0 = primary, 1 = shadow
         const HIT_RECORD_DATA: u64 = 4; // bytes of shader-record data (u32 material id)
         const RECORD_HEADROOM: u32 = 64; // absorb a little material growth post-build
         let record_capacity = material_count + RECORD_HEADROOM;
@@ -336,7 +351,8 @@ impl RtPipeline {
         let hit_record_stride = align_up(handle_size + HIT_RECORD_DATA, handle_align);
         let raygen_offset = 0u64;
         let miss_offset = align_up(handle_stride, base_align);
-        let hit_offset = align_up(miss_offset + handle_stride, base_align);
+        // The miss region holds MISS_COUNT contiguous handle-stride records.
+        let hit_offset = align_up(miss_offset + MISS_COUNT * handle_stride, base_align);
         let sbt_size = hit_offset + record_capacity as u64 * hit_record_stride;
         let sbt = alloc_mapped_buffer(
             allocator,
@@ -355,8 +371,15 @@ impl RtPipeline {
         }
         .ok()?;
         let handle = |g: usize| &handles[g * handle_size as usize..(g + 1) * handle_size as usize];
-        // raygen (group 0) + miss (group 1) handles.
-        for &(g, off) in [(0usize, raygen_offset), (1usize, miss_offset)].iter() {
+        // raygen (group 0), primary miss (group 1 → miss index 0), shadow miss
+        // (group 5 → miss index 1).
+        for &(g, off) in [
+            (0usize, raygen_offset),
+            (1usize, miss_offset),
+            (5usize, miss_offset + handle_stride),
+        ]
+        .iter()
+        {
             // SAFETY: mapped covers sbt_size; off + handle_size within bounds.
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -395,7 +418,7 @@ impl RtPipeline {
         let miss_region = vk::StridedDeviceAddressRegionKHR::default()
             .device_address(sbt.device_address + miss_offset)
             .stride(handle_stride)
-            .size(handle_stride);
+            .size(MISS_COUNT * handle_stride);
         // Per-material records: stride steps one record; the instance's material
         // slot indexes them.
         let hit_region = vk::StridedDeviceAddressRegionKHR::default()

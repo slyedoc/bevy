@@ -13,7 +13,6 @@
 
 pub mod asset;
 pub mod clas_arena;
-pub mod clas_template;
 #[cfg(feature = "cluster_processor")]
 pub mod from_mesh;
 pub mod indices;
@@ -21,26 +20,22 @@ pub mod mesh_manager;
 
 
 pub use self::asset::{
-    write_cluster_mesh_sync, Cluster, ClusterBloatAabb, ClusterBvhNode, ClusterLodGroup,
-    ClusterMesh, ClusterMeshAabb, ClusterMeshLoader, ClusterMeshSaveOrLoadError, ClusterMeshSaver,
-    CLUSTER_MESH_ASSET_VERSION, MAX_JOINTS_PER_MESH,
+    write_cluster_mesh_sync, Cluster, ClusterBvhNode, ClusterLodGroup, ClusterMesh,
+    ClusterMeshAabb, ClusterMeshLoader, ClusterMeshSaveOrLoadError, ClusterMeshSaver,
+    CLUSTER_MESH_ASSET_VERSION,
 };
 pub use self::clas_arena::{init_clas_arena, upload_pending_clas, ClasArena};
-pub use self::clas_template::{
-    init_clas_template_arena, upload_pending_templates, ClusterTemplateArena,
-};
 pub use self::indices::{ClusterIndex, GroupIndex, GpuEntity, NodeIndex};
 pub use self::mesh_manager::{
-    init_cluster_mesh_manager, perform_pending_cluster_mesh_writes, AnimatedMeshPointers,
-    ClusterMeshManager, ClusterMeshUpload, PendingClasUpload,
+    init_cluster_mesh_manager, perform_pending_cluster_mesh_writes, ClusterMeshManager,
+    ClusterMeshUpload, PendingClasUpload,
 };
 pub use crate::gpu::persistent_buffer::{PersistentGpuBuffer, PersistentGpuBufferable};
 
 #[cfg(feature = "cluster_processor")]
 pub use self::from_mesh::{
-    MeshToClusterMeshConversionError, DEFAULT_TEMPLATE_BBOX_BLOAT, MAX_CLUSTER_TRIANGLES,
-    MAX_CLUSTER_VERTICES, MAX_LOD_LEVELS, MERGE_ADDITIVE_FACTOR, MERGE_PREV_FACTOR,
-    SIMPLIFY_TARGET_FRACTION, TARGET_GROUP_SIZE,
+    MeshToClusterMeshConversionError, MAX_CLUSTER_TRIANGLES, MAX_CLUSTER_VERTICES, MAX_LOD_LEVELS,
+    MERGE_ADDITIVE_FACTOR, MERGE_PREV_FACTOR, SIMPLIFY_TARGET_FRACTION, TARGET_GROUP_SIZE,
 };
 
 use bevy_app::{App, Plugin};
@@ -69,7 +64,6 @@ impl Plugin for GeometryPlugin {
                 (
                     init_cluster_mesh_manager.after(SolariSetup),
                     init_clas_arena.after(SolariSetup),
-                    init_clas_template_arena.after(SolariSetup),
                 ),
             )
             .add_systems(
@@ -77,10 +71,6 @@ impl Plugin for GeometryPlugin {
                 (
                     perform_pending_cluster_mesh_writes.in_set(RenderSystems::PrepareAssets),
                     upload_pending_clas
-                        .in_set(RenderSystems::PrepareAssets)
-                        .after(perform_pending_cluster_mesh_writes),
-                    // Animated meshes also get topology-only CLAS templates.
-                    upload_pending_templates
                         .in_set(RenderSystems::PrepareAssets)
                         .after(perform_pending_cluster_mesh_writes),
                 ),

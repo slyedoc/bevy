@@ -19,34 +19,19 @@ use bevy_core_pipeline::schedule::camera_driver;
 use bevy_ecs::schedule::{common_conditions::resource_exists, IntoScheduleConfigs};
 use bevy_render::{
     renderer::{RenderGraph, RenderGraphSystems},
-    ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+    Render, RenderApp, RenderStartup, RenderSystems,
 };
 
-use crate::ecs_gpu::GpuColumnPrepareSet;
 use crate::pipelines::SolariPipelines;
 use crate::{SolariClusterSystems, SolariSetup};
 
-pub mod animated_blas;
 pub mod blas_rebuild;
 pub mod blas_sharing;
-pub mod deform;
 pub mod pipelines;
 pub mod ptlas;
 pub mod selector;
 
 pub use blas_rebuild::{dispatch_blas_rebuild, init_blas_rebuild};
-pub use deform::{
-    deform_bind_group_layout, dispatch_deform, extract_animated_skins, init_deform, prepare_deform,
-    prepare_deform_bind_group, Deform,
-};
-// Instantiate animated CLAS templates with deformed verts + build a per-instance
-// BLAS per animated instance (the `BuildAnimatedBlas` stage). Repoints
-// `instance_blas_address` at the per-instance BLAS; the PTLAS + resolve consume it.
-pub use animated_blas::{
-    animated_blas_bind_group_layout, dispatch_animated_blas, init_animated_blas,
-    prepare_animated_blas, prepare_animated_blas_bind_group, prepare_animated_blas_params,
-    AnimatedBlas,
-};
 pub use pipelines::{
     blas_sharing_bind_group_layout, ptlas_bind_group_layout, selector_bind_group_layout,
 };
@@ -68,8 +53,8 @@ pub struct AccelPlugin;
 
 impl Plugin for AccelPlugin {
     fn build(&self, app: &mut App) {
-        // All AS-pass shaders (selector/blas_sharing/ptlas_fill + deform/instantiate)
-        // are embedded centrally in `crate::pipelines`, co-located with their queue.
+        // All AS-pass shaders (selector/blas_sharing/ptlas_fill) are embedded
+        // centrally in `crate::pipelines`, co-located with their queue.
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -86,11 +71,9 @@ impl Plugin for AccelPlugin {
                 (
                     SolariClusterSystems::Scatter,
                     SolariClusterSystems::Propagate,
-                    SolariClusterSystems::Deform,
                     SolariClusterSystems::Classify,
                     SolariClusterSystems::Select,
                     SolariClusterSystems::BuildBlas,
-                    SolariClusterSystems::BuildAnimatedBlas,
                     SolariClusterSystems::BuildTlas,
                     SolariClusterSystems::Cleanup,
                 )
@@ -105,29 +88,11 @@ impl Plugin for AccelPlugin {
                     init_blas_sharing.after(SolariSetup),
                     init_blas_rebuild.after(SolariSetup),
                     init_ptlas.after(SolariSetup),
-                    init_deform.after(SolariSetup),
-                    init_animated_blas.after(SolariSetup),
                 ),
             )
-            .add_systems(ExtractSchedule, extract_animated_skins)
             .add_systems(
                 Render,
                 (
-                    // Deform skin-input upload — after the column scatter prepares
-                    // (it uploads only its own buffers).
-                    prepare_deform
-                        .in_set(RenderSystems::Prepare)
-                        .after(GpuColumnPrepareSet),
-                    prepare_deform_bind_group.in_set(RenderSystems::PrepareBindGroups),
-                    // Animated CLAS/BLAS prepare — after blas_sharing (stride source)
-                    // and after the deform prepare (active-slot list).
-                    prepare_animated_blas
-                        .in_set(RenderSystems::Prepare)
-                        .after(prepare_deform),
-                    prepare_animated_blas_params
-                        .in_set(RenderSystems::Prepare)
-                        .after(prepare_animated_blas),
-                    prepare_animated_blas_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     prepare_blas_sharing.in_set(RenderSystems::Prepare),
                     prepare_selector_params
                         .in_set(RenderSystems::Prepare)
@@ -143,9 +108,6 @@ impl Plugin for AccelPlugin {
             .add_systems(
                 RenderGraph,
                 (
-                    dispatch_deform
-                        .run_if(resource_exists::<SolariPipelines>)
-                        .in_set(SolariClusterSystems::Deform),
                     dispatch_blas_sharing
                         .run_if(resource_exists::<SolariPipelines>)
                         .in_set(SolariClusterSystems::Classify),
@@ -153,9 +115,6 @@ impl Plugin for AccelPlugin {
                         .run_if(resource_exists::<SolariPipelines>)
                         .in_set(SolariClusterSystems::Select),
                     dispatch_blas_rebuild.in_set(SolariClusterSystems::BuildBlas),
-                    dispatch_animated_blas
-                        .run_if(resource_exists::<SolariPipelines>)
-                        .in_set(SolariClusterSystems::BuildAnimatedBlas),
                     dispatch_ptlas
                         .run_if(resource_exists::<SolariPipelines>)
                         .in_set(SolariClusterSystems::BuildTlas),

@@ -1,6 +1,5 @@
 use super::extract::SolariMaterialAssets;
 use crate::material::MaterialSlots;
-use crate::accel::deform::Deform;
 use crate::accel::ptlas::Ptlas;
 use crate::instance::InstanceManager;
 use crate::geometry::ClusterMeshManager;
@@ -52,7 +51,6 @@ pub fn prepare_raytracing_scene_bindings(
     instance_manager: Res<InstanceManager>,
     cluster_mesh_manager: Res<ClusterMeshManager>,
     ptlas: Option<Res<Ptlas>>,
-    deform: Option<Res<Deform>>,
     material_assets: Res<SolariMaterialAssets>,
     material_slots: Res<MaterialSlots>,
     texture_assets: Res<RenderAssets<GpuImage>>,
@@ -85,13 +83,6 @@ pub fn prepare_raytracing_scene_bindings(
     let Some(tlas) = ptlas.current_tlas() else {
         return;
     };
-    // The deform pool + animated table are required scene-group bindings (the
-    // resolve shader always reads `instance_animated[instance_id]`). `Deform` is
-    // created unconditionally in `RenderStartup`, so this is present whenever the
-    // cluster pipeline is.
-    let Some(deform) = deform else {
-        return;
-    };
     // Hair scene data (segments + instance records + index range). Both are
     // created in `RenderStartup` whenever the cluster pipeline is, so this is
     // present on any solari-capable device; the buffers are empty when there's
@@ -111,6 +102,12 @@ pub fn prepare_raytracing_scene_bindings(
     let mut textures = CachedBindingArray::new();
     let mut samplers = Vec::new();
     let mut materials = StorageBufferList::<GpuMaterial>::default();
+    // The RT-pipeline chit reads materials by buffer-device-address
+    // (`physical_load<Material>`), which requires `SHADER_DEVICE_ADDRESS` on the
+    // VkBuffer. wgpu only adds that flag for AS-input/scratch usages, so request
+    // `BLAS_INPUT` — the wgpu idiom for "I need this buffer's device address"
+    // (it also tags it AS-build-input, harmless here).
+    materials.add_usages(BufferUsages::BLAS_INPUT);
     // Per-instance `transforms` / `previous_frame_transforms` /
     // `material_ids` are slot-indexed GPU columns now (`GpuInstances`,
     // scattered from a delta) — bound directly, not rebuilt here. Same
@@ -260,32 +257,30 @@ pub fn prepare_raytracing_scene_bindings(
     raytracing_scene_bindings.bind_group = Some(render_device.create_bind_group(
         "raytracing_scene_bind_group",
         &pipeline_cache.get_bind_group_layout(&raytracing_scene_bindings.bind_group_layout),
+        // Vertex attributes + materials are reached bindlessly by
+        // buffer-device-address (the RT pipeline's `geometry_addresses` uniform),
+        // so only the cluster index/table, textures, TLAS, lights, and hair are
+        // bound here. Bindings are CONTIGUOUS (0..12) — the raw RT pipeline reads
+        // the layout's raw `VkDescriptorSetLayout`, and wgpu compacts sparse
+        // (gappy) layouts to contiguous physical slots while the naga SPIR-V keeps
+        // the logical numbers; a gap would desync the two. Order must match the
+        // `@binding` order in `raytracing_scene_bindings.wgsl`.
         &BindGroupEntries::sequential((
-            cluster_mesh_manager.vertex_positions.binding(),
-            cluster_mesh_manager.vertex_normals.binding(),
-            cluster_mesh_manager.vertex_tangents.binding(),
-            cluster_mesh_manager.vertex_uvs.binding(),
-            cluster_mesh_manager.indices.binding(),
-            cluster_mesh_manager.clusters.binding(),
-            materials.binding().unwrap(),
-            textures.as_slice(),
-            samplers.as_slice(),
-            tlas.as_binding(),
-            light_sources.binding().unwrap(),
-            dfg_view,
-            dfg_sampler,
-            // Skeletal animation: deform pool + slot-indexed animated table.
-            deform.positions.as_entire_binding(),
-            deform.normals.as_entire_binding(),
-            deform.animated_table().as_entire_binding(),
-            deform.tangents.as_entire_binding(),
-            active_light_list.binding().unwrap(),
-            // Hair: per-segment `{p0,r0, p1,r1}` records, per-instance records, range,
-            // and the transform-table world buffer (instance world matrices).
-            hair_manager.segments.buffer().as_entire_binding(),
-            hair_instance_buffer.as_entire_binding(),
-            hair_params,
-            transform_propagate.current_world().as_entire_binding(),
+            cluster_mesh_manager.indices.binding(),         // 0 cluster_indices
+            cluster_mesh_manager.clusters.binding(),        // 1 clusters
+            textures.as_slice(),                            // 2 textures
+            samplers.as_slice(),                            // 3 samplers
+            tlas.as_binding(),                              // 4 tlas
+            light_sources.binding().unwrap(),               // 5 light_sources
+            dfg_view,                                       // 6 brdf_dfg_lut
+            dfg_sampler,                                    // 7 brdf_dfg_lut_sampler
+            active_light_list.binding().unwrap(),           // 8 active_light_list
+            // Hair: per-segment records, per-instance records, params, and the
+            // transform-table world buffer.
+            hair_manager.segments.buffer().as_entire_binding(), // 9 hair_segments
+            hair_instance_buffer.as_entire_binding(),       // 10 hair_instances
+            hair_params,                                    // 11 hair_params
+            transform_propagate.current_world().as_entire_binding(), // 12 hair_world
         )),
     ));
 }
@@ -300,45 +295,36 @@ impl RaytracingSceneBindings {
                 // `transforms` / `previous_frame_transforms` / `material_ids` /
                 // `directional_lights` / `instance_cluster_ranges` are GPU columns,
                 // now bound from the shared `ecs_gpu::SceneColumns` group — not here.
+                // Vertex attributes + materials are reached bindlessly by
+                // buffer-device-address, so the cluster vertex pools and materials
+                // are no longer bound, and deform is gone with the animation
+                // subsystem. Bindings are CONTIGUOUS (0..12) — a sparse/gappy layout
+                // would be compacted by wgpu to contiguous physical slots, desyncing
+                // it from the naga SPIR-V (which keeps the logical numbers) in the
+                // raw RT pipeline. Order matches `raytracing_scene_bindings.wgsl`.
                 &BindGroupLayoutEntries::sequential(
-                    // COMPUTE for the megakernel/restir path; the RT-pipeline
-                    // stages so the same bind group is visible to raygen + the
-                    // hit/miss shaders when bound into the raw RT pipeline.
+                    // COMPUTE for any compute consumer; the RT-pipeline stages so the
+                    // same bind group is visible to raygen + the hit/miss shaders.
                     ShaderStages::COMPUTE
                         | ShaderStages::RAY_GENERATION
                         | ShaderStages::CLOSEST_HIT
                         | ShaderStages::ANY_HIT
                         | ShaderStages::MISS,
                     (
-                        // Cluster mesh pool (shared across instances)
-                        storage_buffer_read_only_sized(false, None), // 0: vertex_positions (array<f32>)
-                        storage_buffer_read_only_sized(false, None), // 1: vertex_normals (octahedral u32)
-                        storage_buffer_read_only_sized(false, None), // 2: vertex_tangents
-                        storage_buffer_read_only_sized(false, None), // 3: vertex_uvs
-                        storage_buffer_read_only_sized(false, None), // 4: cluster_indices
-                        storage_buffer_read_only_sized(false, None), // 5: clusters
-                        // Materials + textures
-                        storage_buffer_read_only_sized(false, None), // 6: materials
+                        storage_buffer_read_only_sized(false, None), // 0 cluster_indices
+                        storage_buffer_read_only_sized(false, None), // 1 clusters
                         texture_2d(TextureSampleType::Float { filterable: true })
-                            .count(MAX_TEXTURE_COUNT),               // 7: textures
-                        sampler(SamplerBindingType::Filtering).count(MAX_TEXTURE_COUNT), // 8: samplers
-                        // Ray-tracing AS + lighting
-                        acceleration_structure(),                    // 9: tlas
-                        storage_buffer_read_only_sized(false, None), // 10: light_sources
-                        // BRDF DFG LUT
-                        texture_2d(TextureSampleType::Float { filterable: true }), // 11
-                        sampler(SamplerBindingType::Filtering),      // 12
-                        // Skeletal animation: deform pool + per-instance table
-                        storage_buffer_read_only_sized(false, None), // 13: deform_positions
-                        storage_buffer_read_only_sized(false, None), // 14: deform_normals
-                        storage_buffer_read_only_sized(false, None), // 15: instance_animated
-                        storage_buffer_read_only_sized(false, None), // 16: deform_tangents
-                        storage_buffer_read_only_sized(false, None), // 17: active_light_list
-                        // Hair
-                        storage_buffer_read_only_sized(false, None), // 18: hair_segments
-                        storage_buffer_read_only_sized(false, None), // 19: hair_instances
-                        storage_buffer_read_only_sized(false, None), // 20: hair_params
-                        storage_buffer_read_only_sized(false, None), // 21: hair_world (transform table)
+                            .count(MAX_TEXTURE_COUNT), // 2 textures
+                        sampler(SamplerBindingType::Filtering).count(MAX_TEXTURE_COUNT), // 3 samplers
+                        acceleration_structure(),                    // 4 tlas
+                        storage_buffer_read_only_sized(false, None), // 5 light_sources
+                        texture_2d(TextureSampleType::Float { filterable: true }), // 6 brdf_dfg_lut
+                        sampler(SamplerBindingType::Filtering),      // 7 brdf_dfg_lut_sampler
+                        storage_buffer_read_only_sized(false, None), // 8 active_light_list
+                        storage_buffer_read_only_sized(false, None), // 9 hair_segments
+                        storage_buffer_read_only_sized(false, None), // 10 hair_instances
+                        storage_buffer_read_only_sized(false, None), // 11 hair_params
+                        storage_buffer_read_only_sized(false, None), // 12 hair_world
                     ),
                 ),
             ),

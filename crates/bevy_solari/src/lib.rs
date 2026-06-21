@@ -95,18 +95,12 @@ pub enum SolariClusterSystems {
     /// GPU transform propagation (Jacobi) — reads the scattered local/parent
     /// columns, writes the per-node world buffer.
     Propagate,
-    /// Skeletal deform — skin animated cluster meshes into the deform pool
-    /// (reads `world[]` from Propagate; output feeds the instantiate pass).
-    Deform,
     /// Classify instances → LOD bands; elect per-geometry dirty BLAS builds.
     Classify,
     /// Per-bucket object-space DAG cut → CLAS ref lists.
     Select,
     /// Build the per-geometry shared BLASes.
     BuildBlas,
-    /// Instantiate animated CLAS templates with deformed verts + build a
-    /// per-instance BLAS per animated instance; repoint `instance_blas_address`.
-    BuildAnimatedBlas,
     /// Incremental partitioned-TLAS fill + build.
     BuildTlas,
     /// Clear the per-frame instance deltas.
@@ -118,8 +112,7 @@ pub enum SolariClusterSystems {
 /// This includes the most common types in this crate, re-exported for your convenience.
 pub mod prelude {
     pub use crate::{
-        bindings::RaytracingMesh3d, bindings::SolariBlackHole, bindings::SolariFogVolume,
-        bindings::SolariPortal,
+        bindings::RaytracingMesh3d, bindings::SolariFogVolume,
         render::CameraReset, render::SolariCamera,
         render::atmosphere::{SolariAtmosphere, SolariGlobalFog},
         SolariInitPlugin, SolariPlugin,

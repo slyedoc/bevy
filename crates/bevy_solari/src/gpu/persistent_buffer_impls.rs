@@ -1,4 +1,4 @@
-use crate::geometry::asset::{Cluster, ClusterBloatAabb, ClusterBvhNode, ClusterLodGroup, PackedVertex};
+use crate::geometry::asset::{Cluster, ClusterBvhNode, ClusterLodGroup, PackedVertex};
 use crate::geometry::ClusterIndex;
 use super::persistent_buffer::PersistentGpuBufferable;
 use alloc::sync::Arc;
@@ -79,40 +79,6 @@ impl PersistentGpuBufferable for Arc<[Vec4]> {
 
     fn size_in_bytes(&self) -> usize {
         self.len() * size_of::<Vec4>()
-    }
-
-    fn write_bytes_le(
-        &self,
-        _: Self::Metadata,
-        mut buffer_slice: WriteOnly<[u8]>,
-        _: BufferAddress,
-    ) {
-        buffer_slice.copy_from_slice(bytemuck::cast_slice(self));
-    }
-}
-
-impl PersistentGpuBufferable for Arc<[[u16; 4]]> {
-    type Metadata = ();
-
-    fn size_in_bytes(&self) -> usize {
-        self.len() * size_of::<[u16; 4]>()
-    }
-
-    fn write_bytes_le(
-        &self,
-        _: Self::Metadata,
-        mut buffer_slice: WriteOnly<[u8]>,
-        _: BufferAddress,
-    ) {
-        buffer_slice.copy_from_slice(bytemuck::cast_slice(self));
-    }
-}
-
-impl PersistentGpuBufferable for Arc<[ClusterBloatAabb]> {
-    type Metadata = ();
-
-    fn size_in_bytes(&self) -> usize {
-        self.len() * size_of::<ClusterBloatAabb>()
     }
 
     fn write_bytes_le(
