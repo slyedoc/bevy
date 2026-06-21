@@ -38,7 +38,7 @@ use crate::instance::{GeometryIdColumn, InstanceManager};
 use crate::geometry::ClusterMeshManager;
 
 use crate::gpu::allocator::{Allocator, SparseBuffer};
-use super::blas_rebuild::{query_blas_batch_size, query_blas_size, BLAS_REGION_ALIGN};
+use super::blas_rebuild::{query_blas_size, BLAS_REGION_ALIGN};
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 use crate::gpu::extension::ClusterExtensionFns;
@@ -371,19 +371,12 @@ pub fn prepare_blas_sharing(
             .write_buffer(&render_device, &render_queue);
     }
 
-    // Commit sparse pages for the resident geometry set + active slots.
-    // The indirect cluster-BLAS build queries its size with
-    // max_acceleration_structure_count = geometry_count, and the driver requires
-    // the destination pool to hold that full (conservative) batch size — which
-    // exceeds geometry_count * single-AS stride. Commit to the larger of the two
-    // so the build's dst addresses always land in backed pages (else the build
-    // overflows committed memory: VUID-...-10471). Individual BLASes are still
-    // <= stride, so the per-geometry regions don't overlap.
+    // Commit sparse pages for the resident geometry set + active slots. Each BLAS
+    // is <= stride, so geometry_count * stride tiles the regions without overlap.
     let high_water = instances.slot_high_water() as u64;
-    let batch_size = query_blas_batch_size(cluster_fns, geometry_count, max_per);
     resources
         .geometry_blas_pool
-        .commit(0..(geometry_count as u64 * stride).max(batch_size).max(1));
+        .commit(0..(geometry_count as u64 * stride).max(1));
     resources
         .geometry_dst_addresses
         .commit(0..(geometry_count as u64 * 8).max(1));

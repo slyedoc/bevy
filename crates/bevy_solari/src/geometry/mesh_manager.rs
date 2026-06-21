@@ -107,7 +107,7 @@ pub struct ClusterMeshManager {
     pub vertex_tangents: PersistentGpuBuffer<Arc<[Vec4]>>,
     pub vertex_uvs: PersistentGpuBuffer<Arc<[Vec2]>>,
     /// Interleaved (AoS) copy of the four vertex streams above, parallel to
-    /// `vertex_positions` (same global vertex index). One contiguous 40-byte
+    /// `vertex_positions` (same global vertex index). One contiguous 28-byte
     /// [`PackedVertex`] per vertex for the bindless RT-pipeline resolve's
     /// cache-friendly `physical_load`; the SoA pools stay for the CLAS build
     /// and the AS-selector's position/normal reads.
