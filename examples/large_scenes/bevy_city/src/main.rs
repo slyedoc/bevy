@@ -36,9 +36,7 @@ use bevy::{
     solari::prelude::*,
 };
 
-use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-
-use crate::generate_city::{spawn_city, LampAssets};
+use crate::generate_city::{spawn_city};
 use crate::{
     assets::{merge_car_meshes, strip_base_url},
     settings::{settings_ui, Settings, CITY_SIZE_RANGE},
@@ -72,6 +70,7 @@ pub struct Args {
 
 fn main() {
     let args: Args = argh::from_env();
+    let city_size = args.size.clamp(CITY_SIZE_RANGE.0, CITY_SIZE_RANGE.1);
 
     let mut app = App::new();
         // DLSS needs its project id inserted before RenderPlugin (DlssInitPlugin
@@ -131,10 +130,9 @@ fn main() {
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(WinitSettings::continuous())
         .insert_resource(Settings {
-            city_size: args.size.clamp(CITY_SIZE_RANGE.0, CITY_SIZE_RANGE.1),
+            city_size: city_size,
             ..default()
         })
-        .init_resource::<CaptureReady>()
         .insert_resource(UiTheme(create_dark_theme()))
         .insert_resource(WireframeConfig {
             global: false,
@@ -152,16 +150,16 @@ fn main() {
         // doesn't sample the raster atmosphere anyway.
         .add_systems(Startup, (
             scene.spawn(),
+            settings_ui.spawn(),
             #[cfg(not(feature = "solari"))]
             spawn_atmosphere,
-            load_assets,
-            generate_city::setup_lamp_assets,
+            load_assets,            
         ))
         .add_systems(
             Update,
             (
                 simulate_cars,
-                burst_screenshots,
+                
                 settings::update_city_info,
                 update_loading_screen,
                 process_assets.run_if(on_message::<CityAssetsLoaded>),
@@ -169,22 +167,15 @@ fn main() {
                 (
                     add_no_cpu_culling,
                     on_city_spawned,
-                    {
-                        let city_size = args.size.clamp(CITY_SIZE_RANGE.0, CITY_SIZE_RANGE.1);
-                        (move || settings_ui(city_size)).spawn()
-                    },
-                    arm_capture_ready,
-                )
-                    .run_if(on_message::<CitySpawned>),
-                signal_capture_ready,
+                                        
+                ).run_if(on_message::<CitySpawned>),
+                
                 #[cfg(feature = "solari")]
                 (
                     convert_meshes_to_raytracing,
                     convert_standard_materials_to_solari,
+
                     mark_city_static,
-                    // Swap to `add_solari_environment_map` to test the pisa skybox
-                    // instead of the baked atmosphere on the camera.
-                    // add_solari_environment_map,
                 ),
             ),
         )
@@ -470,8 +461,7 @@ fn process_assets(
 
 fn on_city_assets_ready(
     mut commands: Commands,
-    city_assets: Res<CityAssets>,
-    lamps: Option<Res<LampAssets>>,
+    city_assets: Res<CityAssets>,    
     args: Res<Args>,
     mut loading_text: Query<&mut Text, With<LoadingText>>,
 ) {
@@ -479,11 +469,9 @@ fn on_city_assets_ready(
         return;
     };
     text.0 = "Spawning city...".into();
-
     spawn_city(
         &mut commands,
-        &city_assets,
-        lamps.as_deref(),
+        &city_assets,    
         args.seed,
         args.size,
     );
@@ -500,75 +488,6 @@ fn on_city_spawned(
     commands.entity(*loading_screen).despawn();
 }
 
-/// Detects when the scene has finished spawning + streaming so profiling
-/// captures measure the settled frame, not the (very long, at size 100) spawn
-/// spike. `capture.sh` waits for the `CAPTURE_READY` log line.
-#[derive(Resource, Default)]
-struct CaptureReady {
-    /// Set once the city's spawn commands have been issued; entities + streamed
-    /// scenes still settle over the following frames.
-    armed: bool,
-    last_count: usize,
-    stable_frames: u32,
-    done: bool,
-}
-
-/// Arm the detector when the city is spawned (commands issued).
-fn arm_capture_ready(mut ready: ResMut<CaptureReady>) {
-    ready.armed = true;
-}
-
-/// Once the spatial-entity count has plateaued for ~2s after spawn, log
-/// `CAPTURE_READY` (once). Car movement changes transforms, not entity counts,
-/// so the count is stable in steady state.
-fn signal_capture_ready(
-    spatial: Query<(), With<GlobalTransform>>,
-    mut ready: ResMut<CaptureReady>,
-) {
-    if ready.done || !ready.armed {
-        return;
-    }
-    let count = spatial.iter().count();
-    if count > 0 && count == ready.last_count {
-        ready.stable_frames += 1;
-        if ready.stable_frames >= 120 {
-            info!("CAPTURE_READY (settled at {count} spatial entities)");
-            ready.done = true;
-        }
-    } else {
-        ready.last_count = count;
-        ready.stable_frames = 0;
-    }
-}
-
-/// F10: capture 10 consecutive frames to `/tmp/bevy_city_burst/` — for
-/// diffing temporal stability of a fixed view.
-#[derive(Resource, Default)]
-struct BurstCapture {
-    remaining: u32,
-    index: u32,
-}
-
-fn burst_screenshots(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut burst: Local<BurstCapture>,
-    mut commands: Commands,
-) {
-    if keys.just_pressed(KeyCode::F10) {
-        let _ = std::fs::create_dir_all("/tmp/bevy_city_burst");
-        burst.remaining = 10;
-        burst.index = 0;
-        info!("burst capture: 10 frames -> /tmp/bevy_city_burst/");
-    }
-    if burst.remaining > 0 {
-        burst.remaining -= 1;
-        let path = format!("/tmp/bevy_city_burst/frame_{:02}.png", burst.index);
-        burst.index += 1;
-        commands
-            .spawn(Screenshot::primary_window())
-            .observe(save_to_disk(path));
-    }
-}
 
 #[derive(Component)]
 struct Road {

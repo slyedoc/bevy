@@ -1,3 +1,5 @@
+#[cfg(feature = "solari")]
+use bevy::solari::prelude::RaytracingMesh3d;
 use bevy::{
     camera::visibility::NoCpuCulling,
     camera_controller::free_camera::FreeCameraState,
@@ -11,15 +13,13 @@ use bevy::{
     ui::Checked,
     ui_widgets::{
         checkbox_self_update, slider_self_update, Activate, SliderPrecision, SliderStep,
-        ValueChange,
+        SliderValue, ValueChange,
     },
 };
-#[cfg(feature = "solari")]
-use bevy::solari::prelude::RaytracingMesh3d;
 use rand::RngExt;
 
 use crate::assets::CityAssets;
-use crate::generate_city::{spawn_city, CityRoot, LampAssets};
+use crate::generate_city::{spawn_city, CityRoot};
 
 /// Smallest / largest city the regenerate slider offers (blocks per side).
 pub const CITY_SIZE_RANGE: (u32, u32) = (3, 150);
@@ -76,7 +76,7 @@ impl Default for Settings {
     }
 }
 
-pub fn settings_ui(city_size: u32) -> impl Scene {
+pub fn settings_ui() -> impl Scene {
     bsn! {
         Node {
             position_type: PositionType::Absolute,
@@ -193,10 +193,15 @@ pub fn settings_ui(city_size: u32) -> impl Scene {
                     @FeathersSlider {
                         @min: {CITY_SIZE_RANGE.0 as f32},
                         @max: {CITY_SIZE_RANGE.1 as f32},
-                        @value: {city_size as f32},
+                        @value: {CITY_SIZE_RANGE.0 as f32},
                     }
                     SliderStep(1.0)
                     SliderPrecision(0)
+                    on(|add: On<Add>, settings: Res<Settings>, mut commands: Commands| {
+                        commands
+                            .entity(add.entity)
+                            .insert(SliderValue(settings.city_size as f32));
+                    })
                     on(slider_self_update)
                     on(|change: On<ValueChange<f32>>, mut settings: ResMut<Settings>| {
                         settings.city_size = change.value.round() as u32;
@@ -211,7 +216,6 @@ pub fn settings_ui(city_size: u32) -> impl Scene {
                          mut commands: Commands,
                          city_root: Single<Entity, With<CityRoot>>,
                          assets: Res<CityAssets>,
-                         lamps: Option<Res<LampAssets>>,
                          settings: Res<Settings>| {
                             commands.entity(*city_root).despawn();
 
@@ -220,8 +224,7 @@ pub fn settings_ui(city_size: u32) -> impl Scene {
                             println!("new seed: {seed}");
                             spawn_city(
                                 &mut commands,
-                                &assets,
-                                lamps.as_deref(),
+                                &assets,                                
                                 seed,
                                 settings.city_size,
                             );

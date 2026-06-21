@@ -115,6 +115,39 @@ pub(crate) fn query_blas_size(
     sizes_info.acceleration_structure_size
 }
 
+/// Worst-case TOTAL byte size for building `count` cluster-BLASes in one
+/// indirect batch (each up to `max_per` clusters), matching the parameters the
+/// build in [`dispatch_blas_rebuild`] uses. The driver (and validation,
+/// VUID-...-10471) require the destination pool buffer to be at least this size
+/// — which is *larger* than `count * query_blas_size(max_per)` because the
+/// batched query carries per-build headroom the single-AS query doesn't. Size
+/// the BLAS storage pool's committed range from this, not the per-region stride.
+pub(crate) fn query_blas_batch_size(
+    cluster_fns: &nv::cluster_acceleration_structure::Device,
+    count: u32,
+    max_per: u32,
+) -> u64 {
+    let max_total = (count as u64) * (max_per as u64);
+    let mut clusters_input = vk::ClusterAccelerationStructureClustersBottomLevelInputNV::default()
+        .max_total_cluster_count(max_total as u32)
+        .max_cluster_count_per_acceleration_structure(max_per);
+    let op_input = vk::ClusterAccelerationStructureOpInputNV {
+        p_clusters_bottom_level: &mut clusters_input as *mut _,
+    };
+    let size_input = vk::ClusterAccelerationStructureInputInfoNV::default()
+        .max_acceleration_structure_count(count)
+        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .op_type(vk::ClusterAccelerationStructureOpTypeNV::BUILD_CLUSTERS_BOTTOM_LEVEL)
+        .op_mode(vk::ClusterAccelerationStructureOpModeNV::EXPLICIT_DESTINATIONS)
+        .op_input(op_input);
+    let mut sizes_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
+    // SAFETY: size_input fully populated; cluster-AS fn table loaded.
+    unsafe {
+        cluster_fns.get_cluster_acceleration_structure_build_sizes(&size_input, &mut sizes_info);
+    }
+    sizes_info.acceleration_structure_size
+}
+
 /// `RenderGraph` system: issue the per-frame per-bucket BLAS rebuild
 /// against this frame's selector output. Runs after
 /// [`super::selector::dispatch_selector`] and

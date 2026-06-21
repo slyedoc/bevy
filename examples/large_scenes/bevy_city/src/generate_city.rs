@@ -2,69 +2,13 @@ use bevy::prelude::*;
 use noise::{NoiseFn, OpenSimplex};
 use rand::{rngs::SmallRng, RngExt, SeedableRng};
 
-use crate::{assets::CityAssets, Args, Car, Road};
+use crate::{assets::CityAssets, Car, Road};
 
 #[cfg(feature = "solari")]
 use bevy::solari::prelude::*;
 
 #[derive(Component)]
 pub struct CityRoot;
-
-/// Procedural street-lamp assets (pole + emissive bulb), shared by every lamp.
-/// Only present when the city was launched with `--lights`, so
-/// [`spawn_city`] takes `Option<&LampAssets>` as the on/off switch.
-#[derive(Resource)]
-pub struct LampAssets {
-    pole_mesh: Handle<Mesh>,
-    pole_material: Handle<StandardMaterial>,
-    bulb_mesh: Handle<Mesh>,
-    bulb_material: Handle<StandardMaterial>,
-}
-
-/// `Startup`: build the lamp assets when `--lights` is set. Two emissive lamps
-/// per city block — a many-emissive-lights stress source for the ReSTIR path
-/// (the raster path just sees glowing bulbs + bloom; emissive surfaces don't
-/// light it).
-pub fn setup_lamp_assets(
-    args: Res<Args>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    if !args.lights {
-        return;
-    }
-    commands.insert_resource(LampAssets {
-        pole_mesh: meshes.add(Cuboid::new(0.012, 0.25, 0.012)),
-        pole_material: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.15, 0.15, 0.17),
-            perceptual_roughness: 0.8,
-            ..default()
-        }),
-        bulb_mesh: meshes.add(Sphere::new(0.03)),
-        bulb_material: materials.add(StandardMaterial {
-            base_color: Color::BLACK,
-            // Warm sodium-ish glow, bright enough to read against the
-            // RAW_SUNLIGHT + OVERCAST exposure this scene uses.
-            emissive: LinearRgba::rgb(40_000.0, 22_000.0, 9_000.0),
-            ..default()
-        }),
-    });
-}
-
-/// One street lamp: a pole with an emissive bulb on top, beside the road.
-fn spawn_lamp(commands: &mut ChildSpawnerCommands, lamps: &LampAssets, position: Vec3) {
-    commands.spawn((
-        Mesh3d(lamps.pole_mesh.clone()),
-        MeshMaterial3d(lamps.pole_material.clone()),
-        Transform::from_translation(position + Vec3::new(0.0, 0.125, 0.0)),
-    ));
-    commands.spawn((
-        Mesh3d(lamps.bulb_mesh.clone()),
-        MeshMaterial3d(lamps.bulb_material.clone()),
-        Transform::from_translation(position + Vec3::new(0.0, 0.27, 0.0)),
-    ));
-}
 
 /// Spawns a grid of city blocks
 ///
@@ -83,7 +27,6 @@ fn spawn_lamp(commands: &mut ChildSpawnerCommands, lamps: &LampAssets, position:
 pub fn spawn_city(
     commands: &mut Commands,
     assets: &CityAssets,
-    lamps: Option<&LampAssets>,
     seed: u64,
     size: u32,
 ) {
@@ -110,12 +53,6 @@ pub fn spawn_city(
                     let offset = Vec3::new(x, 0.0, z);
 
                     spawn_roads_and_cars(commands, assets, &mut rng, offset);
-
-                    if let Some(lamps) = lamps {
-                        // One lamp beside each of the block's two roads.
-                        spawn_lamp(commands, lamps, offset + Vec3::new(2.75, 0.0, 0.42));
-                        spawn_lamp(commands, lamps, offset + Vec3::new(0.42, 0.0, 2.0));
-                    }
 
                     let density = noise.get([
                         offset.x as f64 * noise_scale,
