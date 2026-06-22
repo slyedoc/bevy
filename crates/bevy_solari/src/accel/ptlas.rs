@@ -421,7 +421,14 @@ pub fn prepare_ptlas_params(
     // the very first build (no `src` to carry from). A change in hair count
     // also grows/shrinks the space and is folded into `high_water`.
     let grew = high_water > resources.as_capacity;
-    let full_rebuild = !resources.has_built || grew;
+    // A mass despawn (regenerate) NULLs a huge number of slots in one incremental
+    // op — many of them disabled AND re-added the same frame — which the
+    // incremental PTLAS can't absorb (device lost). Any frame with a large despawn
+    // takes the proven full-rebuild path instead; normal mover frames (a handful of
+    // despawns, or none) stay incremental.
+    const MASS_DESPAWN_FULL_REBUILD: usize = 4096;
+    let mass_despawn = instances.disabled_slots().len() > MASS_DESPAWN_FULL_REBUILD;
+    let full_rebuild = !resources.has_built || grew || mass_despawn;
 
     // Grow the per-slot written-flags mirror with the slot space. Fresh
     // buffer = all zeros, consistent because growth forces a full rebuild
