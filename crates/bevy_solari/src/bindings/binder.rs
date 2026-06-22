@@ -418,8 +418,6 @@ impl<T, I: Eq + Hash> CachedBindingArray<T, I> {
     }
 }
 
-type StorageBufferList<T> = StorageBuffer<Vec<T>>;
-
 /// Byte stride of one [`GpuMaterial`] record — the RT-pipeline's
 /// `physical_load<Material>` indexes the materials buffer by `material_id * this`.
 /// This is the `ShaderType` (std430) size encase writes records at — NOT the Rust

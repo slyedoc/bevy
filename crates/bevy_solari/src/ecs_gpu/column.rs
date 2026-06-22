@@ -237,8 +237,20 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
     fn upload_prebuilt(&mut self, records: &[u32], device: &RenderDevice, queue: &RenderQueue) {
         self.pending = records.len() as u32 / (Self::WORDS + 1);
         self.delta.reserve(records.len(), device);
-        if let Some(buffer) = self.delta.buffer() {
-            queue.write_buffer(buffer, 0, bytemuck::cast_slice(records));
+        // Upload via the staging-view path (`write_buffer_with`), NOT `write_buffer`.
+        // On a mass regenerate a "tiny" column (parent / material_id / …) becomes a
+        // multi-MB delta (every entity is first-sight); the plain `write_buffer` copy
+        // path corrupts at that scale (garbage `parent[]`/`material_id[]` → wrong
+        // transforms + materials), while the staging view the big `local` delta uses
+        // is fine. Route everything through it.
+        if let (Some(buffer), Some(bytes)) = (
+            self.delta.buffer(),
+            NonZero::<u64>::new(records.len() as u64 * 4),
+        ) {
+            let mut view = queue
+                .write_buffer_with(buffer, 0, bytes)
+                .expect("column delta staging allocation failed");
+            view.copy_from_slice(bytemuck::cast_slice(records));
         }
         *self.params.get_mut() = ScatterParams {
             count: self.pending,
