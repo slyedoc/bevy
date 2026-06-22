@@ -7,8 +7,10 @@ use bevy_asset::Handle;
 use bevy_color::{ColorToComponents, LinearRgba};
 use bevy_ecs::{
     resource::Resource,
-    system::{Res, ResMut},
+    system::{Commands, Res, ResMut},
 };
+use crate::gpu::allocator::Allocator;
+use crate::gpu::stable_storage_buffer::StableStorageBuffer;
 use bevy_math::Vec3;
 use bevy_pbr::DfgLut;
 
@@ -36,6 +38,39 @@ pub struct RaytracingSceneBindings {
     pub materials_buffer: Option<Buffer>,
 }
 
+/// The scene's per-frame-rebuilt tables, now on persistent **stable-address**
+/// buffers. The RT trace reads them by device address (`materials`) or descriptor
+/// (`light_sources` / `active_light_list`); a stable handle/address that's never
+/// freed means an in-flight trace can never read a reallocated/freed buffer — the
+/// root of the regenerate device-lost. Built once in [`init_solari_scene_buffers`]
+/// and overwritten each frame. (`directional_lights` is already a `GpuColumn`.)
+#[derive(Resource)]
+pub struct SolariSceneBuffers {
+    /// `array<Material>`, read bindlessly by `physical_load<Material>`.
+    materials: StableStorageBuffer<Vec<GpuMaterial>>,
+    /// Slot-indexed light table (scene bind group binding 5).
+    light_sources: StableStorageBuffer<Vec<GpuLightSource>>,
+    /// Uniform-pick active-light list (scene bind group binding 8).
+    active_light_list: StableStorageBuffer<Vec<u32>>,
+}
+
+/// `RenderStartup` (after `SolariSetup`): build the persistent scene buffers.
+/// Skipped on a device without the cluster allocator (no solari RT support).
+pub fn init_solari_scene_buffers(
+    mut commands: Commands,
+    render_device: Res<RenderDevice>,
+    allocator: Option<Res<Allocator>>,
+) {
+    let Some(allocator) = allocator else {
+        return;
+    };
+    commands.insert_resource(SolariSceneBuffers {
+        materials: StableStorageBuffer::new(Vec::new(), &allocator, &render_device, "solari.materials"),
+        light_sources: StableStorageBuffer::new(Vec::new(), &allocator, &render_device, "solari.light_sources"),
+        active_light_list: StableStorageBuffer::new(Vec::new(), &allocator, &render_device, "solari.active_light_list"),
+    });
+}
+
 /// Hair scene-group dependencies, bundled so the binder stays under the 16
 /// system-param limit. Each is `Option` (absent on non-solari devices).
 #[derive(bevy_ecs::system::SystemParam)]
@@ -61,6 +96,7 @@ pub fn prepare_raytracing_scene_bindings(
     render_queue: Res<RenderQueue>,
     hair: HairSceneDeps,
     mut raytracing_scene_bindings: ResMut<RaytracingSceneBindings>,
+    scene_buffers: Option<ResMut<SolariSceneBuffers>>,
 ) {
     raytracing_scene_bindings.bind_group = None;
 
@@ -101,20 +137,26 @@ pub fn prepare_raytracing_scene_bindings(
 
     let mut textures = CachedBindingArray::new();
     let mut samplers = Vec::new();
-    let mut materials = StorageBufferList::<GpuMaterial>::default();
-    // The RT-pipeline chit reads materials by buffer-device-address
-    // (`physical_load<Material>`), which requires `SHADER_DEVICE_ADDRESS` on the
-    // VkBuffer. wgpu only adds that flag for AS-input/scratch usages, so request
-    // `BLAS_INPUT` — the wgpu idiom for "I need this buffer's device address"
-    // (it also tags it AS-build-input, harmless here).
-    materials.add_usages(BufferUsages::BLAS_INPUT);
+    // Materials live in a persistent, stable-address `StableStorageBuffer` (built
+    // once in `init_solari_materials`). The RT chit reads them by device address
+    // (`physical_load<Material>`); a stable address that's never freed means the
+    // in-flight trace can't read a reallocated/freed materials buffer (the regen
+    // device-lost). `SHADER_DEVICE_ADDRESS` comes from the sparse buffer itself.
+    let Some(mut scene_buffers) = scene_buffers else {
+        return;
+    };
+    // Disjoint &mut to each persistent buffer for this frame's populate.
+    let SolariSceneBuffers {
+        materials,
+        light_sources,
+        active_light_list,
+    } = &mut *scene_buffers;
     // Per-instance `transforms` / `previous_frame_transforms` /
     // `material_ids` are slot-indexed GPU columns now (`GpuInstances`,
     // scattered from a delta) — bound directly, not rebuilt here. Same
     // for `instance_cluster_ranges`, which reuses the slot-indexed
     // `instance_lod_inputs` column. Only the light buffers are still
-    // built per frame.
-    let mut light_sources = StorageBufferList::<GpuLightSource>::default();
+    // built per frame (into the persistent `light_sources` / `active_light_list`).
 
     let mut process_texture = |texture_handle: &Option<Handle<_>>| -> Option<u32> {
         match texture_handle {
@@ -141,7 +183,11 @@ pub fn prepare_raytracing_scene_bindings(
     if material_count == 0 {
         return;
     }
-    materials.get_mut().resize(material_count, GpuMaterial::default());
+    // Reset to all-default then overwrite the live slots — freed slots stay
+    // default (black) holes, matching the old fresh-buffer-per-frame behavior.
+    let materials_vec = materials.get_mut();
+    materials_vec.clear();
+    materials_vec.resize(material_count, GpuMaterial::default());
     for (asset_id, material) in material_assets.iter() {
         let Some(slot) = material_slots.slot_of(*asset_id) else {
             continue;
@@ -225,7 +271,6 @@ pub fn prepare_raytracing_scene_bindings(
     if light_sources.get().is_empty() {
         light_sources.get_mut().push(GpuLightSource::NONE);
     }
-    let mut active_light_list = StorageBufferList::<u32>::default();
     *active_light_list.get_mut() = lights.active.clone();
     if active_light_list.get().is_empty() {
         active_light_list.get_mut().extend([0u32, 0u32]);
@@ -235,8 +280,10 @@ pub fn prepare_raytracing_scene_bindings(
     light_sources.write_buffer(&render_device, &render_queue);
     active_light_list.write_buffer(&render_device, &render_queue);
 
-    // Expose the materials buffer for the RT-pipeline's bindless `physical_load`.
-    raytracing_scene_bindings.materials_buffer = materials.buffer().cloned();
+    // Expose the (stable-handle) materials buffer for the RT-pipeline's bindless
+    // `physical_load`. The handle never changes across growth, so this is the same
+    // buffer every frame — set_geometry_addresses reads its stable device address.
+    raytracing_scene_bindings.materials_buffer = Some(materials.buffer().clone());
 
     // PTLAS is built by `ptlas::dispatch_ptlas`; no TLAS build here.
 

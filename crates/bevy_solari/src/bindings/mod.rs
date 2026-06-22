@@ -83,7 +83,10 @@ impl Plugin for BindingsPlugin {
             .insert_resource(RaytracingSceneBindings::new())
             .add_systems(
                 RenderStartup,
-                init_cluster_scene_bind_group_layout.in_set(SolariSetup),
+                (
+                    init_cluster_scene_bind_group_layout.in_set(SolariSetup),
+                    binder::init_solari_scene_buffers.after(SolariSetup),
+                ),
             )
             .add_systems(
                 Render,

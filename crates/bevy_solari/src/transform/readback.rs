@@ -84,7 +84,7 @@ const READBACK_CAPACITY: u32 = 131072;
 ///   is disabled) must NOT be readback — the lagged GPU value would clobber the
 ///   current CPU one. Derives `Default` so it works as a required component
 ///   (`register_required_components::<Node, NoGpuGlobalTransformReadback>()`).
-#[derive(Component, Default)]
+#[derive(Component, Default, Clone)]
 pub struct NoGpuGlobalTransformReadback;
 
 /// Main-world handle to the readback output `ShaderBuffer` (the gather writes it;

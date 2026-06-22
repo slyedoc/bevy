@@ -259,6 +259,11 @@ fn camera() -> impl Scene {
         Hdr
         template_value(Transform::from_xyz(15.0, 10.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y))
         FreeCamera
+        // The camera's `GlobalTransform` is CPU-authored by `FreeCamera`; it must
+        // NOT be written back from the GPU transform table, or the lagged value
+        // (and a regen-stale slot→entity reverse-map resolve) clobbers it — the
+        // "camera stuck on an odd pivot after regenerate" symptom.
+        NoGpuGlobalTransformReadback
         Exposure::OVERCAST
         //Bloom::NATURAL
         Msaa::Off

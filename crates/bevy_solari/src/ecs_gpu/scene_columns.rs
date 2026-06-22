@@ -14,7 +14,7 @@ use bevy_ecs::{resource::Resource, schedule::IntoScheduleConfigs, world::World};
 use bevy_render::{
     render_resource::{
         BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource,
-        BindingType, Buffer, BufferBinding, BufferBindingType, PipelineCache, ShaderStages,
+        BindingType, Buffer, BufferBinding, BufferBindingType, BufferId, PipelineCache, ShaderStages,
     },
     renderer::RenderDevice,
     Render, RenderApp, RenderSystems,
@@ -44,8 +44,16 @@ pub struct SceneColumns {
     /// Built from the registered entries (stable once all columns register); the
     /// layout consumer pipelines list and the bind group is created against.
     layout: Option<BindGroupLayoutDescriptor>,
-    /// (Re)built each frame from the columns' current buffers.
+    /// Rebuilt only when [`Self::signature`] changes — the column buffers are
+    /// stable-address sparse buffers, so this is the SAME bind group every steady
+    /// frame. Rebuilding + dropping it per frame frees a descriptor set the
+    /// in-flight RT trace still reads (use-after-free → stale transforms), so the
+    /// cache is a correctness fix, not just an optimization.
     pub bind_group: Option<BindGroup>,
+    /// `(binding, buffer id, committed bytes)` per column the current `bind_group`
+    /// was built from. Unchanged ⇒ keep the cached group; changed (a column grew /
+    /// first appeared) ⇒ rebuild.
+    signature: Vec<(u32, BufferId, u64)>,
 }
 
 impl SceneColumns {
@@ -144,6 +152,21 @@ pub fn prepare_scene_columns_bind_group(world: &mut World) {
         buffers.push((*binding, buffer, bytes));
     }
 
+    // Cache: the column buffers are stable-address, so rebuild only when a column
+    // grew (committed bytes) or first appeared (buffer id). Keeping the same bind
+    // group across frames means its descriptor set isn't freed while the in-flight
+    // RT trace still references it.
+    let signature: Vec<(u32, BufferId, u64)> = buffers
+        .iter()
+        .map(|(binding, buffer, bytes)| (*binding, buffer.id(), *bytes))
+        .collect();
+    {
+        let scene = world.resource::<SceneColumns>();
+        if scene.bind_group.is_some() && scene.signature == signature {
+            return;
+        }
+    }
+
     let device = world.resource::<RenderDevice>().clone();
     let layout = {
         let cache = world.resource::<PipelineCache>();
@@ -166,7 +189,9 @@ pub fn prepare_scene_columns_bind_group(world: &mut World) {
         })
         .collect();
     let bind_group = device.create_bind_group("solari_scene_columns", &layout, &entries);
-    world.resource_mut::<SceneColumns>().bind_group = Some(bind_group);
+    let mut scene = world.resource_mut::<SceneColumns>();
+    scene.bind_group = Some(bind_group);
+    scene.signature = signature;
 }
 
 /// Inits [`SceneColumns`] and schedules its per-frame bind-group build. Added once
