@@ -65,7 +65,7 @@ use bevy_log::warn;
 use crate::accel::AccelPlugin;
 use crate::bindings::BindingsPlugin;
 use crate::hair::HairPlugin;
-use crate::ecs_gpu::SceneColumnsPlugin;
+use crate::ecs_gpu::{ReconcilePlugin, SceneColumnsPlugin};
 use crate::geometry::GeometryPlugin;
 use crate::instance::InstancePlugin;
 use crate::lights::SolariLightsPlugin;
@@ -171,11 +171,12 @@ impl Plugin for SolariPlugin {
         pipelines::embed_solari_shaders(app);
         app.add_plugins((
             SceneColumnsPlugin,
+            ReconcilePlugin,
 
             BindingsPlugin,
             GeometryPlugin,
             InstancePlugin,
-            
+
             AccelPlugin,
             SolarRenderPlugin,
             #[cfg(feature = "bevy_solari_debug")]

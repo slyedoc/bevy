@@ -176,6 +176,32 @@ fn make_record(slot: u32, addr: vec2<u32>) -> WriteInstanceData {
     );
 }
 
+/// Whether `slot`'s world transform is ready to feed the AS build. A slot that
+/// was just (re)bound but whose transform-table node hasn't been propagated yet
+/// reads the zero-initialized `world` buffer, so its gathered `object_to_world`
+/// is the all-zero (degenerate) placeholder — handing that to the partitioned-AS
+/// builder produces a zero-volume / NaN AABB that can hang the build. Such an
+/// instance is written as inactive (null AS) until its transform lands; it pops
+/// in the next frame. A real transform always has a non-zero linear (3x3) part,
+/// even a pure translation (identity 3x3), so an all-zero linear part is the
+/// not-ready sentinel.
+fn transform_ready(slot: u32) -> bool {
+    let m = cluster_instance_transforms[slot];
+    let linear_zero =
+        all(m[0].xyz == vec3<f32>(0.0))
+        && all(m[1].xyz == vec3<f32>(0.0))
+        && all(m[2].xyz == vec3<f32>(0.0));
+    if linear_zero {
+        return false;
+    }
+    // Reject non-finite (NaN: v != v; inf: |v| past the f32 max).
+    let s = m[0] + m[1] + m[2];
+    let finite =
+        (s.x == s.x) && (s.y == s.y) && (s.z == s.z) && (s.w == s.w)
+        && abs(s.x) < 3.0e38 && abs(s.y) < 3.0e38 && abs(s.z) < 3.0e38 && abs(s.w) < 3.0e38;
+    return finite;
+}
+
 /// CPU-seeded delta records: added ∪ moved ∪ disabled.
 @compute @workgroup_size(64)
 fn fill_seed(
@@ -191,7 +217,9 @@ fn fill_seed(
     let slot = pair.x;
     let is_null = pair.y;
     var addr = vec2<u32>(0u, 0u);
-    if is_null == 0u {
+    // Active only if not a removal AND its transform is ready — a not-ready slot
+    // is written inactive (null AS) so a degenerate transform never reaches the build.
+    if is_null == 0u && transform_ready(slot) {
         addr = instance_blas_address[slot];
     }
     write_data[i] = make_record(slot, addr);
@@ -233,7 +261,12 @@ fn fill_incremental(
             return;
         }
     }
-    let addr = instance_blas_address[slot];
+    // Not-ready slots (transform not yet propagated) are written inactive so a
+    // degenerate object-to-world never reaches the partitioned-AS build.
+    var addr = vec2<u32>(0u, 0u);
+    if transform_ready(slot) {
+        addr = instance_blas_address[slot];
+    }
     let idx = atomicAdd(&write_count[0], 1u);
     write_data[idx] = make_record(slot, addr);
 }

@@ -400,6 +400,14 @@ pub(crate) fn rt_pipeline(
             );
         });
     }
+    // `rt.trace` bound the scene + columns descriptor sets via raw
+    // `cmd_bind_descriptor_sets`, bypassing wgpu's tracker — so wgpu would free
+    // those descriptor sets as soon as the bind groups are dropped (the binder
+    // rebuilds the scene group every frame), even while this trace is still
+    // in-flight (the regenerate device-lost). Registering them here ties their
+    // lifetime to this submission's completion via wgpu's normal deferred-free.
+    trace_encoder.keep_bind_group_alive(scene_bg);
+    trace_encoder.keep_bind_group_alive(columns_bg);
     ctx.add_command_buffer(trace_encoder.finish());
 
     // Blit the per-pixel output buffer into the view's HDR storage texture (a

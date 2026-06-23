@@ -27,6 +27,7 @@ use crate::SolariClusterSystems;
 
 pub mod gpu_instances;
 pub mod instance_manager;
+pub mod journal;
 
 pub use gpu_instances::{
     cluster_columns_ready, Affine3x4, GeometryIdColumn, GroupBaseColumn, GpuInstancesPlugin,
@@ -38,6 +39,9 @@ pub use instance_manager::{
     log_slot_ratchet, mark_instance_added, mark_instance_layers_changed,
     mark_instance_material_changed, resolve_instance_material_ids, InstanceManager,
     RaytracingGpuEntity, RtInstanceChanges, RtSlotMap,
+};
+pub use journal::{
+    init_rt_journal, upload_rt_journal, InstanceJournalRecord, RtJournal, JOURNAL_OP_UPSERT,
 };
 
 /// Instance domain plugin: per-`RaytracingMesh3d` slot tracking, the
@@ -72,7 +76,7 @@ impl Plugin for InstancePlugin {
             .init_resource::<MaterialTraversalFlags>()
             .add_systems(
                 RenderStartup,
-                (init_instance_manager, init_material_slots),
+                (init_instance_manager, init_material_slots, init_rt_journal),
             )
             // Serial flush: drain the change set, resolve slot, bind / update the
             // `InstanceManager`. Gated until the column scatter pipelines have
@@ -105,6 +109,10 @@ impl Plugin for InstancePlugin {
                         .in_set(RenderSystems::Prepare)
                         .after(prepare_material_slots)
                         .before(GpuColumnPrepareSet),
+                    // Upload this frame's instance change journal for the GPU
+                    // reconcile. Runs after the flush appended its records (flush is
+                    // in ExtractSchedule, before Prepare).
+                    upload_rt_journal.in_set(RenderSystems::Prepare),
                 ),
             )
             // The delta-clear records in the render graph after the scatters

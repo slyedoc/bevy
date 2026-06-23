@@ -28,6 +28,7 @@ use crate::geometry::{ClusterIndex, GroupIndex, GpuEntity};
 use crate::bindings::RaytracingMesh3d;
 use crate::geometry::ClusterMesh;
 use crate::material::MaterialSlots;
+use super::journal::{InstanceJournalRecord, RtJournal};
 use bevy_asset::{AssetEvent, AssetId, AssetServer, Assets};
 use bytemuck::{Pod, Zeroable};
 use bevy_ecs::{
@@ -448,7 +449,11 @@ impl InstanceManager {
         self.slot_active_pos[slot.0 as usize] = self.active_slots.len() as u32;
         self.active_slots.push(slot);
         self.added_slots.push(slot);
-        // Scatter this slot's bind-only values straight into their GPU columns.
+        // Scatter this slot's bind-only values straight into their GPU columns. (The
+        // GPU reconcile pass also writes these from the journal, but the CPU scatter
+        // stays authoritative — the reconcile has a cold-start window where its
+        // pipeline/bind-group aren't ready on the bind frame, which would leave the
+        // columns empty if it were the sole writer.)
         push_delta_record(&mut self.group_base_delta, slot, ptrs.group_base.0);
         push_delta_record(
             &mut self.lod_input_delta,
@@ -670,6 +675,14 @@ pub fn flush_cluster_instances(
     mut cluster_meshes: ResMut<ClusterMeshManager>,
     mut slot_map: ResMut<RtSlotMap>,
     mut main_world: ResMut<MainWorld>,
+    // GPU instance-change journal — an absolute-state UPSERT is appended per bind
+    // (the REMOVE counterpart is emitted by `free_cluster_slot`). Feeds the GPU
+    // reconcile. `Option` so non-solari devices (no journal) are a no-op.
+    mut journal: Option<ResMut<RtJournal>>,
+    // Resolves the material `AssetId` to its stable GPU slot for the journal
+    // record. Lags a frame for a brand-new material (slot allocated in Prepare);
+    // the reconcile tolerates a 0 until the next bind/upsert refreshes it.
+    material_slots: Option<Res<MaterialSlots>>,
     // Main entities whose `ClusterMesh` asset wasn't resident when added —
     // retried until ready. Touched only during load, never on a move.
     mut pending: Local<HashSet<Entity>>,
@@ -702,6 +715,10 @@ pub fn flush_cluster_instances(
         }
     }
 
+    // [PROBE] count instances binding with an unassigned transform node-slot.
+    let mut bind_total = 0u32;
+    let mut bind_max_node = 0u32;
+
     // Drain this frame's observer-flagged changes (binds + material / cull-layer
     // swaps). Empty in steady state, since movement never enters here.
     for main_entity in changes.0.drain() {
@@ -712,10 +729,16 @@ pub fn flush_cluster_instances(
         let material_id = material.map(|m| m.0.id()).unwrap_or_default();
         let cull_mask = render_layers_to_mask(render_layers);
         let node_slot = node_slot.map(GpuSlot::index).unwrap_or(u32::MAX);
+        if !slot_map.0.contains_key(&render_entity) {
+            bind_total += 1;
+            if node_slot == u32::MAX {
+                bind_max_node += 1;
+            }
+        }
         if let Some(slot) = slot_map.0.get(&render_entity).copied() {
             // Already bound → material / cull-mask update (no-op if unchanged).
             manager.update(slot, material_id, cull_mask);
-        } else if let Some(slot) = try_bind_instance(
+        } else if let Some((slot, pointers)) = try_bind_instance(
             &mut manager,
             &mut cluster_meshes,
             &mut assets,
@@ -729,6 +752,15 @@ pub fn flush_cluster_instances(
             commands
                 .entity(render_entity)
                 .insert(RaytracingGpuEntity(slot));
+            push_instance_upsert(
+                journal.as_deref_mut(),
+                material_slots.as_deref(),
+                slot,
+                &pointers,
+                material_id,
+                node_slot,
+                cull_mask,
+            );
             // Bound here this frame — drop any stale `pending` entry so the
             // retry below doesn't bind it a second time.
             pending.remove(&main_entity);
@@ -754,7 +786,11 @@ pub fn flush_cluster_instances(
             let material_id = material.map(|m| m.0.id()).unwrap_or_default();
             let cull_mask = render_layers_to_mask(render_layers);
             let node_slot = node_slot.map(GpuSlot::index).unwrap_or(u32::MAX);
-            if let Some(slot) = try_bind_instance(
+            bind_total += 1;
+            if node_slot == u32::MAX {
+                bind_max_node += 1;
+            }
+            if let Some((slot, pointers)) = try_bind_instance(
                 &mut manager,
                 &mut cluster_meshes,
                 &mut assets,
@@ -768,11 +804,58 @@ pub fn flush_cluster_instances(
                 commands
                     .entity(render_entity)
                     .insert(RaytracingGpuEntity(slot));
+                push_instance_upsert(
+                    journal.as_deref_mut(),
+                    material_slots.as_deref(),
+                    slot,
+                    &pointers,
+                    material_id,
+                    node_slot,
+                    cull_mask,
+                );
             } else {
                 pending.insert(main_entity);
             }
         }
     }
+
+    if bind_total > 0 {
+        tracing::info!(
+            "[BIND] bound={bind_total} with_unassigned_node_slot={bind_max_node} pending={}",
+            pending.len(),
+        );
+    }
+}
+
+/// Append an absolute `UPSERT` for a freshly-bound instance into the GPU instance
+/// journal, keyed by the stable render entity (the same key `free_cluster_slot`'s
+/// REMOVE uses). No-op when the journal is absent (non-solari device).
+#[allow(clippy::too_many_arguments)]
+fn push_instance_upsert(
+    journal: Option<&mut RtJournal>,
+    material_slots: Option<&MaterialSlots>,
+    slot: GpuEntity,
+    pointers: &SlotMeshPointers,
+    material: AssetId<SolariMaterial>,
+    node_slot: u32,
+    cull_mask: u32,
+) {
+    let Some(journal) = journal else {
+        return;
+    };
+    let material_id = material_slots.and_then(|ms| ms.slot_of(material)).unwrap_or(0);
+    journal.push(InstanceJournalRecord::upsert(
+        slot.0,
+        pointers.geometry_id,
+        material_id,
+        node_slot,
+        cull_mask,
+        0,
+        pointers.group_base.0,
+        pointers.cluster_base.0,
+        pointers.cluster_count,
+        pointers.root_group.0,
+    ));
 }
 
 /// Upload the `ClusterMesh` (if needed) and bind a fresh slot, returning
@@ -787,24 +870,21 @@ fn try_bind_instance(
     material: AssetId<SolariMaterial>,
     cull_mask: u32,
     node_slot: u32,
-) -> Option<GpuEntity> {
+) -> Option<(GpuEntity, SlotMeshPointers)> {
     if asset_server.is_managed(mesh_id) && !asset_server.is_loaded_with_dependencies(mesh_id) {
         return None;
     }
     let upload: ClusterMeshUpload = cluster_meshes.queue_upload_if_needed(mesh_id, assets);
-    Some(manager.bind(
-        SlotMeshPointers {
-            cluster_base: upload.cluster_base,
-            group_base: upload.group_base,
-            root_group: upload.root_group,
-            cluster_count: upload.cluster_count,
-            total_triangle_count: upload.total_triangle_count,
-            geometry_id: upload.geometry_id,
-        },
-        material,
-        cull_mask,
-        node_slot,
-    ))
+    let pointers = SlotMeshPointers {
+        cluster_base: upload.cluster_base,
+        group_base: upload.group_base,
+        root_group: upload.root_group,
+        cluster_count: upload.cluster_count,
+        total_triangle_count: upload.total_triangle_count,
+        geometry_id: upload.geometry_id,
+    };
+    let slot = manager.bind(pointers, material, cull_mask, node_slot);
+    Some((slot, pointers))
 }
 
 /// Observer: free a slot when its render entity despawns (the sync world
@@ -817,9 +897,15 @@ pub fn free_cluster_slot(
     slots: Query<&RaytracingGpuEntity>,
     mut manager: ResMut<InstanceManager>,
     mut slot_map: ResMut<RtSlotMap>,
+    journal: Option<ResMut<RtJournal>>,
 ) {
     if let Ok(slot) = slots.get(remove.entity) {
         manager.despawn_slot(slot.0);
+        // Emit an absolute REMOVE into the GPU instance journal for this slot — the
+        // reconcile clears its PTLAS presence.
+        if let Some(mut journal) = journal {
+            journal.push(InstanceJournalRecord::remove(slot.0 .0));
+        }
     }
     slot_map.0.remove(&remove.entity);
 }
