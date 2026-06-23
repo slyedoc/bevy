@@ -32,6 +32,28 @@ const BINDING_CAMERA: u32 = 1; // uniform buffer (ray gen inputs)
 const BINDING_ENV_MAP: u32 = 2; // environment/skybox cube (miss samples)
 const BINDING_ENV_SAMPLER: u32 = 3; // sampler for the environment cube
 const BINDING_GEOMETRY: u32 = 4; // uniform: bindless geometry buffer-device-addresses (chit reads)
+// DLSS Ray Reconstruction guide G-buffer (set 1, written chit-direct). Present only
+// with the `dlss` feature; the WGSL declares the matching `@group(1)` bindings under
+// `#ifdef SOLARI_DLSS`, so the layout slots and the SPIR-V binding numbers stay in
+// lockstep (set 1 is hand-built, so naga emits these numbers verbatim — no wgpu
+// descriptor compaction). Contiguous after BINDING_GEOMETRY (no gaps).
+#[cfg(feature = "dlss")]
+const BINDING_GBUFFER_NORMAL: u32 = 5; // storage: normal.xyz + linear roughness (.w)
+#[cfg(feature = "dlss")]
+const BINDING_GBUFFER_DIFFUSE: u32 = 6; // storage: diffuse albedo.xyz + linear depth (.w)
+#[cfg(feature = "dlss")]
+const BINDING_GBUFFER_SPECULAR: u32 = 7; // storage: specular albedo.xyz + hit distance (.w)
+#[cfg(feature = "dlss")]
+const BINDING_GBUFFER_MOTION: u32 = 8; // storage: screen-space motion vector.xy (.zw unused)
+
+/// Ring depth for the per-view camera UBO. The CPU rewrites the camera every
+/// frame (host-visible, coherent) but wgpu can't see the raw trace reading it, so
+/// it inserts no wait — overwriting a single buffer races the in-flight trace and
+/// tears `inverse_view_proj` (whole-scene reprojection glitch under camera motion).
+/// Cycling N ≥ frames-in-flight slots via a dynamic uniform offset means the CPU
+/// only ever writes a slot the GPU finished frames ago. 4 covers wgpu's default
+/// 2-frame latency with margin.
+const CAMERA_RING_FRAMES: u64 = 4;
 
 /// Per-frame camera inputs the raygen shader reads — std140-compatible
 /// (mat4 + vec4). `inverse_view_proj` reconstructs a world-space ray per pixel;
@@ -40,6 +62,12 @@ const BINDING_GEOMETRY: u32 = 4; // uniform: bindless geometry buffer-device-add
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RtCamera {
     pub inverse_view_proj: [f32; 16],
+    /// View-from-world — the DLSS guide's view-space linear depth (`-view_z`).
+    pub view_from_world: [f32; 16],
+    /// Unjittered clip-from-world this frame — DLSS motion vectors (current).
+    pub clip_from_world: [f32; 16],
+    /// Unjittered clip-from-world last frame — DLSS motion vectors (previous).
+    pub prev_clip_from_world: [f32; 16],
     pub camera_position: [f32; 4],
     /// `frame_index` in `.x` (RNG seed for temporal variation); `.yzw` pad to a
     /// 16-byte std140 slot.
@@ -47,6 +75,9 @@ pub struct RtCamera {
     /// `.x` = sky/environment brightness (raw cd/m²; 0 ⇒ no skybox, miss stays
     /// at the clear color in `.yzw`).
     pub sky: [f32; 4],
+    /// `.xy` = sub-pixel camera jitter in pixels (added to the primary ray);
+    /// `.zw` reserved. Zero until DLSS drives it from `suggested_jitter`.
+    pub jitter: [f32; 4],
 }
 
 /// Bindless geometry buffer-device-addresses the closest-hit reads via
@@ -102,6 +133,10 @@ pub struct RtPipeline {
     /// the pipeline must be rebuilt (the dispatch checks [`Self::capacity`]).
     record_capacity: u32,
 
+    /// `minUniformBufferOffsetAlignment` — the camera ring's per-slot stride must
+    /// be a multiple of this (dynamic uniform offsets are validated against it).
+    ubo_alignment: u64,
+
     /// Shader modules retained for the pipeline's lifetime (destroyed on drop).
     modules: Vec<vk::ShaderModule>,
 }
@@ -123,9 +158,15 @@ pub struct RtViewBindings {
     device: ash::Device,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
+    /// Camera UBO, a [`CAMERA_RING_FRAMES`]-slot ring (binding 1 is a *dynamic*
+    /// uniform; `set_camera` writes this frame's slot and `trace` binds its offset).
     camera: MappedBuffer,
-    /// Bindless geometry addresses (set 1, binding 4); contents refreshed per
-    /// frame via the mapping (`set_geometry_addresses`).
+    /// Aligned byte stride of one camera ring slot.
+    camera_stride: u64,
+    /// Bindless geometry addresses (set 1, binding 4); refreshed per frame via the
+    /// mapping (`set_geometry_addresses`). Not ringed: the addresses are stable
+    /// (stable-address `RawTraceBindable` buffers), so an in-flight overwrite writes
+    /// identical bytes — benign, unlike the per-frame-varying camera.
     geometry: MappedBuffer,
     /// This view's own linear env-cube sampler (destroyed on drop). Owned here, not
     /// on `RtPipeline`, so the per-view set survives a pipeline rebuild — the set
@@ -177,6 +218,13 @@ impl RtPipeline {
         let handle_size = rt_props.shader_group_handle_size as u64;
         let handle_align = rt_props.shader_group_handle_alignment as u64;
         let base_align = rt_props.shader_group_base_alignment as u64;
+        // Dynamic-uniform-offset granularity for the camera ring. Separate plain
+        // query to avoid re-borrowing `rt_props` through the `props2` chain.
+        // SAFETY: physical_device valid.
+        let ubo_alignment = unsafe { instance.get_physical_device_properties(physical_device) }
+            .limits
+            .min_uniform_buffer_offset_alignment
+            .max(1);
 
         // --- Shaders: WGSL -> SPIR-V -> VkShaderModule -------------------------
         // raygen, miss, and THREE closest-hit programs (opaque / glass / hair) —
@@ -245,7 +293,8 @@ impl RtPipeline {
         // --- Descriptor set layout (set 1: output + camera) --------------------
         // TLAS is NOT here — it comes from the scene bind group (set 0). raygen
         // writes the output buffer; raygen reads the camera.
-        let bindings = [
+        #[cfg_attr(not(feature = "dlss"), allow(unused_mut))]
+        let mut bindings = vec![
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_OUTPUT)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -253,10 +302,17 @@ impl RtPipeline {
                 .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_CAMERA)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                // Dynamic: the camera is a per-frame ring; `trace` binds this frame's
+                // slot via a dynamic offset (avoids tearing the in-flight trace).
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(1)
-                // raygen unprojects; miss reads sky brightness/clear color.
-                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::MISS_KHR),
+                // raygen unprojects; miss reads sky brightness/clear color; the
+                // closest-hit reads the view matrices for the DLSS depth/motion guide.
+                .stage_flags(
+                    vk::ShaderStageFlags::RAYGEN_KHR
+                        | vk::ShaderStageFlags::MISS_KHR
+                        | vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                ),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_ENV_MAP)
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
@@ -274,6 +330,26 @@ impl RtPipeline {
                 // The closest-hit's geometry resolve reads the packed-vertex address.
                 .stage_flags(vk::ShaderStageFlags::CLOSEST_HIT_KHR),
         ];
+        // DLSS guide G-buffers: raygen clears the primary pixel (sky/miss default);
+        // the closest-hit overwrites it on a primary hit. Layout slots must match the
+        // WGSL `#ifdef SOLARI_DLSS` bindings 5/6/7 exactly.
+        #[cfg(feature = "dlss")]
+        for binding in [
+            BINDING_GBUFFER_NORMAL,
+            BINDING_GBUFFER_DIFFUSE,
+            BINDING_GBUFFER_SPECULAR,
+            BINDING_GBUFFER_MOTION,
+        ] {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(
+                        vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                    ),
+            );
+        }
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         // SAFETY: well-formed create info; device live.
         let descriptor_set_layout =
@@ -439,6 +515,7 @@ impl RtPipeline {
             hit_region,
             callable_region,
             record_capacity,
+            ubo_alignment,
             modules,
         };
         Some(out)
@@ -465,6 +542,10 @@ impl RtPipeline {
         allocator: &Allocator,
         output_buffer: vk::Buffer,
         output_size: u64,
+        // DLSS guide G-buffers `(VkBuffer, size)` bound at BINDING_GBUFFER_* (set 1).
+        // Empty unless the `dlss` feature is on; its length sizes the storage-buffer
+        // pool slot, so it must agree with the layout the pipeline was built with.
+        gbuffers: &[(vk::Buffer, u64)],
         env_map_view: vk::ImageView,
         env_map_image: Option<vk::Image>,
     ) -> Option<RtViewBindings> {
@@ -472,10 +553,13 @@ impl RtPipeline {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1),
+                .descriptor_count(1 + gbuffers.len() as u32), // output + DLSS guides
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .descriptor_count(1), // camera (ringed)
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(2), // camera + geometry addresses
+                .descriptor_count(1), // geometry addresses
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(1),
@@ -504,9 +588,11 @@ impl RtPipeline {
             }
         };
 
+        // Camera ring: CAMERA_RING_FRAMES slots, each aligned for a dynamic offset.
+        let camera_stride = align_up(size_of::<RtCamera>() as u64, self.ubo_alignment);
         let camera = alloc_mapped_buffer(
             allocator,
-            size_of::<RtCamera>() as u64,
+            CAMERA_RING_FRAMES * camera_stride,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
         )?;
         let geometry = alloc_mapped_buffer(
@@ -533,10 +619,12 @@ impl RtPipeline {
             .buffer(output_buffer)
             .offset(0)
             .range(output_size)];
+        // Dynamic uniform: offset 0 + the bound window (one slot's data); `trace`
+        // supplies the per-frame slot offset.
         let camera_info = [vk::DescriptorBufferInfo::default()
             .buffer(camera.buffer)
             .offset(0)
-            .range(camera.size)];
+            .range(size_of::<RtCamera>() as u64)];
         // `trace()` transitions the atmosphere cube to SHADER_READ_ONLY_OPTIMAL
         // around the dispatch (skybox/fallback are already in this layout), so the
         // descriptor always sees read-optimal.
@@ -549,7 +637,20 @@ impl RtPipeline {
             .buffer(geometry.buffer)
             .offset(0)
             .range(geometry.size)];
-        let writes = [
+        // DLSS guide descriptors built outside `writes` so the per-binding infos
+        // outlive `update_descriptor_sets` (empty when the feature is off).
+        #[cfg(feature = "dlss")]
+        let gbuffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = gbuffers
+            .iter()
+            .map(|&(buf, size)| {
+                [vk::DescriptorBufferInfo::default()
+                    .buffer(buf)
+                    .offset(0)
+                    .range(size)]
+            })
+            .collect();
+        #[cfg_attr(not(feature = "dlss"), allow(unused_mut))]
+        let mut writes = vec![
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
                 .dst_binding(BINDING_OUTPUT)
@@ -558,7 +659,7 @@ impl RtPipeline {
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
                 .dst_binding(BINDING_CAMERA)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .buffer_info(&camera_info),
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
@@ -576,6 +677,24 @@ impl RtPipeline {
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(&geometry_info),
         ];
+        #[cfg(feature = "dlss")]
+        {
+            let gbuffer_bindings = [
+                BINDING_GBUFFER_NORMAL,
+                BINDING_GBUFFER_DIFFUSE,
+                BINDING_GBUFFER_SPECULAR,
+                BINDING_GBUFFER_MOTION,
+            ];
+            for (i, info) in gbuffer_infos.iter().enumerate() {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(gbuffer_bindings[i])
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info),
+                );
+            }
+        }
         // SAFETY: targets the freshly-allocated set; buffers + image/sampler live.
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
 
@@ -584,6 +703,7 @@ impl RtPipeline {
             descriptor_pool,
             descriptor_set,
             camera,
+            camera_stride,
             geometry,
             env_map_sampler,
             env_map_image,
@@ -607,6 +727,8 @@ impl RtPipeline {
         scene_set: vk::DescriptorSet,
         view: &RtViewBindings,
         columns_set: vk::DescriptorSet,
+        // This frame's camera ring-slot byte offset (from [`RtViewBindings::set_camera`]).
+        camera_dynamic_offset: u32,
         width: u32,
         height: u32,
     ) {
@@ -683,7 +805,10 @@ impl RtPipeline {
                 self.pipeline_layout,
                 0,
                 &[scene_set, view.descriptor_set, columns_set],
-                &[],
+                // One dynamic offset, for set 1's camera (binding 1) — the only
+                // dynamic descriptor across the three bound sets (scene/columns are
+                // wgpu-built with none, hence the prior empty slice).
+                &[camera_dynamic_offset],
             );
             self.rt.cmd_trace_rays(
                 command_buffer,
@@ -739,17 +864,24 @@ impl RtPipeline {
 }
 
 impl RtViewBindings {
-    /// Upload this frame's camera inputs for this view (host-visible, coherent).
-    pub fn set_camera(&self, camera: &RtCamera) {
-        // SAFETY: `camera.mapped` is a valid HOST_VISIBLE|COHERENT mapping of at
-        // least size_of::<RtCamera>() bytes; RtCamera is Pod.
+    /// Upload this frame's camera inputs into the ring slot for `frame_index` and
+    /// return that slot's byte offset — pass it to [`Self::trace`] as the camera's
+    /// dynamic uniform offset. Writing a slot the GPU finished frames ago avoids
+    /// tearing an in-flight trace (host-visible, coherent).
+    pub fn set_camera(&self, camera: &RtCamera, frame_index: u32) -> u32 {
+        let slot = (frame_index as u64) % CAMERA_RING_FRAMES;
+        let offset = slot * self.camera_stride;
+        // SAFETY: `camera.mapped` maps CAMERA_RING_FRAMES * camera_stride bytes;
+        // `offset + size_of::<RtCamera>() <= camera_stride * CAMERA_RING_FRAMES`
+        // since size_of <= camera_stride. RtCamera is Pod.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bytemuck::bytes_of(camera).as_ptr(),
-                self.camera.mapped,
+                self.camera.mapped.add(offset as usize),
                 size_of::<RtCamera>(),
             );
         }
+        offset as u32
     }
 
     /// The output `VkBuffer` baked into binding 0. The dispatch compares this to
@@ -867,13 +999,22 @@ fn compile_rt_wgsl(source: &str, file_path: &str) -> Option<Vec<u32>> {
     register!("../bindings/sampling.wgsl"); // -> pbr, scene_bindings, maths
     register!("../bindings/brdf.wgsl"); // -> pbr, sampling, scene_bindings, maths
 
-    let shader_defs = [(
+    // Shader-def axes for the RT shaders. This is the "pipeline key": each def is a
+    // compile-out feature axis the raygen/chits can `#ifdef` on. Keep the axes few
+    // and orthogonal (debug views ride a runtime uniform, not a def, to avoid a
+    // variant explosion). `SOLARI_DLSS` is compile-time (tied to the cargo feature):
+    // when set, the trace emits the ray-reconstruction guide G-buffer. A future
+    // `SOLARI_RESTIR` axis would slot in here the same way.
+    #[allow(unused_mut)]
+    let mut shader_defs: std::collections::HashMap<String, ShaderDefValue> = [(
         // The scene-columns bind-group index the scene bindings are written with.
         "SOLARI_SCENE_COLUMNS_GROUP".to_string(),
         ShaderDefValue::UInt(2),
     )]
     .into_iter()
     .collect();
+    #[cfg(feature = "dlss")]
+    shader_defs.insert("SOLARI_DLSS".to_string(), ShaderDefValue::Bool(true));
 
     let module = match composer.make_naga_module(NagaModuleDescriptor {
         source,

@@ -36,7 +36,6 @@ extern crate alloc;
 
 pub mod accel;
 pub mod bindings;
-pub mod camera;
 
 pub mod ecs_gpu;
 pub mod geometry;
@@ -122,6 +121,9 @@ pub mod prelude {
         lights::SolariDirectionLight,
         hair::{Hair, HairMaterial, HairAsset, HairStrand},
     };
+
+    #[cfg(feature = "dlss")]
+    pub use crate::render::dlss::SolariDlssMode;
 
     #[cfg(feature = "cluster_processor")]
     pub use crate::geometry::from_mesh::*;
@@ -226,6 +228,12 @@ impl Plugin for SolariPlugin {
             );
             return;
         }
+
+        // Bring up the DLSS Ray Reconstruction SDK (no-op / graceful when the feature
+        // is off or RR is unsupported). The per-view context + RR dispatch are wired
+        // by `SolarRenderPlugin`; this just creates the shared `SolariDlssSdk`.
+        #[cfg(feature = "dlss")]
+        render::dlss::init_dlss(app);
     }
 }
 

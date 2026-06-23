@@ -11,6 +11,7 @@
 
 use ash::vk;
 use bevy_asset::{load_embedded_asset, AssetServer};
+use bevy_math::{Mat4, Vec2};
 use bevy_ecs::prelude::*;
 use bevy_render::{
     camera::ExtractedCamera,
@@ -133,6 +134,41 @@ pub struct RtOutputBuffer {
     pub raw: vk::Buffer,
     pub size: u64,
     pub pixels: u32,
+    /// DLSS ray-reconstruction guide G-buffers — normal+roughness, diffuse+depth,
+    /// specular+hit-distance, and motion vectors — each `pixels` × `vec4<f32>`,
+    /// allocated and reallocated alongside the color output. Written by the
+    /// closest-hit (chit-direct), read by the resolve.
+    #[cfg(feature = "dlss")]
+    pub gbuffer: [RtGbuffer; 4],
+}
+
+/// Per-view cache of last frame's **unjittered** clip-from-world, for the DLSS
+/// motion-vector guide. Written at the end of each `rt_pipeline` dispatch, read as
+/// "previous" the next frame (absent on the first frame ⇒ zero motion). Defined
+/// unconditionally so the `ViewQuery` tuple needn't cfg-gate a single element; only
+/// the `dlss` path ever inserts or reads it.
+#[derive(Component)]
+pub struct RtPrevViewProj {
+    pub clip_from_world: Mat4,
+}
+
+/// Per-view sub-pixel camera jitter (pixels) for DLSS temporal accumulation. Set by
+/// `prepare_solari_dlss` from the RR context's `suggested_jitter`; `rt_pipeline`
+/// folds it into the primary ray, and `solari_dlss_render` passes its negation as
+/// the RR `jitter_offset`. Defined unconditionally so the `ViewQuery` tuple needn't
+/// cfg-gate an element; absent (⇒ zero jitter) unless DLSS is active.
+#[derive(Component, Default)]
+pub struct SolariDlssJitter {
+    pub offset: Vec2,
+}
+
+/// One DLSS ray-reconstruction guide buffer: a `pixels` × `vec4<f32>` GPU storage
+/// buffer the closest-hit writes. Held with its raw `VkBuffer` (for the RT set-1
+/// descriptor) and the wgpu handle (for the resolve pass).
+#[cfg(feature = "dlss")]
+pub struct RtGbuffer {
+    pub buffer: bevy_render::render_resource::Buffer,
+    pub raw: vk::Buffer,
 }
 
 /// `Prepare`: (re)allocate the per-view RT output buffer to fit the viewport.
@@ -166,11 +202,34 @@ pub fn prepare_rt_output(
         let raw = unsafe { buffer.as_hal::<VkApi>() }
             .map(|b| b.raw_handle())
             .expect("rt_output buffer must be Vulkan-backed");
+        // DLSS guide G-buffers: same size + lifetime as the color output, reallocated
+        // with it (the `pixels` early-out above covers a viewport resize).
+        #[cfg(feature = "dlss")]
+        let gbuffer: [RtGbuffer; 4] = core::array::from_fn(|_| {
+            let buffer = allocator.create_buffer(
+                &render_device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                BufferUsages::STORAGE,
+                size,
+                MemoryLocation::GpuOnly,
+                "rt_gbuffer",
+            );
+            // SAFETY: Vulkan-backed (Allocator only builds VkBuffers).
+            let raw = unsafe { buffer.as_hal::<VkApi>() }
+                .map(|b| b.raw_handle())
+                .expect("rt_gbuffer must be Vulkan-backed");
+            RtGbuffer {
+                buffer: buffer.into(),
+                raw,
+            }
+        });
         commands.entity(entity).insert(RtOutputBuffer {
             buffer: buffer.into(),
             raw,
             size,
             pixels,
+            #[cfg(feature = "dlss")]
+            gbuffer,
         });
     }
 }
@@ -188,6 +247,8 @@ pub(crate) fn rt_pipeline(
         Option<&RtViewBindings>,
         Option<&SolariAtmosphereView>,
         Option<&SolariEnvironmentMap>,
+        Option<&RtPrevViewProj>,
+        Option<&SolariDlssJitter>,
     )>,
     rt: Option<Res<RtPipeline>>,
     rt_blit: Res<RtBlit>,
@@ -206,8 +267,17 @@ pub(crate) fn rt_pipeline(
     mut ctx: RenderContext,
 ) {
     let view_entity = view.entity();
-    let (view, camera, view_target, output, view_bindings, atmosphere_view, environment_map) =
-        view.into_inner();
+    let (
+        view,
+        camera,
+        view_target,
+        output,
+        view_bindings,
+        atmosphere_view,
+        environment_map,
+        prev_view_proj,
+        dlss_jitter,
+    ) = view.into_inner();
 
     // Environment cube the miss shader samples (same priority as the megakernel):
     // the baked atmosphere cube if this view has one, else the view's skybox image,
@@ -304,10 +374,22 @@ pub(crate) fn rt_pipeline(
                             .wgpu_device()
                             .poll(wgpu::PollType::wait_indefinitely());
                     }
+                    // DLSS guide G-buffers (empty without the feature) — bound into
+                    // set 1 alongside the color output, same size, same lifetime.
+                    #[cfg(feature = "dlss")]
+                    let gbuffers = [
+                        (output.gbuffer[0].raw, output.size),
+                        (output.gbuffer[1].raw, output.size),
+                        (output.gbuffer[2].raw, output.size),
+                        (output.gbuffer[3].raw, output.size),
+                    ];
+                    #[cfg(not(feature = "dlss"))]
+                    let gbuffers: [(vk::Buffer, u64); 0] = [];
                     if let Some(built) = rt.create_view_bindings(
                         allocator,
                         output.raw,
                         output.size,
+                        &gbuffers,
                         env_view,
                         environment_map_image,
                     ) {
@@ -336,9 +418,19 @@ pub(crate) fn rt_pipeline(
     // always-present view transform + projection:
     // world_from_clip = world_from_view * inverse(clip_from_view).
     let world_from_view = view.world_from_view.to_matrix();
+    let view_from_world = world_from_view.inverse();
     let world_from_clip = world_from_view * view.clip_from_view.inverse();
+    // Unjittered clip-from-world for the DLSS motion-vector guide; "previous" comes
+    // from the per-view cache (absent on the first frame ⇒ current ⇒ zero motion).
+    // Computed unconditionally (a few matrix ops) so the dlss/non-dlss camera path
+    // stays identical; only the chit (under `#ifdef SOLARI_DLSS`) reads these.
+    let clip_from_world = view.clip_from_view * view_from_world;
+    let prev_clip_from_world = prev_view_proj.map_or(clip_from_world, |p| p.clip_from_world);
     let camera_inputs = RtCamera {
         inverse_view_proj: world_from_clip.to_cols_array(),
+        view_from_world: view_from_world.to_cols_array(),
+        clip_from_world: clip_from_world.to_cols_array(),
+        prev_clip_from_world: prev_clip_from_world.to_cols_array(),
         // .xyz = ray origin; .w = camera exposure (raygen scales final radiance by
         // it, like the megakernel's `radiance *= view.exposure`).
         camera_position: view.world_from_view.translation().extend(camera.exposure).to_array(),
@@ -353,9 +445,22 @@ pub(crate) fn rt_pipeline(
         ],
         // .x = sky brightness; .yzw = clear color (black for bevy_city).
         sky: [environment_brightness, 0.0, 0.0, 0.0],
+        // Sub-pixel jitter (pixels) for DLSS temporal accumulation; zero without an
+        // active DLSS context (the trace renders a fresh frame with no accumulator,
+        // so an unaccumulated jitter would only shimmer).
+        jitter: {
+            let j = dlss_jitter.map_or(Vec2::ZERO, |j| j.offset);
+            [j.x, j.y, 0.0, 0.0]
+        },
     };
+    // Write this frame's camera into its ring slot; the returned offset binds that
+    // slot in the trace (avoids the CPU tearing the in-flight trace's camera read).
+    let camera_dynamic_offset = view_bindings.set_camera(&camera_inputs, *frame_counter);
     *frame_counter = frame_counter.wrapping_add(1);
-    view_bindings.set_camera(&camera_inputs);
+    // Cache this frame's unjittered clip-from-world as next frame's "previous".
+    commands
+        .entity(view_entity)
+        .insert(RtPrevViewProj { clip_from_world });
 
     // Bindless geometry addresses for the chit's `physical_load` resolve. Both come
     // from stable-address (`RawTraceBindable`) buffers, so the captured addresses
@@ -389,6 +494,7 @@ pub(crate) fn rt_pipeline(
                 scene_set,
                 view_bindings,
                 columns_set,
+                camera_dynamic_offset,
                 viewport.x,
                 viewport.y,
             );

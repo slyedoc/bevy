@@ -22,6 +22,10 @@ impl Plugin for SolariDebugPlugin {
                 ui::update_render_debug_label,
             ),
         );
+
+        // DLSS Ray Reconstruction mode dropdown (one per SolariCamera).
+        #[cfg(feature = "dlss")]
+        app.add_systems(Update, (ui::spawn_dlss_panels, ui::update_dlss_label));
     }
 
     fn finish(&self, app: &mut App) {

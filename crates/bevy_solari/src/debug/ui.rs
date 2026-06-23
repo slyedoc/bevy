@@ -139,3 +139,94 @@ pub fn update_render_debug_label(
         }
     }
 }
+
+// --- DLSS Ray Reconstruction mode dropdown (per `SolariCamera`) ----------------
+// Unlike the render-debug overlay (a per-camera component), the DLSS mode is a single
+// global resource, so every menu item just sets `SolariDlssMode`.
+
+#[cfg(feature = "dlss")]
+pub use dlss_dropdown::{spawn_dlss_panels, update_dlss_label};
+
+#[cfg(feature = "dlss")]
+mod dlss_dropdown {
+    use super::*;
+    use crate::render::dlss::SolariDlssMode;
+    use crate::render::SolariCamera;
+    use bevy_ecs::system::{Res, ResMut};
+
+    /// Marker on a camera that already has a DLSS dropdown.
+    #[derive(Component)]
+    pub struct DlssPanelSpawned;
+
+    /// Marker on the DLSS button caption.
+    #[derive(Component, Default, Clone)]
+    pub struct DlssLabel;
+
+    /// One DLSS menu item: activating it sets the global [`SolariDlssMode`].
+    fn dlss_item(mode: SolariDlssMode) -> impl Scene {
+        bsn! {
+            @FeathersMenuItem {
+                @caption: bsn! { Text({mode.label().to_string()}) ThemedText }
+            }
+            on(move |_: On<Activate>, mut dlss_mode: ResMut<SolariDlssMode>| {
+                *dlss_mode = mode;
+            })
+        }
+    }
+
+    /// Spawn one bottom-left DLSS dropdown per [`SolariCamera`] (the render-debug
+    /// dropdown sits bottom-right and targets raster cameras, so they don't collide).
+    pub fn spawn_dlss_panels(
+        cameras: Query<Entity, (With<SolariCamera>, Without<DlssPanelSpawned>)>,
+        mut commands: Commands,
+    ) {
+        for camera in &cameras {
+            commands
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        bottom: px(8),
+                        left: px(8),
+                        ..Default::default()
+                    },
+                    TabGroup::default(),
+                    UiTargetCamera(camera),
+                ))
+                .queue_spawn_related_scenes::<Children>(bsn_list! {
+                    (
+                        @FeathersMenu
+                        Children [
+                            (
+                                @FeathersMenuButton {
+                                    @caption: bsn! { Text("dlss: off") ThemedText DlssLabel }
+                                }
+                            ),
+                            (
+                                @FeathersMenuPopup
+                                Children [
+                                    dlss_item(SolariDlssMode::Off),
+                                    dlss_item(SolariDlssMode::Auto),
+                                    dlss_item(SolariDlssMode::Dlaa),
+                                    dlss_item(SolariDlssMode::Quality),
+                                    dlss_item(SolariDlssMode::Balanced),
+                                    dlss_item(SolariDlssMode::Performance),
+                                    dlss_item(SolariDlssMode::UltraPerformance),
+                                ]
+                            )
+                        ]
+                    )
+                });
+            commands.entity(camera).insert(DlssPanelSpawned);
+        }
+    }
+
+    /// Keep the DLSS button caption in sync with the global mode resource.
+    pub fn update_dlss_label(mode: Res<SolariDlssMode>, mut labels: Query<&mut Text, With<DlssLabel>>) {
+        for mut text in &mut labels {
+            let want = format!("dlss: {}", *mode);
+            if text.0 != want {
+                text.0 = want;
+            }
+        }
+    }
+}

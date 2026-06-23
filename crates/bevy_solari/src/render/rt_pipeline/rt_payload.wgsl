@@ -18,6 +18,14 @@ struct RtPayload {
     // primary ray). Threaded out by a hit shader so the NEXT vertex can MIS-weight
     // its emissive against next-event estimation (the BSDF-vs-NEE pair).
     p_bounce: f32,
+#ifdef SOLARI_DLSS
+    // Pixel index (row-major `y*width + x`) the primary-hit closest-hit writes its
+    // ray-reconstruction G-buffer to, or `NO_GBUFFER` on secondary bounces (no
+    // guide written there). The single word the DLSS guide costs the payload — the
+    // surface attributes themselves go straight to the G-buffer storage buffers
+    // from the closest-hit (chit-direct), never riding the payload across bounces.
+    gbuffer_pixel: u32,
+#endif
 }
 
 // Shadow / visibility-ray payload — just an occlusion flag. The closest-hit sets
@@ -31,7 +39,11 @@ struct ShadowPayload {
 
 struct RtCamera {
     inverse_view_proj: mat4x4<f32>,
+    view_from_world: mat4x4<f32>,        // DLSS guide: view-space linear depth
+    clip_from_world: mat4x4<f32>,        // DLSS motion vectors: current (unjittered)
+    prev_clip_from_world: mat4x4<f32>,   // DLSS motion vectors: previous (unjittered)
     camera_position: vec4<f32>,
-    frame: vec4<u32>,          // .x = frame index (RNG seed)
+    frame: vec4<u32>,          // .x = frame index (RNG seed); .y = SER material-hint bits; .z = debug view
     sky: vec4<f32>,            // .x = environment brightness (cd/m²); .yzw = clear color
+    jitter: vec4<f32>,         // .xy = sub-pixel camera jitter (pixels); .zw reserved
 }

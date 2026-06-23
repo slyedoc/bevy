@@ -5,6 +5,8 @@
 //! deferred prepass. Selected via [`SolariViewState`](view::SolariViewState).
 
 pub mod atmosphere;
+#[cfg(feature = "dlss")]
+pub mod dlss;
 pub mod rt_pipeline;
 mod reset;
 pub mod view;
@@ -49,6 +51,13 @@ impl Plugin for SolarRenderPlugin {
             .register_type::<SolariViewState>()
             .register_type::<atmosphere::SolariAtmosphere>()
             .register_type::<atmosphere::SolariGlobalFog>();
+
+        // DLSS Ray Reconstruction quality mode (global, extracted). The SDK is
+        // created in `SolariPlugin::finish` (`dlss::init_dlss`); the per-view context,
+        // guide buffers, and RR dispatch land in later phases.
+        #[cfg(feature = "dlss")]
+        app.init_resource::<dlss::SolariDlssMode>()
+            .add_plugins(ExtractResourcePlugin::<dlss::SolariDlssMode>::default());
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
@@ -110,6 +119,32 @@ impl Plugin for SolarRenderPlugin {
                             .and_then(resource_exists::<RaytracingSceneBindings>)
                             .and_then(resource_exists::<SceneColumns>),
                     ),
+            );
+
+        // DLSS Ray Reconstruction: resolve the trace's guide buffers into textures,
+        // then denoise/upscale the view target. Gated on the SDK existing (RR
+        // supported); per-view component presence (set by `prepare_solari_dlss`) gates
+        // the actual mode. Both run after the trace + blit, before tonemapping.
+        #[cfg(feature = "dlss")]
+        render_app
+            .add_systems(RenderStartup, dlss::init_solari_dlss)
+            .add_systems(
+                Render,
+                dlss::prepare_solari_dlss.in_set(RenderSystems::PrepareResources),
+            )
+            .add_systems(
+                Core3d,
+                (
+                    dlss::solari_dlss_resolve
+                        .after(rt_pipeline::rt_pipeline)
+                        .before(tonemapping)
+                        .run_if(resource_exists::<dlss::SolariDlssSdk>),
+                    dlss::solari_dlss_render
+                        .after(dlss::solari_dlss_resolve)
+                        .before(tonemapping)
+                        .run_if(resource_exists::<dlss::SolariDlssSdk>),
+                )
+                    .chain(),
             );
     }
 }

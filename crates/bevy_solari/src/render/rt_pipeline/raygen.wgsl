@@ -32,6 +32,18 @@ const BH_CAPTURE_RADIUS: f32 = 0.5;
 // columns bind group occupies set 2 (unused by raygen, present for the chits).
 @group(1) @binding(0) var<storage, read_write> output: array<vec4<f32>>;
 @group(1) @binding(1) var<uniform> camera: RtCamera;
+#ifdef SOLARI_DLSS
+// DLSS Ray Reconstruction guide G-buffer (chit-direct): the closest-hit writes the
+// primary hit's packed surface attrs here; raygen clears each pixel to the sky/miss
+// default first. Packed normal.xyz+roughness, diffuse.xyz+depth,
+// specular.xyz+hit-distance (the `.w` depth/hit-distance slots land in a later phase).
+@group(1) @binding(5) var<storage, read_write> gbuffer_normal_roughness: array<vec4<f32>>;
+@group(1) @binding(6) var<storage, read_write> gbuffer_diffuse: array<vec4<f32>>;
+@group(1) @binding(7) var<storage, read_write> gbuffer_specular: array<vec4<f32>>;
+@group(1) @binding(8) var<storage, read_write> gbuffer_motion: array<vec4<f32>>;
+// Sentinel pixel index: this bounce writes no guide (set on every non-primary bounce).
+const NO_GBUFFER: u32 = 0xffffffffu;
+#endif
 
 var<ray_payload> payload: RtPayload;
 
@@ -40,7 +52,9 @@ fn raygen(
     @builtin(ray_invocation_id) id: vec3<u32>,
     @builtin(num_ray_invocations) dims: vec3<u32>,
 ) {
-    let pixel = vec2<f32>(id.xy) + 0.5;
+    // Sub-pixel camera jitter for DLSS temporal accumulation (zero on the non-DLSS
+    // path, so this is a no-op there).
+    let pixel = vec2<f32>(id.xy) + 0.5 + camera.jitter.xy;
     let ndc = (pixel / vec2<f32>(dims.xy)) * 2.0 - 1.0;
     let far = camera.inverse_view_proj * vec4<f32>(ndc.x, -ndc.y, 1.0, 1.0);
     var origin = camera.camera_position.xyz;
@@ -56,6 +70,16 @@ fn raygen(
     // each hit shader's sampling advances the same stream.
     let pixel_index = id.x + id.y * dims.x;
     var rng = pixel_index + camera.frame.x * 5782582u;
+
+#ifdef SOLARI_DLSS
+    // Default this pixel's guide to "no surface" (sky/miss); a primary hit overwrites
+    // it in the closest-hit. Zero normal + roughness 1 + zero albedo is the RR sky
+    // convention; the `.w` depth/hit-distance slots are filled in a later phase.
+    gbuffer_normal_roughness[pixel_index] = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    gbuffer_diffuse[pixel_index] = vec4<f32>(0.0);
+    gbuffer_specular[pixel_index] = vec4<f32>(0.0);
+    gbuffer_motion[pixel_index] = vec4<f32>(0.0);
+#endif
 
     for (var bounce = 0u; bounce < MAX_BOUNCES; bounce += 1u) {
         // Black-hole geodesic (stand-in): bend the ray toward the mass and
@@ -77,6 +101,11 @@ fn raygen(
         payload.bounce = 0u;
         payload.rng = rng;
         payload.p_bounce = p_bounce;
+#ifdef SOLARI_DLSS
+        // Only the primary hit produces the visible guide; later bounces pass the
+        // sentinel so their closest-hit leaves the G-buffer untouched.
+        payload.gbuffer_pixel = select(NO_GBUFFER, pixel_index, bounce == 0u);
+#endif
         // Shader Execution Reordering: trace into a hit object, regroup the warp
         // by MATERIAL, then run the selected closest-hit. With per-material SBT
         // records (instance_contribution_to_hit_group_index = material slot), the

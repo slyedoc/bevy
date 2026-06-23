@@ -10,7 +10,7 @@
 enable wgpu_ray_tracing_pipeline;
 enable primitive_index;
 
-#import bevy_solari::rt_payload::{RtPayload, ShadowPayload}
+#import bevy_solari::rt_payload::{RtPayload, ShadowPayload, RtCamera}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::sampling::{generate_random_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, power_heuristic, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
@@ -21,6 +21,19 @@ var<ray_payload> shadow_payload: ShadowPayload;
 // Driver-provided triangle barycentrics (GLSL `hitAttributeEXT vec2`) — the
 // fixed-function triangle intersection writes (u, v); w = 1 - u - v.
 var<hit_attribute> bary: vec2<f32>;
+
+#ifdef SOLARI_DLSS
+// DLSS Ray Reconstruction guide G-buffer (set 1) — written for the primary hit only
+// (chit-direct), indexed by the launch pixel the raygen threads through the payload.
+// Same bindings/packing as raygen's declarations; the camera supplies the view +
+// motion matrices for the depth and motion-vector guides.
+@group(1) @binding(1) var<uniform> camera: RtCamera;
+@group(1) @binding(5) var<storage, read_write> gbuffer_normal_roughness: array<vec4<f32>>;
+@group(1) @binding(6) var<storage, read_write> gbuffer_diffuse: array<vec4<f32>>;
+@group(1) @binding(7) var<storage, read_write> gbuffer_specular: array<vec4<f32>>;
+@group(1) @binding(8) var<storage, read_write> gbuffer_motion: array<vec4<f32>>;
+const NO_GBUFFER: u32 = 0xffffffffu;
+#endif
 
 // SBT miss index of `miss_shadow` (miss 0 = miss_primary, miss 1 = miss_shadow).
 const SHADOW_MISS_INDEX: u32 = 1u;
@@ -143,6 +156,37 @@ fn chit_opaque(
     }
 
     payload.emitted = emitted;
+
+#ifdef SOLARI_DLSS
+    // Primary-hit ray-reconstruction guide (chit-direct): only the primary bounce
+    // carries a real pixel index; secondary bounces pass NO_GBUFFER and skip this.
+    // F0 = 0.04 for dielectrics, base_color for metals; diffuse is the
+    // energy-conserving complement of the metallic split. The `.w` slots (linear
+    // depth, specular hit distance) land in a later phase.
+    if payload.gbuffer_pixel != NO_GBUFFER {
+        let px = payload.gbuffer_pixel;
+        gbuffer_normal_roughness[px] = vec4<f32>(world_normal, ray_hit.material.roughness);
+        // View-space linear depth, positive into the scene (RR `DepthMode::Linear`).
+        let view_pos = camera.view_from_world * vec4<f32>(ray_hit.world_position, 1.0);
+        let linear_depth = -view_pos.z;
+        let diffuse = ray_hit.material.base_color * (1.0 - ray_hit.material.metallic);
+        gbuffer_diffuse[px] = vec4<f32>(diffuse, linear_depth);
+        let specular = mix(vec3<f32>(0.04), ray_hit.material.base_color, ray_hit.material.metallic);
+        // `.w` = specular hit distance — filled in Phase 3 with the specular guide.
+        gbuffer_specular[px] = vec4<f32>(specular, 0.0);
+        // Screen-space motion vector: current vs previous UNJITTERED clip position,
+        // UV space with y flipped. Sign/scale reconciled against the RR convention
+        // when the dispatch lands (Phase 3); previous_frame_world_position handles
+        // moving instances (parent/skin), the matrices handle the camera.
+        let cur_clip = camera.clip_from_world * vec4<f32>(ray_hit.world_position, 1.0);
+        let prev_clip =
+            camera.prev_clip_from_world * vec4<f32>(ray_hit.previous_frame_world_position, 1.0);
+        let cur_uv = (cur_clip.xy / cur_clip.w) * vec2<f32>(0.5, -0.5);
+        let prev_uv = (prev_clip.xy / prev_clip.w) * vec2<f32>(0.5, -0.5);
+        gbuffer_motion[px] = vec4<f32>(cur_uv - prev_uv, 0.0, 0.0);
+    }
+
+#endif
 
     // BRDF-sampled continuation ray for the next bounce.
     let next_bounce = evaluate_and_sample_brdf(wo, world_normal, ray_hit.material, F_ab, &rng);
