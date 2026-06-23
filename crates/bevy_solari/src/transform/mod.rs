@@ -14,13 +14,12 @@ use bevy_app::{App, Plugin, PostUpdate};
 use bevy_ecs::{
     prelude::With,
     schedule::{common_conditions::resource_exists, IntoScheduleConfigs},
-    system::{Local, Res},
 };
 use bevy_render::{renderer::RenderGraph, Render, RenderApp, RenderStartup, RenderSystems};
 use bevy_transform::systems::{propagate_transforms_for, sync_simple_transforms};
 use bevy_ui::Node;
 
-use crate::ecs_gpu::{assign_gpu_slots, GpuColumnPrepareSet, GpuPresenceColumnPlugin, GpuSlotAllocator};
+use crate::ecs_gpu::{GpuColumnPrepareSet, GpuPresenceColumnPlugin};
 use crate::pipelines::SolariPipelines;
 use crate::{SolariClusterSystems, SolariSetup};
 
@@ -71,14 +70,6 @@ impl Plugin for SolariTransformPlugin {
         .add_systems(
             PostUpdate,
             (sync_simple_transforms, propagate_transforms_for::<With<Node>>),
-        )
-        // TEMP slot-ratchet diagnostic for the transform-graph allocator (the
-        // ~2M-node table). Mirrors the instance-path `log_slot_ratchet`. Runs
-        // after the `Added`-only `assign_gpu_slots::<TransformGraph>` so it sees
-        // this frame's allocations. Remove once the decay is understood.
-        .add_systems(
-            PostUpdate,
-            log_transform_ratchet.after(assign_gpu_slots::<TransformGraph>),
         );
         // Main-app side of the GlobalTransform readback (the output buffer +
         // the `Readback` entity / decode observer).
@@ -132,24 +123,4 @@ impl Plugin for SolariTransformPlugin {
     }
 }
 
-/// TEMP DIAGNOSTIC (slot-ratchet investigation): print the transform-graph
-/// allocator's `high_water / active / free` whenever it changes. `active` is
-/// `high_water - free`. A regenerate that ratchets `high_water` up while
-/// `active` returns to its prior value (and `free` stays ~0) is the overlap
-/// leak this 2M-node table would pay for far more than the instance table.
-pub fn log_transform_ratchet(
-    allocator: Res<GpuSlotAllocator<TransformGraph>>,
-    mut last: Local<Option<(u32, u32)>>,
-) {
-    let high_water = allocator.high_water();
-    let free = allocator.free_count();
-    let now = (high_water, free);
-    if *last != Some(now) {
-        println!(
-            "[XFORM] high_water={high_water} active={} free={free}",
-            high_water - free,
-        );
-        *last = Some(now);
-    }
-}
 

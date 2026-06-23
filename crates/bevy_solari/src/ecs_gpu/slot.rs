@@ -41,53 +41,42 @@ pub trait GpuSlotTable: GpuTable {
     fn set_high_water(&mut self, high_water: u32);
 }
 
-/// Per-entity slot index into table `T` — the component-as-index. Read for free
+/// Per-entity slot handle into table `T` — the component-as-index. Read for free
 /// off the entity (array-indexed), never hashed.
+///
+/// Slot identity carries no generation: the one consumer that needs ABA-safe
+/// identity, the `GlobalTransform` readback, stamps the owning `Entity` into each
+/// record and resolves by it (see `transform::readback`), so a recycled slot is
+/// distinguished by a *different entity*, not a counter.
 #[derive(Component)]
-pub struct GpuSlot<T: GpuSlotTable>(u32, PhantomData<fn() -> T>);
+pub struct GpuSlot<T: GpuSlotTable> {
+    index: u32,
+    _marker: PhantomData<fn() -> T>,
+}
 
 impl<T: GpuSlotTable> GpuSlot<T> {
     /// This entity's dense slot in table `T`.
     #[inline]
     pub fn index(&self) -> u32 {
-        self.0
+        self.index
     }
 }
 
-/// Frames a freed slot is quarantined before it can be re-allocated. Must be ≥ the
-/// GPU's frames-in-flight plus the `GlobalTransform` readback's `map_async` latency,
-/// so a readback enqueued for a slot's *previous* occupant always lands before the
-/// slot is reused (see [`SlotFreeList`]). A small margin over typical double/triple
-/// buffering; readbacks that lag beyond this are caught by the readback observer's
-/// liveness check, which then merely skips them.
-const QUARANTINE_FRAMES: usize = 4;
-
-/// Slot allocator core (monotonic counter + **deferred-reuse** free-list), split out
-/// from [`GpuSlotAllocator`] so the recycle logic is unit-testable without the
-/// `GpuSlotTable` machinery.
-///
-/// A freed slot is **not** returned to the reusable pool immediately — it's
-/// quarantined for [`QUARANTINE_FRAMES`] [`tick`](Self::tick)s first. This closes a
-/// slot-recycle ABA: the GPU→CPU `GlobalTransform` readback is keyed by slot and its
-/// `map_async` lands several frames late; without quarantine, a slot freed and reused
-/// the same/next frame would make a stale readback for the *old* occupant splat onto
-/// the *new* one. During quarantine the slot is still owned by its (now-despawned)
-/// previous entity in the reverse map, so a late readback is correctly skipped; by
-/// the time it's reusable, no readback for it remains in flight.
+/// Slot allocator core: a monotonic counter + free-list, split out from
+/// [`GpuSlotAllocator`] so the recycle logic is unit-testable without the
+/// `GpuSlotTable` machinery. A freed slot is returned to the pool immediately —
+/// the slot-recycle ABA on the `GlobalTransform` readback is closed by stamping the
+/// owning `Entity` into each readback record (entity-keyed, lag-independent), so no
+/// reuse-deferral is needed here.
 #[derive(Default)]
 struct SlotFreeList {
     next: u32,
-    /// Freed and aged past quarantine — reusable now.
+    /// Freed slots, reusable immediately (LIFO).
     free: Vec<u32>,
-    /// Ring of recently-freed slots by frame bucket; drained into `free` once a
-    /// bucket has aged [`QUARANTINE_FRAMES`] [`tick`](Self::tick)s.
-    quarantine: [Vec<u32>; QUARANTINE_FRAMES],
-    /// Current frame's quarantine bucket.
-    head: usize,
 }
 
 impl SlotFreeList {
-    /// Reuse an aged slot if one is available, else bump the high-water.
+    /// Reuse a freed slot if one is available, else bump the high-water.
     fn allocate(&mut self) -> u32 {
         self.free.pop().unwrap_or_else(|| {
             let slot = self.next;
@@ -96,33 +85,19 @@ impl SlotFreeList {
         })
     }
 
-    /// Quarantine `slot` — reusable only after [`QUARANTINE_FRAMES`] ticks.
+    /// Return `slot` to the reusable pool.
     fn free(&mut self, slot: u32) {
-        self.quarantine[self.head].push(slot);
-    }
-
-    /// Advance one frame: release the bucket that was last written
-    /// [`QUARANTINE_FRAMES`] ticks ago (it returns to `head` exactly then).
-    fn tick(&mut self) {
-        self.head = (self.head + 1) % QUARANTINE_FRAMES;
-        let aged = core::mem::take(&mut self.quarantine[self.head]);
-        self.free.extend(aged);
+        self.free.push(slot);
     }
 }
 
-/// Main-world slot allocator for table `T`: a monotonic counter + **deferred-reuse**
-/// free-list ([`SlotFreeList`]) + a `slot → Entity` reverse map.
-///
-/// The forward [`GpuSlot<T>`] component covers entity→slot, but a GPU→CPU readback
-/// (the transform table's `GlobalTransform` writeback) arrives keyed by slot and must
-/// resolve the owning entity — the reverse direction. The map is sized by slot; a
-/// freed slot's entry is left stale (overwritten on reuse), so a reader must only
-/// trust it for currently-live slots — and the deferred reuse guarantees a stale
-/// readback resolves to a *despawned* (skipped), never a recycled-to-live, entity.
+/// Main-world slot allocator for table `T`: a monotonic counter + free-list
+/// ([`SlotFreeList`]). The forward [`GpuSlot<T>`] component covers entity→slot; the
+/// reverse direction is no longer tracked here — the `GlobalTransform` readback
+/// carries the owning `Entity` and resolves it directly (see `transform::readback`).
 #[derive(Resource)]
 pub struct GpuSlotAllocator<T: GpuSlotTable> {
     slots: SlotFreeList,
-    reverse: Vec<Entity>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -130,29 +105,20 @@ impl<T: GpuSlotTable> Default for GpuSlotAllocator<T> {
     fn default() -> Self {
         Self {
             slots: SlotFreeList::default(),
-            reverse: Vec::new(),
             _marker: PhantomData,
         }
     }
 }
 
 impl<T: GpuSlotTable> GpuSlotAllocator<T> {
-    /// Allocate a slot for `entity` (reusing an aged-out freed slot if any) and
-    /// record the `slot → entity` reverse mapping.
-    fn allocate(&mut self, entity: Entity) -> u32 {
-        let slot = self.slots.allocate();
-        let idx = slot as usize;
-        if idx >= self.reverse.len() {
-            self.reverse.resize(idx + 1, Entity::PLACEHOLDER);
-        }
-        self.reverse[idx] = entity;
-        slot
+    /// Allocate a slot (reusing a freed one if any).
+    fn allocate(&mut self) -> u32 {
+        self.slots.allocate()
     }
 
-    /// Advance the freed-slot quarantine by one frame (call once per frame).
-    #[inline]
-    fn tick(&mut self) {
-        self.slots.tick();
+    /// Return `slot` to the reusable pool.
+    fn free(&mut self, slot: u32) {
+        self.slots.free(slot);
     }
 
     /// Slot high-water — every slot `< high_water` has been handed out, so the
@@ -160,20 +126,6 @@ impl<T: GpuSlotTable> GpuSlotAllocator<T> {
     #[inline]
     pub fn high_water(&self) -> u32 {
         self.slots.next
-    }
-
-    /// Reusable slot indices currently aged past quarantine. Exposed for the
-    /// slot-ratchet diagnostic.
-    #[inline]
-    pub fn free_count(&self) -> u32 {
-        self.slots.free.len() as u32
-    }
-
-    /// The entity that currently owns `slot`, or `None` if out of range. Stale
-    /// for freed-and-not-yet-reused slots — only trustworthy for live slots.
-    #[inline]
-    pub fn entity(&self, slot: u32) -> Option<Entity> {
-        self.reverse.get(slot as usize).copied()
     }
 }
 
@@ -185,13 +137,12 @@ pub fn assign_gpu_slots<T: GpuSlotTable>(
     new_members: Query<Entity, (T::Members, Without<GpuSlot<T>>)>,
     mut allocator: ResMut<GpuSlotAllocator<T>>,
 ) {
-    // Advance the freed-slot quarantine once per frame before allocating, so this
-    // frame's allocations only reuse slots whose previous occupant's readbacks have
-    // aged out (slot-recycle ABA fix). Runs every frame even with no new members.
-    allocator.tick();
     for entity in &new_members {
-        let slot = allocator.allocate(entity);
-        commands.entity(entity).insert(GpuSlot::<T>(slot, PhantomData));
+        let index = allocator.allocate();
+        commands.entity(entity).insert(GpuSlot::<T> {
+            index,
+            _marker: PhantomData,
+        });
     }
 }
 
@@ -203,7 +154,7 @@ pub fn free_gpu_slot<T: GpuSlotTable>(
     mut allocator: ResMut<GpuSlotAllocator<T>>,
 ) {
     if let Ok(slot) = slots.get(removed.entity) {
-        allocator.slots.free(slot.0);
+        allocator.free(slot.index());
     }
 }
 
@@ -315,7 +266,7 @@ impl<K: Copy + Eq + Hash> SlotPool<K> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SlotFreeList, QUARANTINE_FRAMES};
+    use super::SlotFreeList;
 
     #[test]
     fn allocate_is_monotonic_until_reuse() {
@@ -328,48 +279,33 @@ mod tests {
     }
 
     #[test]
-    fn freed_slot_is_not_reused_during_quarantine() {
+    fn freed_slot_is_reused_immediately() {
         let mut f = SlotFreeList::default();
         let a = f.allocate(); // 0
-        let _b = f.allocate(); // 1
+        let b = f.allocate(); // 1
         f.free(a);
-        // The next allocation must NOT reuse the just-freed slot — it bumps the
-        // high-water instead (this is the ABA fix: no same/next-frame recycle).
-        assert_eq!(f.allocate(), 2, "freed slot reused before quarantine elapsed");
-        // It also stays unreusable for QUARANTINE_FRAMES-1 ticks.
-        for _ in 0..(QUARANTINE_FRAMES - 1) {
-            f.tick();
-            assert_eq!(f.free.len(), 0, "slot released from quarantine too early");
-        }
+        f.free(b);
+        // Reuse is immediate (the readback's ABA is entity-keyed, not reuse-deferred):
+        // the next allocations drain the free list (LIFO) before bumping the high-water.
+        assert_eq!(f.allocate(), 1);
+        assert_eq!(f.allocate(), 0);
+        assert_eq!(f.allocate(), 2, "free list exhausted → bump high-water");
+        assert_eq!(f.next, 3);
     }
 
     #[test]
-    fn freed_slot_becomes_reusable_after_quarantine() {
-        let mut f = SlotFreeList::default();
-        let a = f.allocate(); // 0
-        f.free(a);
-        for _ in 0..QUARANTINE_FRAMES {
-            f.tick();
-        }
-        assert_eq!(f.free.len(), 1, "slot not released after full quarantine");
-        assert_eq!(f.allocate(), 0, "aged-out slot should be reused");
-    }
-
-    #[test]
-    fn mass_free_then_reuse_after_quarantine() {
-        // Mirrors a regenerate: free a large batch in one frame, confirm none are
-        // reused until the quarantine elapses, then all are.
+    fn mass_free_then_reuse() {
+        // Mirrors a regenerate: free a large batch, confirm it's all reusable at once
+        // (no quarantine delay) before the high-water grows again.
         let mut f = SlotFreeList::default();
         let slots: Vec<u32> = (0..1000).map(|_| f.allocate()).collect();
         for &s in &slots {
             f.free(s);
         }
-        // Allocations during quarantine all grow the high-water (no early reuse).
-        let during = f.allocate();
-        assert!(during >= 1000, "reused a quarantined slot during the burst");
-        for _ in 0..QUARANTINE_FRAMES {
-            f.tick();
+        assert_eq!(f.free.len(), 1000);
+        for _ in 0..1000 {
+            assert!(f.allocate() < 1000, "should reuse the freed batch, not grow");
         }
-        assert_eq!(f.free.len(), 1000, "the freed batch should all be reusable now");
+        assert_eq!(f.allocate(), 1000, "batch exhausted → bump high-water");
     }
 }

@@ -149,11 +149,32 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
     const WORDS: u32 = (size_of::<C::Value>() / 4) as u32;
     const STRIDE: u64 = size_of::<C::Value>() as u64;
 
-    /// The column buffer — bind this read-only into consumer groups. (The inner
-    /// `wgpu::Buffer` of the sparse store; the handle is stable across growth.)
+    /// The raw column buffer handle (the inner `wgpu::Buffer` of the sparse store;
+    /// stable across growth). Use this for bind-group cache keys (`Buffer::id()`) or
+    /// when the binding size is set explicitly. **Do not** `as_entire_binding()` this
+    /// into a shader that calls `arrayLength()` — that binds the whole sparse virtual
+    /// reservation and `arrayLength()` becomes enormous (the GPU-hang class); use
+    /// [`binding`](Self::binding), which sizes to the committed range, instead.
     #[inline]
     pub fn buffer(&self) -> &Buffer {
         self.buffer.buffer()
+    }
+
+    /// A descriptor binding sized to **exactly the committed range**
+    /// ([`committed_bytes`](Self::committed_bytes)), so a shader's `arrayLength()` is
+    /// the real slot count and an out-of-range index is bounds-checked rather than a
+    /// page fault. `None` until the first page is committed (a consumer skips its
+    /// bind group that frame). The committed-sized sibling of
+    /// [`buffer`](Self::buffer); prefer this for any consumer that doesn't set the
+    /// binding size itself.
+    #[inline]
+    pub fn binding(&self) -> Option<bevy_render::render_resource::BindingResource<'_>> {
+        use bevy_render::render_resource::{BindingResource, BufferBinding};
+        Some(BindingResource::Buffer(BufferBinding {
+            buffer: self.buffer.buffer(),
+            offset: 0,
+            size: Some(NonZero::<u64>::new(self.committed_bytes())?),
+        }))
     }
 
     /// The previous-frame buffer (`KEEP_PREVIOUS` columns only).

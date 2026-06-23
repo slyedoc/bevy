@@ -263,7 +263,7 @@ fn camera() -> impl Scene {
         // NOT be written back from the GPU transform table, or the lagged value
         // (and a regen-stale slot→entity reverse-map resolve) clobbers it — the
         // "camera stuck on an odd pivot after regenerate" symptom.
-        NoGpuGlobalTransformReadback
+
         Exposure::OVERCAST
         //Bloom::NATURAL
         Msaa::Off

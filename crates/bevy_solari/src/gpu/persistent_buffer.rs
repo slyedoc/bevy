@@ -136,6 +136,14 @@ impl<T: PersistentGpuBufferable> PersistentGpuBuffer<T> {
     pub fn buffer(&self) -> &Buffer {
         self.buffer.buffer()
     }
+
+    /// Base device address — stable for the buffer's lifetime (the sparse backing
+    /// is never freed). Safe to capture for the raw RT trace; see
+    /// [`RawTraceBindable`](super::raw_trace::RawTraceBindable).
+    #[inline]
+    pub fn device_address(&self) -> vk::DeviceAddress {
+        self.buffer.address
+    }
 }
 
 /// A trait representing data that can be written to a [`PersistentGpuBuffer`].

@@ -153,6 +153,12 @@ pub fn prepare_rt_reconcile_bind_group(
     let Some(params) = reconcile.params.binding() else {
         return;
     };
+    // Bind the WHOLE sparse buffer (stable handle) per column, not the committed
+    // range: this bind group is built once and cached, and the columns grow (regen),
+    // so a committed-sized binding would freeze at the first size and the reconcile
+    // couldn't write slots past it. The reconcile is slot-indexed and never calls
+    // `arrayLength`, so the whole-range bind is safe (no `arrayLength` hang) and
+    // growth-proof — every slot `< high_water` is always in range.
     let layout = pipeline_cache.get_bind_group_layout(&reconcile.layout);
     reconcile.bind_group = Some(render_device.create_bind_group(
         "rt_reconcile",
@@ -168,9 +174,12 @@ pub fn prepare_rt_reconcile_bind_group(
     ));
 }
 
-/// `RenderGraph` (`Scatter`): apply this frame's journal to the columns.
+/// `RenderGraph` (`Scatter`): apply this frame's journal to the columns. Clears the
+/// journal's pending records (`mark_folded`) **only** after a real dispatch, so a
+/// cold-pipeline frame retains them to retry next frame (the retain-until-folded latch).
 pub fn dispatch_rt_reconcile(
     reconcile: Option<Res<RtReconcile>>,
+    journal: Option<ResMut<RtJournal>>,
     pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
@@ -195,6 +204,13 @@ pub fn dispatch_rt_reconcile(
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
     pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+    drop(pass);
+    // Folded: the GPU consumed the journal from its buffer this frame, so the CPU
+    // staging can be dropped. Until this runs (cold pipeline / no bind group), the
+    // records stay live and are re-uploaded next frame.
+    if let Some(mut journal) = journal {
+        journal.mark_folded();
+    }
 }
 
 /// Wires the reconcile pass (embedded shader + the prepare/dispatch systems).
@@ -207,7 +223,13 @@ impl Plugin for ReconcilePlugin {
             return;
         };
         render_app
-            .add_systems(RenderStartup, init_rt_reconcile)
+            // After `init_rt_journal` (which is itself after `SolariSetup`/the
+            // allocator): the reconcile only initializes when the journal exists, so
+            // it must observe the journal already inserted this startup.
+            .add_systems(
+                RenderStartup,
+                init_rt_reconcile.after(crate::instance::init_rt_journal),
+            )
             .add_systems(
                 Render,
                 (

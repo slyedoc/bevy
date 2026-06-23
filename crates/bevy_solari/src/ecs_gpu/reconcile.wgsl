@@ -64,5 +64,9 @@ fn reconcile_apply(
     node_slots[slot] = rec.node_key;
     geometry_ids[slot] = rec.geometry_id;
     group_bases[slot] = rec.group_base;
+    // This vec4 order MUST match `InstanceLodInputGpu` (cluster_base, cluster_count,
+    // group_base, root_group) — the layout the CPU delta scatter writes — so the
+    // reconcile and the CPU writer produce byte-identical columns (the authority flip
+    // relies on this).
     lod_inputs[slot] = vec4<u32>(rec.cluster_base, rec.cluster_count, rec.group_base, rec.root_group);
 }

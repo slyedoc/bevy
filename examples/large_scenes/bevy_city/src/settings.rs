@@ -22,7 +22,7 @@ use crate::assets::CityAssets;
 use crate::generate_city::{spawn_city, CityRoot};
 
 /// Smallest / largest city the regenerate slider offers (blocks per side).
-pub const CITY_SIZE_RANGE: (u32, u32) = (3, 150);
+pub const CITY_SIZE_RANGE: (u32, u32) = (3, 250);
 
 /// On the scene-info line under "Regenerate City"; [`update_city_info`] keeps
 /// it current.

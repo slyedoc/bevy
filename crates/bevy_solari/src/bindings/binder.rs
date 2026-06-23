@@ -11,6 +11,7 @@ use bevy_ecs::{
 };
 use crate::gpu::allocator::Allocator;
 use crate::gpu::stable_storage_buffer::StableStorageBuffer;
+use crate::gpu::RawTraceBindable;
 use bevy_math::Vec3;
 use bevy_pbr::DfgLut;
 
@@ -32,10 +33,13 @@ const TEXTURE_MAP_NONE: u32 = u32::MAX;
 pub struct RaytracingSceneBindings {
     pub bind_group: Option<BindGroup>,
     pub bind_group_layout: BindGroupLayoutDescriptor,
-    /// The materials storage buffer (this frame), exposed so the RT-pipeline path
-    /// can reach it by buffer-device-address (`physical_load<Material>`) instead of
-    /// the bound `materials` array. `None` until the first bind-group build.
-    pub materials_buffer: Option<Buffer>,
+    /// Stable device address of the materials storage buffer, exposed so the
+    /// RT-pipeline path can reach it by `physical_load<Material>` instead of the
+    /// bound `materials` array. Captured from the stable-address
+    /// [`StableStorageBuffer`](crate::gpu::stable_storage_buffer::StableStorageBuffer)
+    /// via [`RawTraceBindable`](crate::gpu::RawTraceBindable), so it stays valid for
+    /// any in-flight trace. `0` until the first bind-group build.
+    pub materials_device_address: ash::vk::DeviceAddress,
 }
 
 /// The scene's per-frame-rebuilt tables, now on persistent **stable-address**
@@ -281,9 +285,9 @@ pub fn prepare_raytracing_scene_bindings(
     active_light_list.write_buffer(&render_device, &render_queue);
 
     // Expose the (stable-handle) materials buffer for the RT-pipeline's bindless
-    // `physical_load`. The handle never changes across growth, so this is the same
-    // buffer every frame — set_geometry_addresses reads its stable device address.
-    raytracing_scene_bindings.materials_buffer = Some(materials.buffer().clone());
+    // `physical_load`. `trace_device_address` is only callable on stable-address
+    // buffers, so the trace can never capture a reallocating one (compile-time).
+    raytracing_scene_bindings.materials_device_address = materials.trace_device_address();
 
     // PTLAS is built by `ptlas::dispatch_ptlas`; no TLAS build here.
 
@@ -336,7 +340,7 @@ impl RaytracingSceneBindings {
     pub fn new() -> Self {
         Self {
             bind_group: None,
-            materials_buffer: None,
+            materials_device_address: 0,
             bind_group_layout: BindGroupLayoutDescriptor::new(
                 "raytracing_scene_bind_group_layout",
                 // `transforms` / `previous_frame_transforms` / `material_ids` /

@@ -71,7 +71,26 @@ pub struct InstanceJournalRecord {
     pub root_group: u32,
 }
 
-const _: () = assert!(size_of::<InstanceJournalRecord>() == 48);
+// `reconcile.wgsl`'s `JournalRecord` reads these fields by their fixed order (12
+// contiguous `u32`s). Pin the size AND every field offset so a reorder here can't
+// silently desync the shader — the const-offset assertion that makes the CPU writer
+// and the GPU reconcile provably agree on the record layout.
+const _: () = {
+    use core::mem::offset_of;
+    assert!(size_of::<InstanceJournalRecord>() == 48);
+    assert!(offset_of!(InstanceJournalRecord, slot) == 0);
+    assert!(offset_of!(InstanceJournalRecord, _pad0) == 4);
+    assert!(offset_of!(InstanceJournalRecord, op) == 8);
+    assert!(offset_of!(InstanceJournalRecord, geometry_id) == 12);
+    assert!(offset_of!(InstanceJournalRecord, material_id) == 16);
+    assert!(offset_of!(InstanceJournalRecord, node_key) == 20);
+    assert!(offset_of!(InstanceJournalRecord, cull_mask) == 24);
+    assert!(offset_of!(InstanceJournalRecord, flags) == 28);
+    assert!(offset_of!(InstanceJournalRecord, group_base) == 32);
+    assert!(offset_of!(InstanceJournalRecord, cluster_base) == 36);
+    assert!(offset_of!(InstanceJournalRecord, cluster_count) == 40);
+    assert!(offset_of!(InstanceJournalRecord, root_group) == 44);
+};
 
 impl InstanceJournalRecord {
     /// A `REMOVE` for `slot` — only the slot + op matter (the reconcile clears the
@@ -129,8 +148,13 @@ pub const JOURNAL_VIRTUAL_BYTES: u64 = 256 * 1024 * 1024;
 /// clears the staging for the next frame.
 #[derive(Resource)]
 pub struct RtJournal {
-    /// This frame's records, appended by the instance lifecycle observers /
-    /// extract. Drained (cleared, capacity kept) after upload each frame.
+    /// Pending records, appended by the instance lifecycle observers / extract.
+    /// **Retained until folded:** cleared by [`mark_folded`](Self::mark_folded) only
+    /// after the reconcile actually dispatches over them (the retain-until-folded
+    /// latch — the twin of [`GpuColumn`](crate::ecs_gpu::GpuColumn)'s `pending`). On
+    /// the cold-start frames before the reconcile pipeline compiles, the records stay
+    /// here and are re-uploaded each frame, so the initial binds are never lost once
+    /// the reconcile becomes the columns' sole writer (the authority flip).
     staging: Vec<InstanceJournalRecord>,
     /// Stable-address ring the reconcile reads. Grown by commit; never freed.
     pub buffer: SparseBuffer,
@@ -152,6 +176,14 @@ impl RtJournal {
     pub fn staged_len(&self) -> usize {
         self.staging.len()
     }
+
+    /// Drop the pending records — called by the reconcile **only after it has
+    /// actually dispatched** over them (with a live pipeline + bind group), so a
+    /// cold-pipeline frame keeps them live to retry next frame. Capacity is kept.
+    #[inline]
+    pub fn mark_folded(&mut self) {
+        self.staging.clear();
+    }
 }
 
 /// `RenderStartup`: allocate the journal ring + insert [`RtJournal`]. No-op when
@@ -160,8 +192,22 @@ pub fn init_rt_journal(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     allocator: Option<Res<Allocator>>,
+    additional: Res<bevy_render::renderer::raw_vulkan_init::AdditionalVulkanFeatures>,
 ) {
     let Some(allocator) = allocator else {
+        // Ordering tripwire (release-safe): this system is `.after(SolariSetup)`, so
+        // whenever solari is *supported* the allocator already exists. A missing
+        // allocator while the feature IS present means an init-ordering regression
+        // (someone dropped the `.after`) — which silently kills the journal AND the
+        // whole reconcile, leaving instance columns unwritten. Fail loud, not dark.
+        // (Feature absent → solari legitimately disabled; init_allocator already warned.)
+        if additional.has::<crate::gpu::extension::ClusterAccelerationStructureFeature>() {
+            bevy_log::error!(
+                "init_rt_journal ran before the raw-VK allocator despite solari being supported \
+                 — RenderStartup ordering regression; restore `.after(SolariSetup)`. The GPU \
+                 instance reconcile will be absent and instance columns won't be written."
+            );
+        }
         return;
     };
     let buffer = allocator.create_sparse_buffer(
@@ -179,11 +225,13 @@ pub fn init_rt_journal(
     });
 }
 
-/// `Render::Prepare`: upload this frame's staged records into the stable-address
-/// ring and publish the count, then clear the staging (capacity kept). Always
-/// starts at offset 0 — the reconcile reads `[0, count)`; records are
-/// frame-scoped (the GPU consumes them the same frame), so no wraparound is
-/// needed within a frame.
+/// `Render::Prepare`: upload the pending records into the stable-address ring and
+/// publish the count. Always starts at offset 0 — the reconcile reads `[0, count)`.
+///
+/// The staging is **not** cleared here: [`RtJournal::mark_folded`] clears it from the
+/// reconcile dispatch, only once the records have actually been folded. So a frame
+/// whose reconcile pipeline isn't ready yet re-uploads the same records next frame
+/// rather than dropping them (the retain-until-folded latch).
 pub fn upload_rt_journal(
     journal: Option<bevy_ecs::system::ResMut<RtJournal>>,
     render_queue: Res<RenderQueue>,
@@ -203,5 +251,4 @@ pub fn upload_rt_journal(
         render_queue.write_buffer(journal.buffer.buffer(), 0, bytemuck::cast_slice(&staging));
         journal.staging = staging;
     }
-    journal.staging.clear();
 }

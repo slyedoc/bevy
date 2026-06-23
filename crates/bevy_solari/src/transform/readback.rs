@@ -21,13 +21,14 @@
 //! records — skipping nodes whose `no_readback` flag is set (the
 //! [`NoGpuGlobalTransformReadback`] opt-out, scattered as a transform-table column) so
 //! they never cost transfer — into a `ShaderBuffer` → bevy's [`Readback`] streams
-//! it to the main world → an observer resolves slot→entity (the allocator's
-//! reverse map) and writes `GlobalTransform`.
+//! it to the main world → an observer resolves the owning entity (carried in each
+//! record as `Entity::to_bits`) and writes its `GlobalTransform`.
 
 use bevy_app::{App, Startup};
 use bevy_asset::{Assets, Handle, RenderAssetUsages};
 use bevy_ecs::{
     component::Component,
+    entity::Entity,
     observer::On,
     resource::Resource,
     system::{Commands, Query, Res, ResMut},
@@ -49,11 +50,13 @@ use bevy_render::{
 use bevy_transform::components::GlobalTransform;
 use bytemuck::{Pod, Zeroable};
 
-use crate::ecs_gpu::{GpuColumn, GpuSlotAllocator};
+use crate::ecs_gpu::GpuColumn;
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 
-use super::graph::{LocalColumn, NoReadbackColumn, ParentColumn, TransformGraph};
+use super::graph::{
+    LocalColumn, NodeEntityColumn, NoReadbackColumn, ParentColumn,
+};
 use super::propagate::TransformPropagate;
 
 /// Master switch for the whole readback (gather dispatch + the `GlobalTransform`
@@ -65,8 +68,9 @@ const READBACK_ENABLED: bool = true;
 const WORKGROUP_SIZE: u32 = 64;
 /// `u32`s of header at the front of the readback buffer: `[count, _, _, _]`.
 const HEADER_WORDS: u32 = 4;
-/// `u32`s per record: `slot` + a `mat3x4` world transform (12 floats).
-const RECORD_WORDS: u32 = 13;
+/// `u32`s per record: `slot` + a `mat3x4` world transform (12 floats) + the owning
+/// entity's bits (`[lo, hi]` — the identity the writeback resolves by).
+const RECORD_WORDS: u32 = 15;
 /// Max records read back per frame. The output buffer is sized to this and bevy's
 /// `Readback` streams the **whole** buffer each frame (it can't size to the live
 /// count), so this is also the per-frame transfer (`capacity × 52 B` ≈ 6.8 MB at
@@ -131,6 +135,7 @@ pub fn transform_readback_bind_group_layout() -> BindGroupLayoutDescriptor {
                 uniform_buffer::<ReadbackParams>(false),     // 3 params
                 storage_buffer_read_only_sized(false, None), // 4 no_readback (per-node opt-out flag)
                 storage_buffer_read_only_sized(false, None), // 5 parent (ancestor walk for cascade)
+                storage_buffer_read_only_sized(false, None), // 6 node_generation (ABA stamp)
             ),
         ),
     )
@@ -209,14 +214,22 @@ pub fn prepare_transform_readback_bind_group(
     local: Option<Res<GpuColumn<LocalColumn>>>,
     no_readback: Option<Res<GpuColumn<NoReadbackColumn>>>,
     parent: Option<Res<GpuColumn<ParentColumn>>>,
+    entity: Option<Res<GpuColumn<NodeEntityColumn>>>,
     propagate: Option<Res<TransformPropagate>>,
     target: Option<Res<TransformReadbackTarget>>,
     gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
-    let (Some(resource_manager), Some(local), Some(no_readback), Some(parent), Some(propagate), Some(target)) =
-        (resource_manager, local, no_readback, parent, propagate, target)
+    let (
+        Some(resource_manager),
+        Some(local),
+        Some(no_readback),
+        Some(parent),
+        Some(entity),
+        Some(propagate),
+        Some(target),
+    ) = (resource_manager, local, no_readback, parent, entity, propagate, target)
     else {
         readback.bind_group = None;
         return;
@@ -240,6 +253,7 @@ pub fn prepare_transform_readback_bind_group(
             params,
             no_readback.buffer().as_entire_binding(),
             parent.buffer().as_entire_binding(),
+            entity.buffer().as_entire_binding(),
         )),
     ));
 }
@@ -286,13 +300,12 @@ pub fn dispatch_transform_readback(
 
 /// Main world: decode a delivered readback buffer and write `GlobalTransform` for
 /// each record. Opt-out ([`NoGpuGlobalTransformReadback`]) is enforced GPU-side (those
-/// nodes never make it into the buffer), so this just resolves slot→entity via
-/// the allocator's reverse map and writes — then **count-scopes** the next
-/// readback's transfer to this frame's record count (it can't be sized GPU-side
-/// per frame, so we drive bevy's `Readback` range from the lagged count).
+/// nodes never make it into the buffer), so this resolves the owning entity straight
+/// from the record (it carries `Entity::to_bits`) and writes — then **count-scopes**
+/// the next readback's transfer to this frame's record count (it can't be sized
+/// GPU-side per frame, so we drive bevy's `Readback` range from the lagged count).
 fn write_readback_global_transforms(
     event: On<ReadbackComplete>,
-    allocator: Res<GpuSlotAllocator<TransformGraph>>,
     mut transforms: Query<&mut GlobalTransform>,
     mut readbacks: Query<&mut Readback>,
 ) {
@@ -334,12 +347,17 @@ fn write_readback_global_transforms(
 
     for k in 0..count {
         let base = header + k * rec;
-        let slot = words[base];
-        let Some(entity) = allocator.entity(slot) else {
-            continue;
+        // Resolve the owning entity straight from the record (entity-keyed identity,
+        // lag-independent): a recycled slot's new occupant carries a different entity,
+        // and a despawned occupant's `get_mut` fails — either way no stale splat. The
+        // record's slot field (`words[base]`) is unused here; the gather only needs it
+        // to index `world`.
+        let bits = (words[base + 13] as u64) | ((words[base + 14] as u64) << 32);
+        let Some(entity) = Entity::try_from_bits(bits) else {
+            continue; // never-written / torn slot id — skip.
         };
         let Ok(mut global) = transforms.get_mut(entity) else {
-            continue; // despawned / reused slot since dispatch — skip.
+            continue; // despawned / recycled since dispatch — skip.
         };
         // 3 rows of a `mat3x4` (row k = linear row k .xyz, translation k .w).
         // Rebuild the column-major `Affine3A`: column j = (row0[j], row1[j], row2[j]).

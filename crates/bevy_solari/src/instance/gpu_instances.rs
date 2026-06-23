@@ -98,18 +98,22 @@ impl GpuColumnDesc for MaterialColumn {
     }
 }
 
-/// Per-instance group base (cluster scene group). Bind-only.
+/// Per-instance group base (cluster scene group). Bind-only, **reconcile-written**:
+/// the GPU reconcile pass ([`crate::ecs_gpu::reconcile`]) is its sole writer (fed by
+/// the journal `UPSERT`), so the CPU delta is empty — `GpuColumn` still owns/grows the
+/// buffer, the empty delta just means it never CPU-scatters (like [`TransformColumn`]).
 pub struct GroupBaseColumn;
 impl GpuColumnDesc for GroupBaseColumn {
     type Value = u32;
     type Table = InstanceManager;
     const LABEL: &'static str = "gpu_instances.group_bases";
-    fn delta_records(m: &InstanceManager) -> &[u32] {
-        m.group_base_delta()
+    fn delta_records(_: &InstanceManager) -> &[u32] {
+        &[]
     }
 }
 
-/// Per-instance packed LOD inputs (selector reads these). Bind-only.
+/// Per-instance packed LOD inputs (selector reads these). Bind-only,
+/// **reconcile-written** (see [`GroupBaseColumn`]).
 pub struct LodInputColumn;
 impl GpuColumnDesc for LodInputColumn {
     type Value = InstanceLodInputGpu;
@@ -118,19 +122,20 @@ impl GpuColumnDesc for LodInputColumn {
     /// Scene-columns group: `instance_cluster_ranges` @binding(4) (the path tracer
     /// reads `(cluster_base, cluster_count)` from the LOD-input struct).
     const SCENE_BINDING: Option<u32> = Some(4);
-    fn delta_records(m: &InstanceManager) -> &[u32] {
-        m.lod_input_delta()
+    fn delta_records(_: &InstanceManager) -> &[u32] {
+        &[]
     }
 }
 
-/// Per-instance geometry id (BLAS sharing + PTLAS fill read these). Bind-only.
+/// Per-instance geometry id (BLAS sharing + PTLAS fill read these). Bind-only,
+/// **reconcile-written** (see [`GroupBaseColumn`]).
 pub struct GeometryIdColumn;
 impl GpuColumnDesc for GeometryIdColumn {
     type Value = u32;
     type Table = InstanceManager;
     const LABEL: &'static str = "gpu_instances.geometry_ids";
-    fn delta_records(m: &InstanceManager) -> &[u32] {
-        m.geometry_id_delta()
+    fn delta_records(_: &InstanceManager) -> &[u32] {
+        &[]
     }
 }
 
@@ -157,8 +162,9 @@ impl GpuColumnDesc for NodeSlotColumn {
     type Value = u32;
     type Table = InstanceManager;
     const LABEL: &'static str = "gpu_instances.node_slots";
-    fn delta_records(m: &InstanceManager) -> &[u32] {
-        m.node_slot_delta()
+    /// Bind-only, **reconcile-written** (see [`GroupBaseColumn`]).
+    fn delta_records(_: &InstanceManager) -> &[u32] {
+        &[]
     }
 }
 

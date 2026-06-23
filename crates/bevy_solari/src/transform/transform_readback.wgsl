@@ -13,6 +13,8 @@
 // Record k layout (u32 words, after the 4-word header):
 //   [0]    = slot
 //   [1..13] = world transform, mat3x4 as 3 vec4 rows (12 floats, bitcast)
+//   [13,14] = owning entity bits (Entity::to_bits as [lo, hi]); the CPU resolves the
+//             entity from these and writes its GlobalTransform (entity-keyed identity)
 
 struct ReadbackParams {
     changed_count: u32,
@@ -27,9 +29,10 @@ struct ReadbackParams {
 @group(0) @binding(3) var<uniform> params: ReadbackParams;
 @group(0) @binding(4) var<storage, read> no_readback: array<u32>;    // 1 = opt out (NoGpuGlobalTransformReadback)
 @group(0) @binding(5) var<storage, read> parent: array<u32>;         // parent node-slot (ROOT_PARENT at roots)
+@group(0) @binding(6) var<storage, read> node_entity: array<vec2<u32>>; // owning entity bits [lo, hi]
 
 const HEADER: u32 = 4u;
-const RECORD: u32 = 13u;
+const RECORD: u32 = 15u;
 // Root sentinel — must match `ROOT_PARENT` in graph.rs / transform_propagate.wgsl.
 const ROOT_PARENT: u32 = 0xffffffffu;
 // Ancestor-walk depth guard (cycle / corrupt-parent backstop).
@@ -98,4 +101,10 @@ fn readback(
     atomicStore(&out[base + 10u],  bitcast<u32>(r2.y));
     atomicStore(&out[base + 11u],  bitcast<u32>(r2.z));
     atomicStore(&out[base + 12u],  bitcast<u32>(r2.w));
+    // Stamp the owning entity's bits; the CPU resolves the entity from these and writes
+    // its GlobalTransform. A recycled slot carries a different entity, so a late
+    // readback can never splat onto the slot's new occupant.
+    let e = node_entity[slot];
+    atomicStore(&out[base + 13u],  e.x);
+    atomicStore(&out[base + 14u],  e.y);
 }

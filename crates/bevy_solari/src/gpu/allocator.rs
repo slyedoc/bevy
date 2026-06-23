@@ -681,9 +681,20 @@ pub fn init_allocator(
     additional: Res<AdditionalVulkanFeatures>,
 ) {
     if !additional.has::<ClusterAccelerationStructureFeature>() {
+        // Solari is silently disabled if we just return with no allocator — every
+        // downstream `Option<Res<Allocator>>` init then no-ops, with no signal as to
+        // why. Say it once so a "nothing renders" report has an obvious first answer.
+        bevy_log::warn_once!(
+            "bevy_solari disabled: the GPU/driver lacks the cluster acceleration-structure \
+             feature (VK_NV_cluster_acceleration_structure et al.). All solari passes no-op."
+        );
         return;
     }
     let Some(memory) = Allocator::try_new(&render_device) else {
+        bevy_log::warn_once!(
+            "bevy_solari disabled: raw-VK allocator init failed despite the cluster-AS feature \
+             being present. All solari passes no-op."
+        );
         return;
     };
     commands.insert_resource(memory);

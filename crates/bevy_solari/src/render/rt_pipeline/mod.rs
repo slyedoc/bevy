@@ -33,6 +33,7 @@ use crate::ecs_gpu::SceneColumns;
 use crate::material::MaterialSlots;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::extension::RayTracingPipelineFeature;
+use crate::gpu::RawTraceBindable;
 use crate::gpu::rt_pipeline::{RtCamera, RtGeometryAddresses, RtPipeline, RtViewBindings};
 use crate::geometry::ClusterMeshManager;
 use crate::render::atmosphere::{AtmosphereSky, SolariAtmosphereView};
@@ -356,21 +357,14 @@ pub(crate) fn rt_pipeline(
     *frame_counter = frame_counter.wrapping_add(1);
     view_bindings.set_camera(&camera_inputs);
 
-    // Bindless geometry addresses for the chit's `physical_load` resolve: the
-    // interleaved packed-vertex pool's device address (stable across frames unless
-    // the sparse pool grows; refreshed each frame regardless).
-    if let (Some(allocator), Some(cluster_mesh_manager)) =
-        (allocator.as_deref(), cluster_mesh_manager.as_deref())
-    {
-        let vertex_packed =
-            allocator.wgpu_buffer_device_address(cluster_mesh_manager.vertex_packed.buffer());
-        let materials = scene_bindings
-            .materials_buffer
-            .as_ref()
-            .map_or(0, |b| allocator.wgpu_buffer_device_address(b));
+    // Bindless geometry addresses for the chit's `physical_load` resolve. Both come
+    // from stable-address (`RawTraceBindable`) buffers, so the captured addresses
+    // stay valid for any in-flight trace — `trace_device_address` won't compile on a
+    // reallocating buffer. The materials address is captured at bind time (binder.rs).
+    if let Some(cluster_mesh_manager) = cluster_mesh_manager.as_deref() {
         view_bindings.set_geometry_addresses(&RtGeometryAddresses {
-            vertex_packed,
-            materials,
+            vertex_packed: cluster_mesh_manager.vertex_packed.trace_device_address(),
+            materials: scene_bindings.materials_device_address,
             material_stride: crate::bindings::GPU_MATERIAL_SIZE,
             _pad: 0,
         });

@@ -421,11 +421,6 @@ pub fn prepare_ptlas_params(
     // the very first build (no `src` to carry from). A change in hair count
     // also grows/shrinks the space and is folded into `high_water`.
     let grew = high_water > resources.as_capacity;
-    // A mass despawn (regenerate) NULLs a huge number of slots in one incremental
-    // op — many of them disabled AND re-added the same frame — which the
-    // incremental PTLAS can't absorb (device lost). Any frame with a large despawn
-    // takes the proven full-rebuild path instead; normal mover frames (a handful of
-    // despawns, or none) stay incremental.
     // A regenerate churns a large fraction of the slot space in a burst — a mass
     // despawn of the old scene AND a respawn that streams in many new slots over
     // several frames. The incremental in-place PTLAS update can't absorb a mass
@@ -436,18 +431,6 @@ pub fn prepare_ptlas_params(
     let mass_churn = instances.disabled_slots().len() > MASS_CHURN_FULL_REBUILD
         || instances.added_slots().len() > MASS_CHURN_FULL_REBUILD;
     let full_rebuild = !resources.has_built || grew || mass_churn;
-
-    if full_rebuild {
-        tracing::info!(
-            "[PTLAS] full={full_rebuild} (has_built={} grew={grew} mass_churn={mass_churn}) \
-             high_water={high_water} as_capacity={} active={active_count} \
-             added={} disabled={}",
-            resources.has_built,
-            resources.as_capacity,
-            instances.added_slots().len(),
-            instances.disabled_slots().len(),
-        );
-    }
 
     // Grow the per-slot written-flags mirror with the slot space. Fresh
     // buffer = all zeros, consistent because growth forces a full rebuild
@@ -576,14 +559,6 @@ pub fn prepare_ptlas_params(
             partitioned_fns
                 .get_partitioned_acceleration_structures_build_sizes(&size_input, &mut sizes_info);
         }
-    }
-    if full_rebuild {
-        tracing::info!(
-            "[PTLAS] sizes: as={} MB scratch={} MB (scratch_virtual={} MB) capacity={capacity}",
-            sizes_info.acceleration_structure_size / (1024 * 1024),
-            sizes_info.build_scratch_size / (1024 * 1024),
-            PTLAS_SCRATCH_VIRTUAL_BYTES / (1024 * 1024),
-        );
     }
     debug_assert!(
         sizes_info.build_scratch_size <= PTLAS_SCRATCH_VIRTUAL_BYTES,

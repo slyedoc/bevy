@@ -63,6 +63,12 @@ crate::gpu_table! {
             // 1 if the node opts out of CPU `GlobalTransform` readback
             // (`NoGpuGlobalTransformReadback`). Read by the readback gather to skip it.
             NoReadbackColumn => no_readback: u32 = "transform.no_readback",
+            // The owning entity's bits (`Entity::to_bits` as `[lo, hi]`). The readback
+            // gather stamps it into each record so the CPU writeback resolves the entity
+            // directly and writes its `GlobalTransform`. Entity-keyed identity makes the
+            // readback ABA-proof: a recycled slot's new occupant has a different entity,
+            // and a despawned occupant's `get_mut` simply fails — no stale splat.
+            NodeEntityColumn => entity: [u32; 2] = "transform.entity",
         }
     }
 }
@@ -117,6 +123,7 @@ pub struct TransformDeltaBuf {
     local: Vec<u32>,
     parent: Vec<u32>,
     no_readback: Vec<u32>,
+    entity: Vec<u32>,
 }
 
 impl TransformDeltaBuf {
@@ -131,6 +138,10 @@ impl TransformDeltaBuf {
     #[inline]
     fn push_no_readback(&mut self, slot: u32, flag: u32) {
         push_record(&mut self.no_readback, slot, flag);
+    }
+    #[inline]
+    fn push_entity(&mut self, slot: u32, entity_bits: [u32; 2]) {
+        push_record(&mut self.entity, slot, entity_bits);
     }
 }
 
@@ -151,6 +162,7 @@ pub fn extract_transform_graph(
     members: Extract<
         Query<
             (
+                Entity,
                 Ref<Transform>,
                 Option<Ref<ChildOf>>,
                 &GpuSlot<TransformGraph>,
@@ -170,17 +182,22 @@ pub fn extract_transform_graph(
 ) {
     members.par_iter().for_each_init(
         || queues.borrow_local_mut(),
-        |buf, (transform, child_of, slot, no_cpu_global)| {
+        |buf, (entity, transform, child_of, slot, no_cpu_global)| {
             let slot = slot.index();
             // `is_changed()` includes the frame the component was added.
             if transform.is_changed() {
                 // Raw TRS — the propagate shader builds the matrix (no CPU pack).
                 buf.push_local(slot, LocalTRS::from_transform(&transform));
-                // The readback opt-out flag scatters at first sight only —
-                // it almost never changes, so movers don't re-send it. Later
-                // marker adds/removes are caught by the dedicated passes below.
+                // The readback opt-out flag + the owning entity's bits scatter at
+                // first sight only — neither changes over an occupant's lifetime, so
+                // movers never re-send them. A reused slot is "first seen" by its new
+                // occupant (it's `Added`), which scatters the new entity, overwriting
+                // the previous occupant's. Later marker adds/removes are caught by the
+                // dedicated passes below.
                 if transform.is_added() {
                     buf.push_no_readback(slot, no_cpu_global as u32);
+                    let bits = entity.to_bits();
+                    buf.push_entity(slot, [bits as u32, (bits >> 32) as u32]);
                 }
             }
             let parent_changed = match &child_of {
@@ -200,10 +217,12 @@ pub fn extract_transform_graph(
             }
         },
     );
-    // `parent` / `no_readback` are tiny (reparent / first-sight only) — serial.
+    // `parent` / `no_readback` / `entity` are tiny (reparent / first-sight only) —
+    // serial.
     for buf in queues.iter_mut() {
         table.parent.append(&mut buf.parent);
         table.no_readback.append(&mut buf.no_readback);
+        table.entity.append(&mut buf.entity);
     }
 
     // Readback opt-out flag changes after first sight. Removals first: an entity

@@ -52,6 +52,7 @@ use bevy_render::{
     render_resource::ShaderType, renderer::RenderDevice, sync_world::RenderEntity, MainWorld,
 };
 
+
 /// Render-world component carrying this instance's GPU [`GpuEntity`].
 ///
 /// Lives on the **synced render entity** (`RaytracingMesh3d` requires
@@ -172,21 +173,14 @@ pub struct InstanceManager {
     /// Pre-built per-column scatter deltas — the raw `[slot, value-words…]`
     /// records each `GpuColumn` uploads verbatim. The value the column needs is
     /// appended here at its point of change (no per-slot CPU mirror to gather
-    /// back out of): `group_base` / `lod_input` / `geometry_id` once at bind;
-    /// `material` when [`resolve_instance_material_ids`] resolves a changed slot.
-    /// (The world transform is NOT here — it's produced GPU-side by the transform
-    /// table's Jacobi pass and gathered into `TransformColumn`.) The GPU buffers
-    /// are the source of truth across a capacity growth (copied old→new on the
-    /// GPU), so nothing is mirrored CPU-side.
-    group_base_delta: Vec<u32>,
-    lod_input_delta: Vec<u32>,
-    geometry_id_delta: Vec<u32>,
+    /// CPU column scatter deltas. Only the columns the CPU still owns are here:
+    /// `material` (resolved when [`resolve_instance_material_ids`] resolves a changed
+    /// slot) and the cull `mask` (bind + `RenderLayers` change). The bind-only columns
+    /// (`group_base` / `lod_input` / `geometry_id` / `node_slot`) are written GPU-side
+    /// by the reconcile pass from the journal, so they have no CPU delta.
     material_delta: Vec<u32>,
     /// Cull mask scatter delta — pushed at bind and on a `RenderLayers` change.
     instance_mask_delta: Vec<u32>,
-    /// Transform-table node-slot scatter delta — `[slot, node_slot]` pushed at
-    /// bind (an entity's `GpuSlot` is stable). The gather pass reads the column.
-    node_slot_delta: Vec<u32>,
     /// Slots whose material `AssetId` changed this frame (added ∪
     /// material-swapped). [`resolve_instance_material_ids`] re-resolves
     /// only these to a GPU material index; the binder also reads it to decide
@@ -220,12 +214,8 @@ impl InstanceManager {
             rewrite_slots: Vec::new(),
             disabled_slots: Vec::new(),
             released_slots: Vec::new(),
-            group_base_delta: Vec::new(),
-            lod_input_delta: Vec::new(),
-            geometry_id_delta: Vec::new(),
             material_delta: Vec::new(),
             instance_mask_delta: Vec::new(),
-            node_slot_delta: Vec::new(),
             material_dirty: Vec::new(),
             max_active_cluster_count: 0,
         }
@@ -278,20 +268,6 @@ impl InstanceManager {
     #[inline]
     pub fn active_count(&self) -> usize {
         self.active_slots.len()
-    }
-
-    /// Reusable slot indices currently on the free-list (despawned, not yet
-    /// re-allocated). Exposed for the slot-ratchet diagnostic.
-    #[inline]
-    pub fn free_count(&self) -> usize {
-        self.free_slots.len()
-    }
-
-    /// Slots released (despawned) this frame, before [`Self::clear_deltas`]
-    /// runs. Exposed for the slot-ratchet diagnostic.
-    #[inline]
-    pub fn released_count(&self) -> usize {
-        self.released_slots.len()
     }
 
     /// Iterator over this frame's active slots, in extract order.
@@ -353,20 +329,9 @@ impl InstanceManager {
     }
 
     /// This frame's `group_base` / `lod_input` / `geometry_id` / `material`
-    /// scatter deltas — raw `[slot, value-words…]` records each column uploads
-    /// verbatim. Built at bind (the first three) / material resolve.
-    #[inline]
-    pub fn group_base_delta(&self) -> &[u32] {
-        &self.group_base_delta
-    }
-    #[inline]
-    pub fn lod_input_delta(&self) -> &[u32] {
-        &self.lod_input_delta
-    }
-    #[inline]
-    pub fn geometry_id_delta(&self) -> &[u32] {
-        &self.geometry_id_delta
-    }
+    /// This frame's material-id scatter delta — `[slot, material_id]` records
+    /// pushed when [`resolve_instance_material_ids`] resolves a changed slot.
+    /// Uploaded verbatim by [`super::gpu_instances::MaterialColumn`].
     #[inline]
     pub fn material_delta(&self) -> &[u32] {
         &self.material_delta
@@ -377,12 +342,6 @@ impl InstanceManager {
     #[inline]
     pub fn instance_mask_delta(&self) -> &[u32] {
         &self.instance_mask_delta
-    }
-    /// This frame's node-slot scatter delta — `[slot, node_slot]` records pushed
-    /// at bind. Uploaded verbatim by [`super::gpu_instances::NodeSlotColumn`].
-    #[inline]
-    pub fn node_slot_delta(&self) -> &[u32] {
-        &self.node_slot_delta
     }
 
     /// Allocate a fresh slot. Grows the persistent per-slot vectors to cover
@@ -419,26 +378,22 @@ impl InstanceManager {
         self.rewrite_slots.clear();
         self.disabled_slots.clear();
         self.released_slots.clear();
-        self.group_base_delta.clear();
-        self.lod_input_delta.clear();
-        self.geometry_id_delta.clear();
         self.material_delta.clear();
         self.instance_mask_delta.clear();
-        self.node_slot_delta.clear();
         self.material_dirty.clear();
     }
 
-    /// Bind a newly-seen instance: allocate a slot, add it to the persistent
-    /// active set, and scatter its bind-only per-column values delta-direct
-    /// (`group_base` / `lod_input` / `geometry_id` / `node_slot`) plus flag its
-    /// material for resolution. The world transform is not scattered here — it's
-    /// produced GPU-side (transform table → Jacobi → gather into `TransformColumn`).
+    /// Bind a newly-seen instance: allocate a slot, add it to the persistent active
+    /// set, scatter its cull mask, and flag its material for resolution. The bind-only
+    /// per-column values (`group_base` / `lod_input` / `geometry_id` / `node_slot`) are
+    /// written GPU-side by the reconcile pass from the journal `UPSERT` emitted
+    /// alongside this bind (the caller pushes it). The world transform is produced
+    /// GPU-side too (transform gather → `TransformColumn`).
     fn bind(
         &mut self,
         ptrs: SlotMeshPointers,
         material_asset_id: AssetId<SolariMaterial>,
         cull_mask: u32,
-        node_slot: u32,
     ) -> GpuEntity {
         let slot = self.allocate_slot(ptrs);
         // Running worst-case cluster count (monotonic; see field doc).
@@ -449,25 +404,8 @@ impl InstanceManager {
         self.slot_active_pos[slot.0 as usize] = self.active_slots.len() as u32;
         self.active_slots.push(slot);
         self.added_slots.push(slot);
-        // Scatter this slot's bind-only values straight into their GPU columns. (The
-        // GPU reconcile pass also writes these from the journal, but the CPU scatter
-        // stays authoritative — the reconcile has a cold-start window where its
-        // pipeline/bind-group aren't ready on the bind frame, which would leave the
-        // columns empty if it were the sole writer.)
-        push_delta_record(&mut self.group_base_delta, slot, ptrs.group_base.0);
-        push_delta_record(
-            &mut self.lod_input_delta,
-            slot,
-            InstanceLodInputGpu {
-                cluster_base: ptrs.cluster_base.0,
-                cluster_count: ptrs.cluster_count,
-                group_base: ptrs.group_base.0,
-                root_group: ptrs.root_group.0,
-            },
-        );
-        push_delta_record(&mut self.geometry_id_delta, slot, ptrs.geometry_id);
+        // The cull mask is CPU-owned (it changes post-bind via `update`).
         push_delta_record(&mut self.instance_mask_delta, slot, cull_mask);
-        push_delta_record(&mut self.node_slot_delta, slot, node_slot);
         // New material → resolve its GPU index this frame.
         self.material_dirty.push(slot);
         slot
@@ -715,10 +653,6 @@ pub fn flush_cluster_instances(
         }
     }
 
-    // [PROBE] count instances binding with an unassigned transform node-slot.
-    let mut bind_total = 0u32;
-    let mut bind_max_node = 0u32;
-
     // Drain this frame's observer-flagged changes (binds + material / cull-layer
     // swaps). Empty in steady state, since movement never enters here.
     for main_entity in changes.0.drain() {
@@ -729,12 +663,6 @@ pub fn flush_cluster_instances(
         let material_id = material.map(|m| m.0.id()).unwrap_or_default();
         let cull_mask = render_layers_to_mask(render_layers);
         let node_slot = node_slot.map(GpuSlot::index).unwrap_or(u32::MAX);
-        if !slot_map.0.contains_key(&render_entity) {
-            bind_total += 1;
-            if node_slot == u32::MAX {
-                bind_max_node += 1;
-            }
-        }
         if let Some(slot) = slot_map.0.get(&render_entity).copied() {
             // Already bound → material / cull-mask update (no-op if unchanged).
             manager.update(slot, material_id, cull_mask);
@@ -746,7 +674,6 @@ pub fn flush_cluster_instances(
             mesh.id(),
             material_id,
             cull_mask,
-            node_slot,
         ) {
             slot_map.0.insert(render_entity, slot);
             commands
@@ -786,10 +713,6 @@ pub fn flush_cluster_instances(
             let material_id = material.map(|m| m.0.id()).unwrap_or_default();
             let cull_mask = render_layers_to_mask(render_layers);
             let node_slot = node_slot.map(GpuSlot::index).unwrap_or(u32::MAX);
-            bind_total += 1;
-            if node_slot == u32::MAX {
-                bind_max_node += 1;
-            }
             if let Some((slot, pointers)) = try_bind_instance(
                 &mut manager,
                 &mut cluster_meshes,
@@ -798,7 +721,6 @@ pub fn flush_cluster_instances(
                 mesh.id(),
                 material_id,
                 cull_mask,
-                node_slot,
             ) {
                 slot_map.0.insert(render_entity, slot);
                 commands
@@ -817,13 +739,6 @@ pub fn flush_cluster_instances(
                 pending.insert(main_entity);
             }
         }
-    }
-
-    if bind_total > 0 {
-        tracing::info!(
-            "[BIND] bound={bind_total} with_unassigned_node_slot={bind_max_node} pending={}",
-            pending.len(),
-        );
     }
 }
 
@@ -869,7 +784,6 @@ fn try_bind_instance(
     mesh_id: AssetId<ClusterMesh>,
     material: AssetId<SolariMaterial>,
     cull_mask: u32,
-    node_slot: u32,
 ) -> Option<(GpuEntity, SlotMeshPointers)> {
     if asset_server.is_managed(mesh_id) && !asset_server.is_loaded_with_dependencies(mesh_id) {
         return None;
@@ -883,7 +797,7 @@ fn try_bind_instance(
         total_triangle_count: upload.total_triangle_count,
         geometry_id: upload.geometry_id,
     };
-    let slot = manager.bind(pointers, material, cull_mask, node_slot);
+    let slot = manager.bind(pointers, material, cull_mask);
     Some((slot, pointers))
 }
 
@@ -908,33 +822,6 @@ pub fn free_cluster_slot(
         }
     }
     slot_map.0.remove(&remove.entity);
-}
-
-/// TEMP DIAGNOSTIC (slot-ratchet investigation): print the slot allocator's
-/// `high_water / active / free` whenever it changes, with this frame's
-/// `+added / -released`. Runs at the end of `ExtractSchedule` (after the
-/// flush), so a Regenerate click leaves a clean before→after trace: if
-/// `high_water` jumps while `free` stays 0, the new city allocated *before*
-/// the old city freed (the overlap ratchet); if `free` spikes then drains
-/// with `high_water` flat, reuse is clean and the decay is a shrink.
-pub fn log_slot_ratchet(
-    manager: Res<InstanceManager>,
-    mut last: Local<Option<(u32, usize, usize)>>,
-) {
-    let now = (
-        manager.slot_high_water(),
-        manager.active_count(),
-        manager.free_count(),
-    );
-    if *last != Some(now) {
-        let (hw, active, free) = now;
-        println!(
-            "[SLOT] high_water={hw} active={active} free={free} | +{} -{}",
-            manager.added_slots().len(),
-            manager.released_count(),
-        );
-        *last = Some(now);
-    }
 }
 
 /// `Render::Prepare` (after `prepare_material_slots`, before

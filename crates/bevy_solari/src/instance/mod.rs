@@ -36,9 +36,9 @@ pub use gpu_instances::{
 };
 pub use instance_manager::{
     clear_instance_deltas, flush_cluster_instances, free_cluster_slot, init_instance_manager,
-    log_slot_ratchet, mark_instance_added, mark_instance_layers_changed,
-    mark_instance_material_changed, resolve_instance_material_ids, InstanceManager,
-    RaytracingGpuEntity, RtInstanceChanges, RtSlotMap,
+    mark_instance_added, mark_instance_layers_changed, mark_instance_material_changed,
+    resolve_instance_material_ids, InstanceManager, RaytracingGpuEntity, RtInstanceChanges,
+    RtSlotMap,
 };
 pub use journal::{
     init_rt_journal, upload_rt_journal, InstanceJournalRecord, RtJournal, JOURNAL_OP_UPSERT,
@@ -76,7 +76,16 @@ impl Plugin for InstancePlugin {
             .init_resource::<MaterialTraversalFlags>()
             .add_systems(
                 RenderStartup,
-                (init_instance_manager, init_material_slots, init_rt_journal),
+                (
+                    init_instance_manager,
+                    init_material_slots,
+                    // MUST run after the raw-VK allocator exists (`SolariSetup`): the
+                    // journal's sparse ring is allocated through it, and `init_rt_journal`
+                    // silently no-ops if the allocator isn't inserted yet — which leaves
+                    // the journal (and the whole reconcile) absent and the GPU columns
+                    // unwritten once the CPU scatter is gone.
+                    init_rt_journal.after(crate::SolariSetup),
+                ),
             )
             // Serial flush: drain the change set, resolve slot, bind / update the
             // `InstanceManager`. Gated until the column scatter pipelines have
@@ -86,12 +95,7 @@ impl Plugin for InstancePlugin {
             // when the flush runs), so no bind is missed.
             .add_systems(
                 ExtractSchedule,
-                (
-                    flush_cluster_instances.run_if(cluster_columns_ready),
-                    // TEMP slot-ratchet diagnostic — runs after the flush so it
-                    // logs post-allocate state. Remove once the decay is fixed.
-                    log_slot_ratchet.after(flush_cluster_instances),
-                ),
+                flush_cluster_instances.run_if(cluster_columns_ready),
             )
             .add_observer(free_cluster_slot)
             .add_systems(

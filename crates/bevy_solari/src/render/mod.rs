@@ -6,7 +6,6 @@
 
 pub mod atmosphere;
 pub mod rt_pipeline;
-mod jitter;
 mod reset;
 pub mod view;
 pub mod view_cull;
@@ -20,7 +19,6 @@ use bevy_core_pipeline::{
 use bevy_ecs::schedule::{common_conditions::resource_exists, IntoScheduleConfigs, SystemCondition};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
-    camera::TemporalJitter,
     extract_component::{ExtractComponent, ExtractComponentPlugin},
     extract_resource::ExtractResourcePlugin,
     ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
@@ -81,13 +79,13 @@ impl Plugin for SolarRenderPlugin {
                 )
                     .in_set(RenderSystems::PrepareResources),
             )
-            .add_systems(
-                Render,
-                // Zero the camera jitter — the RT path writes a fresh frame and
-                // has no temporal accumulator, so a jittered projection would just
-                // shimmer.
-                jitter::zero_solari_jitter.in_set(RenderSystems::PrepareViews),
-            )
+            // .add_systems(
+            //     Render,
+            //     // Zero the camera jitter — the RT path writes a fresh frame and
+            //     // has no temporal accumulator, so a jittered projection would just
+            //     // shimmer.
+            //     jitter::zero_solari_jitter.in_set(RenderSystems::PrepareViews),
+            // )
             .add_systems(
                 Render,
                 atmosphere::prepare_atmosphere_bind_group.in_set(RenderSystems::PrepareBindGroups),
@@ -118,5 +116,5 @@ impl Plugin for SolarRenderPlugin {
 
 #[derive(Component, Default, Reflect, Clone, ExtractComponent)]
 #[reflect(Component, Default, Clone)]
-#[require(Hdr, TemporalJitter, CameraReset)]
+#[require(Hdr, CameraReset)]
 pub struct SolariCamera;
