@@ -263,6 +263,7 @@ fn camera() -> impl Scene {
         // NOT be written back from the GPU transform table, or the lagged value
         // (and a regen-stale slot→entity reverse-map resolve) clobbers it — the
         // "camera stuck on an odd pivot after regenerate" symptom.
+        NoGpuGlobalTransformReadback
 
         Exposure::OVERCAST
         //Bloom::NATURAL
@@ -344,6 +345,10 @@ fn sun() -> impl Scene {
             illuminance: light_consts::lux::RAW_SUNLIGHT,
         }
         template_value(Transform::from_xyz(1.0, 0.15, 1.0).looking_at(Vec3::ZERO, Vec3::Y))
+        // CPU-authored static sun: keep its GlobalTransform off the async GPU
+        // readback so the atmosphere bake always reads the correct sun direction
+        // (a clobbered/laggy sun baked a black sky and latched it).
+        NoGpuGlobalTransformReadback
     }
 }
 

@@ -138,11 +138,11 @@ impl Plugin for SolarRenderPlugin {
                     dlss::solari_dlss_resolve
                         .after(rt_pipeline::rt_pipeline)
                         .before(tonemapping)
-                        .run_if(resource_exists::<dlss::SolariDlssSdk>),
+                        .run_if(resource_exists::<dlss::SolariDlssSdk>.and_then(dlss::dlss_enabled)),
                     dlss::solari_dlss_render
                         .after(dlss::solari_dlss_resolve)
                         .before(tonemapping)
-                        .run_if(resource_exists::<dlss::SolariDlssSdk>),
+                        .run_if(resource_exists::<dlss::SolariDlssSdk>.and_then(dlss::dlss_enabled)),
                 )
                     .chain(),
             );

@@ -320,10 +320,11 @@ fn create_dlss_textures(render_device: &RenderDevice, size: UVec2) -> SolariDlss
     }
 }
 
-/// `Render`/`PrepareResources`: create / refresh the per-view RR context, guide
-/// textures, and sub-pixel jitter; tear them down when the mode is `Off`. No-op when
-/// the SDK is absent (DLSS unsupported). Runs before `rt_pipeline` (which reads the
-/// jitter later, in `Core3d`).
+/// `Render`/`PrepareResources`: create the per-view RR context + guide textures ONCE
+/// (kept for the view's lifetime — the NGX lifecycle must not churn while the raw
+/// trace is live) and set the sub-pixel jitter when DLSS is on. No-op when the SDK is
+/// absent (DLSS unsupported). Runs before `rt_pipeline` (which reads the jitter later,
+/// in `Core3d`).
 ///
 /// Phase 3a: always DLAA (render == display); the true per-mode render resolution +
 /// `MainPassResolutionOverride` upscaling lands in the next milestone.
@@ -348,28 +349,6 @@ pub fn prepare_solari_dlss(
         return;
     };
 
-    // Off: tear down the per-view DLSS state so the trace output presents raw
-    // (and unjittered — without `SolariDlssJitter`, `rt_pipeline` jitters by zero).
-    if *mode == SolariDlssMode::Off {
-        let mut tearing_down = false;
-        for (entity, _, context, _) in &views {
-            if context.is_some() {
-                commands
-                    .entity(entity)
-                    .remove::<(SolariDlssContext, SolariDlssTextures, SolariDlssJitter)>();
-                tearing_down = true;
-            }
-        }
-        // Drain the GPU before the removed contexts drop at command flush — freeing
-        // an NGX context whose `render` is still in flight hangs the device.
-        if tearing_down {
-            let _ = render_device
-                .wgpu_device()
-                .poll(wgpu::PollType::wait_indefinitely());
-        }
-        return;
-    }
-
     // Linear depth (no hardware depth) ⇒ no `InvertedDepth`. HDR (linear Rgba16Float
     // color). Low-resolution MVs (ours are at render resolution). NO auto-exposure:
     // raygen already applies the camera exposure (`final_color *= exposure`), so the
@@ -387,9 +366,14 @@ pub fn prepare_solari_dlss(
             continue;
         };
 
-        // Reuse keys on what actually shapes the context (resolution + flags + the
-        // dlss_wgpu quality), NOT `SolariDlssMode` — otherwise cycling modes would
-        // recreate the context every press and free it mid-flight (GPU hang).
+        // CRITICAL: the NGX feature lifecycle (create/destroy) must NEVER run while the
+        // raw trace is live — it hard-hangs the GPU (the restir path didn't hit this
+        // because it had no raw trace; draining alone didn't cover it). So the per-view
+        // context is created ONCE, as early as possible — the first frame the viewport
+        // is known, before the rt_pipeline has even built or traced — and kept for the
+        // view's lifetime regardless of mode. `SolariDlssMode` gates ONLY whether the
+        // resolve/render run (see the run conditions) and whether the trace is jittered,
+        // never the context. Recreated only on a resolution/quality change (rare).
         let reuse = match context.as_deref() {
             Some(c) => {
                 UVec2::from(c.context.lock().unwrap().upscaled_resolution()) == upscaled
@@ -400,24 +384,21 @@ pub fn prepare_solari_dlss(
         };
 
         let render_resolution;
+        let jitter: Vec2;
         if reuse {
             let context = context.unwrap();
             let locked = context.context.lock().unwrap();
             render_resolution = UVec2::from(locked.render_resolution());
-            let offset: Vec2 = locked
+            jitter = locked
                 .suggested_jitter(frame_count.0, render_resolution.to_array())
                 .into();
-            drop(locked);
-            commands.entity(entity).insert(SolariDlssJitter { offset });
         } else {
-            // Replacing an existing context (resolution / quality change) drops the
-            // old one at command flush — drain first so its in-flight NGX resources
-            // aren't freed mid-use (device hang). First-time create has no old context.
-            if context.is_some() {
-                let _ = render_device
-                    .wgpu_device()
-                    .poll(wgpu::PollType::wait_indefinitely());
-            }
+            // Drain before the rare resolution/quality recreate (which drops the old
+            // context at command flush). The very first create is pre-trace, so the GPU
+            // is already idle.
+            let _ = render_device
+                .wgpu_device()
+                .poll(wgpu::PollType::wait_indefinitely());
             let context = DlssRayReconstruction::new(
                 upscaled.to_array(),
                 perf_quality,
@@ -431,17 +412,14 @@ pub fn prepare_solari_dlss(
             .expect("Failed to create solari DLSS Ray Reconstruction context");
 
             render_resolution = UVec2::from(context.render_resolution());
-            let offset: Vec2 = context
+            jitter = context
                 .suggested_jitter(frame_count.0, render_resolution.to_array())
                 .into();
-            commands.entity(entity).insert((
-                SolariDlssContext {
-                    context: Mutex::new(context),
-                    feature_flags,
-                    perf_quality,
-                },
-                SolariDlssJitter { offset },
-            ));
+            commands.entity(entity).insert(SolariDlssContext {
+                context: Mutex::new(context),
+                feature_flags,
+                perf_quality,
+            });
         }
 
         // (Re)allocate the guide textures when the render resolution changes.
@@ -450,12 +428,31 @@ pub fn prepare_solari_dlss(
                 .entity(entity)
                 .insert(create_dlss_textures(&render_device, render_resolution));
         }
+
+        // Jitter the trace only when DLSS is actually running; Off renders a fresh,
+        // unjittered frame (an unaccumulated jitter would just shimmer). The context
+        // itself stays alive either way — the mode never touches its lifecycle.
+        if *mode == SolariDlssMode::Off {
+            commands.entity(entity).remove::<SolariDlssJitter>();
+        } else {
+            commands
+                .entity(entity)
+                .insert(SolariDlssJitter { offset: jitter });
+        }
     }
 }
 
+/// Run condition: DLSS is enabled (mode != `Off`). The per-view context + guide
+/// textures exist regardless (created eagerly and kept alive — see
+/// [`prepare_solari_dlss`]), so this is the sole gate on the resolve + render
+/// dispatch; toggling the mode never touches the NGX lifecycle.
+pub fn dlss_enabled(mode: Res<SolariDlssMode>) -> bool {
+    *mode != SolariDlssMode::Off
+}
+
 /// `Core3d` (after `rt_pipeline`, before `solari_dlss_render`): unpack the trace's
-/// packed guide buffers into the guide textures RR consumes. Only runs for views
-/// with an active DLSS context (the `ViewQuery` requires the textures).
+/// packed guide buffers into the guide textures RR consumes. Gated on
+/// [`dlss_enabled`]; the context + textures are always present.
 pub fn solari_dlss_resolve(
     view: ViewQuery<(&RtOutputBuffer, &SolariDlssTextures)>,
     resolve: Res<SolariDlssResolve>,
