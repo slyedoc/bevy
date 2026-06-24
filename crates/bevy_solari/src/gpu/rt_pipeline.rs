@@ -133,6 +133,14 @@ pub struct RtPipeline {
     /// the pipeline must be rebuilt (the dispatch checks [`Self::capacity`]).
     record_capacity: u32,
 
+    /// Per-material-slot SBT hit-group class the records were baked with (0 =
+    /// opaque, 1 = glass, …; see `material::material_sbt_class`). Each record's
+    /// shader handle is `handle(2 + class)`, so a material changing class (glass
+    /// loading/unloading, a live edit) needs the records rebuilt — the handle is
+    /// baked, unlike the per-frame GPU `FORCE_NO_OPAQUE` flag. The dispatch
+    /// compares this via [`Self::classes_changed`].
+    material_classes: Vec<u32>,
+
     /// `minUniformBufferOffsetAlignment` — the camera ring's per-slot stride must
     /// be a multiple of this (dynamic uniform offsets are validated against it).
     ubo_alignment: u64,
@@ -200,8 +208,11 @@ impl RtPipeline {
         allocator: &Allocator,
         scene_layout: vk::DescriptorSetLayout,
         columns_layout: vk::DescriptorSetLayout,
-        material_count: u32,
+        material_classes: &[u32],
     ) -> Option<Self> {
+        // One hit record per material slot; `material_classes[slot]` selects the
+        // record's hit-group handle (opaque/glass/hair).
+        let material_count = material_classes.len() as u32;
         let device = allocator.device().clone();
         let instance = allocator.instance();
         let physical_device = allocator.physical_device();
@@ -258,6 +269,16 @@ impl RtPipeline {
                 "miss_shadow.wgsl",
             )?,
         )?;
+        // Any-hit alpha-cutout test (foliage / fences), attached to the OPAQUE hit
+        // group. Runs only for PTLAS-`FORCE_NO_OPAQUE` (alpha-masked) instances; opaque
+        // geometry commits in hardware and skips it.
+        let ahit_alpha_mod = create_shader_module(
+            &device,
+            &compile_rt_wgsl(
+                include_str!("../render/rt_pipeline/ahit_alpha.wgsl"),
+                "ahit_alpha.wgsl",
+            )?,
+        )?;
         let modules = vec![
             raygen_mod,
             miss_mod,
@@ -265,9 +286,12 @@ impl RtPipeline {
             chit_glass_mod,
             chit_hair_mod,
             miss_shadow_mod,
+            ahit_alpha_mod,
         ];
 
-        // naga emits each entry point under its WGSL function name.
+        // naga emits each entry point under its WGSL function name. Stage 6 is the
+        // alpha-cutout any-hit, referenced by the opaque hit group below (it has no
+        // group of its own).
         let stages = [
             shader_stage(vk::ShaderStageFlags::RAYGEN_KHR, raygen_mod, c"raygen"),
             shader_stage(vk::ShaderStageFlags::MISS_KHR, miss_mod, c"miss_primary"),
@@ -275,16 +299,20 @@ impl RtPipeline {
             shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_glass_mod, c"chit_glass"),
             shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_hair_mod, c"chit_hair"),
             shader_stage(vk::ShaderStageFlags::MISS_KHR, miss_shadow_mod, c"miss_shadow"),
+            shader_stage(vk::ShaderStageFlags::ANY_HIT_KHR, ahit_alpha_mod, c"ahit_alpha"),
         ];
 
         // Group 0 = raygen, 1 = primary miss (both general), 2/3/4 = the
         // opaque/glass/hair triangle hit groups (their order in the hit region IS
         // the SBT offset HIT_GROUP_OPAQUE=0/_GLASS=1/_HAIR=2 routed in ptlas_fill /
-        // ptlas_hair_write), 5 = shadow miss (miss index 1, general).
+        // ptlas_hair_write), 5 = shadow miss (miss index 1, general). The opaque hit
+        // group also carries the alpha-cutout any-hit (stage 6); it fires only for
+        // PTLAS-`FORCE_NO_OPAQUE` instances (alpha-masked foliage), so opaque geometry
+        // pays nothing.
         let groups = [
             general_group(0),
             general_group(1),
-            hit_group(2),
+            hit_group_with_any_hit(2, 6),
             hit_group(3),
             hit_group(4),
             general_group(5),
@@ -327,8 +355,11 @@ impl RtPipeline {
                 .binding(BINDING_GEOMETRY)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
-                // The closest-hit's geometry resolve reads the packed-vertex address.
-                .stage_flags(vk::ShaderStageFlags::CLOSEST_HIT_KHR),
+                // The closest-hit's geometry resolve AND the alpha-cutout any-hit both
+                // read the bindless geometry addresses (packed-vertex UV + materials).
+                .stage_flags(
+                    vk::ShaderStageFlags::CLOSEST_HIT_KHR | vk::ShaderStageFlags::ANY_HIT_KHR,
+                ),
         ];
         // DLSS guide G-buffers: raygen clears the primary pixel (sky/miss default);
         // the closest-hit overwrites it on a primary hit. Layout slots must match the
@@ -465,17 +496,26 @@ impl RtPipeline {
                 );
             }
         }
-        // One record per material slot: [opaque handle | material id]. Every
-        // record uses the OPAQUE closest-hit (group 2) for now; glass/hair
-        // per-material handles are a follow-up. The data slot = the record index =
-        // the material id the instance routes to, read back via `var<shader_record>`.
-        let opaque_handle = handle(2);
+        // One record per material slot: [class hit-group handle | material id].
+        // The record's handle is `handle(2 + class)` — opaque (group 2), glass
+        // (group 3), or hair (group 4) — so an instance routing to its material's
+        // record lands on the closest-hit its CLASS selects, not always the opaque
+        // one. Headroom records past the live material count, and any out-of-range
+        // class, fall back to opaque. The data slot = the record index = the
+        // material id the instance routes to, read back via `var<shader_record>`
+        // (uniform per record → uniform per warp after SER).
         for record in 0..record_capacity as u64 {
             let rec_off = hit_offset + record * hit_record_stride;
+            let class = material_classes
+                .get(record as usize)
+                .copied()
+                .unwrap_or(0)
+                .min(2);
+            let group_handle = handle(2 + class as usize);
             // SAFETY: rec_off + handle_size + 4 within the record.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    opaque_handle.as_ptr(),
+                    group_handle.as_ptr(),
                     sbt.mapped.add(rec_off as usize),
                     handle_size as usize,
                 );
@@ -515,6 +555,7 @@ impl RtPipeline {
             hit_region,
             callable_region,
             record_capacity,
+            material_classes: material_classes.to_vec(),
             ubo_alignment,
             modules,
         };
@@ -526,6 +567,16 @@ impl RtPipeline {
     /// to `record = material slot`, so a slot past the end would read OOB).
     pub fn capacity(&self) -> u32 {
         self.record_capacity
+    }
+
+    /// Whether this frame's per-material SBT classes differ from those the hit
+    /// records were baked with — a glass material loading/unloading or a live
+    /// class edit. The class selects a record's shader handle, which is baked at
+    /// build time (unlike the per-frame GPU `FORCE_NO_OPAQUE` flag), so a change
+    /// needs a rebuild. The dispatch checks this alongside [`Self::capacity`] and
+    /// drains + recreates the pipeline when it returns `true`.
+    pub fn classes_changed(&self, current: &[u32]) -> bool {
+        self.material_classes != current
     }
 
     /// Build the per-view set-1 resources (descriptor set + camera UBO) for one
@@ -1104,6 +1155,22 @@ fn hit_group(shader: u32) -> vk::RayTracingShaderGroupCreateInfoKHR<'static> {
         .general_shader(vk::SHADER_UNUSED_KHR)
         .closest_hit_shader(shader)
         .any_hit_shader(vk::SHADER_UNUSED_KHR)
+        .intersection_shader(vk::SHADER_UNUSED_KHR)
+}
+
+/// A triangle hit group with closest-hit stage `closest` + any-hit stage `any_hit`.
+/// The any-hit (alpha cutout) fires only for non-opaque geometry — i.e. instances
+/// PTLAS marked `FORCE_NO_OPAQUE` (alpha-masked materials). Opaque geometry commits
+/// in hardware and never invokes it, so opaque materials pay no alpha-test cost.
+fn hit_group_with_any_hit(
+    closest: u32,
+    any_hit: u32,
+) -> vk::RayTracingShaderGroupCreateInfoKHR<'static> {
+    vk::RayTracingShaderGroupCreateInfoKHR::default()
+        .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
+        .general_shader(vk::SHADER_UNUSED_KHR)
+        .closest_hit_shader(closest)
+        .any_hit_shader(any_hit)
         .intersection_shader(vk::SHADER_UNUSED_KHR)
 }
 

@@ -290,12 +290,15 @@ fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ra
     return rayQueryGetCommittedIntersection(&rq);
 }
 
-// Mask test for a candidate triangle: base-color texture alpha at the hit UV
-// against the material's cutoff. No texture = solid (alpha 1). The base-color
-// FACTOR's alpha is not applied (the binder stores rgb only) — glTF cutouts
-// author the mask in the texture.
-fn alpha_test(hit: RayIntersection) -> bool {
-    let material = load_material_bindless(material_ids[hit.instance_index]);
+// Mask-test core, addressable from both the inline rayQuery candidate
+// (`alpha_test`) and the RT-pipeline any-hit shader (`ahit_alpha`): base-color
+// texture alpha at the hit UV against the material's cutoff. `true` = keep the hit
+// (solid texel), `false` = cut it (a hole the ray passes through). No texture =
+// solid (alpha 1). The base-color FACTOR's alpha is not applied (the binder stores
+// rgb only) — glTF cutouts author the mask in the texture. `cluster_index` and
+// `bary` (the triangle's u, v) come from the hit; w is reconstructed here.
+fn alpha_passes(material_id: u32, cluster_index: u32, primitive_index: u32, bary: vec2<f32>) -> bool {
+    let material = load_material_bindless(material_id);
     if material.alpha_mask < 0.0 {
         return true; // opaque material on a non-opaque instance (stale flag)
     }
@@ -303,15 +306,20 @@ fn alpha_test(hit: RayIntersection) -> bool {
     if texture_id == TEXTURE_MAP_NONE {
         return material.alpha_mask <= 1.0;
     }
-    let cluster = clusters[hit.geometry_index];
-    let idx_base = cluster.index_offset + hit.primitive_index * 3u;
+    let cluster = clusters[cluster_index];
+    let idx_base = cluster.index_offset + primitive_index * 3u;
     let uv0 = load_packed_uv(cluster.vertex_offset + cluster_indices[idx_base + 0u]);
     let uv1 = load_packed_uv(cluster.vertex_offset + cluster_indices[idx_base + 1u]);
     let uv2 = load_packed_uv(cluster.vertex_offset + cluster_indices[idx_base + 2u]);
-    let barycentrics = vec3(1.0 - hit.barycentrics.x - hit.barycentrics.y, hit.barycentrics);
+    let barycentrics = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
     let uv = mat3x2(uv0, uv1, uv2) * barycentrics;
     let alpha = textureSampleLevel(textures[texture_id], samplers[texture_id], uv, 0.0).a;
     return alpha >= material.alpha_mask;
+}
+
+// Mask test for an inline rayQuery candidate triangle.
+fn alpha_test(hit: RayIntersection) -> bool {
+    return alpha_passes(material_ids[hit.instance_index], hit.geometry_index, hit.primitive_index, hit.barycentrics);
 }
 
 // A `partial_lod` at or below this means "sample mip 0" — used by callers that

@@ -35,8 +35,8 @@ const BH_CAPTURE_RADIUS: f32 = 0.5;
 #ifdef SOLARI_DLSS
 // DLSS Ray Reconstruction guide G-buffer (chit-direct): the closest-hit writes the
 // primary hit's packed surface attrs here; raygen clears each pixel to the sky/miss
-// default first. Packed normal.xyz+roughness, diffuse.xyz+depth,
-// specular.xyz+hit-distance (the `.w` depth/hit-distance slots land in a later phase).
+// default first. Packed normal.xyz+roughness, diffuse.xyz+depth (chit-direct), and
+// specular.xyz+hit-distance — the specular `.w` is filled by raygen after bounce 1.
 @group(1) @binding(5) var<storage, read_write> gbuffer_normal_roughness: array<vec4<f32>>;
 @group(1) @binding(6) var<storage, read_write> gbuffer_diffuse: array<vec4<f32>>;
 @group(1) @binding(7) var<storage, read_write> gbuffer_specular: array<vec4<f32>>;
@@ -74,7 +74,7 @@ fn raygen(
 #ifdef SOLARI_DLSS
     // Default this pixel's guide to "no surface" (sky/miss); a primary hit overwrites
     // it in the closest-hit. Zero normal + roughness 1 + zero albedo is the RR sky
-    // convention; the `.w` depth/hit-distance slots are filled in a later phase.
+    // convention; the specular `.w` hit-distance stays 0 unless bounce 1 fills it.
     gbuffer_normal_roughness[pixel_index] = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     gbuffer_diffuse[pixel_index] = vec4<f32>(0.0);
     gbuffer_specular[pixel_index] = vec4<f32>(0.0);
@@ -129,6 +129,21 @@ fn raygen(
         hitObjectExecuteShader(&hit, &payload);
         rng = payload.rng;
 
+#ifdef SOLARI_DLSS
+        // DLSS specular hit-distance guide. The primary surface's first
+        // continuation ray (≈ the specular reflection in this 1-spp path) only
+        // reveals where it lands HERE, after bounce 1 — the primary closest-hit
+        // emitted the ray but not its hit point. Record that world-space distance
+        // (primary hit → bounce-1 hit; `origin` is still the primary hit point at
+        // this point in the loop) into the primary pixel's specular `.w`. A missed
+        // or absorbed reflection leaves the cleared 0 (RR reads that as no
+        // reflection lag); RR weights this by the specular albedo already in
+        // `.xyz`, so writing it for every surface, not only mirrors, is correct.
+        if bounce == 1u && payload.bounce == 1u {
+            gbuffer_specular[pixel_index].w = length(payload.next_origin - origin);
+        }
+#endif
+
         // Fog extinction (stand-in): attenuate over the traversed segment.
         if FOG_DENSITY > 0.0 {
             let seg = length(payload.next_origin - origin);
@@ -143,6 +158,15 @@ fn raygen(
         origin = payload.next_origin;
         direction = payload.next_direction;
         p_bounce = payload.p_bounce;
+
+        // Never feed a degenerate (zero-length or non-finite) direction to the next
+        // traceRay — the RT core hangs the GPU on a zero-length ray. A hit shader
+        // can produce one from a float edge (e.g. glass critical-angle refraction)
+        // or a bad normal; terminate the path instead of hanging. `dot > eps` is
+        // false for both zero and NaN.
+        if !(dot(direction, direction) > 1.0e-8) {
+            break;
+        }
 
         // Russian roulette: survival capped below 1 (unbiased — the ÷p
         // compensates) so even lossless paths terminate.

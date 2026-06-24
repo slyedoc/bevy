@@ -37,11 +37,13 @@ const NO_GBUFFER: u32 = 0xffffffffu;
 
 // SBT miss index of `miss_shadow` (miss 0 = miss_primary, miss 1 = miss_shadow).
 const SHADOW_MISS_INDEX: u32 = 1u;
-// Shadow rays skip the closest-hit (we only need occlusion), stop at the first
-// hit, and force-opaque so no any-hit is needed (alpha geometry casts solid
-// shadows — a follow-up could add an alpha any-hit for cutouts).
+// Shadow rays skip the closest-hit (we only need occlusion) and stop at the first
+// hit. NOT force-opaque: alpha-masked geometry (foliage) runs the alpha-cutout
+// any-hit on the opaque hit group, so light passes through the holes — cutout
+// shadows. Opaque geometry still commits in hardware via its OPAQUE flag, so only
+// foliage shadow-ray hits pay the alpha test (parity with the inline rayQuery path).
 const SHADOW_RAY_FLAGS: u32 =
-    RAY_FLAG_TERMINATE_ON_FIRST_HIT | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_FORCE_OPAQUE;
+    RAY_FLAG_TERMINATE_ON_FIRST_HIT | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
 
 // Per-material SBT shader record: each hit record bakes its material id (the
 // record index = the material slot, set as `instance_contribution_to_hit_group_index`
@@ -161,29 +163,40 @@ fn chit_opaque(
     // Primary-hit ray-reconstruction guide (chit-direct): only the primary bounce
     // carries a real pixel index; secondary bounces pass NO_GBUFFER and skip this.
     // F0 = 0.04 for dielectrics, base_color for metals; diffuse is the
-    // energy-conserving complement of the metallic split. The `.w` slots (linear
-    // depth, specular hit distance) land in a later phase.
+    // energy-conserving complement of the metallic split. The `.w` slots carry
+    // linear depth (diffuse) and specular hit distance (specular — defaulted 0
+    // here, filled by raygen after the first continuation ray).
     if payload.gbuffer_pixel != NO_GBUFFER {
         let px = payload.gbuffer_pixel;
-        gbuffer_normal_roughness[px] = vec4<f32>(world_normal, ray_hit.material.roughness);
-        // View-space linear depth, positive into the scene (RR `DepthMode::Linear`).
-        let view_pos = camera.view_from_world * vec4<f32>(ray_hit.world_position, 1.0);
-        let linear_depth = -view_pos.z;
-        let diffuse = ray_hit.material.base_color * (1.0 - ray_hit.material.metallic);
-        gbuffer_diffuse[px] = vec4<f32>(diffuse, linear_depth);
-        let specular = mix(vec3<f32>(0.04), ray_hit.material.base_color, ray_hit.material.metallic);
-        // `.w` = specular hit distance — filled in Phase 3 with the specular guide.
-        gbuffer_specular[px] = vec4<f32>(specular, 0.0);
-        // Screen-space motion vector: current vs previous UNJITTERED clip position,
-        // UV space with y flipped. Sign/scale reconciled against the RR convention
-        // when the dispatch lands (Phase 3); previous_frame_world_position handles
-        // moving instances (parent/skin), the matrices handle the camera.
         let cur_clip = camera.clip_from_world * vec4<f32>(ray_hit.world_position, 1.0);
-        let prev_clip =
-            camera.prev_clip_from_world * vec4<f32>(ray_hit.previous_frame_world_position, 1.0);
-        let cur_uv = (cur_clip.xy / cur_clip.w) * vec2<f32>(0.5, -0.5);
-        let prev_uv = (prev_clip.xy / prev_clip.w) * vec2<f32>(0.5, -0.5);
-        gbuffer_motion[px] = vec4<f32>(cur_uv - prev_uv, 0.0, 0.0);
+        // A hit at/behind the eye (camera clipping into a surface) drives clip.w → 0;
+        // the perspective divides below would emit NaN/Inf into the guide and hang
+        // DLSS. Skip the guide for such a pixel, leaving the raygen sky default.
+        if cur_clip.w > 1.0e-4 {
+            gbuffer_normal_roughness[px] = vec4<f32>(world_normal, ray_hit.material.roughness);
+            // View-space linear depth, positive into the scene (RR `DepthMode::Linear`).
+            let view_pos = camera.view_from_world * vec4<f32>(ray_hit.world_position, 1.0);
+            let linear_depth = max(-view_pos.z, 1.0e-4);
+            let diffuse = ray_hit.material.base_color * (1.0 - ray_hit.material.metallic);
+            gbuffer_diffuse[px] = vec4<f32>(diffuse, linear_depth);
+            let specular = mix(vec3<f32>(0.04), ray_hit.material.base_color, ray_hit.material.metallic);
+            // `.w` = specular hit distance; raygen overwrites it after bounce 1, so 0
+            // here just defaults surfaces whose continuation ray hits nothing.
+            gbuffer_specular[px] = vec4<f32>(specular, 0.0);
+            // Screen-space motion vector: current vs previous UNJITTERED clip position,
+            // UV space with y flipped. previous_frame_world_position handles moving
+            // instances (parent/skin), the matrices handle the camera. Guard last
+            // frame's divide too; zero motion if the surface was at the eye then.
+            let prev_clip =
+                camera.prev_clip_from_world * vec4<f32>(ray_hit.previous_frame_world_position, 1.0);
+            var motion = vec2<f32>(0.0);
+            if prev_clip.w > 1.0e-4 {
+                let cur_uv = (cur_clip.xy / cur_clip.w) * vec2<f32>(0.5, -0.5);
+                let prev_uv = (prev_clip.xy / prev_clip.w) * vec2<f32>(0.5, -0.5);
+                motion = cur_uv - prev_uv;
+            }
+            gbuffer_motion[px] = vec4<f32>(motion, 0.0, 0.0);
+        }
     }
 
 #endif

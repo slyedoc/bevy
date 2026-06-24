@@ -19,8 +19,8 @@ use derive_more::derive::From;
 
 pub mod material_slots;
 pub use material_slots::{
-    init_material_slots, prepare_material_slots, prepare_material_traversal_flags, MaterialSlots,
-    MaterialTraversalFlags,
+    init_material_slots, material_sbt_class, prepare_material_slots,
+    prepare_material_traversal_flags, MaterialSlots, MaterialTraversalFlags,
 };
 
 #[cfg(feature = "gltf")]

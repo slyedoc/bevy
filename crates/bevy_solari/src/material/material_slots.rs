@@ -78,6 +78,24 @@ pub fn prepare_material_slots(
     );
 }
 
+/// [`MaterialTraversalFlags`] bit: the material alpha-tests (cutout foliage),
+/// so its instances traverse `FORCE_NO_OPAQUE` to surface candidate hits.
+pub const MATERIAL_TRAVERSAL_ALPHA_TESTED: u32 = 0x1;
+/// [`MaterialTraversalFlags`] bit: the material is glass/transmissive, so its
+/// instances route to the glass RT-pipeline hit group.
+pub const MATERIAL_TRAVERSAL_GLASS: u32 = 0x2;
+
+/// The RT-pipeline SBT hit-group CLASS an instance's material selects, from its
+/// [`MaterialTraversalFlags`] word: glass → 1 (the `chit_glass` closest-hit),
+/// else 0 (`chit_opaque`). The SBT bakes `handle(2 + class)` into that
+/// material's hit record, so glass instances reach `chit_glass` instead of
+/// every hit landing on the opaque program. This is the single CPU-side
+/// surface-class → shader routing key; add a BSDF class by extending this and
+/// the pipeline's hit groups in lockstep.
+pub fn material_sbt_class(traversal_flags: u32) -> u32 {
+    u32::from(traversal_flags & MATERIAL_TRAVERSAL_GLASS != 0)
+}
+
 /// Per-material-slot traversal flags consumed by the PTLAS fill (bit 0 =
 /// the material needs candidate-hit inspection, i.e. it alpha-tests — see
 /// [`SolariMaterial::traversal_alpha_cutoff`]). Slot-aligned with
@@ -114,9 +132,10 @@ pub fn prepare_material_traversal_flags(
         if let Some(material) = material_assets.get(&asset_id) {
             // bit 0: alpha-tested (FORCE_NO_OPAQUE during traversal).
             // bit 1: glass/transmissive — selects the glass RT-pipeline hit group.
-            let alpha = (material.traversal_alpha_cutoff() >= 0.0) as u32;
-            let glass = (material.specular_transmission > 0.0) as u32;
-            list[slot as usize] = alpha | (glass << 1);
+            let alpha =
+                u32::from(material.traversal_alpha_cutoff() >= 0.0) * MATERIAL_TRAVERSAL_ALPHA_TESTED;
+            let glass = u32::from(material.specular_transmission > 0.0) * MATERIAL_TRAVERSAL_GLASS;
+            list[slot as usize] = alpha | glass;
         }
     }
     flags.buffer.write_buffer(&render_device, &render_queue);

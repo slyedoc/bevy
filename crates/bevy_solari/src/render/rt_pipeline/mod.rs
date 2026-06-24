@@ -31,7 +31,7 @@ use wgpu::hal::api::Vulkan as VkApi;
 
 use crate::bindings::RaytracingSceneBindings;
 use crate::ecs_gpu::SceneColumns;
-use crate::material::MaterialSlots;
+use crate::material::{material_sbt_class, MaterialSlots, MaterialTraversalFlags};
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::extension::RayTracingPipelineFeature;
 use crate::gpu::RawTraceBindable;
@@ -87,6 +87,33 @@ fn raw_image(texture: &bevy_render::render_resource::Texture) -> Option<vk::Imag
 pub(crate) struct RtEnvImages<'w> {
     texture_assets: Res<'w, RenderAssets<GpuImage>>,
     fallback_image: Res<'w, FallbackImage>,
+}
+
+/// Material routing inputs for the SBT, bundled into one [`SystemParam`] to keep
+/// the dispatch under bevy's 16-system-param limit. `slots` sizes the per-material
+/// hit records; `traversal_flags` carries the glass bit that selects each record's
+/// hit-group class.
+#[derive(bevy_ecs::system::SystemParam)]
+pub(crate) struct RtMaterials<'w> {
+    slots: Res<'w, MaterialSlots>,
+    traversal_flags: Res<'w, MaterialTraversalFlags>,
+}
+
+impl RtMaterials<'_> {
+    /// Number of material slots — the count of per-material SBT hit records.
+    fn len(&self) -> u32 {
+        self.slots.len()
+    }
+
+    /// Per-material-slot SBT hit-group class (opaque/glass), slot-aligned with the
+    /// `materials[]` array — the routing key the SBT bakes into each material's hit
+    /// record so glass instances reach `chit_glass` (see `material_sbt_class`).
+    fn sbt_classes(&self) -> Vec<u32> {
+        let flags = self.traversal_flags.buffer.get();
+        (0..self.slots.len() as usize)
+            .map(|slot| material_sbt_class(flags.get(slot).copied().unwrap_or(0)))
+            .collect()
+    }
 }
 
 /// The wgpu compute pipeline + layout copying the RT output buffer to the view.
@@ -257,7 +284,7 @@ pub(crate) fn rt_pipeline(
     scene_bindings: Res<RaytracingSceneBindings>,
     scene_columns: Res<SceneColumns>,
     cluster_mesh_manager: Option<Res<ClusterMeshManager>>,
-    material_slots: Res<MaterialSlots>,
+    materials: RtMaterials,
     atmosphere_sky: Option<Res<AtmosphereSky>>,
     env_images: RtEnvImages,
     pipeline_cache: Res<PipelineCache>,
@@ -316,20 +343,28 @@ pub(crate) fn rt_pipeline(
         return;
     };
 
+    // Per-material-slot SBT hit-group class the pipeline bakes into each material's
+    // hit record — the routing key that sends glass instances to `chit_glass`
+    // instead of every hit landing on `chit_opaque`. Derived from the already
+    // CPU-computed `MaterialTraversalFlags` (glass bit) and slot-aligned with
+    // `materials[]`, so `classes[slot]` is the class of the material in that record.
+    // Recomputed each frame; the pipeline rebuilds below when it changes.
+    let material_classes = materials.sbt_classes();
+
     // Lazily build the view-independent RT pipeline once the scene + columns
     // layouts exist (its pipeline layout bakes in their raw VkDescriptorSetLayouts)
     // and materials are present (the SBT sizes one hit record per material slot).
     // The per-view set 1 (output/camera/env) is built separately below. Inserted
     // via commands → live next frame.
     let Some(rt) = rt else {
-        if additional.has::<RayTracingPipelineFeature>() && material_slots.len() > 0 {
+        if additional.has::<RayTracingPipelineFeature>() && materials.len() > 0 {
             if let (Some(allocator), Some(scene_layout), Some(columns_layout)) = (
                 allocator.as_deref(),
                 raw_bgl(&pipeline_cache, &scene_bindings.bind_group_layout),
                 raw_bgl(&pipeline_cache, columns_layout_desc),
             ) {
                 if let Some(built) =
-                    RtPipeline::new(allocator, scene_layout, columns_layout, material_slots.len())
+                    RtPipeline::new(allocator, scene_layout, columns_layout, &material_classes)
                 {
                     commands.insert_resource(built);
                 }
@@ -339,12 +374,14 @@ pub(crate) fn rt_pipeline(
     };
 
     // Materials can stream in after the pipeline was first built (the SBT bakes
-    // one hit record per material slot at build time + headroom). If the live
-    // count has outgrown those records, an instance routing to a slot past the
-    // hit region would read out of bounds — rebuild at the larger count. Drain
+    // one hit record per material slot at build time + headroom). Rebuild when
+    // either the live count has outgrown those records (an instance routing to a
+    // slot past the hit region would read out of bounds) OR a material's CLASS
+    // changed (glass loading/unloading, a live edit) — the record's hit-group
+    // handle is baked, so the new class only takes effect after a rebuild. Drain
     // the GPU first so dropping the old pipeline (when this frame's `remove`
     // command applies) can't free a `VkPipeline` a still-executing trace uses.
-    if material_slots.len() > rt.capacity() {
+    if materials.len() > rt.capacity() || rt.classes_changed(&material_classes) {
         let _ = render_device
             .wgpu_device()
             .poll(wgpu::PollType::wait_indefinitely());
@@ -439,7 +476,7 @@ pub(crate) fn rt_pipeline(
         // hint reorderThread should sort by (driver clamps to its own max).
         frame: [
             *frame_counter,
-            (u32::BITS - material_slots.len().max(1).leading_zeros()),
+            (u32::BITS - materials.len().max(1).leading_zeros()),
             0,
             0,
         ],
