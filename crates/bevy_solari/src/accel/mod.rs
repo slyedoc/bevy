@@ -27,6 +27,7 @@ use crate::{SolariClusterSystems, SolariSetup};
 
 pub mod blas_rebuild;
 pub mod blas_sharing;
+pub mod partition_alloc;
 pub mod pipelines;
 pub mod ptlas;
 pub mod selector;
@@ -38,6 +39,7 @@ pub use pipelines::{
 pub use blas_sharing::{
     dispatch_blas_sharing, init_blas_sharing, prepare_blas_sharing, prepare_blas_sharing_bind_group,
 };
+pub use partition_alloc::{block_of, PartitionAllocator, BLOCK_SHIFT};
 pub use ptlas::{dispatch_ptlas, init_ptlas, prepare_ptlas_fill_bind_group, prepare_ptlas_params};
 pub use selector::{
     dispatch_selector, init_selector, prepare_selector_bind_group, prepare_selector_params,

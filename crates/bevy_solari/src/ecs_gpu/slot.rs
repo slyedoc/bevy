@@ -262,11 +262,86 @@ impl<K: Copy + Eq + Hash> SlotPool<K> {
             self.free(key);
         }
     }
+
+    /// Reclaim trailing free slots: peel every freed index that sits at the top of
+    /// the `[0, len)` range so [`len`](Self::len) tracks the live high-water rather
+    /// than a peak that only ever ratchets up. Holes below the live range are kept
+    /// (reused by the next [`allocate`](Self::allocate)). Returns the new `len`.
+    ///
+    /// `len` otherwise never shrinks — a transient spike in simultaneously-live keys
+    /// raises it permanently. A consumer that caps on `len` (e.g. a PTLAS
+    /// `partition_count <= max_partition_count` build guard) must `compact` first, or
+    /// a one-frame spike past the cap bricks the build long after the live set
+    /// shrank back. Does **not** bump `generation`: it only removes never-resolved
+    /// slots, so no cached resolution is invalidated. `O(free·log free)`.
+    pub fn compact(&mut self) -> u32 {
+        if self.free.is_empty() {
+            return self.next;
+        }
+        // Holes ascending; peel any that abut the top of the range.
+        self.free.sort_unstable();
+        while let Some(&top) = self.free.last() {
+            if top + 1 == self.next {
+                self.free.pop();
+                self.next -= 1;
+            } else {
+                break;
+            }
+        }
+        self.next
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SlotFreeList;
+    use super::{SlotFreeList, SlotPool};
+
+    #[test]
+    fn compact_reclaims_only_the_trailing_free_run() {
+        let mut p: SlotPool<u32> = SlotPool::default();
+        for k in 0..5 {
+            p.allocate(k); // slots 0..5, len == 5
+        }
+        assert_eq!(p.len(), 5);
+        // Free a tail run (3,4) and an interior hole (1). 0 and 2 stay resident.
+        p.free(4);
+        p.free(3);
+        p.free(1);
+        assert_eq!(p.len(), 5, "len does not shrink on its own");
+
+        // Compaction peels the contiguous top run (4 then 3) but keeps the interior
+        // hole at 1 — resident slots 0 and 2 are untouched.
+        assert_eq!(p.compact(), 3);
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.slot_of(0), Some(0));
+        assert_eq!(p.slot_of(2), Some(2));
+        assert_eq!(p.slot_of(1), None);
+        // The interior hole is still reused before the high-water grows.
+        let gen_before = p.generation();
+        assert_eq!(p.allocate(99), 1, "interior hole reused");
+        assert_eq!(p.allocate(100), 3, "then bump the (compacted) high-water");
+        assert_eq!(p.len(), 4);
+        assert!(
+            p.generation() > gen_before,
+            "allocate bumps generation; compact did not"
+        );
+    }
+
+    #[test]
+    fn compact_all_freed_drops_to_zero() {
+        let mut p: SlotPool<u32> = SlotPool::default();
+        for k in 0..1000 {
+            p.allocate(k);
+        }
+        for k in 0..1000 {
+            p.free(k);
+        }
+        assert_eq!(p.len(), 1000, "high-water ratchets until compaction");
+        assert_eq!(p.compact(), 0, "everything freed → len collapses to 0");
+        assert!(p.is_empty());
+        assert_eq!(p.allocate(7), 0, "fresh allocation starts from 0 again");
+    }
+
 
     #[test]
     fn allocate_is_monotonic_until_reuse() {
