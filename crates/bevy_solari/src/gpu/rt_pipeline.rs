@@ -86,8 +86,14 @@ pub struct RtCamera {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RtGeometryAddresses {
     /// Base device address of the interleaved [`PackedVertex`] pool
-    /// (`ClusterMeshManager::vertex_packed`).
+    /// (`ClusterMeshManager::vertex_packed`) — 16-byte shading attrs (normal,
+    /// tangent, uv); position is NOT here.
     pub vertex_packed: u64,
+    /// Base device address of the SoA position pool
+    /// (`ClusterMeshManager::vertex_positions`, stride 12). Position source for the
+    /// sampling/non-hit-triangle resolve path (the closest-hit gets positions from
+    /// the AS via position fetch instead).
+    pub vertex_positions: u64,
     /// Base device address of the materials storage buffer.
     pub materials: u64,
     /// Byte stride of one material record (`GPU_MATERIAL_SIZE`).

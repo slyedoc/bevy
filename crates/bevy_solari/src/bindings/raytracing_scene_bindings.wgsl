@@ -416,11 +416,13 @@ fn resolve_material_lod(material: Material, uv: vec2<f32>, partial_lod: f32) -> 
 }
 
 // Bindless geometry addresses (set 1, binding 4). The interleaved `PackedVertex`
-// pool + the materials buffer are reached by buffer-device-address via
-// `physical_load` — one contiguous 28-byte record per vertex (pos@0, normal@12,
-// tangent@16, uv@20), and the whole material struct in one cache-coherent load.
+// pool, the SoA position pool, and the materials buffer are reached by
+// buffer-device-address via `physical_load` — `vertex_packed` is a 16-byte record
+// per vertex (normal@0, tangent@4, uv@8); position lives in `vertex_positions`
+// (stride 12) and is read by the closest-hit from the AS via position fetch.
 struct SolariGeometryAddresses {
     vertex_packed: u64,
+    vertex_positions: u64,
     materials: u64,
     material_stride: u32,
     _pad: u32,
@@ -450,18 +452,35 @@ fn unpack_tangent(p: u32) -> vec4<f32> {
 
 fn load_cluster_vertex(vertex_index: u32) -> Vertex {
     var v: Vertex;
-    let base = geometry_addresses.vertex_packed + u64(vertex_index) * u64(28u);
-    v.position = physical_load<vec3<f32>>(base);
-    v.normal = octahedral_decode_signed(unpack2x16snorm(physical_load<u32>(base + u64(12u))));
-    v.tangent = unpack_tangent(physical_load<u32>(base + u64(16u)));
-    v.uv = physical_load<vec2<f32>>(base + u64(20u));
+    // Position lives in the separate SoA pool (stride 12) — the same buffer the CLAS
+    // build reads. The interleaved packed pool holds only the 16-byte shading attrs.
+    v.position = physical_load<vec3<f32>>(
+        geometry_addresses.vertex_positions + u64(vertex_index) * u64(12u),
+    );
+    let base = geometry_addresses.vertex_packed + u64(vertex_index) * u64(16u);
+    v.normal = octahedral_decode_signed(unpack2x16snorm(physical_load<u32>(base)));
+    v.tangent = unpack_tangent(physical_load<u32>(base + u64(4u)));
+    v.uv = physical_load<vec2<f32>>(base + u64(8u));
+    return v;
+}
+
+/// Like [`load_cluster_vertex`] but skips position entirely: the position-fetch path
+/// reads the three hit-triangle positions from `@builtin(hit_triangle_vertex_positions)`
+/// instead, so only normal / tangent / uv are fetched from the 16-byte packed pool.
+/// `position` is left at the `Vertex` default; the caller fills it from the builtin.
+fn load_cluster_vertex_attrs(vertex_index: u32) -> Vertex {
+    var v: Vertex;
+    let base = geometry_addresses.vertex_packed + u64(vertex_index) * u64(16u);
+    v.normal = octahedral_decode_signed(unpack2x16snorm(physical_load<u32>(base)));
+    v.tangent = unpack_tangent(physical_load<u32>(base + u64(4u)));
+    v.uv = physical_load<vec2<f32>>(base + u64(8u));
     return v;
 }
 
 /// Just the UV of a packed vertex (the alpha-test fast path needs no other field).
 fn load_packed_uv(vertex_index: u32) -> vec2<f32> {
     return physical_load<vec2<f32>>(
-        geometry_addresses.vertex_packed + u64(vertex_index) * u64(28u) + u64(20u),
+        geometry_addresses.vertex_packed + u64(vertex_index) * u64(16u) + u64(8u),
     );
 }
 
@@ -719,10 +738,6 @@ fn resolve_triangle_data_full_cone_mat(
     cone_width: f32,
     ray_direction: vec3<f32>,
 ) -> ResolvedRayHitFull {
-    let material = load_material_bindless(material_id);
-
-    let previous_frame_transform = previous_frame_transforms[instance_id];
-
     let cluster = clusters[cluster_global_id];
     // `cluster_indices` stores per-cluster LOCAL vertex indices
     // (0..vertex_count) — the bake widens meshopt's u8 locals to
@@ -737,6 +752,69 @@ fn resolve_triangle_data_full_cone_mat(
         load_cluster_vertex(cluster.vertex_offset + cluster_indices[idx_base + 1u]),
         load_cluster_vertex(cluster.vertex_offset + cluster_indices[idx_base + 2u]),
     );
+    return resolve_triangle_data_core(
+        instance_id,
+        material_id,
+        transform,
+        cluster.triangle_count,
+        barycentrics,
+        cone_width,
+        vertices,
+    );
+}
+
+/// Position-fetch variant for the RT closest-hit: the hit triangle's three
+/// object-space vertex positions come from `@builtin(hit_triangle_vertex_positions)`
+/// (`VK_KHR_ray_tracing_position_fetch`) rather than the vertex pool, so the three
+/// `physical_load<vec3<f32>>` position fetches are skipped — only normal / tangent /
+/// uv are read. These positions are exactly the geometry the ray traversed (the CLAS
+/// triangle), so `world_position` + the geometric normal come from the true hit
+/// surface. Mip-0 (no ray cone), matching `resolve_triangle_data_full_mat`.
+fn resolve_triangle_data_full_mat_fetch(
+    instance_id: u32,
+    material_id: u32,
+    transform: mat3x4<f32>,
+    cluster_global_id: u32,
+    triangle_id: u32,
+    barycentrics: vec3<f32>,
+    object_positions: array<vec3<f32>, 3>,
+) -> ResolvedRayHitFull {
+    let cluster = clusters[cluster_global_id];
+    let idx_base = cluster.index_offset + triangle_id * 3u;
+    // Attrs-only fetch (skips the position head); the builtin supplies position.
+    var v0 = load_cluster_vertex_attrs(cluster.vertex_offset + cluster_indices[idx_base + 0u]);
+    var v1 = load_cluster_vertex_attrs(cluster.vertex_offset + cluster_indices[idx_base + 1u]);
+    var v2 = load_cluster_vertex_attrs(cluster.vertex_offset + cluster_indices[idx_base + 2u]);
+    v0.position = object_positions[0];
+    v1.position = object_positions[1];
+    v2.position = object_positions[2];
+    return resolve_triangle_data_core(
+        instance_id,
+        material_id,
+        transform,
+        cluster.triangle_count,
+        barycentrics,
+        -1.0,
+        array<Vertex, 3>(v0, v1, v2),
+    );
+}
+
+/// Shared resolve body: given the hit triangle's three fully-populated vertices
+/// (position + normal + tangent + uv), the instance transform, and the cluster's
+/// triangle count, produce the full shading hit. Fed by both the vertex-pool path
+/// (`resolve_triangle_data_full_cone_mat`) and the position-fetch path
+/// (`resolve_triangle_data_full_mat_fetch`).
+fn resolve_triangle_data_core(
+    instance_id: u32,
+    material_id: u32,
+    transform: mat3x4<f32>,
+    triangle_count: u32,
+    barycentrics: vec3<f32>,
+    cone_width: f32,
+    vertices: array<Vertex, 3>,
+) -> ResolvedRayHitFull {
+    let material = load_material_bindless(material_id);
+    let previous_frame_transform = previous_frame_transforms[instance_id];
 
     let world_vertices = transform_positions(transform, vertices);
     let world_position = mat3x3(world_vertices[0], world_vertices[1], world_vertices[2]) * barycentrics;
@@ -804,7 +882,7 @@ fn resolve_triangle_data_full_cone_mat(
         world_tangent,
         uv,
         triangle_area,
-        cluster.triangle_count,
+        triangle_count,
         resolved_material,
         material_id,
     );

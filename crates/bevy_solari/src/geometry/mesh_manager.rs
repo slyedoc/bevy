@@ -210,7 +210,6 @@ impl ClusterMeshManager {
         // global vertex index.
         let packed: Arc<[PackedVertex]> = (0..mesh.vertex_positions.len())
             .map(|i| PackedVertex {
-                position: mesh.vertex_positions[i].to_array(),
                 normal: mesh.vertex_normals[i],
                 tangent: super::asset::pack_tangent(mesh.vertex_tangents[i]),
                 uv: mesh.vertex_uvs[i].to_array(),

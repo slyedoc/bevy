@@ -328,9 +328,19 @@ impl ClasArena {
         let op_input = vk::ClusterAccelerationStructureOpInputNV {
             p_triangle_clusters: &mut triangle_input as *mut _,
         };
+        // ALLOW_DATA_ACCESS so the closest-hit can read the hit triangle's three
+        // object-space vertex positions back from the CLAS via
+        // `@builtin(hit_triangle_vertex_positions)` (VK_KHR_ray_tracing_position_fetch,
+        // part of the required RTX feature set). The vertices live in the CLAS — not
+        // the cluster-referencing BLAS — so the flag belongs on this build. The same
+        // flags drive the size query and the build (the size depends on them):
+        // `size_input` is reused as `cmd_info.input` below.
         let size_input = vk::ClusterAccelerationStructureInputInfoNV::default()
             .max_acceleration_structure_count(cluster_count as u32)
-            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+            .flags(
+                vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                    | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS,
+            )
             .op_type(vk::ClusterAccelerationStructureOpTypeNV::BUILD_TRIANGLE_CLUSTER)
             .op_mode(vk::ClusterAccelerationStructureOpModeNV::IMPLICIT_DESTINATIONS)
             .op_input(op_input);

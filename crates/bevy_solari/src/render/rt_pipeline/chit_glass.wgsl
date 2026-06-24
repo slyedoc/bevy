@@ -17,7 +17,7 @@ enable primitive_index;
 
 #import bevy_solari::rt_payload::{RtPayload, RtCamera}
 #import bevy_solari::brdf::sample_glass_bsdf
-#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat, offset_ray_origin}
+#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin}
 
 var<incoming_ray_payload> payload: RtPayload;
 // Driver-provided triangle barycentrics (the fixed-function intersection's u, v).
@@ -55,6 +55,9 @@ fn chit_glass(
     // medium when this is the exit/back face), for Beer-Lambert absorption.
     @builtin(ray_t_current_max) ray_t: f32,
     @builtin(object_to_world) object_to_world: mat4x3<f32>,
+    // Hit triangle's object-space vertex positions from the CLAS (position fetch);
+    // skips the vertex-pool position loads. See `chit_opaque` / `clas_arena`.
+    @builtin(hit_triangle_vertex_positions) hit_positions: array<vec3<f32>, 3>,
 ) {
     var rng = payload.rng;
     let barycentrics = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
@@ -64,7 +67,7 @@ fn chit_glass(
         vec4<f32>(object_to_world[0].y, object_to_world[1].y, object_to_world[2].y, object_to_world[3].y),
         vec4<f32>(object_to_world[0].z, object_to_world[1].z, object_to_world[2].z, object_to_world[3].z),
     );
-    let ray_hit = resolve_triangle_data_full_mat(instance_id, sbt.material_id, transform, cluster_id, primitive_index, barycentrics);
+    let ray_hit = resolve_triangle_data_full_mat_fetch(instance_id, sbt.material_id, transform, cluster_id, primitive_index, barycentrics, hit_positions);
 
     let wo = -ray_direction;
     // Geometric normal: robust for the front/back-face test and the

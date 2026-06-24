@@ -86,6 +86,15 @@ pub struct RayTracingPipelineFeature;
 /// for shading coherence; without it the raygen falls back to plain `traceRay`.
 pub struct RayTracingInvocationReorderFeature;
 
+/// Marker registered when `VK_KHR_ray_tracing_position_fetch` is enabled. The
+/// closest-hit shaders read the hit triangle's three object-space vertex
+/// positions straight from the acceleration structure via
+/// `@builtin(hit_triangle_vertex_positions)` instead of re-fetching them from the
+/// vertex pool — but only when the AS was built with `ALLOW_DATA_ACCESS` (see
+/// `clas_arena` / `blas_rebuild`). Both the build flag and the `SOLARI_POSITION_FETCH`
+/// shader def gate on this marker; absent → the chit falls back to the pool load.
+pub struct RayTracingPositionFetchFeature;
+
 /// Register the cluster-AS + partitioned-AS Vulkan device-creation
 /// callback. Called by `SolariInitPlugin::build` — apps using
 /// `DefaultPlugins` get this wiring automatically.
@@ -227,6 +236,22 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 let features = Box::leak(Box::new(
                     vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV::default()
                         .ray_tracing_invocation_reorder(true),
+                ));
+                *args.create_info = core::mem::take(args.create_info).push(features);
+            }
+
+            // Ray-tracing position fetch — the closest-hit reads the hit triangle's
+            // three object-space vertex positions from the AS directly, instead of a
+            // vertex-pool fetch (one less indirection per hit; geometric normal +
+            // area come free). KHR core extension; pairs with the `ALLOW_DATA_ACCESS`
+            // build flag the CLAS / cluster-BLAS builds set when this is present.
+            if supports(khr::ray_tracing_position_fetch::NAME) {
+                args.extensions
+                    .push(khr::ray_tracing_position_fetch::NAME);
+                additional.insert::<RayTracingPositionFetchFeature>();
+                let features = Box::leak(Box::new(
+                    vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
+                        .ray_tracing_position_fetch(true),
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
             }

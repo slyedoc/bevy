@@ -506,6 +506,7 @@ pub(crate) fn rt_pipeline(
     if let Some(cluster_mesh_manager) = cluster_mesh_manager.as_deref() {
         view_bindings.set_geometry_addresses(&RtGeometryAddresses {
             vertex_packed: cluster_mesh_manager.vertex_packed.trace_device_address(),
+            vertex_positions: cluster_mesh_manager.vertex_positions.trace_device_address(),
             materials: scene_bindings.materials_device_address,
             material_stride: crate::bindings::GPU_MATERIAL_SIZE,
             _pad: 0,

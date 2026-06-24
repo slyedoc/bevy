@@ -151,20 +151,21 @@ impl ClusterMesh {
     }
 }
 
-/// Interleaved (AoS) vertex record for the bindless RT-pipeline resolve: all of
-/// one vertex's shading attributes in one contiguous 28-byte slot, so a
-/// closest-hit touches one cache line per vertex instead of the four separate SoA
-/// pools (`vertex_positions`/`normals`/`tangents`/`uvs`). Reached by
+/// Interleaved (AoS) vertex record for the bindless RT-pipeline resolve: one
+/// vertex's shading attributes in one contiguous 16-byte slot, so a closest-hit
+/// touches one cache line per vertex instead of separate SoA pools. Reached by
 /// buffer-device-address via `physical_load` (field-by-field, no std430 padding —
-/// exact 28 B: position@0, normal@12, tangent@16, uv@20). Compact on purpose: a
-/// path-tracer fetches 3 of these per hit at scattered addresses, so a smaller
-/// record packs more vertices per cache line → higher L1 hit. Built at upload,
+/// exact 16 B: normal@0, tangent@4, uv@8). Position is NOT here — the closest-hit
+/// reads it straight from the acceleration structure via
+/// `@builtin(hit_triangle_vertex_positions)` (`VK_KHR_ray_tracing_position_fetch`),
+/// and the rare CPU/sampling path that resolves a non-hit triangle reads it from
+/// the separate `vertex_positions` SoA pool. Dropping the 12-byte position head
+/// (28→16 B) packs more vertices per cache line → higher L1 hit, and removes the
+/// position duplication between this pool and `vertex_positions`. Built at upload,
 /// parallel to `vertex_positions` (same global vertex index).
 #[derive(Copy, Clone, Pod, Zeroable, Debug, Default)]
 #[repr(C)]
 pub struct PackedVertex {
-    /// Object-space position (matches `vertex_positions`).
-    pub position: [f32; 3],
     /// Octahedral-encoded normal (2×16snorm packed, matches `vertex_normals`).
     pub normal: u32,
     /// Tangent direction + bitangent sign packed into one `u32`: xyz in 10 bits
