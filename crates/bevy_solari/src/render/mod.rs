@@ -58,6 +58,8 @@ impl Plugin for SolarRenderPlugin {
         #[cfg(feature = "dlss")]
         app.init_resource::<dlss::SolariDlssMode>()
             .add_plugins(ExtractResourcePlugin::<dlss::SolariDlssMode>::default());
+        app.init_resource::<rt_pipeline::SolariCostHeatmap>()
+            .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariCostHeatmap>::default());
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app

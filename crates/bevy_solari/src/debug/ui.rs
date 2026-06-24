@@ -140,23 +140,181 @@ pub fn update_render_debug_label(
     }
 }
 
+// --- "view" dropdown (normal / time heatmap) + cost-heatmap sliders ------------
+// A bottom-left "view" dropdown selects normal rendering vs the per-pixel cost
+// heatmap (`SolariCostHeatmap.enabled`). In heatmap view the two sliders (center,
+// contrast) appear and the DLSS dropdown hides; in normal view it's the reverse.
+
+pub use view_panel::{spawn_view_panels, toggle_heatmap_controls, update_view_label};
+
+mod view_panel {
+    use super::*;
+    use crate::render::rt_pipeline::SolariCostHeatmap;
+    use crate::render::SolariCamera;
+    use bevy_ecs::system::{Res, ResMut};
+    use bevy_feathers::controls::FeathersSlider;
+    use bevy_feathers::theme::ThemeBackgroundColor;
+    use bevy_feathers::tokens::WINDOW_BG;
+    use bevy_ui::{Display, FlexDirection, UiRect};
+    use bevy_ui_widgets::{slider_self_update, SliderPrecision, ValueChange};
+
+    /// Marker on a camera that already has a view panel.
+    #[derive(Component)]
+    pub struct ViewPanelSpawned;
+
+    /// Marker on the view button caption.
+    #[derive(Component, Default, Clone)]
+    pub struct ViewLabel;
+
+    /// Marker on the container holding the heatmap sliders (shown only in heatmap view).
+    #[derive(Component, Default, Clone)]
+    pub struct HeatmapControls;
+
+    /// One view menu item: sets whether the cost heatmap is enabled.
+    fn view_item(enabled: bool, label: &'static str) -> impl Scene {
+        bsn! {
+            @FeathersMenuItem {
+                @caption: bsn! { Text({label.to_string()}) ThemedText }
+            }
+            on(move |_: On<Activate>, mut heatmap: ResMut<SolariCostHeatmap>| {
+                heatmap.enabled = enabled;
+            })
+        }
+    }
+
+    /// Spawn one bottom-left view dropdown + heatmap sliders per [`SolariCamera`]
+    /// (sits above the DLSS dropdown at `bottom: 8`).
+    pub fn spawn_view_panels(
+        cameras: Query<Entity, (With<SolariCamera>, Without<ViewPanelSpawned>)>,
+        mut commands: Commands,
+    ) {
+        for camera in &cameras {
+            commands
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        bottom: px(48),
+                        left: px(8),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(4),
+                        padding: UiRect::all(px(8)),
+                        ..Default::default()
+                    },
+                    // Card background (the Feathers "window" surface token), so the
+                    // dropdown + sliders read as one panel instead of floating bare.
+                    ThemeBackgroundColor(WINDOW_BG),
+                    TabGroup::default(),
+                    UiTargetCamera(camera),
+                ))
+                .queue_spawn_related_scenes::<Children>(bsn_list! {
+                    (
+                        @FeathersMenu
+                        Children [
+                            (
+                                @FeathersMenuButton {
+                                    @caption: bsn! { Text("view: normal") ThemedText ViewLabel }
+                                }
+                            ),
+                            (
+                                @FeathersMenuPopup
+                                Children [
+                                    view_item(false, "normal"),
+                                    view_item(true, "time heatmap"),
+                                ]
+                            )
+                        ]
+                    ),
+                    (
+                        Node {
+                            display: Display::None,
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(2),
+                        }
+                        HeatmapControls
+                        Children [
+                            (Text("center") ThemedText),
+                            (
+                                @FeathersSlider { @min: 10.0, @max: 24.0, @value: 16.0 }
+                                SliderPrecision(1)
+                                on(slider_self_update)
+                                on(|c: On<ValueChange<f32>>, mut heatmap: ResMut<SolariCostHeatmap>| {
+                                    heatmap.center = c.value;
+                                })
+                            ),
+                            (Text("contrast") ThemedText),
+                            (
+                                @FeathersSlider { @min: 0.0, @max: 1.0, @value: 0.15 }
+                                SliderPrecision(2)
+                                on(slider_self_update)
+                                on(|c: On<ValueChange<f32>>, mut heatmap: ResMut<SolariCostHeatmap>| {
+                                    heatmap.contrast = c.value;
+                                })
+                            ),
+                        ]
+                    )
+                });
+            commands.entity(camera).insert(ViewPanelSpawned);
+        }
+    }
+
+    /// Keep the view button caption in sync with the heatmap toggle.
+    pub fn update_view_label(
+        heatmap: Res<SolariCostHeatmap>,
+        mut labels: Query<&mut Text, With<ViewLabel>>,
+    ) {
+        let want = if heatmap.enabled {
+            "view: time heatmap"
+        } else {
+            "view: normal"
+        };
+        for mut text in &mut labels {
+            if text.0 != want {
+                text.0 = want.to_string();
+            }
+        }
+    }
+
+    /// Show the heatmap sliders only in heatmap view.
+    pub fn toggle_heatmap_controls(
+        heatmap: Res<SolariCostHeatmap>,
+        mut controls: Query<&mut Node, With<HeatmapControls>>,
+    ) {
+        let want = if heatmap.enabled {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        for mut node in &mut controls {
+            if node.display != want {
+                node.display = want;
+            }
+        }
+    }
+}
+
 // --- DLSS Ray Reconstruction mode dropdown (per `SolariCamera`) ----------------
 // Unlike the render-debug overlay (a per-camera component), the DLSS mode is a single
 // global resource, so every menu item just sets `SolariDlssMode`.
 
 #[cfg(feature = "dlss")]
-pub use dlss_dropdown::{spawn_dlss_panels, update_dlss_label};
+pub use dlss_dropdown::{spawn_dlss_panels, toggle_dlss_visibility, update_dlss_label};
 
 #[cfg(feature = "dlss")]
 mod dlss_dropdown {
     use super::*;
     use crate::render::dlss::SolariDlssMode;
+    use crate::render::rt_pipeline::SolariCostHeatmap;
     use crate::render::SolariCamera;
     use bevy_ecs::system::{Res, ResMut};
+    use bevy_ui::Display;
 
     /// Marker on a camera that already has a DLSS dropdown.
     #[derive(Component)]
     pub struct DlssPanelSpawned;
+
+    /// Marker on the DLSS dropdown root node, so it can be hidden in heatmap view.
+    #[derive(Component)]
+    pub struct DlssPanelRoot;
 
     /// Marker on the DLSS button caption.
     #[derive(Component, Default, Clone)]
@@ -191,6 +349,7 @@ mod dlss_dropdown {
                     },
                     TabGroup::default(),
                     UiTargetCamera(camera),
+                    DlssPanelRoot,
                 ))
                 .queue_spawn_related_scenes::<Children>(bsn_list! {
                     (
@@ -226,6 +385,24 @@ mod dlss_dropdown {
             let want = format!("dlss: {}", *mode);
             if text.0 != want {
                 text.0 = want;
+            }
+        }
+    }
+
+    /// Hide the DLSS dropdown in heatmap view — DLSS would denoise the heatmap, and the
+    /// view panel's sliders take its place.
+    pub fn toggle_dlss_visibility(
+        heatmap: Res<SolariCostHeatmap>,
+        mut roots: Query<&mut Node, With<DlssPanelRoot>>,
+    ) {
+        let want = if heatmap.enabled {
+            Display::None
+        } else {
+            Display::Flex
+        };
+        for mut node in &mut roots {
+            if node.display != want {
+                node.display = want;
             }
         }
     }

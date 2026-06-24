@@ -1111,6 +1111,11 @@ fn compile_rt_wgsl(source: &str, file_path: &str) -> Option<Vec<u32>> {
     .collect();
     #[cfg(feature = "dlss")]
     shader_defs.insert("SOLARI_DLSS".to_string(), ShaderDefValue::Bool(true));
+    // Compile in the `shader_clock()` reads only when the device enabled
+    // `VK_KHR_shader_clock`; otherwise the cost-heatmap path compiles out.
+    if crate::gpu::extension::shader_clock_available() {
+        shader_defs.insert("SOLARI_SHADER_CLOCK".to_string(), ShaderDefValue::Bool(true));
+    }
 
     let module = match composer.make_naga_module(NagaModuleDescriptor {
         source,

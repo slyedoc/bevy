@@ -38,6 +38,7 @@ use crate::gpu::RawTraceBindable;
 use crate::gpu::rt_pipeline::{RtCamera, RtGeometryAddresses, RtPipeline, RtViewBindings};
 use crate::geometry::ClusterMeshManager;
 use crate::render::atmosphere::{AtmosphereSky, SolariAtmosphereView};
+use bevy_render::extract_resource::ExtractResource;
 use crate::render::view_cull::SolariEnvironmentMap;
 use crate::render::SolariCamera;
 
@@ -87,6 +88,43 @@ fn raw_image(texture: &bevy_render::render_resource::Texture) -> Option<vk::Imag
 pub(crate) struct RtEnvImages<'w> {
     texture_assets: Res<'w, RenderAssets<GpuImage>>,
     fallback_image: Res<'w, FallbackImage>,
+}
+
+/// Per-pixel cost-heatmap debug view (requires `VK_KHR_shader_clock`). When
+/// `enabled`, the raygen reads the shader clock around the trace and replaces the
+/// shaded color with a colormap of the per-pixel cost; `scale` maps clocks → `[0, 1]`
+/// for the colormap (tune per scene). Set it from the main world (e.g. on a
+/// keypress) — `bevy_solari::prelude::SolariCostHeatmap`. A no-op when the device
+/// lacks shader_clock (the raygen's clock reads compile out).
+#[derive(Resource, Clone, Copy, ExtractResource)]
+pub struct SolariCostHeatmap {
+    pub enabled: bool,
+    /// `log2(cycles)` that maps to the colormap midpoint (green) — slide it to the
+    /// scene's midrange cost. `-` / `=` shift it. Default 16 (≈ 65k cycles).
+    pub center: f32,
+    /// Contrast: colormap change per `log2(cycles)` stop around [`center`](Self::center).
+    /// Crank it up to push the slowest toward red and the fastest toward blue; `[` / `]`
+    /// halve / 1.5× it.
+    pub contrast: f32,
+}
+
+impl Default for SolariCostHeatmap {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            center: 16.0,
+            // ~0.15/stop spreads a ±3-stop range across the colormap.
+            contrast: 0.15,
+        }
+    }
+}
+
+/// Debug/feature inputs bundled into one [`SystemParam`] to keep the dispatch under
+/// bevy's 16-system-param limit: the device feature set + the cost-heatmap toggle.
+#[derive(bevy_ecs::system::SystemParam)]
+pub(crate) struct RtDebug<'w> {
+    additional: Res<'w, AdditionalVulkanFeatures>,
+    cost_heatmap: Option<Res<'w, SolariCostHeatmap>>,
 }
 
 /// Material routing inputs for the SBT, bundled into one [`SystemParam`] to keep
@@ -280,7 +318,7 @@ pub(crate) fn rt_pipeline(
     rt: Option<Res<RtPipeline>>,
     rt_blit: Res<RtBlit>,
     allocator: Option<Res<Allocator>>,
-    additional: Res<AdditionalVulkanFeatures>,
+    debug: RtDebug,
     scene_bindings: Res<RaytracingSceneBindings>,
     scene_columns: Res<SceneColumns>,
     cluster_mesh_manager: Option<Res<ClusterMeshManager>>,
@@ -357,7 +395,7 @@ pub(crate) fn rt_pipeline(
     // The per-view set 1 (output/camera/env) is built separately below. Inserted
     // via commands → live next frame.
     let Some(rt) = rt else {
-        if additional.has::<RayTracingPipelineFeature>() && materials.len() > 0 {
+        if debug.additional.has::<RayTracingPipelineFeature>() && materials.len() > 0 {
             if let (Some(allocator), Some(scene_layout), Some(columns_layout)) = (
                 allocator.as_deref(),
                 raw_bgl(&pipeline_cache, &scene_bindings.bind_group_layout),
@@ -477,7 +515,9 @@ pub(crate) fn rt_pipeline(
         frame: [
             *frame_counter,
             (u32::BITS - materials.len().max(1).leading_zeros()),
-            0,
+            // .z = cost-heatmap debug view (1 = on); the raygen colormaps the clock
+            // delta when set (needs SOLARI_SHADER_CLOCK / VK_KHR_shader_clock).
+            debug.cost_heatmap.as_deref().is_some_and(|h| h.enabled) as u32,
             0,
         ],
         // .x = sky brightness; .yzw = clear color (black for bevy_city).
@@ -487,7 +527,11 @@ pub(crate) fn rt_pipeline(
         // so an unaccumulated jitter would only shimmer).
         jitter: {
             let j = dlss_jitter.map_or(Vec2::ZERO, |j| j.offset);
-            [j.x, j.y, 0.0, 0.0]
+            // .zw = cost-heatmap log2 center + contrast (read by the raygen colormap).
+            let hm = debug.cost_heatmap.as_deref();
+            let center = hm.map_or(0.0, |h| h.center);
+            let contrast = hm.map_or(0.0, |h| h.contrast);
+            [j.x, j.y, center, contrast]
         },
     };
     // Write this frame's camera into its ring slot; the returned offset binds that

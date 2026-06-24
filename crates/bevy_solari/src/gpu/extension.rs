@@ -61,6 +61,19 @@ pub struct ClusterAccelerationStructureFeature;
 /// Marker type for `VK_NV_partitioned_acceleration_structure`.
 pub struct PartitionedAccelerationStructureFeature;
 
+/// Device `maxPartitionCount` for `VK_NV_partitioned_acceleration_structure`
+/// (`VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV`), queried once at
+/// device creation. `0` until queried / when the extension is absent. The PTLAS build
+/// clamps its `partition_count` to this (floating-origin Stage 3 — block partitions
+/// must fit). Read via [`max_partition_count`].
+static MAX_PARTITION_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Device `maxPartitionCount`, or `0` if the partitioned-AS extension is unsupported
+/// or the device hasn't been created yet.
+pub fn max_partition_count() -> u32 {
+    MAX_PARTITION_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Marker type registered in [`AdditionalVulkanFeatures`] when
 /// `VK_NV_ray_tracing_linear_swept_spheres` is enabled on the device.
 /// The hair pipeline (LSS BLAS build + shading) checks
@@ -94,6 +107,25 @@ pub struct RayTracingInvocationReorderFeature;
 /// `clas_arena` / `blas_rebuild`). Both the build flag and the `SOLARI_POSITION_FETCH`
 /// shader def gate on this marker; absent → the chit falls back to the pool load.
 pub struct RayTracingPositionFetchFeature;
+
+/// Marker registered when `VK_KHR_shader_clock` is enabled (`shaderSubgroupClock`).
+/// The raygen reads the shader clock (`shader_clock()` → `OpReadClockKHR`) around the
+/// trace to write a per-pixel cost value for the debug heatmap. Absent → the heatmap
+/// pass is skipped and the raygen's clock reads compile out (`SOLARI_SHADER_CLOCK`
+/// shader def gates them).
+pub struct ShaderClockFeature;
+
+/// `true` once `VK_KHR_shader_clock` has been enabled on the device. The free
+/// `compile_rt_wgsl` (no ECS access) reads this to decide whether to define the
+/// `SOLARI_SHADER_CLOCK` shader def — emitting `OpReadClockKHR` without the
+/// extension enabled is a device error, so the clock reads compile out when absent.
+static SHADER_CLOCK_AVAILABLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether `VK_KHR_shader_clock` was enabled at device creation.
+pub fn shader_clock_available() -> bool {
+    SHADER_CLOCK_AVAILABLE.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Register the cluster-AS + partitioned-AS Vulkan device-creation
 /// callback. Called by `SolariInitPlugin::build` — apps using
@@ -187,6 +219,25 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                         .partitioned_acceleration_structure(true),
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
+
+                // Read the device's maxPartitionCount once (Stage-0 residual; the
+                // floating-origin PTLAS build clamps partition_count to it). Chained
+                // into a properties2 query on the physical device we have in hand.
+                let mut pas_props =
+                    vk::PhysicalDevicePartitionedAccelerationStructurePropertiesNV::default();
+                // The NV props struct isn't marked `ExtendsPhysicalDeviceProperties2` in
+                // this ash fork (no `push_next`), so chain `p_next` manually; `pas_props`
+                // outlives the query call below.
+                let mut props2 = vk::PhysicalDeviceProperties2::default();
+                props2.p_next = &mut pas_props as *mut _ as *mut core::ffi::c_void;
+                instance.get_physical_device_properties2(physical_device, &mut props2);
+                MAX_PARTITION_COUNT
+                    .store(pas_props.max_partition_count, core::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    target: "bevy_solari",
+                    "VK_NV_partitioned_acceleration_structure: maxPartitionCount = {}",
+                    pas_props.max_partition_count
+                );
             }
 
             // Ray-traced hair via linear swept spheres. Blackwell-only; on
@@ -252,6 +303,21 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 let features = Box::leak(Box::new(
                     vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
                         .ray_tracing_position_fetch(true),
+                ));
+                *args.create_info = core::mem::take(args.create_info).push(features);
+            }
+
+            // Shader clock — `shader_clock()` (OpReadClockKHR, Subgroup scope) for the
+            // per-pixel cost heatmap. `shaderSubgroupClock` is the widely-supported
+            // form (per-SM realtime counter); the SPIR-V capability the shader emits
+            // needs the extension enabled here.
+            if supports(khr::shader_clock::NAME) {
+                args.extensions.push(khr::shader_clock::NAME);
+                additional.insert::<ShaderClockFeature>();
+                SHADER_CLOCK_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
+                let features = Box::leak(Box::new(
+                    vk::PhysicalDeviceShaderClockFeaturesKHR::default()
+                        .shader_subgroup_clock(true),
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
             }

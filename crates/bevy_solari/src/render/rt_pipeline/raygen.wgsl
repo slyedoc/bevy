@@ -47,6 +47,42 @@ const NO_GBUFFER: u32 = 0xffffffffu;
 
 var<ray_payload> payload: RtPayload;
 
+#ifdef SOLARI_SHADER_CLOCK
+// 32-bit (LO) clock delta, correcting a single wrap of the counter — the NVIDIA
+// timer-instrumentation approach (the low 32 bits are plenty for a heatmap and keep
+// register pressure down).
+fn clock_delta(start: u32, end: u32) -> u32 {
+    return select(~0u - (start - end), end - start, end >= start);
+}
+
+// 10-stop "temperature" colormap (NVIDIA timer-instrumentation): deep blue (cheap) →
+// cyan → green → yellow → orange → red → magenta (expensive). Input clamped to [0, 1].
+fn cost_heatmap(t: f32) -> vec3<f32> {
+    var c = array<vec3<f32>, 10>(
+        vec3<f32>(0.0, 2.0, 91.0),
+        vec3<f32>(0.0, 108.0, 251.0),
+        vec3<f32>(0.0, 221.0, 221.0),
+        vec3<f32>(51.0, 221.0, 0.0),
+        vec3<f32>(255.0, 252.0, 0.0),
+        vec3<f32>(255.0, 180.0, 0.0),
+        vec3<f32>(255.0, 104.0, 0.0),
+        vec3<f32>(226.0, 22.0, 0.0),
+        vec3<f32>(191.0, 0.0, 83.0),
+        vec3<f32>(145.0, 0.0, 65.0),
+    );
+    let s = clamp(t, 0.0, 1.0) * 10.0;
+    let cur = min(i32(s), 9);
+    let prv = max(cur - 1, 0);
+    let nxt = min(cur + 1, 9);
+    let fc = f32(cur);
+    let blur = 0.8;
+    let wc = smoothstep(fc - blur, fc + blur, s) * (1.0 - smoothstep(fc + 1.0 - blur, fc + 1.0 + blur, s));
+    let wp = 1.0 - smoothstep(fc - blur, fc + blur, s);
+    let wn = smoothstep(fc + 1.0 - blur, fc + 1.0 + blur, s);
+    return clamp((wc * c[cur] + wp * c[prv] + wn * c[nxt]) / 255.0, vec3(0.0), vec3(1.0));
+}
+#endif
+
 @ray_generation
 fn raygen(
     @builtin(ray_invocation_id) id: vec3<u32>,
@@ -79,6 +115,21 @@ fn raygen(
     gbuffer_diffuse[pixel_index] = vec4<f32>(0.0);
     gbuffer_specular[pixel_index] = vec4<f32>(0.0);
     gbuffer_motion[pixel_index] = vec4<f32>(0.0);
+#endif
+
+#ifdef SOLARI_SHADER_CLOCK
+    // Per-pixel cost measurement (heatmap). Read the start clock (32-bit LO) and fold
+    // it into the RNG so the compiler can't sink the read past the bounce loop: the
+    // loop consumes `rng`, which now depends on `clk0`, pinning the read before it.
+    // Clock reads are otherwise freely reorderable (no NVAPI fake-UAV in Vulkan), and
+    // the compiler was sinking the start read down next to the end read → ~0 delta.
+    // Heatmap-mode only (frame.z == 1), where the shaded color is discarded, so it
+    // never perturbs a normal render.
+    var clk0 = 0u;
+    if camera.frame.z == 1u {
+        clk0 = u32(shader_clock());
+        rng = rng ^ clk0;
+    }
 #endif
 
     for (var bounce = 0u; bounce < MAX_BOUNCES; bounce += 1u) {
@@ -182,6 +233,24 @@ fn raygen(
     // position carries the exposure.
     var final_color = select(radiance, vec3<f32>(0.0), captured);
     final_color *= camera.camera_position.w;
+
+#ifdef SOLARI_SHADER_CLOCK
+    // Cost heatmap debug view (frame.z == 1): replace the shaded color with a
+    // colormap of the clock delta across the whole trace. jitter.z scales clocks →
+    // [0, 1] (tunable per scene). Bypasses DLSS naturally since the blit reads this
+    // buffer; turn DLSS off for a clean read.
+    if camera.frame.z == 1u {
+        let cycles = f32(clock_delta(clk0, u32(shader_clock())));
+        // Per-pixel cost spans orders of magnitude → map log2(cycles) → color, pivoting
+        // at the data center so the knob is a CONTRAST control, not a shift. jitter.z =
+        // center (the green midpoint; `-` / `=` slide it to the scene's midrange);
+        // jitter.w = contrast (color change per log2 stop; `[` / `]` crank it — higher
+        // pushes the slowest toward red and the fastest toward blue).
+        let t = 0.5 + (log2(max(cycles, 1.0)) - camera.jitter.z) * camera.jitter.w;
+        final_color = cost_heatmap(t);
+    }
+#endif
+
     let index = id.y * dims.x + id.x;
     output[index] = vec4<f32>(final_color, 1.0);
 }
