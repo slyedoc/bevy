@@ -279,6 +279,15 @@ impl RtPipeline {
                 "ahit_alpha.wgsl",
             )?,
         )?;
+        // Portal closest-hit — teleports rays (no shading); SBT-routed for
+        // portal-flagged materials so its scan/redirect math stays off chit_opaque.
+        let chit_portal_mod = create_shader_module(
+            &device,
+            &compile_rt_wgsl(
+                include_str!("../render/rt_pipeline/chit_portal.wgsl"),
+                "chit_portal.wgsl",
+            )?,
+        )?;
         let modules = vec![
             raygen_mod,
             miss_mod,
@@ -287,11 +296,12 @@ impl RtPipeline {
             chit_hair_mod,
             miss_shadow_mod,
             ahit_alpha_mod,
+            chit_portal_mod,
         ];
 
         // naga emits each entry point under its WGSL function name. Stage 6 is the
-        // alpha-cutout any-hit, referenced by the opaque hit group below (it has no
-        // group of its own).
+        // alpha-cutout any-hit (referenced by the opaque hit group, no group of its
+        // own); stage 7 is the portal closest-hit.
         let stages = [
             shader_stage(vk::ShaderStageFlags::RAYGEN_KHR, raygen_mod, c"raygen"),
             shader_stage(vk::ShaderStageFlags::MISS_KHR, miss_mod, c"miss_primary"),
@@ -300,21 +310,23 @@ impl RtPipeline {
             shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_hair_mod, c"chit_hair"),
             shader_stage(vk::ShaderStageFlags::MISS_KHR, miss_shadow_mod, c"miss_shadow"),
             shader_stage(vk::ShaderStageFlags::ANY_HIT_KHR, ahit_alpha_mod, c"ahit_alpha"),
+            shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_portal_mod, c"chit_portal"),
         ];
 
-        // Group 0 = raygen, 1 = primary miss (both general), 2/3/4 = the
-        // opaque/glass/hair triangle hit groups (their order in the hit region IS
-        // the SBT offset HIT_GROUP_OPAQUE=0/_GLASS=1/_HAIR=2 routed in ptlas_fill /
-        // ptlas_hair_write), 5 = shadow miss (miss index 1, general). The opaque hit
-        // group also carries the alpha-cutout any-hit (stage 6); it fires only for
-        // PTLAS-`FORCE_NO_OPAQUE` instances (alpha-masked foliage), so opaque geometry
-        // pays nothing.
+        // Group 0 = raygen, 1 = primary miss (both general); 2/3/4/5 = the
+        // opaque/glass/hair/portal triangle hit groups (their order IS the per-class
+        // SBT handle: `handle(2 + class)`, with class from `material_sbt_class`; hair
+        // class 2 reaches group 4 via a reserved record); 6 = shadow miss (miss index
+        // 1, general). The opaque hit group also carries the alpha-cutout any-hit
+        // (stage 6), firing only for PTLAS-`FORCE_NO_OPAQUE` instances. The portal hit
+        // group's `chit_portal` (stage 7) teleports rays without shading.
         let groups = [
             general_group(0),
             general_group(1),
             hit_group_with_any_hit(2, 6),
             hit_group(3),
             hit_group(4),
+            hit_group(7),
             general_group(5),
         ];
 
@@ -447,7 +459,7 @@ impl RtPipeline {
         // reads as the canonical material binding (uniform per record → uniform
         // per warp after SER). Distinct per-material records also give SER a
         // per-material reorder key and a slot for future per-class handles.
-        const GROUP_COUNT: u32 = 6; // raygen, primary miss, opaque, glass, hair, shadow miss
+        const GROUP_COUNT: u32 = 7; // raygen, primary miss, opaque, glass, hair, portal, shadow miss
         const MISS_COUNT: u64 = 2; // miss index 0 = primary, 1 = shadow
         const HIT_RECORD_DATA: u64 = 4; // bytes of shader-record data (u32 material id)
         const RECORD_HEADROOM: u32 = 64; // absorb a little material growth post-build
@@ -486,11 +498,11 @@ impl RtPipeline {
         .ok()?;
         let handle = |g: usize| &handles[g * handle_size as usize..(g + 1) * handle_size as usize];
         // raygen (group 0), primary miss (group 1 → miss index 0), shadow miss
-        // (group 5 → miss index 1).
+        // (group 6 → miss index 1).
         for &(g, off) in [
             (0usize, raygen_offset),
             (1usize, miss_offset),
-            (5usize, miss_offset + handle_stride),
+            (6usize, miss_offset + handle_stride),
         ]
         .iter()
         {
@@ -505,11 +517,12 @@ impl RtPipeline {
         }
         // One record per material slot: [class hit-group handle | material id].
         // The record's handle is `handle(2 + class)` — opaque (group 2), glass
-        // (group 3), or hair (group 4) — so an instance routing to its material's
-        // record lands on the closest-hit its CLASS selects, not always the opaque
-        // one. Headroom records past the live material count, and any out-of-range
-        // class, fall back to opaque. The data slot = the record index = the
-        // material id the instance routes to, read back via `var<shader_record>`
+        // (group 3), or portal (group 5, class 3) — so an instance routing to its
+        // material's record lands on the closest-hit its CLASS selects, not always
+        // the opaque one. (Hair is class 2 → group 4, reached via the reserved
+        // record below, not a material.) Headroom records past the live material
+        // count, and any out-of-range class, fall back to opaque. The data slot =
+        // the record index = the material id, read back via `var<shader_record>`
         // (uniform per record → uniform per warp after SER).
         for record in 0..total_records {
             let rec_off = hit_offset + record * hit_record_stride;
@@ -523,7 +536,7 @@ impl RtPipeline {
                     .get(record as usize)
                     .copied()
                     .unwrap_or(0)
-                    .min(2);
+                    .min(3);
                 handle(2 + class as usize)
             };
             // SAFETY: rec_off + handle_size + 4 within the record.

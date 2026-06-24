@@ -29,6 +29,7 @@ mod bind_groups;
 mod binder;
 mod extract;
 mod fog_volume;
+pub mod portal;
 mod types;
 
 pub use bind_groups::{
@@ -39,6 +40,7 @@ pub use binder::{prepare_raytracing_scene_bindings, RaytracingSceneBindings};
 pub(crate) use binder::{GPU_MATERIAL_SIZE, MAX_TEXTURE_COUNT};
 pub use extract::SolariMaterialAssets;
 pub use fog_volume::{SolariFogVolume, SolariFogVolumes, SolariFogVolumesTablePlugin};
+pub use portal::{SolariPortal, SolariPortals, SolariPortalsTablePlugin};
 pub use types::RaytracingMesh3d;
 
 /// Register the cluster scene-bind-group shader library (the `@group(0)`
@@ -71,9 +73,10 @@ impl Plugin for BindingsPlugin {
         register_scene_shaders(app);
         app.add_plugins(ExtractResourcePlugin::<SolariMaterialAssets>::default());
         app.register_type::<SolariFogVolume>();
-        // Fog-volume gpu_table! (slot allocator, column scatter, change-driven
-        // extract; its column joins the scene-columns group).
-        app.add_plugins((SolariFogVolumesTablePlugin,));
+        app.register_type::<SolariPortal>();
+        // Fog-volume + portal gpu_table!s (slot allocator, column scatter,
+        // change-driven extract; their columns join the scene-columns group).
+        app.add_plugins((SolariFogVolumesTablePlugin, SolariPortalsTablePlugin));
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;

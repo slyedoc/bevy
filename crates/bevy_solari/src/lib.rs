@@ -111,7 +111,7 @@ pub enum SolariClusterSystems {
 /// This includes the most common types in this crate, re-exported for your convenience.
 pub mod prelude {
     pub use crate::{
-        bindings::RaytracingMesh3d, bindings::SolariFogVolume,
+        bindings::RaytracingMesh3d, bindings::SolariFogVolume, bindings::SolariPortal,
         render::CameraReset, render::SolariCamera,
         render::atmosphere::{SolariAtmosphere, SolariGlobalFog},
         SolariInitPlugin, SolariPlugin,

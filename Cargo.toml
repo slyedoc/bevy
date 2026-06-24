@@ -1656,6 +1656,24 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
+name = "solari_portal"
+path = "examples/3d/solari/portal.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_portal]
+name = "Solari (portals)"
+description = "Ray portals — surfaces that teleport rays to a paired portal, routed to a dedicated SBT hit group (Bevy Solari)."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
 name = "solari_fog_volumes"
 path = "examples/3d/solari/fog_volumes.rs"
 doc-scrape-examples = true

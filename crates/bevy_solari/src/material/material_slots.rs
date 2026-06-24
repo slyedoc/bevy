@@ -84,15 +84,22 @@ pub const MATERIAL_TRAVERSAL_ALPHA_TESTED: u32 = 0x1;
 /// [`MaterialTraversalFlags`] bit: the material is glass/transmissive, so its
 /// instances route to the glass RT-pipeline hit group.
 pub const MATERIAL_TRAVERSAL_GLASS: u32 = 0x2;
+/// [`MaterialTraversalFlags`] bit: the material is a ray-portal surface, so its
+/// instances route to the `chit_portal` hit group (teleport, no shading).
+pub const MATERIAL_TRAVERSAL_PORTAL: u32 = 0x4;
 
 /// The RT-pipeline SBT hit-group CLASS an instance's material selects, from its
-/// [`MaterialTraversalFlags`] word: glass → 1 (the `chit_glass` closest-hit),
-/// else 0 (`chit_opaque`). The SBT bakes `handle(2 + class)` into that
-/// material's hit record, so glass instances reach `chit_glass` instead of
-/// every hit landing on the opaque program. This is the single CPU-side
-/// surface-class → shader routing key; add a BSDF class by extending this and
-/// the pipeline's hit groups in lockstep.
+/// [`MaterialTraversalFlags`] word: portal → 3 (`chit_portal`), glass → 1
+/// (`chit_glass`), else 0 (`chit_opaque`). The SBT bakes `handle(2 + class)`
+/// into that material's hit record (class 2 = hair is reached via a reserved
+/// record, not a material), so portal/glass instances reach their dedicated
+/// program instead of the opaque one. This is the single CPU-side surface-class
+/// → shader routing key; add a class by extending this and the pipeline's hit
+/// groups in lockstep.
 pub fn material_sbt_class(traversal_flags: u32) -> u32 {
+    if traversal_flags & MATERIAL_TRAVERSAL_PORTAL != 0 {
+        return 3;
+    }
     u32::from(traversal_flags & MATERIAL_TRAVERSAL_GLASS != 0)
 }
 
@@ -135,7 +142,8 @@ pub fn prepare_material_traversal_flags(
             let alpha =
                 u32::from(material.traversal_alpha_cutoff() >= 0.0) * MATERIAL_TRAVERSAL_ALPHA_TESTED;
             let glass = u32::from(material.specular_transmission > 0.0) * MATERIAL_TRAVERSAL_GLASS;
-            list[slot as usize] = alpha | glass;
+            let portal = u32::from(material.portal) * MATERIAL_TRAVERSAL_PORTAL;
+            list[slot as usize] = alpha | glass | portal;
         }
     }
     flags.buffer.write_buffer(&render_device, &render_queue);

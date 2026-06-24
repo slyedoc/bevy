@@ -88,6 +88,10 @@ pub struct SolariMaterial {
     pub alpha_mode: AlphaMode,
     /// Optional tangent-space normal map.
     pub normal_map_texture: Option<Handle<Image>>,
+    /// Marks this as a ray-portal surface ([`SolariPortal`](crate::bindings::SolariPortal)):
+    /// its hits route to the `chit_portal` SBT program, which teleports the ray
+    /// to the paired portal instead of shading. The other fields are ignored.
+    pub portal: bool,
 }
 
 impl SolariMaterial {
@@ -140,6 +144,7 @@ impl Default for SolariMaterial {
             nested_priority: 0,
             alpha_mode: AlphaMode::Opaque,
             normal_map_texture: None,
+            portal: false,
         }
     }
 }
@@ -169,6 +174,9 @@ impl From<&StandardMaterial> for SolariMaterial {
             nested_priority: 0,
             alpha_mode: m.alpha_mode,
             normal_map_texture: m.normal_map_texture.clone(),
+            // `StandardMaterial` has no portal concept — set `SolariMaterial::portal`
+            // directly (or via a `SolariPortal` setup) for portal surfaces.
+            portal: false,
         }
     }
 }

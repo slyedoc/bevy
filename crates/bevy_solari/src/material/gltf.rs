@@ -55,6 +55,8 @@ fn solari_material_from_gltf(
         nested_priority,
         alpha_mode: material.alpha_mode,
         normal_map_texture: material.normal_map_texture.clone(),
+        // No glTF portal concept; portal surfaces set `SolariMaterial::portal` directly.
+        portal: false,
     }
 }
 

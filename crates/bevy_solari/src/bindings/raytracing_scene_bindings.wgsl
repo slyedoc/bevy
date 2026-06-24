@@ -236,6 +236,19 @@ struct FogVolume {
 }
 @group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(7) var<storage> fog_volumes: array<FogVolume>;
 
+// Ray portals (`bindings::portal`, the `SolariPortals` gpu_table, indexed by
+// portal slot): the instance-slot pairing `portal_redirect` matches a hit
+// against. The teleport map derives at hit time from the live instance
+// transform column (`transforms`), so portals on GPU-propagated / moving
+// parents stay exact. `valid = 0` is inert (tombstone / grown-buffer tail).
+struct Portal {
+    instance_slot: u32,
+    target_slot: u32,
+    valid: u32,
+    _pad: u32,
+}
+@group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(5) var<storage> portals: array<Portal>;
+
 const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
 
@@ -476,6 +489,61 @@ fn affine_transform_point(m: mat3x4<f32>, p: vec3<f32>) -> vec3<f32> {
 // Apply the linear part only (for directions / normals).
 fn affine_transform_direction(m: mat3x4<f32>, v: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(dot(m[0].xyz, v), dot(m[1].xyz, v), dot(m[2].xyz, v));
+}
+
+// Nudge past the exit portal's surface so the continued ray doesn't immediately
+// re-hit it.
+const PORTAL_SURFACE_OFFSET: f32 = 1e-4;
+
+// Inverse of a row-packed affine (mat3x4, column k = the 4x4's row k):
+// 3x3 adjugate for the linear part, `-L⁻¹·t` for the translation.
+fn affine_inverse(m: mat3x4<f32>) -> mat3x4<f32> {
+    // The linear part's COLUMNS (standard math convention).
+    let c0 = vec3(m[0].x, m[1].x, m[2].x);
+    let c1 = vec3(m[0].y, m[1].y, m[2].y);
+    let c2 = vec3(m[0].z, m[1].z, m[2].z);
+    let t = vec3(m[0].w, m[1].w, m[2].w);
+    let inv_det = 1.0 / dot(c0, cross(c1, c2));
+    let r0 = cross(c1, c2) * inv_det;
+    let r1 = cross(c2, c0) * inv_det;
+    let r2 = cross(c0, c1) * inv_det;
+    return mat3x4<f32>(
+        vec4(r0, -dot(r0, t)),
+        vec4(r1, -dot(r1, t)),
+        vec4(r2, -dot(r2, t)),
+    );
+}
+
+// If `hit_instance` is a portal surface, rewrite the ray to continue from the
+// paired portal and return true; else leave the ray and return false. The map is
+// `W_target · R_y(π) · W_portal⁻¹` — into portal-local space, a half-turn about
+// local Y (so the BACK of the target shows looking into the front of this one),
+// out through the target's frame. Reads the live instance transform column, so
+// moving / GPU-propagated portals stay exact. Light is NOT transported: portals
+// carry the view, not next-event estimation. Called only from `chit_portal`
+// (SBT-routed), so the scan + this math never touch the opaque chit's registers.
+fn portal_redirect(
+    hit_instance: u32,
+    hit_position: vec3<f32>,
+    ray_origin: ptr<function, vec3<f32>>,
+    ray_direction: ptr<function, vec3<f32>>,
+) -> bool {
+    for (var i = 0u; i < arrayLength(&portals); i += 1u) {
+        if portals[i].valid == 0u || portals[i].instance_slot != hit_instance {
+            continue;
+        }
+        let into_portal = affine_inverse(transforms[portals[i].instance_slot]);
+        let out_of_target = transforms[portals[i].target_slot];
+        var p = affine_transform_point(into_portal, hit_position);
+        var d = affine_transform_direction(into_portal, *ray_direction);
+        p = vec3(-p.x, p.y, -p.z);
+        d = vec3(-d.x, d.y, -d.z);
+        let direction = normalize(affine_transform_direction(out_of_target, d));
+        *ray_origin = affine_transform_point(out_of_target, p) + direction * PORTAL_SURFACE_OFFSET;
+        *ray_direction = direction;
+        return true;
+    }
+    return false;
 }
 
 
