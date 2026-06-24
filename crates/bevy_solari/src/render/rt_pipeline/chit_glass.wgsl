@@ -67,19 +67,25 @@ fn chit_glass(
     let ray_hit = resolve_triangle_data_full_mat(instance_id, sbt.material_id, transform, cluster_id, primitive_index, barycentrics);
 
     let wo = -ray_direction;
-    // Refraction uses the GEOMETRIC normal (smooth shading normals distort the
-    // refracted direction). Orient it into `wo`'s hemisphere and pick `eta`
-    // (n_incident / n_transmitted) by which side the ray enters from: a front
-    // face is air→glass, a back face is glass→air (ray leaving the medium).
-    var normal = ray_hit.geometric_world_normal;
-    let entering = dot(ray_direction, normal) < 0.0;
-    var eta: f32;
-    if entering {
-        eta = 1.0 / ray_hit.material.ior;
-    } else {
-        eta = ray_hit.material.ior;
-        normal = -normal; // face the incoming (interior) side
-    }
+    // Geometric normal: robust for the front/back-face test and the
+    // self-intersection offset. `eta` = n_incident / n_transmitted — a front face
+    // is air→glass (1/ior), a back face is glass→air (ior, ray leaving the medium).
+    let geo_normal = ray_hit.geometric_world_normal;
+    let entering = dot(ray_direction, geo_normal) < 0.0;
+    let eta = select(ray_hit.material.ior, 1.0 / ray_hit.material.ior, entering);
+    // Geometric normal oriented into `wo`'s hemisphere (the safe interface normal).
+    let safe_normal = select(-geo_normal, geo_normal, entering);
+
+    // The SMOOTH interpolated shading normal drives the refraction, so a curved
+    // lens refracts smoothly instead of faceting per triangle (the geometric
+    // normal is flat per triangle → a blocky lens). Align it to the geometric
+    // side, orient it to `wo`, and fall back to the geometric normal at
+    // silhouettes — there the interpolated normal tilts past the view horizon,
+    // giving a negative cosine and a broken refraction.
+    var normal = ray_hit.world_normal;
+    if dot(normal, geo_normal) < 0.0 { normal = -normal; } // align to geo side
+    if !entering { normal = -normal; }                     // orient to wo's side
+    if dot(wo, normal) <= 1.0e-3 { normal = safe_normal; } // silhouette fallback
 
 #ifdef SOLARI_DLSS
     // Primary-hit ray-reconstruction guide (chit-direct): give glass pixels a real
@@ -155,9 +161,10 @@ fn chit_glass(
 
     payload.emitted = vec3<f32>(0.0);
     payload.attenuation = sample.throughput * absorption;
-    // Refraction crosses to the far side of `normal`; reflection stays on its
-    // side. Offset along whichever the next ray leaves on, to avoid re-hitting.
-    let push_normal = select(normal, -normal, refracted);
+    // Offset along the GEOMETRIC normal (robust self-intersection avoidance),
+    // toward the side the next ray leaves: refraction crosses to the far side,
+    // reflection stays on the incoming (`wo`) side.
+    let push_normal = select(safe_normal, -safe_normal, refracted);
     payload.next_origin = offset_ray_origin(ray_hit.world_position, push_normal);
     payload.next_direction = normalize(wi);
     // Delta lobe → no MIS against NEE at the next vertex (it can't be reached by
