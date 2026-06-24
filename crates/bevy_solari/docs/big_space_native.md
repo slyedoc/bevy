@@ -1,6 +1,8 @@
 # big_space, native in bevy_solari — design & Vulkan feasibility
 
-> Status: design + feasibility, **net-new** (the working tree has no floating-origin state — verified clean). All ash/Vulkan facts below were read from `/mnt/code/f/ash` and the live solari tree at `/mnt/code/f/bevy/crates/bevy_solari`; each load-bearing claim is marked **confirmed** / **uncertain (RTX-gated)**.
+> Status: design + feasibility. All ash/Vulkan facts below were read from `/mnt/code/f/ash` and the live solari tree at `/mnt/code/f/bevy/crates/bevy_solari`; each load-bearing claim is marked **confirmed** / **uncertain (RTX-gated)**.
+
+> **ARCHITECTURE LOCK (2026-06-24).** Direction fixed: **native** in solari's GPU pipeline, **no `big_space` dependency** (it is the credited *reference algorithm*, not a dep), **no CPU per-object/per-block work** (it must not break the 2M-objects / 240 fps GPU-driven pipeline). This **supersedes the CPU `SlotPool` block allocator** sketched in §12.1 — allocation, if a per-block partition layer is built, must be **GPU-side**. What's **shipped + cargo-clean**: the native cell offset in the GPU transform-propagate (`SolariGridCell` + `SolariFloatingOrigin` + `transform_propagate.wgsl`, change-driven so static geometry is free at steady state), the `max_partition_count` readback, and a runnable example `examples/3d/solari/floating_origin.rs` (camera 1 AU out, native API, no big_space dep). The probe-validated per-block `WRITE_PARTITION_TRANSLATION` (§2–3) is the **galactic-precision + O(partitions)-recenter layer** on top, with **GPU** block assignment — a follow-up, not the foundation. Read §12.1's CPU allocator as historical.
 
 ---
 
@@ -46,8 +48,8 @@ This **supersedes** the simpler "add `(cell−origin)*edge` in the propagate sha
 | Per-instance `partition_index` field already in the write-instance record | **confirmed** | `definitions.rs:38128-38138`; solari's WGSL mirror already writes it (`accel/ptlas_fill.wgsl` `make_record`, `instance_index`/`part`) |
 | `PARTITION_INDEX_GLOBAL_NV = !0` | **confirmed** | `ash/src/vk/constants.rs:32`; matches solari's `PTLAS_GLOBAL_PARTITION` |
 | `max_partition_count` is a queryable device property | **confirmed (value NOT read)** | `PhysicalDevicePartitionedAccelerationStructurePropertiesNV.max_partition_count`, `definitions.rs:38024`. **solari does not query it today** (must add). |
-| The translation is **added at traversal to all instances in the partition** | **uncertain — INFERRED, not in this checkout** | The runtime-add prose lives in the absent man-page (`VkPartitionedAccelerationStructureWritePartitionTranslationDataNV.html`). The struct name, per-partition keying, the enable flag, and the GLOBAL exclusion are all strongly consistent with it, and it is the universally documented NV behavior — but it is **not** locally verifiable. **RTX-validate.** Cite as "per NV `VK_NV_partitioned_acceleration_structure` spec." |
-| The GLOBAL partition (`!0`) **cannot** receive a translation | **uncertain (RTX-gated) — but design is robust either way** | VUID-10574 bounds `partition_index < input.partitionCount`; `!0` is never `<`. **Caveat:** the *instance* VUID-10569 reads identically yet solari legally routes instances to GLOBAL on RTX today — so the carve-out is in spec prose, not the VUID string. The reason to never translate GLOBAL is **semantic** (a translation on the spans-all partition is meaningless) + RTX behavior, not the bare VUID wording. |
+| The translation is **added at traversal to all instances in the partition** | **CONFIRMED on RTX (2026-06-24)** | Stage-0 probe (§14), bevy_city on RTX 50-series: `SOLARI_PTLAS_TRANSLATE=5` shifted every static (partition-0) building exactly 5 m and they **stayed put** (absolute set, not additive — re-issued every frame with no accumulation/drift), while GLOBAL movers (cars) were unmoved. Runtime-add + absolute-set + per-frame-idempotent all hold. |
+| The GLOBAL partition (`!0`) is **untranslated** (and the design never translates it) | **CONFIRMED consistent on RTX** | Same probe: cars routed to GLOBAL did not shift while partition 0 did, so a partition-0 translation leaves GLOBAL unaffected. The design never issues a translation against `!0` (movers re-emit via `WRITE_INSTANCE` on recenter), so whether `!0` *accepts* one is moot — and the observed behavior matches. |
 | `src==dst` in-place / incremental builds; size once for worst case | **confirmed** | solari already does this (`accel/ptlas.rs:830-841`). Per-build counts must be `≤` sized counts. |
 | ≤ one op of each type per build (max 3 indirect commands) | **confirmed (spec VUID-10564)** | Batch all translations into one strided array under one `IndirectCommand`. |
 
@@ -211,8 +213,8 @@ Double-subtract trap (two celled nodes in one chain both subtracting origin) is 
 
 ## 11. Open questions / RTX-validation-gated unknowns
 
-1. **Runtime-add semantics (uncertain — INFERRED).** "The partition translation is added to every instance in the partition at traversal" is the NV man-page description, **not present in this ash/Vulkan-Headers checkout**. Strongly consistent with the struct shape + enable flag, but must be **observed on RTX**. Cite as "per NV spec," not as locally verified.
-2. **Can the GLOBAL partition (`!0`) be translated? (uncertain — RTX-gated.)** VUID-10574 wording is identical to the instance VUID-10569 that GLOBAL legally violates today, so the wording alone doesn't decide it; the semantic + RTX behavior do. **The design never routes a translation to GLOBAL** and re-emits movers via `WRITE_INSTANCE`, so it is correct either way — but confirm on hardware.
+1. **Runtime-add semantics — RESOLVED (CONFIRMED on RTX 2026-06-24).** The Stage-0 probe (§14) confirmed the partition translation is added to every instance in the partition at traversal, as an **absolute set** (re-issued every frame, no accumulation), stable across in-place incremental builds. bevy_city + `SOLARI_PTLAS_TRANSLATE=5`: static buildings shifted 5 m and held; GLOBAL movers unmoved.
+2. **GLOBAL partition (`!0`) — RESOLVED (consistent on RTX).** Movers in GLOBAL were unaffected by the partition-0 translation. The design never translates GLOBAL (movers re-emit via `WRITE_INSTANCE` on recenter), so the question is moot and the observed behavior matches.
 3. **`max_partition_count` actual value (unverified).** Not read from hardware here (NV docs cite ~2^21-order). If small, the populated-block budget shrinks and N must grow. **Query at startup, clamp, grow N on exhaustion.**
 4. **Partition-count churn → full rebuild (§6).** Verified failure mode: if `partition_count` tracks live `block_count`, a new block re-sizes and forces an `O(all-instances)` rebuild. **Must pre-size to a fixed clamped max.** Confirm with a streaming stress test crossing block boundaries.
 5. **Block-local AABB ⇒ cell-sized AABB (claim 13, mechanism only — not RTX-measured).** The argument that this avoids the reverted spatial-grid traversal inflation (`ptlas.rs:50-64`) is sound in principle; **measure traversal cost on RTX** before trusting it at 1M instances.
@@ -492,12 +494,16 @@ per-partition `[f32;3]` to every instance in that partition at traversal. That i
 PTLAS op-wiring path assumes it. So the build order front-loads validating it, and lets the RTX-*independent*
 foundation proceed in parallel without betting on it.
 
-### Stage 0 — RTX validation gate *(do first; blocks Stages 2–3)*
-- Minimal raw-VK probe on the RTX box: build a 2-partition PTLAS, set `enable_partition_translation`, write one
-  `WRITE_PARTITION_TRANSLATION` to partition 1, and confirm instances in partition 1 render shifted by the translation
-  while partition 0 / the GLOBAL partition (`!0`) are unaffected. Read back `max_partition_count`.
-- Resolves §11.1 (traversal-add semantics) and §11.2 (can GLOBAL be translated). If it behaves differently, only the
-  op-wiring changes — the Stage 1 foundation and the precision model stand regardless.
+### Stage 0 — RTX validation gate — ✅ PASSED (2026-06-24, RTX 50-series)
+- **Implemented** as an env-gated path in the live PTLAS build (`accel/ptlas.rs`, `SOLARI_PTLAS_TRANSLATE`), not a
+  standalone harness — it reuses the proven build+trace, so a pass/fail is unambiguous and it doubles as the first
+  increment of Stage 3. Sets `enable_partition_translation` (sizing query **and** build), emits one
+  `WRITE_PARTITION_TRANSLATION` against the static partition (0) every frame. Default unset → builds byte-identical.
+- **Result:** bevy_city, `SOLARI_PTLAS_TRANSLATE=5` → every static building shifted exactly 5 m and held steady
+  (absolute set, no per-frame accumulation/drift); GLOBAL movers (cars) unmoved. **`max_partition_count` still to be
+  read back** (the only Stage-0 residual — needed to clamp partition_count in Stage 3).
+- Resolves §11.1 (traversal-add semantics) and §11.2 (GLOBAL untranslated) — Stages 2–3 are unblocked on real behavior.
+  The env-gated op-wiring stays as the validated seed of Stage 3.
 
 ### Stage 1 — RTX-independent CPU/GPU-table foundation *(safe to build now, no gate)*
 - [x] `SlotPool::compact()` + tests — the high-water reclaim (§13 invariant 2). **Done, green.**
@@ -522,3 +528,43 @@ foundation proceed in parallel without betting on it.
 
 **Net:** Stage 1 is the safe forward progress available pre-hardware; Stages 2–4 wait on the Stage 0 probe so no
 op-wiring is written against an unverified assumption.
+
+---
+
+## 15. User-selectable space size (big_space `GridPrecision` parity)
+
+big_space lets the app pick the world's reach by choosing the integer cell type — `GridPrecision`
+(`i8…i128`, default `i64`), selected by a cargo feature (`big_space/src/lib.rs`). solari should expose the
+**same knob, specified the same way**, so a big_space scene maps 1:1 onto the native path and the user reasons
+about "how big is the world" exactly as they do today.
+
+**Where the type actually lives (and why the GPU is unaffected).** The cell precision is a **CPU-side** concern:
+the `PartitionAllocator` key (`block` coord), `SolariGridCell`, and the `(block_origin − origin)` subtraction in
+`PartitionAllocator::block_translations` are where wide integers matter. The GPU never sees an absolute cell — it
+sees only the per-partition `[f32;3]` translation (the already-reduced `(block − origin)·edge`) and, on the
+shader-add fallback, the small `(cell − origin)` *delta* which fits `i32` regardless of absolute scale. So widening
+to `i64`/`i128` is a **CPU type change with zero GPU/`SHADER_INT64` cost** — exactly why this is cheap.
+
+**Proposed API (parity, minimal):**
+- A `CellScalar` type alias selected by a cargo feature on `bevy_solari` (`grid_i32` / `grid_i64` / …, default
+  `i64` to match big_space), threaded through `SolariGridCell { cell: [CellScalar; 3] }`, the `PartitionAllocator`
+  key, and `SolariFloatingOrigin::origin_cell`. One alias, one place — the v1 `i32` is just `CellScalar = i32`.
+- When the big_space feature is on (the integration that replaces big_space's CPU propagation), `CellScalar` is
+  `big_space::GridPrecision` directly, so there is literally one precision knob, not two.
+- v1 ships `i32` (`grid_i32`, solar-system scale, ~4 ly ceiling at 2000 m cells); `i64` is the star-to-star setting.
+  The widening is the one-line alias swap §7 anticipated.
+
+This is a deliberate post-Stage-2 change (it touches the cell column's type), staged so it lands once the cell
+column is built for real rather than retrofitted twice.
+
+## 16. Test beds — port big_space examples into `examples/3d/solari`
+
+Stage 2/3 are only *visually* testable with a floating-origin scene (cells spanning multiple blocks), so 1–2
+big_space samples adapted to solari are the validation vehicle (and a good showcase). Plan:
+- Adapt a big_space sample (e.g. its `demo`/`spatial_hash` example) to `examples/3d/solari/big_space.rs`: swap the
+  standard camera/material for `SolariCamera` + `convert_meshes_to_raytracing`/`…_materials_to_solari`, keep the
+  big_space grid + `FloatingOrigin` + controller. The existing `tau_zero` `scene.rs` is essentially this already
+  and can seed it.
+- It renders **today** on stock solari (showing the f32-collapse at AU distance — the built-in diagnostic), then
+  becomes the Stage-2/3 pass/fail surface: with the native path on, AU-distant blocks render crisp and stable.
+- Credit big_space in the example header (MIT/Apache, aevyrie), matching §10.

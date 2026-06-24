@@ -39,7 +39,9 @@ use crate::gpu::allocator::{Allocator, SparseBuffer};
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 
-use super::graph::{LocalColumn, ParentColumn, TransformGraph};
+use super::graph::{
+    CellColumn, CellScalar, LocalColumn, ParentColumn, SolariFloatingOrigin, TransformGraph,
+};
 
 const WORKGROUP_SIZE: u32 = 64;
 /// Bytes per node world entry: `mat3x4<f32>` = 48 B, same packing as `Affine3x4`.
@@ -60,6 +62,14 @@ struct PropagateParams {
     record_stride: u32,
     /// 1 → walk every node (id = slot); 0 → walk only `changed[k*stride]`.
     full_rebuild: u32,
+    /// Metres per floating-origin cell edge; `0` → the cell offset is identically zero
+    /// (a scene with no floating origin propagates exactly as before).
+    cell_edge: f32,
+    /// Floating-origin (camera) cell every celled node is expressed relative to; the
+    /// shader adds `(node_cell − origin) × cell_edge` to a node with `has_cell`.
+    origin_x: i32,
+    origin_y: i32,
+    origin_z: i32,
     _pad: u32,
 }
 
@@ -89,6 +99,12 @@ pub struct TransformPropagate {
     /// UNDEFINED on first residency); [`dispatch_transform_propagate`] records the
     /// clear before the walk, then takes it.
     pending_clear: Option<Range<u64>>,
+    /// Last frame's floating-origin cell. When it changes (a recenter — the camera
+    /// crossed a cell boundary), every node's camera-relative world shifts, so that
+    /// frame latches `needs_full_rebuild` to re-propagate. Between recenters the
+    /// change-only path holds (static nodes keep last frame's world). Full
+    /// [`CellScalar`] width so a recenter is detected even at i64/i128 scale.
+    last_origin: [CellScalar; 3],
     params: UniformBuffer<PropagateParams>,
     bind_group: Option<BindGroup>,
 }
@@ -107,6 +123,7 @@ pub fn transform_propagate_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_sized(false, None),           // 2 world (rw, persistent)
                 storage_buffer_read_only_sized(false, None), // 3 changed (delta records)
                 uniform_buffer::<PropagateParams>(false),    // 4 params
+                storage_buffer_read_only_sized(false, None), // 5 cell (i32×4 per node)
             ),
         ),
     )
@@ -161,6 +178,7 @@ pub fn init_transform_propagate(
         // appeared during warmup, then it stays clear (see the field docs).
         needs_full_rebuild: true,
         pending_clear: None,
+        last_origin: [0; 3],
         params,
         bind_group: None,
     });
@@ -174,6 +192,7 @@ pub fn prepare_transform_propagate(
     mut propagate: Option<ResMut<TransformPropagate>>,
     graph: Option<Res<TransformGraph>>,
     local: Option<Res<GpuColumn<LocalColumn>>>,
+    origin: Option<Res<SolariFloatingOrigin>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
@@ -181,6 +200,17 @@ pub fn prepare_transform_propagate(
     else {
         return;
     };
+
+    // Floating-origin offset. Default (origin `0`, edge `0`) → no offset, so a
+    // non-floating-origin scene is byte-identical. A recenter (origin cell changed)
+    // shifts every node's camera-relative world that frame, so force a full
+    // re-propagate via the cold-start latch; between recenters the change-only path
+    // holds (movers re-walk with the stable origin; static nodes keep their world).
+    let origin = origin.map(|o| *o).unwrap_or_default();
+    if origin.origin_cell != propagate.last_origin {
+        propagate.needs_full_rebuild = true;
+        propagate.last_origin = origin.origin_cell;
+    }
     propagate.node_count = graph.high_water();
     let high_water = propagate.node_count.max(1);
 
@@ -212,6 +242,11 @@ pub fn prepare_transform_propagate(
         count: propagate.dispatch_count,
         record_stride: local.record_stride(),
         full_rebuild: full_rebuild as u32,
+        cell_edge: origin.cell_edge,
+        // Low 32 bits — the GPU subtracts in i32, exact for the renderable delta.
+        origin_x: origin.origin_cell[0] as i32,
+        origin_y: origin.origin_cell[1] as i32,
+        origin_z: origin.origin_cell[2] as i32,
         _pad: 0,
     };
     propagate.params.write_buffer(&render_device, &render_queue);
@@ -225,11 +260,12 @@ pub fn prepare_transform_propagate_bind_groups(
     resource_manager: Option<Res<SolariResourceManager>>,
     local: Option<Res<GpuColumn<LocalColumn>>>,
     parent: Option<Res<GpuColumn<ParentColumn>>>,
+    cell: Option<Res<GpuColumn<CellColumn>>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
-    let (Some(propagate), Some(resource_manager), Some(local), Some(parent)) =
-        (propagate.as_deref_mut(), resource_manager, local, parent)
+    let (Some(propagate), Some(resource_manager), Some(local), Some(parent), Some(cell)) =
+        (propagate.as_deref_mut(), resource_manager, local, parent, cell)
     else {
         return;
     };
@@ -251,6 +287,7 @@ pub fn prepare_transform_propagate_bind_groups(
             propagate.world.buffer().as_entire_binding(),
             changed.as_entire_binding(),
             params,
+            cell.buffer().as_entire_binding(),
         )),
     );
     propagate.bind_group = Some(bind_group);

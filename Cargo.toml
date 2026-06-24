@@ -1637,6 +1637,24 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
+name = "solari_floating_origin"
+path = "examples/3d/solari/floating_origin.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_floating_origin]
+name = "Solari (floating origin)"
+description = "Galactic-scale ray tracing with no f32 collapse: solari's native GPU floating origin (big_space-style), camera parked 1 AU from the grid origin."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
 name = "solari_scope"
 path = "examples/3d/solari/scope.rs"
 doc-scrape-examples = true

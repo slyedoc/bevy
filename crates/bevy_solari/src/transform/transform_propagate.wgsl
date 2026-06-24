@@ -32,6 +32,12 @@ struct PropagateParams {
     // 1 → node = thread id (walk every node, e.g. after a growth); 0 → node =
     // `changed[k * record_stride]` (walk only this frame's changed nodes).
     full_rebuild: u32,
+    // Metres per floating-origin cell edge; 0 → the cell offset is identically zero.
+    cell_edge: f32,
+    // Floating-origin (camera) cell every celled node is expressed relative to.
+    origin_x: i32,
+    origin_y: i32,
+    origin_z: i32,
     _pad: u32,
 }
 
@@ -44,6 +50,7 @@ const MAX_DEPTH: u32 = 64u;
 @group(0) @binding(2) var<storage, read_write> world: array<vec4<f32>>;  // 3 per node (persistent)
 @group(0) @binding(3) var<storage, read> changed: array<u32>;            // [slot, words…] per record
 @group(0) @binding(4) var<uniform> params: PropagateParams;
+@group(0) @binding(5) var<storage, read> cell: array<i32>;               // 4 per node: [x, y, z, has_cell]
 
 // One row of `A ∘ B`: A's row `ar` (.xyz linear, .w translation) times B's linear
 // columns `bc{0,1,2}` and translation `bt`.
@@ -58,9 +65,26 @@ struct Mat3x4 { r0: vec4<f32>, r1: vec4<f32>, r2: vec4<f32> }
 // → 3×3, columns scaled by `scale`, translation in `.w`.
 fn load_local(node: u32) -> Mat3x4 {
     let b = node * 10u;
-    let t = vec3<f32>(local[b], local[b + 1u], local[b + 2u]);
+    var t = vec3<f32>(local[b], local[b + 1u], local[b + 2u]);
     let qx = local[b + 3u]; let qy = local[b + 4u]; let qz = local[b + 5u]; let qw = local[b + 6u];
     let s = vec3<f32>(local[b + 7u], local[b + 8u], local[b + 9u]);
+
+    // Floating-origin offset: a celled node (has_cell != 0) is shifted into
+    // camera-cell-relative space by (cell − origin) × cell_edge. The subtraction is
+    // done in INTEGERS first — a body 1 AU out has a huge cell index, but (cell − origin)
+    // is small, so the f32 we scale by cell_edge stays sub-meter precise (computing
+    // cell·edge − origin·edge in f32 would catastrophically cancel). A non-celled node
+    // (no SolariGridCell) adds nothing and inherits its celled ancestor's offset through
+    // the composition in `propagate`. Single grid only (one celled node per chain).
+    let cb = node * 4u;
+    if cell[cb + 3u] != 0 {
+        let d = vec3<f32>(
+            f32(cell[cb] - params.origin_x),
+            f32(cell[cb + 1u] - params.origin_y),
+            f32(cell[cb + 2u] - params.origin_z),
+        );
+        t = t + d * params.cell_edge;
+    }
 
     let xx = qx * qx; let yy = qy * qy; let zz = qz * qz;
     let xy = qx * qy; let xz = qx * qz; let yz = qy * qz;

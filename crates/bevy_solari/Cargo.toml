@@ -10,6 +10,14 @@ keywords = ["bevy"]
 
 
 [features]
+# Floating-origin cell precision (mirrors `big_space`'s `GridPrecision`): the integer
+# width [`SolariGridCell`]/[`SolariFloatingOrigin`] store per axis. Default `i32` (lean —
+# 12 B/cell, ~solar-system range at km cells). Opt into a wider type to manage range vs
+# memory. The GPU is unaffected (it only uses the camera-relative low word); a wider
+# scalar just extends the absolute range you can place geometry at. `grid_i128` wins over
+# `grid_i64` if both are set.
+grid_i64 = []
+grid_i128 = []
 # Pulls bevy_anti_alias/dlss (for DlssInitPlugin's Vulkan extension
 # registration + DlssProjectId) plus dlss_wgpu, which the `restir` path drives
 # directly for prepass-free DLSS Ray Reconstruction.

@@ -15,7 +15,10 @@ use bevy_ecs::{
     prelude::With,
     schedule::{common_conditions::resource_exists, IntoScheduleConfigs},
 };
-use bevy_render::{renderer::RenderGraph, Render, RenderApp, RenderStartup, RenderSystems};
+use bevy_render::{
+    extract_resource::ExtractResourcePlugin, renderer::RenderGraph, Render, RenderApp,
+    RenderStartup, RenderSystems,
+};
 use bevy_transform::systems::{propagate_transforms_for, sync_simple_transforms};
 use bevy_ui::Node;
 
@@ -33,8 +36,9 @@ pub use gather::{
     prepare_transform_gather_bind_group, transform_gather_bind_group_layout, TransformGather,
 };
 pub use graph::{
-    extract_transform_graph, LocalColumn, NodeEntityColumn, ParentColumn, StaticColumn,
-    TransformGraph, TransformStatic, TransformTablePlugin, ROOT_PARENT,
+    extract_transform_graph, CellColumn, LocalColumn, NodeEntityColumn, ParentColumn,
+    SolariFloatingOrigin, SolariGridCell, StaticColumn, TransformGraph, TransformStatic,
+    TransformTablePlugin, ROOT_PARENT,
 };
 pub use propagate::{
     dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,
@@ -66,6 +70,11 @@ impl Plugin for SolariTransformPlugin {
         // The TransformStatic presence flag (node-slot indexed) the PTLAS fill
         // reads to choose an instance's partition. Observer-fed, zero per-frame cost.
         .add_plugins(GpuPresenceColumnPlugin::<StaticColumn>::default())
+        // Solari's native floating origin (the GPU-table reimplementation of big_space's
+        // grid; credited). Default (origin 0, edge 0) = no offset, so non-floating-origin
+        // scenes are unaffected. Mirrored to the render world for the propagate pass.
+        .init_resource::<SolariFloatingOrigin>()
+        .add_plugins(ExtractResourcePlugin::<SolariFloatingOrigin>::default())
         // TODO: handle few few transforms locally, not sending to gpu, might not need anymore
         .add_systems(
             PostUpdate,
