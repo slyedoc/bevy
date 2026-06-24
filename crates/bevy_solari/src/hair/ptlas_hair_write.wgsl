@@ -39,7 +39,9 @@ struct WriteInstanceData {
 struct HairWriteParams {
     hair_count: u32,
     hair_base: u32,
-    pad0: u32,
+    // SBT hit-record index hair routes to (RtPipeline::hair_sbt_record) — the
+    // record baked with the hair closest-hit handle.
+    hair_sbt_record: u32,
     pad1: u32,
 }
 
@@ -85,7 +87,7 @@ fn hair_write(
         explicit_aabb,
         inst,           // instance_id (presented to the hit shader as instance_index)
         h.mask,         // 8-bit cull mask (hair visible to all view masks)
-        2u,             // hit-group contribution — HIT_GROUP_HAIR (RT-pipeline path)
+        params.hair_sbt_record, // hit-group contribution — the reserved hair SBT record
         0u,             // instance_flags — opaque LSS geometry, no force-no-opaque
         inst,           // instance_index — PTLAS slot
         PTLAS_GLOBAL_PARTITION,

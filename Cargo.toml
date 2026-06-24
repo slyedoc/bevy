@@ -1568,6 +1568,7 @@ path = "examples/3d/solari/hair.rs"
 doc-scrape-examples = true
 required-features = [
     "bevy_solari",
+    "bevy_solari_debug",
     "cluster_processor",
     "free_camera",
     "bevy_dev_tools",

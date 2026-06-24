@@ -18,6 +18,7 @@ use bevy_render::{
 };
 
 use crate::accel::ptlas::Ptlas;
+use crate::gpu::rt_pipeline::RtPipeline;
 use crate::resource_manager::SolariResourceManager;
 use crate::transform::TransformPropagate;
 
@@ -29,7 +30,10 @@ use super::HairInstances;
 pub struct HairWriteParams {
     pub hair_count: u32,
     pub hair_base: u32,
-    pub pad0: u32,
+    /// SBT hit-record index hair instances route to ([`RtPipeline::hair_sbt_record`]),
+    /// baked into each hair record's `instance_contribution_to_hit_group_index` so
+    /// the trace reaches `chit_hair`. 0 until the RT pipeline exists (no trace yet).
+    pub hair_sbt_record: u32,
     pub pad1: u32,
 }
 
@@ -75,6 +79,7 @@ pub fn init_hair_ptlas_write(mut commands: Commands) {
 pub fn prepare_hair_ptlas_write(
     mut write: ResMut<HairPtlasWrite>,
     instances: Option<Res<HairInstances>>,
+    rt_pipeline: Option<Res<RtPipeline>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
@@ -82,11 +87,16 @@ pub fn prepare_hair_ptlas_write(
         write.hair_count = 0;
         return;
     };
+    // The hair SBT record lives in the RT pipeline's SBT; 0 until it's built (hair
+    // can't be traced before then anyway). Reads last frame's pipeline, which is
+    // this frame's except on a capacity rebuild — and a rebuild frame skips the
+    // trace, so a stale index is never consumed.
+    let hair_sbt_record = rt_pipeline.map_or(0, |rt| rt.hair_sbt_record());
     write.hair_count = instances.count;
     *write.params.get_mut() = HairWriteParams {
         hair_count: instances.count,
         hair_base: instances.base,
-        pad0: 0,
+        hair_sbt_record,
         pad1: 0,
     };
     write.params.write_buffer(&render_device, &render_queue);

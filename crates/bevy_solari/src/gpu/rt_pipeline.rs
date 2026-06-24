@@ -451,7 +451,14 @@ impl RtPipeline {
         const MISS_COUNT: u64 = 2; // miss index 0 = primary, 1 = shadow
         const HIT_RECORD_DATA: u64 = 4; // bytes of shader-record data (u32 material id)
         const RECORD_HEADROOM: u32 = 64; // absorb a little material growth post-build
+        // One extra hit record, appended AFTER the per-material records, baked with
+        // the hair hit-group handle (group 4). Hair instances route to it
+        // (`hair_sbt_record`) via `ptlas_hair_write`; it's a single shared record
+        // (chit_hair keys off the instance, not a per-record material id). Kept off
+        // the material region so material routing/SER is untouched.
+        const HAIR_RECORDS: u64 = 1;
         let record_capacity = material_count + RECORD_HEADROOM;
+        let total_records = record_capacity as u64 + HAIR_RECORDS;
         let handle_stride = align_up(handle_size, handle_align);
         // Hit records carry the material-id data slot, so they're wider than a
         // bare handle.
@@ -460,7 +467,7 @@ impl RtPipeline {
         let miss_offset = align_up(handle_stride, base_align);
         // The miss region holds MISS_COUNT contiguous handle-stride records.
         let hit_offset = align_up(miss_offset + MISS_COUNT * handle_stride, base_align);
-        let sbt_size = hit_offset + record_capacity as u64 * hit_record_stride;
+        let sbt_size = hit_offset + total_records * hit_record_stride;
         let sbt = alloc_mapped_buffer(
             allocator,
             sbt_size,
@@ -504,14 +511,21 @@ impl RtPipeline {
         // class, fall back to opaque. The data slot = the record index = the
         // material id the instance routes to, read back via `var<shader_record>`
         // (uniform per record → uniform per warp after SER).
-        for record in 0..record_capacity as u64 {
+        for record in 0..total_records {
             let rec_off = hit_offset + record * hit_record_stride;
-            let class = material_classes
-                .get(record as usize)
-                .copied()
-                .unwrap_or(0)
-                .min(2);
-            let group_handle = handle(2 + class as usize);
+            // The appended hair record (index == record_capacity) always routes to
+            // the hair closest-hit (group 4); every other record picks its material
+            // class handle (headroom / out-of-range → opaque).
+            let group_handle = if record == record_capacity as u64 {
+                handle(4)
+            } else {
+                let class = material_classes
+                    .get(record as usize)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(2);
+                handle(2 + class as usize)
+            };
             // SAFETY: rec_off + handle_size + 4 within the record.
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -535,12 +549,13 @@ impl RtPipeline {
             .device_address(sbt.device_address + miss_offset)
             .stride(handle_stride)
             .size(MISS_COUNT * handle_stride);
-        // Per-material records: stride steps one record; the instance's material
-        // slot indexes them.
+        // Per-material records + the appended hair record; stride steps one record.
+        // An instance's material slot indexes the material records; hair indexes the
+        // last one (`hair_sbt_record`).
         let hit_region = vk::StridedDeviceAddressRegionKHR::default()
             .device_address(sbt.device_address + hit_offset)
             .stride(hit_record_stride)
-            .size(record_capacity as u64 * hit_record_stride);
+            .size(total_records * hit_record_stride);
         let callable_region = vk::StridedDeviceAddressRegionKHR::default();
 
         let out = Self {
@@ -566,6 +581,16 @@ impl RtPipeline {
     /// the pipeline once the live material count exceeds this (an instance routes
     /// to `record = material slot`, so a slot past the end would read OOB).
     pub fn capacity(&self) -> u32 {
+        self.record_capacity
+    }
+
+    /// SBT hit-record index reserved for hair (the single record appended after the
+    /// per-material records, baked with the hair closest-hit handle). Hair PTLAS
+    /// instances set this as their `instance_contribution_to_hit_group_index` so
+    /// they reach `chit_hair` instead of mis-indexing a material record. Stable for
+    /// the pipeline's lifetime; it only changes on a capacity rebuild (which also
+    /// skips that frame's trace, so a one-frame-stale value is never consumed).
+    pub fn hair_sbt_record(&self) -> u32 {
         self.record_capacity
     }
 
@@ -1049,6 +1074,7 @@ fn compile_rt_wgsl(source: &str, file_path: &str) -> Option<Vec<u32>> {
     register!("../bindings/raytracing_scene_bindings.wgsl"); // -> pbr, atmosphere, utils
     register!("../bindings/sampling.wgsl"); // -> pbr, scene_bindings, maths
     register!("../bindings/brdf.wgsl"); // -> pbr, sampling, scene_bindings, maths
+    register!("../hair/hair.wgsl"); // bevy_solari::hair (Chiang fiber BSDF) -> pbr
 
     // Shader-def axes for the RT shaders. This is the "pipeline key": each def is a
     // compile-out feature axis the raygen/chits can `#ifdef` on. Keep the axes few
