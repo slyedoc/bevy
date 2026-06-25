@@ -8,17 +8,7 @@
 //! the corner.
 
 use bevy::{
-    camera::CameraMainTextureUsages,
-    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
-    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
-    diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin},
-    feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
-    image::{ImageAddressMode, ImageLoaderSettings},
-    mesh::VertexAttributeValues,
-    post_process::bloom::Bloom,
-    prelude::*,
-    render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
-    solari::prelude::*,
+    camera::CameraMainTextureUsages, camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig}, diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin}, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, image::{ImageAddressMode, ImageLoaderSettings}, mesh::VertexAttributeValues, pbr::PbrPlugin, post_process::bloom::Bloom, prelude::*, render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages}, solari::prelude::*,
 };
 use chacha20::ChaCha8Rng;
 use rand::{RngExt, SeedableRng};
@@ -43,10 +33,8 @@ fn main() {
                 filter: "wgpu=error,naga=warn,bevy_solari=info".into(),
                 ..default()
             })
-            // `SolariTransformPlugin` runs the CPU `sync_simple_transforms` +
-            // UI propagation, so bevy's `TransformPlugin` is redundant here — 3D
-            // entities ride the GPU transform table.
-            .disable::<TransformPlugin>(),
+            .disable::<TransformPlugin>()
+            .disable::<PbrPlugin>(),
         SolariPlugin,
         FeathersPlugins,
         FreeCameraPlugin,
