@@ -112,6 +112,14 @@ impl<T: PersistentGpuBufferable> PersistentGpuBuffer<T> {
 
     /// Mark a section of the GPU buffer as no longer needed.
     pub fn mark_slice_unused(&mut self, buffer_slice: Range<BufferAddress>) {
+        // Empty slices were never actually allocated (e.g. a small mesh with no
+        // interior `nodes`, or the deliberately-`0..0` `child_table`), and
+        // `free_range` panics on an empty range — so freeing one is a no-op.
+        // This only matters when cluster meshes are *removed* (live re-bake in
+        // tools like sly_tree, geometry churn); static scenes never hit it.
+        if buffer_slice.start >= buffer_slice.end {
+            return;
+        }
         self.allocation_planner.free_range(buffer_slice);
     }
 

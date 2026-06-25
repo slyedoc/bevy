@@ -33,8 +33,8 @@ pub use gather::{
     prepare_transform_gather_bind_group, transform_gather_bind_group_layout, TransformGather,
 };
 pub use graph::{
-    extract_transform_graph, LocalColumn, ParentColumn, StaticColumn, TransformGraph,
-    TransformStatic, TransformTablePlugin, ROOT_PARENT,
+    extract_transform_graph, LocalColumn, NodeEntityColumn, ParentColumn, StaticColumn,
+    TransformGraph, TransformStatic, TransformTablePlugin, ROOT_PARENT,
 };
 pub use propagate::{
     dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,

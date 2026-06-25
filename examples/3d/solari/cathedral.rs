@@ -44,6 +44,8 @@ fn main() {
         .add_plugins((
             DefaultPlugins,
             SolariPlugin,
+            // GPU picking backend: cursor rays traced against the PTLAS.
+            SolariPickingPlugin,
             FeathersPlugins,
             FreeCameraPlugin,
             FrameTimeDiagnosticsPlugin::default(),
@@ -63,7 +65,21 @@ fn main() {
             Update,
             (convert_meshes_to_raytracing, convert_standard_materials_to_solari).chain(),
         )
+        .add_observer(log_click)
         .run();
+}
+
+/// Picking test: log the entity (and world hit position) the cursor clicked,
+/// resolved through the Solari ray-query picking backend. `Pointer<Click>`
+/// bubbles up the hierarchy, so gate on the original target to log just the
+/// directly-clicked entity once (not the parents it propagates to).
+fn log_click(click: On<Pointer<Click>>) {
+    if click.entity == click.original_event_target() {
+        info!(
+            "solari pick: clicked {} at {:?} (depth {:.2})",
+            click.entity, click.hit.position, click.hit.depth,
+        );
+    }
 }
 
 /// One jewel tone per lancet, left to right. The color is the light that

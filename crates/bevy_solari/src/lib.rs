@@ -46,6 +46,7 @@ pub mod resource_manager;
 pub mod material;
 pub mod lights;
 pub mod instance;
+pub mod ray_query;
 pub mod render;
 pub mod transform;
 pub mod hair;
@@ -68,6 +69,7 @@ use crate::ecs_gpu::{ReconcilePlugin, SceneColumnsPlugin};
 use crate::geometry::GeometryPlugin;
 use crate::instance::InstancePlugin;
 use crate::lights::SolariLightsPlugin;
+use crate::ray_query::RayQueryPlugin;
 use crate::material::SolariMaterialPlugin;
 use crate::render::SolarRenderPlugin;
 use crate::transform::SolariTransformPlugin;
@@ -102,6 +104,9 @@ pub enum SolariClusterSystems {
     BuildBlas,
     /// Incremental partitioned-TLAS fill + build.
     BuildTlas,
+    /// Reusable batch ray-query trace against the built TLAS (no-op until a
+    /// producer fills its ray buffer).
+    RayQueries,
     /// Clear the per-frame instance deltas.
     Cleanup,
 }
@@ -121,6 +126,7 @@ pub mod prelude {
         material::{SolariMaterial, SolariMaterial3d},
         lights::SolariDirectionLight,
         hair::{Hair, HairMaterial, HairAsset, HairStrand},
+        ray_query::picking::SolariPickingPlugin,
     };
 
     #[cfg(feature = "dlss")]
@@ -181,6 +187,7 @@ impl Plugin for SolariPlugin {
             InstancePlugin,
 
             AccelPlugin,
+            RayQueryPlugin,
             SolarRenderPlugin,
             #[cfg(feature = "bevy_solari_debug")]
             SolariDebugPlugin,

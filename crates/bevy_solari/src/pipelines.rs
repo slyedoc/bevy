@@ -26,7 +26,7 @@ use bevy_render::render_resource::{
     CachedComputePipelineId, ComputePipelineDescriptor, PipelineCache,
 };
 
-use crate::bindings::ClusterSceneBindGroupLayout;
+use crate::bindings::{ClusterSceneBindGroupLayout, RaytracingSceneBindings};
 use crate::resource_manager::SolariResourceManager;
 
 /// Every solari compute-pass pipeline id, queued once at `RenderStartup`. Fields
@@ -56,6 +56,9 @@ pub struct SolariPipelines {
 
     /// Appends hair instances to the PTLAS WRITE stream (`hair/ptlas_hair_write.wgsl`).
     pub ptlas_hair_write: CachedComputePipelineId,
+
+    /// Reusable inline-`rayQuery` batch trace (`ray_query/ray_query.wgsl`).
+    pub ray_query: CachedComputePipelineId,
 }
 
 /// Register every solari compute shader as an embedded asset. Called from
@@ -75,6 +78,7 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "accel/blas_sharing.wgsl");
     embedded_asset!(app, "accel/ptlas_fill.wgsl");
     embedded_asset!(app, "hair/ptlas_hair_write.wgsl");
+    embedded_asset!(app, "ray_query/ray_query.wgsl");
 }
 
 /// `RenderStartup`, after [`SolariResourceManager`] is built: queue every pass's
@@ -89,6 +93,9 @@ pub fn init_solari_pipelines(
     // the cluster/sparse support solari needs (the manager gates on the allocator).
     resource_manager: Option<Res<SolariResourceManager>>,
     cluster_scene_layout: Res<ClusterSceneBindGroupLayout>,
+    // The raytracing scene group (`@group(0)`, holding the TLAS) — the batch
+    // ray-query pipeline's layout pairs it with the I/O group (`@group(1)`).
+    scene_bindings: Res<RaytracingSceneBindings>,
 ) {
     let Some(resource_manager) = resource_manager else {
         return;
@@ -220,6 +227,17 @@ pub fn init_solari_pipelines(
         constants: vec![],
     });
 
+    // Batch ray-query: the self-contained shader needs only the scene group (0, for
+    // the TLAS) + this pass's I/O group (1).
+    let ray_query = crate::ray_query::queue_ray_query_pipeline(
+        &pipeline_cache,
+        asset_server.as_ref(),
+        vec![
+            scene_bindings.bind_group_layout.clone(),
+            resource_manager.ray_query_io.clone(),
+        ],
+    );
+
     commands.insert_resource(SolariPipelines {
         transform_propagate,
         transform_gather,
@@ -237,5 +255,6 @@ pub fn init_solari_pipelines(
         ptlas_incremental,
         ptlas_finalize,
         ptlas_hair_write,
+        ray_query,
     });
 }
