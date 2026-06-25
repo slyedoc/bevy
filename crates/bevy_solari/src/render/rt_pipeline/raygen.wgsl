@@ -107,6 +107,11 @@ fn raygen(
     let pixel_index = id.x + id.y * dims.x;
     var rng = pixel_index + camera.frame.x * 5782582u;
 
+    // Primary-hit depth (reverse-Z NDC) for the gizmo-depth bridge, written into
+    // the always-present output buffer's alpha so rasterized overlays (gizmos)
+    // occlude against the ray-traced scene — with or without DLSS. -1 = miss/sky.
+    var primary_depth = -1.0;
+
 #ifdef SOLARI_DLSS
     // Default this pixel's guide to "no surface" (sky/miss); a primary hit overwrites
     // it in the closest-hit. Zero normal + roughness 1 + zero albedo is the RR sky
@@ -180,6 +185,18 @@ fn raygen(
         hitObjectExecuteShader(&hit, &payload);
         rng = payload.rng;
 
+        // Capture the PRIMARY hit's depth on bounce 0. A miss leaves
+        // `payload.next_origin` at the camera ray origin (the miss shader doesn't
+        // touch it; raygen seeded it to `origin`), so a moved origin marks a hit.
+        // `origin` is still the primary ray origin here — it's advanced below.
+        if bounce == 0u {
+            let hit_pos = payload.next_origin;
+            if dot(hit_pos - origin, hit_pos - origin) > 1e-10 {
+                let clip = camera.clip_from_world * vec4<f32>(hit_pos, 1.0);
+                primary_depth = clip.z / clip.w;
+            }
+        }
+
 #ifdef SOLARI_DLSS
         // DLSS specular hit-distance guide. The primary surface's first
         // continuation ray (≈ the specular reflection in this 1-spp path) only
@@ -252,5 +269,8 @@ fn raygen(
 #endif
 
     let index = id.y * dims.x + id.x;
-    output[index] = vec4<f32>(final_color, 1.0);
+    // Alpha carries the primary-hit depth for the gizmo-depth bridge. The blit
+    // forces the displayed alpha back to 1.0, and DLSS resolve reads only the
+    // G-buffers, so this never affects the displayed image either way.
+    output[index] = vec4<f32>(final_color, primary_depth);
 }

@@ -7,6 +7,7 @@
 pub mod atmosphere;
 #[cfg(feature = "dlss")]
 pub mod dlss;
+pub mod gizmo_depth;
 pub mod rt_pipeline;
 mod reset;
 pub mod view;
@@ -15,9 +16,13 @@ pub mod view_cull;
 use bevy_app::{App, Plugin};
 use bevy_camera::Hdr;
 use bevy_core_pipeline::{
+    core_3d::{main_opaque_pass_3d, main_transparent_pass_3d},
     schedule::{Core3d, Core3dSystems},
-    tonemapping::tonemapping,
 };
+// Only the DLSS resolve/render systems order against tonemapping now that the RT
+// compose runs inside `MainPass`; gate the import so the non-DLSS build is clean.
+#[cfg(feature = "dlss")]
+use bevy_core_pipeline::tonemapping::tonemapping;
 use bevy_ecs::schedule::{common_conditions::resource_exists, IntoScheduleConfigs, SystemCondition};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
@@ -101,26 +106,45 @@ impl Plugin for SolarRenderPlugin {
                 Render,
                 atmosphere::prepare_atmosphere_bind_group.in_set(RenderSystems::PrepareBindGroups),
             )
+            // Compose-FIRST: bake the sky, then trace + blit the RT image into the
+            // view target BEFORE the raster main pass, so the rasterized opaque +
+            // transparent phases (gizmos, debug overlays) draw ON TOP of the
+            // ray-traced scene instead of being clobbered by a blit that runs after
+            // them. (The camera must not clear — `ClearColorConfig::None` — or the
+            // opaque pass would wipe the composed image; the RT pass already covers
+            // every pixel via the sky/miss shader.) Mirrors solari-pt's `compose`
+            // ordering; `gizmo_depth` (Stage 2) then bridges RT depth between the
+            // opaque and transparent phases so overlays occlude correctly.
             .add_systems(
                 Core3d,
-                atmosphere::dispatch_atmosphere_bake
-                    .after(Core3dSystems::MainPass)
-                    .before(rt_pipeline::rt_pipeline)
-                    .run_if(resource_exists::<SolariPipelines>),
+                (
+                    atmosphere::dispatch_atmosphere_bake
+                        .run_if(resource_exists::<SolariPipelines>),
+                    rt_pipeline::rt_pipeline
+                        // No `resource_exists::<RtPipeline>` gate — the system
+                        // lazily builds it on the first ready frame.
+                        .run_if(
+                            rt_pipeline_enabled
+                                .and_then(resource_exists::<rt_pipeline::RtBlit>)
+                                .and_then(resource_exists::<RaytracingSceneBindings>)
+                                .and_then(resource_exists::<SceneColumns>),
+                        ),
+                )
+                    .chain()
+                    .before(main_opaque_pass_3d)
+                    .in_set(Core3dSystems::MainPass),
             )
+            // Bridge the RT primary-hit depth (packed in the output buffer's `.w`)
+            // into the hardware depth buffer AFTER the opaque pass clears it and
+            // BEFORE the transparent pass draws gizmos, so overlays occlude against
+            // the ray-traced scene. Runs per `SolariCamera` view (its `ViewQuery`
+            // only matches once the view's `RtOutputBuffer` exists).
             .add_systems(
                 Core3d,
-                rt_pipeline::rt_pipeline
-                    .after(Core3dSystems::MainPass)
-                    .before(tonemapping)
-                    // No `resource_exists::<RtPipeline>` gate — the system
-                    // lazily builds it on the first ready frame.
-                    .run_if(
-                        rt_pipeline_enabled
-                            .and_then(resource_exists::<rt_pipeline::RtBlit>)
-                            .and_then(resource_exists::<RaytracingSceneBindings>)
-                            .and_then(resource_exists::<SceneColumns>),
-                    ),
+                gizmo_depth::solari_gizmo_depth
+                    .after(main_opaque_pass_3d)
+                    .before(main_transparent_pass_3d)
+                    .run_if(resource_exists::<SolariPipelines>),
             );
 
         // DLSS Ray Reconstruction: resolve the trace's guide buffers into textures,

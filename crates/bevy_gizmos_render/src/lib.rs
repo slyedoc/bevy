@@ -114,11 +114,16 @@ impl Plugin for GizmoRenderPlugin {
                 tracing::warn!("bevy_sprite_render feature is enabled but bevy_sprite_render::SpriteRenderPlugin was not detected. Are you sure you loaded GizmoPlugin after SpriteRenderPlugin?");
             }
             #[cfg(feature = "bevy_pbr")]
-            if app.is_plugin_added::<bevy_pbr::PbrPlugin>() {
+            {
+                // `LineGizmo3dPlugin` no longer depends on `PbrPlugin` — its pipeline
+                // uses a View-only `@group(0)` instead of the mesh view bind group —
+                // so install it unconditionally (line gizmos work with PBR off, e.g.
+                // a pure ray-traced view). The transform gizmo still uses the
+                // mesh/material stack, so keep it gated on `PbrPlugin` being present.
                 app.add_plugins(pipeline_3d::LineGizmo3dPlugin);
-                app.add_plugins(transform_gizmo_render::TransformGizmoRenderPlugin);
-            } else {
-                tracing::warn!("bevy_pbr feature is enabled but bevy_pbr::PbrPlugin was not detected. Are you sure you loaded GizmoPlugin after PbrPlugin?");
+                if app.is_plugin_added::<bevy_pbr::PbrPlugin>() {
+                    app.add_plugins(transform_gizmo_render::TransformGizmoRenderPlugin);
+                }
             }
         } else {
             tracing::warn!("bevy_render feature is enabled but RenderApp was not detected. Are you sure you loaded GizmoPlugin after RenderPlugin?");

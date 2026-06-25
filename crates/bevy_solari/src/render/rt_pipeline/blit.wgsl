@@ -12,5 +12,8 @@ fn blit(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let index = gid.y * dims.x + gid.x;
-    textureStore(view_output, vec2<i32>(gid.xy), rt_output[index]);
+    // `.w` carries the primary-hit depth (gizmo-depth bridge), not alpha — force
+    // alpha to 1.0 so it never tints the displayed image.
+    let c = rt_output[index];
+    textureStore(view_output, vec2<i32>(gid.xy), vec4<f32>(c.rgb, 1.0));
 }

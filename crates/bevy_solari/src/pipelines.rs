@@ -22,8 +22,9 @@ use bevy_ecs::{
     resource::Resource,
     system::{Commands, Res},
 };
+use bevy_core_pipeline::FullscreenShader;
 use bevy_render::render_resource::{
-    CachedComputePipelineId, ComputePipelineDescriptor, PipelineCache,
+    CachedComputePipelineId, CachedRenderPipelineId, ComputePipelineDescriptor, PipelineCache,
 };
 
 use crate::bindings::{ClusterSceneBindGroupLayout, RaytracingSceneBindings};
@@ -59,6 +60,9 @@ pub struct SolariPipelines {
 
     /// Reusable inline-`rayQuery` batch trace (`ray_query/ray_query.wgsl`).
     pub ray_query: CachedComputePipelineId,
+    /// Fullscreen depth-write bridging RT primary-hit depth into the hardware depth
+    /// buffer so gizmos occlude against the ray-traced scene (`render/gizmo_depth.wgsl`).
+    pub gizmo_depth: CachedRenderPipelineId,
 }
 
 /// Register every solari compute shader as an embedded asset. Called from
@@ -79,6 +83,7 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "accel/ptlas_fill.wgsl");
     embedded_asset!(app, "hair/ptlas_hair_write.wgsl");
     embedded_asset!(app, "ray_query/ray_query.wgsl");
+    embedded_asset!(app, "render/gizmo_depth.wgsl");
 }
 
 /// `RenderStartup`, after [`SolariResourceManager`] is built: queue every pass's
@@ -96,6 +101,8 @@ pub fn init_solari_pipelines(
     // The raytracing scene group (`@group(0)`, holding the TLAS) — the batch
     // ray-query pipeline's layout pairs it with the I/O group (`@group(1)`).
     scene_bindings: Res<RaytracingSceneBindings>,
+    // Fullscreen vertex for the gizmo-depth bridge raster pass.
+    fullscreen_shader: Res<FullscreenShader>,
 ) {
     let Some(resource_manager) = resource_manager else {
         return;
@@ -238,6 +245,13 @@ pub fn init_solari_pipelines(
         ],
     );
 
+    let gizmo_depth = crate::render::gizmo_depth::gizmo_depth_pipeline(
+        &pipeline_cache,
+        &fullscreen_shader,
+        load_embedded_asset!(asset_server.as_ref(), "render/gizmo_depth.wgsl"),
+        resource_manager.gizmo_depth.clone(),
+    );
+
     commands.insert_resource(SolariPipelines {
         transform_propagate,
         transform_gather,
@@ -256,5 +270,6 @@ pub fn init_solari_pipelines(
         ptlas_finalize,
         ptlas_hair_write,
         ray_query,
+        gizmo_depth,
     });
 }
