@@ -434,7 +434,7 @@ impl ResolvedScene {
         &'a mut self,
         context: &mut ResolveContext,
         type_id: TypeId,
-        default: fn() -> Box<dyn ErasedComponentTemplate>,
+        default: impl FnOnce() -> Box<dyn ErasedComponentTemplate>,
     ) -> &'a mut dyn ErasedComponentTemplate {
         let mut is_cached = false;
         let index = self.template_indices.entry(type_id).or_insert_with(|| {

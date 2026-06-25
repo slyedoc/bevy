@@ -910,6 +910,8 @@ pub mod macro_utils;
 
 extern crate alloc;
 
+pub mod dynamic_bsn;
+pub mod dynamic_bsn_lexer;
 mod resolved_scene;
 mod scene;
 mod scene_component;
@@ -929,6 +931,14 @@ pub use spawn_system::*;
 use bevy_app::{App, Plugin, SceneSpawnerSystems, SpawnScene};
 use bevy_asset::AssetApp;
 use bevy_ecs::prelude::*;
+
+use crate::dynamic_bsn::DynamicBsnLoader;
+use lalrpop_util::lalrpop_mod;
+
+lalrpop_mod!(
+    #[allow(unused_qualifications, missing_docs)]
+    pub(crate) dynamic_bsn_grammar
+);
 
 /// Creates a `Scene` using BSN (Bevy Scene Notation) syntax.
 ///
@@ -1073,6 +1083,7 @@ impl Plugin for ScenePlugin {
             .init_resource::<WaitingScenes>()
             .init_asset::<ScenePatch>()
             .init_asset::<SceneListPatch>()
+            .init_asset_loader::<DynamicBsnLoader>()
             .add_systems(
                 SpawnScene,
                 (resolve_scene_patches, spawn_queued)
@@ -1099,7 +1110,7 @@ mod tests {
     use bevy_ecs::relationship::Relationship;
     use bevy_ecs::system::{system_value, SystemHandle};
     use bevy_ecs::world::DeferredWorld;
-    use bevy_reflect::TypePath;
+    use bevy_reflect::{prelude::ReflectDefault, Reflect, TypePath};
     use bevy_scene_macros::SceneComponent;
     use std::path::Path;
     use std::sync::Mutex;
@@ -1263,6 +1274,13 @@ mod tests {
             ) -> Result<Self::Asset, Self::Error> {
                 Ok(ScenePatch::load_with(load_context, a()))
             }
+
+            // Claim the `.bsn` extension so this fake loader (registered after `ScenePlugin`'s real
+            // `DynamicBsnLoader`) wins for this test's fake `a.bsn`, since the last-registered loader
+            // for an extension takes precedence.
+            fn extensions(&self) -> &[&str] {
+                &["bsn"]
+            }
         }
 
         // Insert an asset that the fake loader can fake read.
@@ -1318,6 +1336,131 @@ mod tests {
         let x = world.entity(children[0]);
         let name = x.get::<Name>().unwrap();
         assert_eq!(name.as_str(), "X");
+    }
+
+    // Asset + component used to exercise inline asset values in dynamic `.bsn`: a `Handle<T>` field
+    // given a `T { .. }` struct literal (instead of a string path) is added to `Assets<T>` and
+    // resolved to a handle by the loader.
+    #[derive(Asset, Reflect, Clone, Default)]
+    #[reflect(Default, Clone)]
+    struct InlineTestAsset {
+        value: u32,
+    }
+
+    #[derive(Component, FromTemplate, Reflect, Clone, Default)]
+    #[reflect(Component, Default, Clone)]
+    struct InlineTestHandle(Handle<InlineTestAsset>);
+
+    #[test]
+    fn dynamic_bsn_inline_asset_value() {
+        let mut app = App::new();
+        let dir = Dir::default();
+        let dir_clone = dir.clone();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || {
+                Box::new(MemoryAssetReader {
+                    root: dir_clone.clone(),
+                })
+            }),
+        );
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin::default(),
+            ScenePlugin,
+        ));
+        app.init_asset::<InlineTestAsset>()
+            .register_type::<InlineTestAsset>()
+            .register_asset_reflect::<InlineTestAsset>()
+            .register_type::<InlineTestHandle>();
+        app.finish();
+        app.cleanup();
+
+        // A `.bsn` whose `Handle<InlineTestAsset>` field is given an inline asset value.
+        dir.insert_asset_text(
+            Path::new("inline.bsn"),
+            "bevy_scene::tests::InlineTestHandle(\
+             bevy_scene::tests::InlineTestAsset { value: 7 })",
+        );
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let handle = asset_server.load::<ScenePatch>("inline.bsn");
+        run_app_until(&mut app, || asset_server.is_loaded(&handle));
+
+        // Inherit the loaded scene and spawn it; the inline asset is resolved during apply.
+        fn scene() -> impl Scene {
+            bsn! { :"inline.bsn" }
+        }
+        let world = app.world_mut();
+        let asset_handle = {
+            let root = world.spawn_scene(scene()).unwrap();
+            root.get::<InlineTestHandle>()
+                .expect("spawned entity should have `InlineTestHandle`")
+                .0
+                .clone()
+        };
+
+        let asset = world
+            .resource::<Assets<InlineTestAsset>>()
+            .get(&asset_handle)
+            .expect("inline asset value should have been added to `Assets`");
+        assert_eq!(asset.value, 7);
+    }
+
+    #[test]
+    fn dynamic_bsn_string_path_handle() {
+        let mut app = App::new();
+        let dir = Dir::default();
+        let dir_clone = dir.clone();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || {
+                Box::new(MemoryAssetReader {
+                    root: dir_clone.clone(),
+                })
+            }),
+        );
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin::default(),
+            ScenePlugin,
+        ));
+        app.init_asset::<InlineTestAsset>()
+            .register_type::<InlineTestAsset>()
+            .register_asset_reflect::<InlineTestAsset>()
+            .register_type::<InlineTestHandle>();
+        app.finish();
+        app.cleanup();
+
+        // A `.bsn` whose `Handle<InlineTestAsset>` field is given a string asset path. The loader
+        // converts the string into a `HandleTemplate::Path` and resolves it to a `Handle` (pointing
+        // at that path) at spawn time via the `AssetServer`.
+        dir.insert_asset_text(
+            Path::new("string_path.bsn"),
+            "bevy_scene::tests::InlineTestHandle(\"some/asset/path.inlinetestasset\")",
+        );
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let handle = asset_server.load::<ScenePatch>("string_path.bsn");
+        run_app_until(&mut app, || asset_server.is_loaded(&handle));
+
+        fn scene() -> impl Scene {
+            bsn! { :"string_path.bsn" }
+        }
+        let world = app.world_mut();
+        let root = world.spawn_scene(scene()).unwrap();
+        let asset_handle = root
+            .get::<InlineTestHandle>()
+            .expect("spawned entity should have `InlineTestHandle`")
+            .0
+            .clone();
+
+        // The handle must point at the asset path given in the `.bsn` string literal.
+        assert_eq!(
+            asset_handle.path().map(|p| p.to_string()),
+            Some("some/asset/path.inlinetestasset".to_string()),
+            "string-path handle field should resolve to a handle for that path"
+        );
     }
 
     #[test]
