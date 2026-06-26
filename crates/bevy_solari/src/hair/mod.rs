@@ -39,8 +39,14 @@ use bevy_transform::components::Transform;
 use bytemuck::{Pod, Zeroable};
 
 use crate::ecs_gpu::GpuSlot;
+use crate::material::material_slots::MaterialSlots;
+use crate::material::SolariMaterial;
 use crate::transform::TransformGraph;
 use crate::{SolariClusterSystems, SolariSetup};
+
+/// [`GpuHairInstance::material_id`] sentinel: shade as fiber hair (Chiang BSDF),
+/// not as an opaque [`SolariMaterial`] surface. Mirrors WGSL `HAIR_MATERIAL_NONE`.
+pub const HAIR_MATERIAL_NONE: u32 = 0xFFFF_FFFF;
 
 /// A hair/fur groom on an entity. The entity's [`GlobalTransform`] places the
 /// groom in the world; the [`HairAsset`] supplies the strand geometry.
@@ -51,6 +57,21 @@ pub struct Hair {
     pub asset: Handle<HairAsset>,
     /// Fiber shading parameters.
     pub material: HairMaterial,
+}
+
+/// Branches/twigs (or any opaque swept-sphere geometry) rendered as ray-traced
+/// linear swept spheres — the **same** LSS geometry as [`Hair`], but shaded as an
+/// opaque BRDF surface with a normal [`SolariMaterial`] (bark/wood) and the
+/// round-cone surface normal, instead of the fiber BSDF. The entity's
+/// [`GlobalTransform`] places it; the [`HairAsset`] supplies the strands (each a
+/// node polyline with per-point radii). Blackwell-only, like [`Hair`].
+#[derive(Component, Clone, Debug)]
+#[require(Transform, SyncToRenderWorld)]
+pub struct SolariBranches {
+    /// Swept-sphere strand geometry (branch polylines + pipe radii).
+    pub strands: Handle<HairAsset>,
+    /// Opaque surface material (bark/wood/etc).
+    pub material: Handle<SolariMaterial>,
 }
 
 /// Physically-based hair appearance, parameterized by melanin like UE / NVIDIA
@@ -139,7 +160,7 @@ pub fn melanin_absorption(melanin: f32, redness: f32, dye: Vec3, beta_n: f32) ->
 /// transform is NOT stored here: the hair entity is a transform-table node, so
 /// its world matrix already lives in the GPU `world` buffer at `transform_slot`
 /// (both passes read `world[transform_slot]`, like directional lights). Mirrors
-/// `GpuHairInstance` in WGSL. `repr(C)`, 48 bytes, 16-aligned.
+/// `GpuHairInstance` in WGSL. `repr(C)`, 64 bytes, 16-aligned.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct GpuHairInstance {
@@ -157,14 +178,21 @@ pub struct GpuHairInstance {
     pub blas_address_hi: u32,
     /// 8-bit PTLAS instance cull mask (hair is visible to all view masks).
     pub mask: u32,
+    /// Opaque-surface material slot ([`SolariBranches`]), or [`HAIR_MATERIAL_NONE`]
+    /// for fiber hair — the hair closest-hit branches on this to BRDF shading.
+    pub material_id: u32,
+    pub _pad: [u32; 3],
 }
 
-/// Render-world copy of one extracted hair entity, before its asset residency
-/// is resolved.
+/// Render-world copy of one extracted hair/branch entity, before its asset
+/// residency is resolved.
 pub struct ExtractedHairInstance {
     pub transform_slot: u32,
     pub asset: AssetId<HairAsset>,
+    /// Fiber appearance (used only for [`Hair`]; ignored when `surface` is set).
     pub material: HairMaterial,
+    /// Opaque surface material for [`SolariBranches`] (`None` = fiber hair).
+    pub surface: Option<AssetId<SolariMaterial>>,
 }
 
 /// Render-world list of this frame's hair entities (rebuilt each frame — hair
@@ -221,6 +249,7 @@ pub fn init_hair_instances(mut commands: Commands) {
 /// before `PostUpdate` assigns it) are skipped.
 pub fn extract_hair_instances(
     hair: Extract<Query<(&GpuSlot<TransformGraph>, &Hair)>>,
+    branches: Extract<Query<(&GpuSlot<TransformGraph>, &SolariBranches)>>,
     mut extracted: ResMut<ExtractedHairInstances>,
 ) {
     extracted.0.clear();
@@ -229,6 +258,17 @@ pub fn extract_hair_instances(
             transform_slot: slot.index(),
             asset: hair.asset.id(),
             material: hair.material,
+            surface: None,
+        });
+    }
+    // Opaque branch instances share the LSS geometry + instance buffer; the
+    // surface material slot is resolved in `prepare_hair_instances`.
+    for (slot, branches) in &branches {
+        extracted.0.push(ExtractedHairInstance {
+            transform_slot: slot.index(),
+            asset: branches.strands.id(),
+            material: HairMaterial::default(),
+            surface: Some(branches.material.id()),
         });
     }
 }
@@ -242,6 +282,7 @@ pub fn prepare_hair_instances(
     extracted: Res<ExtractedHairInstances>,
     manager: Option<Res<HairManager>>,
     instance_manager: Option<Res<crate::instance::InstanceManager>>,
+    material_slots: Option<Res<MaterialSlots>>,
     mut instances: ResMut<HairInstances>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -261,6 +302,12 @@ pub fn prepare_hair_instances(
         };
         let m = &e.material;
         let sigma_a = melanin_absorption(m.melanin, m.redness, m.dye, m.azimuthal_roughness);
+        // Opaque branches resolve their surface material to a stable slot; fiber
+        // hair (and a not-yet-slotted material) uses the sentinel → Chiang BSDF.
+        let material_id = e
+            .surface
+            .and_then(|asset| material_slots.as_deref().and_then(|s| s.slot_of(asset)))
+            .unwrap_or(HAIR_MATERIAL_NONE);
         instances.buffer.push(GpuHairInstance {
             sigma_a,
             transform_slot: e.transform_slot,
@@ -272,12 +319,17 @@ pub fn prepare_hair_instances(
             blas_address_lo: (entry.blas_address & 0xFFFF_FFFF) as u32,
             blas_address_hi: (entry.blas_address >> 32) as u32,
             mask: 0xFF,
+            material_id,
+            _pad: [0; 3],
         });
     }
     instances.count = instances.buffer.len() as u32;
     // Keep a live buffer for the bind group even with zero hair.
     if instances.buffer.is_empty() {
-        instances.buffer.push(GpuHairInstance::default());
+        instances.buffer.push(GpuHairInstance {
+            material_id: HAIR_MATERIAL_NONE,
+            ..Default::default()
+        });
     }
     instances
         .buffer
@@ -334,6 +386,8 @@ impl Plugin for HairPlugin {
                     prepare_hair_instances
                         .in_set(RenderSystems::Prepare)
                         .after(manager::prepare_hair_geometry)
+                        // Needs each branch material's stable slot for `material_id`.
+                        .after(crate::material::prepare_material_slots)
                         .before(crate::accel::ptlas::prepare_ptlas_params),
                     ptlas_hair::prepare_hair_ptlas_write
                         .in_set(RenderSystems::Prepare)

@@ -125,7 +125,7 @@ pub mod prelude {
         transform::{NoGpuGlobalTransformReadback, TransformStatic},
         material::{SolariMaterial, SolariMaterial3d},
         lights::SolariDirectionLight,
-        hair::{Hair, HairMaterial, HairAsset, HairStrand},
+        hair::{Hair, HairMaterial, HairAsset, HairStrand, SolariBranches},
         ray_query::picking::SolariPickingPlugin,
     };
 

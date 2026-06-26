@@ -242,13 +242,19 @@ pub fn extract_hair_assets(
         return;
     }
     for event in events.read() {
-        let id = match event {
-            AssetEvent::Added { id } | AssetEvent::Modified { id } => *id,
+        let (id, modified) = match event {
+            AssetEvent::Added { id } => (*id, false),
+            AssetEvent::Modified { id } => (*id, true),
             _ => continue,
         };
-        // Re-upload-as-new on modify is a future milestone; for v1 skip if
-        // already resident (avoids orphaning a built BLAS).
-        if manager.entries.contains_key(&id) {
+        // `Added`: skip if already resident (no duplicate first build). `Modified`:
+        // re-flatten + rebuild the BLAS in place for live geometry edits (e.g. a
+        // tree growing) — `prepare_hair_geometry` re-places the data and swaps the
+        // `entries` record, so the instance follows the same frame (the BuildBlas
+        // pass runs before the trace) with no residency gap. The old arena range +
+        // BLAS handle are leaked (the bump arenas have no eviction yet — a future
+        // milestone), so keep modify frequency throttled.
+        if !modified && manager.entries.contains_key(&id) {
             continue;
         }
         let Some(asset) = assets.get(id) else {

@@ -132,7 +132,13 @@ struct GpuHairInstance {
     blas_address_lo: u32,
     blas_address_hi: u32,
     mask: u32,
+    // Opaque-surface material slot for `SolariBranches` (bark/wood/etc), or
+    // `HAIR_MATERIAL_NONE` for fiber hair shaded by the Chiang BSDF.
+    material_id: u32,
 }
+
+// `GpuHairInstance.material_id` sentinel: shade as fiber hair, not an opaque surface.
+const HAIR_MATERIAL_NONE = 0xFFFFFFFFu;
 // Per swept segment: the two capped-cylinder endpoints + radii, local space.
 struct HairSegment {
     p0: vec4<f32>, // xyz position, w radius
@@ -202,6 +208,52 @@ fn resolve_hair_hit(
     hit.alpha = h.alpha;
     hit.ior = h.ior;
     return hit;
+}
+
+/// The opaque-surface material slot of an LSS instance (`HAIR_MATERIAL_NONE` for
+/// fiber hair). Lets the hair closest-hit route opaque `SolariBranches` to BRDF
+/// shading without the per-segment geometry work of `resolve_lss_surface`.
+fn lss_material_id(instance_index: u32) -> u32 {
+    return hair_instances[instance_index - hair_params.base].material_id;
+}
+
+/// An opaque hit on a linear-swept-sphere (round-cone) primitive: the surface
+/// point, the round-cone surface normal (taper-tilted radial), and the material.
+struct LssSurface {
+    world_position: vec3<f32>,
+    world_normal: vec3<f32>,
+    material_id: u32,
+}
+
+/// Resolve an opaque LSS (branch) hit: reconstruct the hit segment's world
+/// endpoints + radii, then build the round-cone surface normal. The normal is the
+/// outward radial direction from the swept-sphere axis, tilted along the axis by
+/// the taper slope `(r0 - r1)/L` so the cone's slant is shaded (not a pure
+/// cylinder). Radii are object-space; branch transforms are ~rigid, so the slope
+/// ratio is taken directly.
+fn resolve_lss_surface(
+    instance_index: u32,
+    primitive_index: u32,
+    world_position: vec3<f32>,
+) -> LssSurface {
+    let h = hair_instances[instance_index - hair_params.base];
+    let seg = hair_segments[h.segment_base + primitive_index];
+    let wp0 = hair_world_point(h.transform_slot, seg.p0.xyz);
+    let wp1 = hair_world_point(h.transform_slot, seg.p1.xyz);
+    let axis = wp1 - wp0;
+    let len = max(length(axis), 1.0e-6);
+    let dir = axis / len;
+    // Closest axis point (clamped to the segment), then the outward radial.
+    let h_along = clamp(dot(world_position - wp0, dir), 0.0, len);
+    let radial = world_position - (wp0 + dir * h_along);
+    let rl = length(radial);
+    let n_radial = select(vec3<f32>(0.0, 1.0, 0.0), radial / rl, rl > 1.0e-6);
+    let slope = (seg.p0.w - seg.p1.w) / len;
+    var s: LssSurface;
+    s.world_position = world_position;
+    s.world_normal = normalize(n_radial + dir * slope);
+    s.material_id = h.material_id;
+    return s;
 }
 
 // Per-instance LOD inputs, slot-indexed. This is the SAME buffer the

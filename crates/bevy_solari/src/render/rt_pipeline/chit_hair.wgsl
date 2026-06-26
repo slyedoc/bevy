@@ -11,8 +11,9 @@ enable primitive_index;
 
 #import bevy_solari::rt_payload::{RtPayload, ShadowPayload, RtCamera}
 #import bevy_solari::hair::{eval_hair_bsdf, sample_hair_bsdf, pdf_hair_bsdf}
+#import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::sampling::{generate_random_light_sample, calculate_resolved_light_contribution, power_heuristic, NULL_LIGHT_ID}
-#import bevy_solari::scene_bindings::{resolve_hair_hit, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX}
+#import bevy_solari::scene_bindings::{resolve_hair_hit, lss_material_id, resolve_lss_surface, load_material_bindless, resolve_material_lod, HAIR_MATERIAL_NONE, MIRROR_ROUGHNESS_THRESHOLD, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX}
 
 var<incoming_ray_payload> payload: RtPayload;
 // Outgoing payload for the NEE shadow ray (see `miss_shadow`).
@@ -49,6 +50,102 @@ fn chit_hair(
     @builtin(ray_t_current_max) ray_t: f32,
 ) {
     var rng = payload.rng;
+
+    // ── Opaque branch path (`SolariBranches`: bark/wood on the same LSS geometry) ──
+    // When the instance carries a real material slot it's not fiber hair — shade it
+    // as an opaque surface (round-cone normal + BRDF), structured exactly like
+    // `chit_opaque`, then return before the fiber path below.
+    let lss_material = lss_material_id(instance_id);
+    if lss_material != HAIR_MATERIAL_NONE {
+        let hit_position = ray_origin + ray_direction * ray_t;
+        let surf = resolve_lss_surface(instance_id, primitive_index, hit_position);
+        let material = resolve_material_lod(load_material_bindless(lss_material), vec2<f32>(0.0), 0.0);
+        let wo = -ray_direction;
+        let world_normal = bend_shading_normal(surf.world_normal, wo);
+        let NdotV = max(dot(world_normal, wo), 0.0001);
+        let F_ab = F_AB(material.perceptual_roughness, NdotV);
+
+        // Branches aren't registered emissive lights, so no NEE-MIS on emissive.
+        var emitted = material.emissive;
+        let is_specular =
+            material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && material.metallic > 0.9999;
+        if !is_specular {
+            let sample = generate_random_light_sample(&rng);
+            if sample.light_sample.light_id != NULL_LIGHT_ID {
+                let lc = calculate_resolved_light_contribution(
+                    sample.resolved_light_sample, hit_position, world_normal);
+                if lc.inverse_pdf > 0.0 {
+                    let shadow_origin = offset_ray_origin(hit_position, surf.world_normal);
+                    let light_pos = sample.resolved_light_sample.world_position;
+                    var shadow_dir = light_pos.xyz;
+                    var shadow_tmax = RAY_T_MAX;
+                    if light_pos.w == 1.0 {
+                        let to_light = shadow_dir - shadow_origin;
+                        let dist = length(to_light);
+                        shadow_dir = to_light / dist;
+                        shadow_tmax = dist - RAY_T_MIN;
+                    }
+                    var visible = false;
+                    if shadow_tmax >= RAY_T_MIN {
+                        shadow_payload.occluded = 1u;
+                        traceRay(
+                            tlas,
+                            RayDesc(SHADOW_RAY_FLAGS, 0xffu, RAY_T_MIN, shadow_tmax, shadow_origin, shadow_dir),
+                            0u, 0u, SHADOW_MISS_INDEX, &shadow_payload);
+                        visible = shadow_payload.occluded == 0u;
+                    }
+                    if visible {
+                        var nee_mis = 1.0;
+                        if lc.brdf_rays_can_hit {
+                            let pdf_b = brdf_pdf(wo, lc.wi, world_normal, material, F_ab);
+                            nee_mis = power_heuristic(1.0 / lc.inverse_pdf, pdf_b);
+                        }
+                        let direct = evaluate_brdf(wo, lc.wi, world_normal, material, F_ab);
+                        emitted += nee_mis * lc.radiance * lc.inverse_pdf * direct;
+                    }
+                }
+            }
+        }
+        payload.emitted = emitted;
+
+#ifdef SOLARI_DLSS
+        if payload.gbuffer_pixel != NO_GBUFFER {
+            let px = payload.gbuffer_pixel;
+            let cur_clip = camera.clip_from_world * vec4<f32>(hit_position, 1.0);
+            if cur_clip.w > 1.0e-4 {
+                gbuffer_normal_roughness[px] = vec4<f32>(world_normal, material.roughness);
+                let view_pos = camera.view_from_world * vec4<f32>(hit_position, 1.0);
+                let diffuse = material.base_color * (1.0 - material.metallic);
+                gbuffer_diffuse[px] = vec4<f32>(diffuse, max(-view_pos.z, 1.0e-4));
+                let specular = mix(vec3<f32>(0.04), material.base_color, material.metallic);
+                gbuffer_specular[px] = vec4<f32>(specular, 0.0);
+                let prev_clip = camera.prev_clip_from_world * vec4<f32>(hit_position, 1.0);
+                var motion = vec2<f32>(0.0);
+                if prev_clip.w > 1.0e-4 {
+                    let cur_uv = (cur_clip.xy / cur_clip.w) * vec2<f32>(0.5, -0.5);
+                    let prev_uv = (prev_clip.xy / prev_clip.w) * vec2<f32>(0.5, -0.5);
+                    motion = cur_uv - prev_uv;
+                }
+                gbuffer_motion[px] = vec4<f32>(motion, 0.0, 0.0);
+            }
+        }
+#endif
+
+        let next = evaluate_and_sample_brdf(wo, world_normal, material, F_ab, &rng);
+        if next.pdf == 0.0 {
+            payload.bounce = 0u; // dead path — terminate
+            payload.rng = rng;
+            return;
+        }
+        payload.attenuation = next.throughput;
+        payload.next_origin = offset_ray_origin(hit_position, surf.world_normal);
+        payload.next_direction = next.wi;
+        payload.p_bounce = next.pdf;
+        payload.bounce = 1u;
+        payload.rng = rng;
+        return;
+    }
+
     let world_position = ray_origin + ray_direction * ray_t;
     let hair = resolve_hair_hit(instance_id, primitive_index, world_position);
     let wo = -ray_direction;

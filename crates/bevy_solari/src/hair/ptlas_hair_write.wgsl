@@ -8,7 +8,7 @@
 // above the cluster slot high-water. Hair records are re-specified every frame
 // (small N), always in the global partition, referencing the asset's LSS BLAS.
 
-/// Must match `GpuHairInstance` (Rust, `hair/mod.rs`) byte-for-byte. 48 B.
+/// Must match `GpuHairInstance` (Rust, `hair/mod.rs`) byte-for-byte. 64 B.
 struct GpuHairInstance {
     sigma_a: vec3<f32>,  // absorption from melanin (+ dye), CPU-derived
     transform_slot: u32, // index into the GPU `world` buffer (×3 rows)
@@ -20,6 +20,9 @@ struct GpuHairInstance {
     blas_address_lo: u32,
     blas_address_hi: u32,
     mask: u32,
+    // Opaque-surface material slot (`SolariBranches`) or 0xffffffff for fiber hair.
+    // Unused by the PTLAS write, but present so the stride matches the path tracer.
+    material_id: u32,
 }
 
 /// Must match `VkPartitionedAccelerationStructureWriteInstanceDataNV` /
