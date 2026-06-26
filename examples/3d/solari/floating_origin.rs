@@ -19,16 +19,7 @@
 //! and credited).
 
 use bevy::{
-    camera::CameraMainTextureUsages,
-    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
-    feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
-    math::{DVec3, IVec3},
-    prelude::*,
-    render::render_resource::TextureUsages,
-    solari::prelude::*,
-    // The floating-origin types live in solari's transform module (not yet in the
-    // prelude); import them explicitly.
-    solari::transform::{SolariFloatingOrigin, SolariGridCell},
+    camera::CameraMainTextureUsages, camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, math::{DVec3, IVec3}, pbr::PbrPlugin, prelude::*, render::render_resource::TextureUsages, solari::{prelude::*, transform::{SolariFloatingOrigin, SolariGridCell}},
 };
 
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -50,14 +41,25 @@ fn main() {
     app.insert_resource(UiTheme(create_dark_theme()))
         // `FeathersPlugins` + the `bevy_solari_debug` feature give the in-engine
         // debug-view dropdown (bottom-left): pathtrace reference, G-buffer views, etc.
-        .add_plugins((DefaultPlugins, SolariPlugin, FeathersPlugins, FreeCameraPlugin))
+        .add_plugins((
+            DefaultPlugins
+                .build()
+                .disable::<PbrPlugin>()
+                .disable::<TransformPlugin>(),                
+            SolariPlugin,
+            FeathersPlugins,
+            FreeCameraPlugin,
+        ))
         .add_systems(Startup, setup)
+        // The camera-follow recenter is built into `SolariTransformPlugin` now — the
+        // example only has to set the initial origin cell + `cell_edge` (see `setup`).
         .add_systems(
             Update,
             (
-                (convert_meshes_to_raytracing, convert_standard_materials_to_solari).chain(),
-                recenter_floating_origin,
-            ),
+                convert_meshes_to_raytracing,
+                convert_standard_materials_to_solari,
+            )
+                .chain(),
         )
         .run();
 }
@@ -199,40 +201,4 @@ fn setup(
         },
         Transform::from_translation(camera_local).looking_to(Vec3::NEG_X, Vec3::Y),
     ));
-}
-
-/// Keep the floating origin glued to the camera so its rendered coordinates stay small —
-/// large camera coords are what make the ray tracer jitter and (because solari is a 1-spp
-/// path tracer that denoises temporally) make the image pixelate as you fly off. When the
-/// camera's local Transform drifts past half a cell, shift `origin_cell` by the whole
-/// cells crossed and wrap the Transform back toward the cell centre: the world position is
-/// unchanged, everything is just re-expressed relative to the new cell.
-///
-/// The origin jump moves every instance a full cell in one frame, so we pulse
-/// [`CameraReset`] — a one-frame temporal-history reset (DLSS + ReSTIR) so the reprojection
-/// doesn't smear/teleport across the discontinuity. (The O(partitions), zero-reset recenter
-/// is the partition-translation layer; this is the foundation's O(cells)-re-propagate + a
-/// 1-frame reset, which is imperceptible at a cell crossing.)
-fn recenter_floating_origin(
-    mut origin: ResMut<SolariFloatingOrigin>,
-    mut camera: Query<(&mut Transform, &mut CameraReset), With<SolariCamera>>,
-) {
-    let Ok((mut transform, mut reset)) = camera.single_mut() else {
-        return;
-    };
-    let edge = origin.cell_edge;
-    if edge <= 0.0 {
-        return;
-    }
-    // Whole cells the camera has drifted from its cell centre (round → nearest cell, so
-    // the local stays within ±½ cell; handles multi-cell jumps from a fast camera too).
-    let drift = (transform.translation / edge).round();
-    if drift == Vec3::ZERO {
-        return;
-    }
-    origin.origin_cell[0] += drift.x as i32;
-    origin.origin_cell[1] += drift.y as i32;
-    origin.origin_cell[2] += drift.z as i32;
-    transform.translation -= drift * edge;
-    reset.0 = true;
 }
