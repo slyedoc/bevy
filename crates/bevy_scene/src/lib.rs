@@ -1463,6 +1463,210 @@ mod tests {
         );
     }
 
+    // Mirrors the real San Miguel `SolariMaterial` shape: an inline asset (`InlineTestMat`, a
+    // reflect-built `Asset`) whose texture field is an `Option<Handle<T>>`. Present textures are
+    // written as a bare string path (`tex: "..."`) and must resolve to `Some(handle)`; omitted
+    // textures default to `None`. The wrapper must be an `Asset` (reflect-built), never a
+    // `FromTemplate` component, because `Option<Handle<T>>` does not implement `Template`.
+    #[derive(Asset, Reflect, Clone, Default)]
+    #[reflect(Default, Clone)]
+    struct InlineTestMat {
+        tex: Option<Handle<InlineTestAsset>>,
+    }
+
+    #[derive(Component, FromTemplate, Reflect, Clone, Default)]
+    #[reflect(Component, Default, Clone)]
+    struct InlineTestMatHolder(Handle<InlineTestMat>);
+
+    // Enum with a tuple variant + a holder component, to exercise enum-tuple-variant *field values*
+    // in dynamic `.bsn` (the `AlphaMode::Mask(0.5)` shape): the loader must switch the field's enum
+    // to the named variant and fill its tuple fields, not just handle tuple *structs*.
+    #[derive(Reflect, Clone, Default, PartialEq, Debug)]
+    #[reflect(Default, Clone)]
+    enum TestAlpha {
+        #[default]
+        Opaque,
+        Mask(f32),
+    }
+
+    #[derive(Component, FromTemplate, Reflect, Clone, Default)]
+    #[reflect(Component, Default, Clone)]
+    struct TestAlphaHolder {
+        mode: TestAlpha,
+    }
+
+    #[test]
+    fn dynamic_bsn_nested_option_handle() {
+        let mut app = App::new();
+        let dir = Dir::default();
+        let dir_clone = dir.clone();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || {
+                Box::new(MemoryAssetReader {
+                    root: dir_clone.clone(),
+                })
+            }),
+        );
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin::default(),
+            ScenePlugin,
+        ));
+        app.init_asset::<InlineTestAsset>()
+            .register_type::<InlineTestAsset>()
+            .register_asset_reflect::<InlineTestAsset>()
+            .init_asset::<InlineTestMat>()
+            .register_type::<InlineTestMat>()
+            .register_asset_reflect::<InlineTestMat>()
+            .register_type::<Option<Handle<InlineTestAsset>>>()
+            .register_type::<InlineTestMatHolder>();
+        app.finish();
+        app.cleanup();
+
+        // Present texture: the `Option<Handle<_>>` field is given a bare string path.
+        dir.insert_asset_text(
+            Path::new("mat_with_tex.bsn"),
+            "bevy_scene::tests::InlineTestMatHolder(\
+             bevy_scene::tests::InlineTestMat { tex: \"tex/wall.inlinetestasset\" })",
+        );
+        // Absent texture: the field is omitted entirely (must default to `None`).
+        dir.insert_asset_text(
+            Path::new("mat_no_tex.bsn"),
+            "bevy_scene::tests::InlineTestMatHolder(bevy_scene::tests::InlineTestMat {})",
+        );
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let with_tex = asset_server.load::<ScenePatch>("mat_with_tex.bsn");
+        let no_tex = asset_server.load::<ScenePatch>("mat_no_tex.bsn");
+        run_app_until(&mut app, || {
+            asset_server.is_loaded(&with_tex) && asset_server.is_loaded(&no_tex)
+        });
+
+        fn with_tex_scene() -> impl Scene {
+            bsn! { :"mat_with_tex.bsn" }
+        }
+        fn no_tex_scene() -> impl Scene {
+            bsn! { :"mat_no_tex.bsn" }
+        }
+
+        // Present texture: the inline material's `tex` must be `Some(handle)` pointing at the path.
+        {
+            let world = app.world_mut();
+            let mat_handle = world
+                .spawn_scene(with_tex_scene())
+                .unwrap()
+                .get::<InlineTestMatHolder>()
+                .expect("spawned entity should have `InlineTestMatHolder`")
+                .0
+                .clone();
+            let mat = world
+                .resource::<Assets<InlineTestMat>>()
+                .get(&mat_handle)
+                .expect("inline material should have been added to `Assets`");
+            let tex = mat
+                .tex
+                .as_ref()
+                .expect("present texture should resolve to `Some`");
+            assert_eq!(
+                tex.path().map(|p| p.to_string()),
+                Some("tex/wall.inlinetestasset".to_string()),
+                "nested `Option<Handle>` string path should resolve to a handle for that path"
+            );
+        }
+
+        // Absent texture: the inline material's `tex` must be `None`.
+        {
+            let world = app.world_mut();
+            let mat_handle = world
+                .spawn_scene(no_tex_scene())
+                .unwrap()
+                .get::<InlineTestMatHolder>()
+                .expect("spawned entity should have `InlineTestMatHolder`")
+                .0
+                .clone();
+            let mat = world
+                .resource::<Assets<InlineTestMat>>()
+                .get(&mat_handle)
+                .expect("inline material should have been added to `Assets`");
+            assert!(
+                mat.tex.is_none(),
+                "omitted texture field should default to `None`"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_bsn_enum_tuple_variant_field() {
+        let mut app = App::new();
+        let dir = Dir::default();
+        let dir_clone = dir.clone();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || {
+                Box::new(MemoryAssetReader {
+                    root: dir_clone.clone(),
+                })
+            }),
+        );
+        app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default(), ScenePlugin));
+        app.register_type::<TestAlpha>()
+            .register_type::<TestAlphaHolder>();
+        app.finish();
+        app.cleanup();
+
+        // A tuple-variant field value (`Mask(0.5)`) and an omitted field (must default to `Opaque`).
+        dir.insert_asset_text(
+            Path::new("masked.bsn"),
+            "bevy_scene::tests::TestAlphaHolder { mode: bevy_scene::tests::TestAlpha::Mask(0.5) }",
+        );
+        dir.insert_asset_text(
+            Path::new("opaque.bsn"),
+            "bevy_scene::tests::TestAlphaHolder {}",
+        );
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let masked = asset_server.load::<ScenePatch>("masked.bsn");
+        let opaque = asset_server.load::<ScenePatch>("opaque.bsn");
+        run_app_until(&mut app, || {
+            asset_server.is_loaded(&masked) && asset_server.is_loaded(&opaque)
+        });
+
+        fn masked_scene() -> impl Scene {
+            bsn! { :"masked.bsn" }
+        }
+        fn opaque_scene() -> impl Scene {
+            bsn! { :"opaque.bsn" }
+        }
+
+        let world = app.world_mut();
+        let masked_mode = world
+            .spawn_scene(masked_scene())
+            .unwrap()
+            .get::<TestAlphaHolder>()
+            .expect("spawned entity should have `TestAlphaHolder`")
+            .mode
+            .clone();
+        assert_eq!(
+            masked_mode,
+            TestAlpha::Mask(0.5),
+            "enum tuple-variant field value should resolve to the named variant with its field"
+        );
+
+        let opaque_mode = world
+            .spawn_scene(opaque_scene())
+            .unwrap()
+            .get::<TestAlphaHolder>()
+            .expect("spawned entity should have `TestAlphaHolder`")
+            .mode
+            .clone();
+        assert_eq!(
+            opaque_mode,
+            TestAlpha::Opaque,
+            "omitted enum field should keep its default variant"
+        );
+    }
+
     #[test]
     fn inline_scene_patching() {
         let mut app = test_app();

@@ -140,16 +140,17 @@ pub fn update_render_debug_label(
     }
 }
 
-// --- "view" dropdown (normal / time heatmap) + cost-heatmap sliders ------------
-// A bottom-left "view" dropdown selects normal rendering vs the per-pixel cost
-// heatmap (`SolariCostHeatmap.enabled`). In heatmap view the two sliders (center,
-// contrast) appear and the DLSS dropdown hides; in normal view it's the reverse.
+// --- "view" dropdown (normal / time heatmap / displacement) + heatmap sliders --
+// A bottom-left "view" dropdown selects normal rendering, the per-pixel cost
+// heatmap (`SolariCostHeatmap.enabled`), or the displacement-map debug view
+// (`SolariShowDisplacement.enabled`). In heatmap view the two sliders (center,
+// contrast) appear and the DLSS dropdown hides; otherwise it's the reverse.
 
 pub use view_panel::{spawn_view_panels, toggle_heatmap_controls, update_view_label};
 
 mod view_panel {
     use super::*;
-    use crate::render::rt_pipeline::SolariCostHeatmap;
+    use crate::render::rt_pipeline::{SolariCostHeatmap, SolariShowDisplacement};
     use crate::render::SolariCamera;
     use bevy_ecs::system::{Res, ResMut};
     use bevy_feathers::controls::FeathersSlider;
@@ -170,14 +171,18 @@ mod view_panel {
     #[derive(Component, Default, Clone)]
     pub struct HeatmapControls;
 
-    /// One view menu item: sets whether the cost heatmap is enabled.
-    fn view_item(enabled: bool, label: &'static str) -> impl Scene {
+    /// One view menu item: selects the active debug view by setting the two view toggles (they're
+    /// mutually exclusive — `normal` clears both, `heatmap`/`displacement` set exactly one).
+    fn view_item(heatmap_on: bool, displacement_on: bool, label: &'static str) -> impl Scene {
         bsn! {
             @FeathersMenuItem {
                 @caption: bsn! { Text({label.to_string()}) ThemedText }
             }
-            on(move |_: On<Activate>, mut heatmap: ResMut<SolariCostHeatmap>| {
-                heatmap.enabled = enabled;
+            on(move |_: On<Activate>,
+                     mut heatmap: ResMut<SolariCostHeatmap>,
+                     mut displacement: ResMut<SolariShowDisplacement>| {
+                heatmap.enabled = heatmap_on;
+                displacement.enabled = displacement_on;
             })
         }
     }
@@ -218,8 +223,9 @@ mod view_panel {
                             (
                                 @FeathersMenuPopup
                                 Children [
-                                    view_item(false, "normal"),
-                                    view_item(true, "time heatmap"),
+                                    view_item(false, false, "normal"),
+                                    view_item(true, false, "time heatmap"),
+                                    view_item(false, true, "displacement"),
                                 ]
                             )
                         ]
@@ -257,13 +263,16 @@ mod view_panel {
         }
     }
 
-    /// Keep the view button caption in sync with the heatmap toggle.
+    /// Keep the view button caption in sync with the active view toggle.
     pub fn update_view_label(
         heatmap: Res<SolariCostHeatmap>,
+        displacement: Res<SolariShowDisplacement>,
         mut labels: Query<&mut Text, With<ViewLabel>>,
     ) {
         let want = if heatmap.enabled {
             "view: time heatmap"
+        } else if displacement.enabled {
+            "view: displacement"
         } else {
             "view: normal"
         };

@@ -550,8 +550,12 @@ impl BsnAst {
                 // This could be an enum variant (`some_crate::Enum::Variant`)
                 // or a struct.
                 if !resolved_symbol.template_is_enum {
-                    // This is a struct.
-                    let ReflectMut::Struct(reflect_struct) = reflect.reflect_mut() else {
+                    // This is a struct. Build a *dynamic* representation seeded from the default
+                    // (so unspecified fields keep their defaults), with the specified fields
+                    // replaced wholesale. Keeping it dynamic lets fields hold `HandleTemplate` /
+                    // `Some(HandleTemplate)` / nested asset values that the apply step resolves into
+                    // concrete handles; applying those onto a concrete field would kind-mismatch.
+                    let ReflectRef::Struct(default_struct) = reflect.reflect_ref() else {
                         return Err(DynamicBsnLoaderError::UnknownType(
                             template_type_registration
                                 .type_info()
@@ -565,6 +569,14 @@ impl BsnAst {
                     };
 
                     let mut dynamic_struct = DynamicStruct::default();
+                    dynamic_struct.set_represented_type(reflect.get_represented_type_info());
+                    for i in 0..default_struct.field_len() {
+                        if let (Some(name), Some(value)) =
+                            (default_struct.name_at(i), default_struct.field_at(i))
+                        {
+                            dynamic_struct.insert_boxed(name.to_owned(), value.to_dynamic());
+                        }
+                    }
                     for field in &bsn_struct.1 {
                         let Some(field_info) = struct_info.field(&field.0) else {
                             return Err(DynamicBsnLoaderError::StructDoesntHaveField(
@@ -578,8 +590,7 @@ impl BsnAst {
                         )?;
                         dynamic_struct.insert_boxed(field.0.clone(), reflect);
                     }
-                    reflect_struct.apply(&dynamic_struct);
-                    return Ok(reflect.into_partial_reflect());
+                    return Ok(Box::new(dynamic_struct));
                 }
 
                 // Enum struct variant: build fields and wrap in DynamicEnum
@@ -635,24 +646,74 @@ impl BsnAst {
                 let mut reflect =
                     create_reflect_default_from_type_registration(template_type_registration)?;
 
-                let Ok(tuple_info) = template_type_registration.type_info().as_tuple_struct()
-                else {
-                    return Err(DynamicBsnLoaderError::TypeNotNamedTuple);
-                };
+                // This could be an enum tuple variant (`some_crate::Enum::Variant(..)`, e.g.
+                // `AlphaMode::Mask(0.5)`) or a tuple struct.
+                if !resolved_symbol.template_is_enum {
+                    let Ok(tuple_info) = template_type_registration.type_info().as_tuple_struct()
+                    else {
+                        return Err(DynamicBsnLoaderError::TypeNotNamedTuple);
+                    };
 
-                let mut dynamic_tuple_struct = DynamicTupleStruct::default();
-                for (field_id, field_info) in named_tuple.1.iter().zip(tuple_info.iter()) {
-                    let reflect_val = self.convert_bsn_expr_to_reflect(
+                    // Build a *dynamic* representation seeded from the default (so unspecified
+                    // trailing fields keep their defaults), with the specified leading fields
+                    // replaced wholesale. Keeping it dynamic lets fields hold `HandleTemplate` /
+                    // `Some(HandleTemplate)` / nested asset values that the apply step resolves
+                    // into concrete handles.
+                    let mut parsed_fields = Vec::with_capacity(named_tuple.1.len());
+                    for (field_id, field_info) in named_tuple.1.iter().zip(tuple_info.iter()) {
+                        parsed_fields.push(self.convert_bsn_expr_to_reflect(
+                            *field_id,
+                            app_type_registry,
+                            field_info.ty().id(),
+                        )?);
+                    }
+
+                    let mut dynamic_tuple_struct = DynamicTupleStruct::default();
+                    dynamic_tuple_struct.set_represented_type(reflect.get_represented_type_info());
+                    let ReflectRef::TupleStruct(default_ts) = reflect.reflect_ref() else {
+                        return Err(DynamicBsnLoaderError::TypeNotNamedTuple);
+                    };
+                    let mut parsed = parsed_fields.into_iter();
+                    for i in 0..default_ts.field_len() {
+                        match parsed.next() {
+                            Some(value) => dynamic_tuple_struct.insert_boxed(value),
+                            None => dynamic_tuple_struct
+                                .insert_boxed(default_ts.field(i).unwrap().to_dynamic()),
+                        }
+                    }
+                    return Ok(Box::new(dynamic_tuple_struct));
+                }
+
+                // Enum tuple variant: build the field values and wrap in a `DynamicEnum`, then
+                // apply onto the default-instantiated enum (switching it to this variant). The
+                // result is a concrete-typed enum value, so it applies cleanly onto the target
+                // field (e.g. an `alpha_mode: AlphaMode`).
+                let enum_info = template_type_registration
+                    .type_info()
+                    .as_enum()
+                    .map_err(|_| DynamicBsnLoaderError::TypeNotNamedTuple)?;
+                let variant_info = enum_info
+                    .variant(&named_tuple.0 .1)
+                    .ok_or_else(|| DynamicBsnLoaderError::UnknownType(named_tuple.0.as_path()))?
+                    .as_tuple_variant()?;
+
+                let mut dynamic_tuple = DynamicTuple::default();
+                for (field_id, field_info) in named_tuple.1.iter().zip(variant_info.iter()) {
+                    dynamic_tuple.insert_boxed(self.convert_bsn_expr_to_reflect(
                         *field_id,
                         app_type_registry,
                         field_info.ty().id(),
-                    )?;
-                    dynamic_tuple_struct.insert_boxed(reflect_val);
+                    )?);
                 }
 
-                if let ReflectMut::TupleStruct(ts) = reflect.reflect_mut() {
-                    ts.apply(&dynamic_tuple_struct);
-                }
+                let dynamic_enum =
+                    DynamicEnum::new(named_tuple.0 .1.clone(), DynamicVariant::Tuple(dynamic_tuple));
+                let ReflectMut::Enum(reflect_enum) = reflect.reflect_mut() else {
+                    return Err(DynamicBsnLoaderError::UnknownType(
+                        template_type_registration.type_info().type_path().to_owned(),
+                    ));
+                };
+                reflect_enum.apply(&dynamic_enum);
                 Ok(reflect.into_partial_reflect())
             }
 
@@ -665,6 +726,35 @@ impl BsnAst {
                         create_reflect_default_from_type_registration(expected_type_registration)?;
                     reflect.apply(string);
                     return Ok(reflect.into_partial_reflect());
+                }
+
+                // An `Option<Handle<T>>` field: build the inner `HandleTemplate<T>::Path` exactly as
+                // for a bare `Handle<T>`, then wrap it in `Option::Some` (a bare string is always
+                // `Some`; we never author `None`). The apply step later resolves the inner
+                // `HandleTemplate` to a concrete `Handle<T>`.
+                let expected_type_path = expected_type_registration.type_info().type_path();
+                if let Some(inner_handle_type_path) =
+                    option_handle_inner_type_path(expected_type_path)
+                {
+                    let Some(handle_template) = handle_template_type_path(inner_handle_type_path)
+                        .and_then(|path| type_registry.get_with_type_path(&path))
+                    else {
+                        return Err(DynamicBsnLoaderError::TypeMismatch);
+                    };
+                    let Some(reflect_convert) = handle_template.data::<ReflectConvert>() else {
+                        return Err(DynamicBsnLoaderError::TypeMismatch);
+                    };
+                    let Ok(converted) = reflect_convert.try_convert_from(Box::new(string.clone()))
+                    else {
+                        return Err(DynamicBsnLoaderError::TypeMismatch);
+                    };
+
+                    let mut some_tuple = DynamicTuple::default();
+                    some_tuple.insert_boxed(converted.into_partial_reflect());
+                    let mut dynamic_option =
+                        DynamicEnum::new("Some", DynamicVariant::Tuple(some_tuple));
+                    dynamic_option.set_represented_type(Some(expected_type_registration.type_info()));
+                    return Ok(Box::new(dynamic_option));
                 }
 
                 // Otherwise, look for a registered `String` -> `expected` conversion. The conversion
@@ -837,6 +927,29 @@ fn create_reflect_default_from_type_registration(
     Ok(reflect_default.default())
 }
 
+/// Given a `bevy_asset::handle::Handle<T>` type path, returns the type path of the corresponding
+/// `bevy_asset::handle::HandleTemplate<T>` (the [`Template`](bevy_ecs::template::Template) that
+/// produces the handle), or `None` if `handle_type_path` is not a `Handle<T>` type path.
+fn handle_template_type_path(handle_type_path: &str) -> Option<String> {
+    const HANDLE_PREFIX: &str = "bevy_asset::handle::Handle<";
+    const HANDLE_TEMPLATE_PREFIX: &str = "bevy_asset::handle::HandleTemplate<";
+
+    let inner = handle_type_path.strip_prefix(HANDLE_PREFIX)?;
+    Some(format!("{HANDLE_TEMPLATE_PREFIX}{inner}"))
+}
+
+/// If `type_path` is `core::option::Option<bevy_asset::handle::Handle<T>>`, returns the inner
+/// `bevy_asset::handle::Handle<T>` type path. Otherwise returns `None`.
+fn option_handle_inner_type_path(type_path: &str) -> Option<&str> {
+    const OPTION_PREFIX: &str = "core::option::Option<";
+    const HANDLE_PREFIX: &str = "bevy_asset::handle::Handle<";
+
+    let inner = type_path
+        .strip_prefix(OPTION_PREFIX)?
+        .strip_suffix('>')?;
+    inner.starts_with(HANDLE_PREFIX).then_some(inner)
+}
+
 /// If `registration` is a `bevy_asset::handle::Handle<T>`, returns the registration for the
 /// corresponding `bevy_asset::handle::HandleTemplate<T>` (the [`Template`](bevy_ecs::template::Template)
 /// that produces the handle), if it is registered. Otherwise returns `None`.
@@ -848,12 +961,7 @@ fn handle_template_registration<'a>(
     type_registry: &'a TypeRegistry,
     registration: &TypeRegistration,
 ) -> Option<&'a TypeRegistration> {
-    const HANDLE_PREFIX: &str = "bevy_asset::handle::Handle<";
-    const HANDLE_TEMPLATE_PREFIX: &str = "bevy_asset::handle::HandleTemplate<";
-
-    let type_path = registration.type_info().type_path();
-    let inner = type_path.strip_prefix(HANDLE_PREFIX)?;
-    let template_type_path = format!("{HANDLE_TEMPLATE_PREFIX}{inner}");
+    let template_type_path = handle_template_type_path(registration.type_info().type_path())?;
     type_registry.get_with_type_path(&template_type_path)
 }
 
@@ -1056,67 +1164,29 @@ impl ErasedComponentTemplate for DefaultDynamicErasedTemplate {
 }
 
 /// Walks the fields of a reflected struct / tuple struct and resolves any field that names an asset
-/// into a concrete `Handle<T>`, replacing the field value. Two forms are handled, both produced by
-/// [`BsnAst::convert_bsn_expr_to_reflect`] for a `Handle<T>` field:
+/// into a concrete `Handle<T>`, replacing the field value. The forms handled, all produced by
+/// [`BsnAst::convert_bsn_expr_to_reflect`], are:
 ///
-/// - A **string literal** (`"path/to/asset"`) becomes a `HandleTemplate<T>::Path(AssetPath)` (via
-///   [`ReflectConvert`]); here we read the path back out and load it through the
+/// - A **string literal** assigned to a `Handle<T>` field becomes a `HandleTemplate<T>::Path`
+///   (via [`ReflectConvert`]); here we read the path back out and load it through the
 ///   [`AssetServer`](bevy_asset::AssetServer).
-/// - An **inline asset value** (`SomeAsset { .. }`) is left in the field as a reflected `T` value
-///   (the asset's own type, not a `Handle`/`HandleTemplate`); here we add it to `Assets<T>` via
-///   [`ReflectAsset`] and use the resulting handle.
+/// - A **string literal** assigned to an `Option<Handle<T>>` field becomes a
+///   `Some(HandleTemplate<T>::Path)`; here we resolve the inner handle and re-wrap in `Some`.
+/// - An **inline asset value** (`SomeAsset { .. }`) is left in the field as a reflected asset value;
+///   here we first recurse into the asset value to resolve *its* handle / option-handle fields, then
+///   add it to `Assets<T>` via [`ReflectAsset`] and use the resulting handle.
 ///
-/// In both cases [`ReflectHandle`] (registered on `Handle<T>`) types the resulting handle.
+/// In all cases [`ReflectHandle`] (registered on `Handle<T>`) types the resulting handle.
 ///
 /// `reflect` is a *dynamic* representation (`DynamicStruct` / `DynamicTupleStruct`) of the output
-/// component; resolved handle fields are replaced wholesale (the container is rebuilt) so the
-/// resolved `Handle<T>` value cleanly supersedes the `HandleTemplate`/asset value.
+/// component / inline asset; resolved fields are replaced wholesale (the container is rebuilt) so the
+/// resolved value cleanly supersedes the `HandleTemplate`/asset value, avoiding a kind-mismatch
+/// `.apply`.
 fn build_handle_template_fields(
     reflect: &mut Box<dyn PartialReflect>,
     context: &mut TemplateContext,
 ) {
-    const HANDLE_TEMPLATE_PREFIX: &str = "bevy_asset::handle::HandleTemplate<";
-    const HANDLE_PREFIX: &str = "bevy_asset::handle::Handle<";
-
-    /// What field `i` needs, decided from an immutable inspection of its current value.
-    enum FieldAction {
-        /// `HandleTemplate::Path(AssetPath)`: load the path. Carries the corresponding `Handle<T>`
-        /// type path.
-        LoadPath(AssetPath<'static>, String),
-        /// An inline asset value of a registered asset type: add it to `Assets<T>`. Carries the
-        /// asset's type path (used to find both `ReflectAsset` and the `Handle<T>` registration).
-        AddInline(String),
-    }
-
-    // Reads the `AssetPath` out of a reflected `HandleTemplate::Path(AssetPath)` value, along with
-    // the `Handle<T>` type path it corresponds to. Only the `Path` variant is read here (the only
-    // `HandleTemplate` variant `convert_bsn_expr_to_reflect` produces from a string literal).
-    fn handle_template_path(reflect: &dyn PartialReflect) -> Option<(AssetPath<'static>, String)> {
-        let type_path = reflect.get_represented_type_info()?.type_path();
-        let inner = type_path.strip_prefix(HANDLE_TEMPLATE_PREFIX)?;
-        let handle_type_path = format!("{HANDLE_PREFIX}{inner}");
-        let ReflectRef::Enum(enum_value) = reflect.reflect_ref() else {
-            return None;
-        };
-        if enum_value.variant_name() != "Path" {
-            return None;
-        }
-        let asset_path = enum_value
-            .field_at(0)?
-            .try_downcast_ref::<AssetPath<'static>>()?
-            .clone();
-        Some((asset_path, handle_type_path))
-    }
-
     let app_type_registry = context.resource::<AppTypeRegistry>().clone();
-
-    fn field_at(reflect: &dyn PartialReflect, i: usize) -> Option<&dyn PartialReflect> {
-        match reflect.reflect_ref() {
-            ReflectRef::Struct(reflect_struct) => reflect_struct.field_at(i),
-            ReflectRef::TupleStruct(reflect_tuple_struct) => reflect_tuple_struct.field(i),
-            _ => None,
-        }
-    }
 
     let field_count = match reflect.reflect_ref() {
         ReflectRef::Struct(reflect_struct) => reflect_struct.field_len(),
@@ -1128,75 +1198,18 @@ fn build_handle_template_fields(
     let mut replacements: Vec<Option<Box<dyn PartialReflect>>> = Vec::with_capacity(field_count);
 
     for i in 0..field_count {
-        // Decide what to do from an immutable borrow of the field, dropping it before any work.
-        let action = {
-            let Some(field) = field_at(&**reflect, i) else {
-                replacements.push(None);
-                continue;
+        let replacement = {
+            let field = match reflect.reflect_ref() {
+                ReflectRef::Struct(reflect_struct) => reflect_struct.field_at(i),
+                ReflectRef::TupleStruct(reflect_tuple_struct) => reflect_tuple_struct.field(i),
+                _ => None,
             };
-            if let Some((path, handle_type_path)) = handle_template_path(field) {
-                Some(FieldAction::LoadPath(path, handle_type_path))
-            } else if let Some(type_info) = field.get_represented_type_info() {
-                let type_path = type_info.type_path();
-                let is_asset = app_type_registry
-                    .read()
-                    .get_with_type_path(type_path)
-                    .is_some_and(|registration| registration.data::<ReflectAsset>().is_some());
-                is_asset.then(|| FieldAction::AddInline(type_path.to_owned()))
-            } else {
-                None
-            }
+            field.and_then(|field| resolve_handle_field(field, &app_type_registry, context))
         };
-
-        // Build the concrete `Handle<T>` reflected value (typed via `ReflectHandle`).
-        let handle_reflect: Option<Box<dyn Reflect>> = match action {
-            None => None,
-            Some(FieldAction::LoadPath(asset_path, handle_type_path)) => {
-                let reflect_handle = app_type_registry
-                    .read()
-                    .get_with_type_path(&handle_type_path)
-                    .and_then(|registration| registration.data::<ReflectHandle>())
-                    .cloned();
-                reflect_handle.map(|reflect_handle| {
-                    let untyped: UntypedHandle = context
-                        .resource::<AssetServer>()
-                        .load_builder()
-                        .load_erased(reflect_handle.asset_type_id(), asset_path);
-                    reflect_handle.typed(untyped)
-                })
-            }
-            Some(FieldAction::AddInline(asset_type_path)) => {
-                let handle_type_path = format!("{HANDLE_PREFIX}{asset_type_path}>");
-                // Add the inline asset value to `Assets<T>` via `ReflectAsset` (needs `&mut World`,
-                // obtained safely through `world_scope`), then type the resulting handle.
-                let reflect_asset = app_type_registry
-                    .read()
-                    .get_with_type_path(&asset_type_path)
-                    .and_then(|registration| registration.data::<ReflectAsset>())
-                    .cloned();
-                let reflect_handle = app_type_registry
-                    .read()
-                    .get_with_type_path(&handle_type_path)
-                    .and_then(|registration| registration.data::<ReflectHandle>())
-                    .cloned();
-                match (reflect_asset, reflect_handle, field_at(&**reflect, i)) {
-                    (Some(reflect_asset), Some(reflect_handle), Some(field)) => {
-                        let untyped = context
-                            .entity
-                            .world_scope(|world| reflect_asset.add(world, field));
-                        Some(reflect_handle.typed(untyped))
-                    }
-                    _ => None,
-                }
-            }
-        };
-
-        // Store the resolved handle (as a dynamic value) for this field, or `None` to keep the
-        // original field value.
-        replacements.push(handle_reflect.map(|handle| handle.to_dynamic()));
+        replacements.push(replacement);
     }
 
-    // Rebuild the container with the resolved handle fields replaced. Build the new value fully
+    // Rebuild the container with the resolved fields replaced. Build the new value fully
     // (borrowing the current value), then reassign.
     let represented_type = reflect.get_represented_type_info();
     let rebuilt: Option<Box<dyn PartialReflect>> = match reflect.reflect_ref() {
@@ -1230,6 +1243,121 @@ fn build_handle_template_fields(
     if let Some(rebuilt) = rebuilt {
         *reflect = rebuilt;
     }
+}
+
+/// Reads the `AssetPath` out of a reflected `HandleTemplate::Path(AssetPath)` value, along with the
+/// `Handle<T>` type path it corresponds to. Returns `None` if `reflect` is not a `HandleTemplate`
+/// in the `Path` variant (the only variant `convert_bsn_expr_to_reflect` produces from a string).
+fn handle_template_path(reflect: &dyn PartialReflect) -> Option<(AssetPath<'static>, String)> {
+    const HANDLE_TEMPLATE_PREFIX: &str = "bevy_asset::handle::HandleTemplate<";
+    const HANDLE_PREFIX: &str = "bevy_asset::handle::Handle<";
+
+    let type_path = reflect.get_represented_type_info()?.type_path();
+    let inner = type_path.strip_prefix(HANDLE_TEMPLATE_PREFIX)?;
+    let handle_type_path = format!("{HANDLE_PREFIX}{inner}");
+    let ReflectRef::Enum(enum_value) = reflect.reflect_ref() else {
+        return None;
+    };
+    if enum_value.variant_name() != "Path" {
+        return None;
+    }
+    let asset_path = enum_value
+        .field_at(0)?
+        .try_downcast_ref::<AssetPath<'static>>()?
+        .clone();
+    Some((asset_path, handle_type_path))
+}
+
+/// Loads `asset_path` for the asset behind `handle_type_path` (a `Handle<T>` type path) and returns
+/// the concrete typed `Handle<T>` reflected value, using [`ReflectHandle`].
+fn load_typed_handle(
+    handle_type_path: &str,
+    asset_path: AssetPath<'static>,
+    type_registry: &AppTypeRegistry,
+    context: &mut TemplateContext,
+) -> Option<Box<dyn Reflect>> {
+    let reflect_handle = type_registry
+        .read()
+        .get_with_type_path(handle_type_path)
+        .and_then(|registration| registration.data::<ReflectHandle>())
+        .cloned()?;
+    let untyped: UntypedHandle = context
+        .resource::<AssetServer>()
+        .load_builder()
+        .load_erased(reflect_handle.asset_type_id(), asset_path);
+    Some(reflect_handle.typed(untyped))
+}
+
+/// Resolves a single field value, returning its replacement (as a dynamic value) or `None` to keep
+/// the original. Handles bare-`Handle` string paths, `Option<Handle>` (`Some(HandleTemplate::Path)`)
+/// values, and inline asset values (recursing into the asset to resolve *its* handle fields before
+/// adding it to `Assets<T>`).
+fn resolve_handle_field(
+    field: &dyn PartialReflect,
+    type_registry: &AppTypeRegistry,
+    context: &mut TemplateContext,
+) -> Option<Box<dyn PartialReflect>> {
+    const HANDLE_PREFIX: &str = "bevy_asset::handle::Handle<";
+
+    // Bare `Handle<T>` field holding a `HandleTemplate::Path`.
+    if let Some((asset_path, handle_type_path)) = handle_template_path(field) {
+        return load_typed_handle(&handle_type_path, asset_path, type_registry, context)
+            .map(|handle| handle.to_dynamic());
+    }
+
+    let field_type_path = field.get_represented_type_info()?.type_path();
+
+    // `Option<Handle<T>>` field holding `Some(HandleTemplate::Path)`: resolve the inner handle and
+    // re-wrap in `Some`.
+    if let Some(inner_handle_type_path) = option_handle_inner_type_path(field_type_path) {
+        let ReflectRef::Enum(enum_value) = field.reflect_ref() else {
+            return None;
+        };
+        if enum_value.variant_name() != "Some" {
+            return None;
+        }
+        let (asset_path, handle_type_path) = handle_template_path(enum_value.field_at(0)?)?;
+        debug_assert_eq!(handle_type_path, inner_handle_type_path);
+        let handle = load_typed_handle(&handle_type_path, asset_path, type_registry, context)?;
+        let mut some_tuple = DynamicTuple::default();
+        some_tuple.insert_boxed(handle.into_partial_reflect());
+        let mut dynamic_option = DynamicEnum::new("Some", DynamicVariant::Tuple(some_tuple));
+        dynamic_option.set_represented_type(field.get_represented_type_info());
+        return Some(Box::new(dynamic_option));
+    }
+
+    // Inline asset value of a registered asset type: recurse to resolve its handle fields, then add
+    // it to `Assets<T>` and replace the field with the resulting concrete `Handle<T>`.
+    let is_asset = type_registry
+        .read()
+        .get_with_type_path(field_type_path)
+        .is_some_and(|registration| registration.data::<ReflectAsset>().is_some());
+    if !is_asset {
+        return None;
+    }
+
+    let asset_type_path = field_type_path.to_owned();
+    let handle_type_path = format!("{HANDLE_PREFIX}{asset_type_path}>");
+
+    // Recurse into a dynamic copy of the asset value to resolve its nested handle / option-handle
+    // fields before adding it, so the stored asset holds concrete `Handle`s.
+    let mut asset_value = field.to_dynamic();
+    build_handle_template_fields(&mut asset_value, context);
+
+    let reflect_asset = type_registry
+        .read()
+        .get_with_type_path(&asset_type_path)
+        .and_then(|registration| registration.data::<ReflectAsset>())
+        .cloned()?;
+    let reflect_handle = type_registry
+        .read()
+        .get_with_type_path(&handle_type_path)
+        .and_then(|registration| registration.data::<ReflectHandle>())
+        .cloned()?;
+    let untyped = context
+        .entity
+        .world_scope(|world| reflect_asset.add(world, asset_value.as_partial_reflect()));
+    Some(reflect_handle.typed(untyped).to_dynamic())
 }
 
 #[derive(Clone)]

@@ -78,6 +78,9 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "render/rt_pipeline/blit.wgsl");
     #[cfg(feature = "dlss")]
     embedded_asset!(app, "render/dlss_resolve.wgsl");
+    embedded_asset!(app, "geometry/tess_displace.wgsl");
+    embedded_asset!(app, "geometry/tess_normals.wgsl");
+    embedded_asset!(app, "geometry/tess_ptlas_write.wgsl");
     embedded_asset!(app, "accel/selector.wgsl");
     embedded_asset!(app, "accel/blas_sharing.wgsl");
     embedded_asset!(app, "accel/ptlas_fill.wgsl");

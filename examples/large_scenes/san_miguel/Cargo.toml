@@ -22,7 +22,7 @@ argh = "0.1.12"
 
 [features]
 
-default = ["debug_text"]
+default = ["debug_text", "solari"]
 debug_text = ["bevy/bevy_ui"]
 # Full ray-traced rendering via bevy_solari (PbrPlugin disabled). Mirrors the
 # bevy_city `solari` feature; `cluster_processor` gates the mesh→ClusterMesh

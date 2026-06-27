@@ -210,6 +210,9 @@ pub fn prepare_raytracing_scene_bindings(
         else {
             continue;
         };
+        let Some(displacement_texture_id) = process_texture(&material.depth_map) else {
+            continue;
+        };
 
         // Texture-size term of the ray-cone LOD, from the base-color texture
         // (representative of the material's maps). 0 ⇒ no base-color texture.
@@ -258,6 +261,9 @@ pub fn prepare_raytracing_scene_bindings(
             alpha_mask: material.traversal_alpha_cutoff(),
             dispersion: material.dispersion.max(0.0),
             texel_lod_bias,
+            displacement_texture_id,
+            displacement_scale: material.depth_scale,
+            displacement_bias: material.depth_bias,
         };
     }
 
@@ -458,6 +464,12 @@ struct GpuMaterial {
     // crushed warp occupancy). Shared across the material's maps (they're
     // near-always the same resolution).
     texel_lod_bias: f32,
+    // Displacement (height) map: `TEXTURE_MAP_NONE` if absent. Consumed when the
+    // surface is tessellated — each generated micro-vertex offsets along its
+    // normal by `height * displacement_scale + displacement_bias` (world units).
+    displacement_texture_id: u32,
+    displacement_scale: f32,
+    displacement_bias: f32,
 }
 
 impl Default for GpuMaterial {
@@ -480,6 +492,9 @@ impl Default for GpuMaterial {
             alpha_mask: -1.0,
             dispersion: 0.0,
             texel_lod_bias: 0.0,
+            displacement_texture_id: TEXTURE_MAP_NONE,
+            displacement_scale: 0.0,
+            displacement_bias: 0.0,
         }
     }
 }

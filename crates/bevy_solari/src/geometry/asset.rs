@@ -10,7 +10,7 @@ use bevy_asset::{
     Asset, AssetLoader, AssetPath, AsyncReadExt, AsyncWriteExt, LoadContext,
 };
 use bevy_math::{Vec2, Vec3, Vec4};
-use bevy_reflect::TypePath;
+use bevy_reflect::{Reflect, TypePath};
 use bevy_render::render_resource::ShaderType;
 use bevy_tasks::block_on;
 use bytemuck::{Pod, Zeroable};
@@ -37,7 +37,12 @@ pub const CLUSTER_MESH_ASSET_VERSION: u64 = 2;
 /// The selector walks `nodes` (optional interior tree) down to
 /// `groups` (DAG-cut units) and emits the contiguous cluster range
 /// each accepted group owns.
-#[derive(Asset, TypePath, Clone)]
+// Reflect-opaque: `ClusterMesh` is never authored inline / reflected field-by-field (it loads from
+// the binary `.cluster_mesh` format), but it must be `Reflect` so `HandleTemplate<ClusterMesh>` is
+// reflectable and `RaytracingMesh3d("path")` can resolve from a `.bsn` string. `Clone` is cheap
+// (the heavy fields are `Arc`s).
+#[derive(Asset, Clone, Reflect)]
+#[reflect(opaque)]
 pub struct ClusterMesh {
     /// `[f32; 3]` positions, one entry per vertex. 12-byte stride
     /// keeps the stream tight; shaders read via an `array<f32>`

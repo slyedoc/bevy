@@ -15,12 +15,12 @@ use bevy_ecs::{
     prelude::{Query, ResMut, With},
     schedule::{common_conditions::resource_exists, IntoScheduleConfigs},
 };
-use bevy_math::Vec3;
+use bevy_math::{Quat, Vec3};
 use bevy_render::{
     extract_resource::ExtractResourcePlugin, renderer::RenderGraph, Render, RenderApp,
     RenderStartup, RenderSystems,
 };
-use bevy_transform::components::Transform;
+use bevy_transform::components::{GlobalTransform, Transform};
 use bevy_transform::systems::{propagate_transforms_for, sync_simple_transforms};
 use bevy_ui::Node;
 
@@ -103,6 +103,14 @@ pub struct SolariTransformPlugin;
 
 impl Plugin for SolariTransformPlugin {
     fn build(&self, app: &mut App) {
+        // Solari owns the transform system on the full-RT path (`TransformPlugin` is disabled), so
+        // it registers the transform components + the glam types it's responsible for. This also
+        // lets dynamic `.bsn` scenes name `Transform { translation: Vec3, rotation: Quat, scale:
+        // Vec3 }` without relying on the `reflect_auto_register` feature being enabled.
+        app.register_type::<Transform>()
+            .register_type::<GlobalTransform>()
+            .register_type::<Vec3>()
+            .register_type::<Quat>();
 
         // The transform pass shaders are embedded centrally in `crate::pipelines`,
         // co-located with their `SolariPipelines` builds.

@@ -72,7 +72,7 @@ fn reset_on_change(
         return;
     }
     for mut reset in &mut cameras {
-        reset.0 = true;
+        reset.history = true;
     }
 }
 

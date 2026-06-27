@@ -13,7 +13,7 @@ enable primitive_index;
 #import bevy_solari::rt_payload::{RtPayload, ShadowPayload, RtCamera}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::sampling::{generate_random_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, power_heuristic, NULL_LIGHT_ID}
-#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, load_material_bindless, sample_texture_lod, TEXTURE_MAP_NONE}
 
 var<incoming_ray_payload> payload: RtPayload;
 // Outgoing payload for the NEE shadow ray (see `miss_shadow`).
@@ -92,6 +92,23 @@ fn chit_opaque(
         vec4<f32>(object_to_world[0].z, object_to_world[1].z, object_to_world[2].z, object_to_world[3].z),
     );
     let ray_hit = resolve_triangle_data_full_mat_fetch(instance_id, sbt.material_id, transform, cluster_id, primitive_index, barycentrics, hit_positions);
+
+    // Displacement debug view (`frame.w == 1`): replace shading with the surface's height map in
+    // grayscale, validating the displacement wiring (which map → which surface, the UVs, the sign)
+    // BEFORE tessellation actually moves geometry. Surfaces with no displacement map read dim grey
+    // for context. Terminate the path and divide by exposure so the raygen's `radiance *= exposure`
+    // cancels — the pixel shows the raw `[0,1]` height.
+    if camera.frame.w == 1u {
+        let dmat = load_material_bindless(ray_hit.material_id);
+        var height = 0.02;
+        if dmat.displacement_texture_id != TEXTURE_MAP_NONE {
+            height = sample_texture_lod(dmat.displacement_texture_id, ray_hit.uv, 0.0).r;
+        }
+        payload.emitted = vec3<f32>(height) / max(camera.camera_position.w, 1e-6);
+        payload.bounce = 0u;
+        payload.rng = rng;
+        return;
+    }
 
     let wo = -ray_direction;
     // Bend the smooth shading normal into the view hemisphere so silhouette

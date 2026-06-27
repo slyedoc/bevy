@@ -300,11 +300,14 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 args.extensions
                     .push(khr::ray_tracing_position_fetch::NAME);
                 additional.insert::<RayTracingPositionFetchFeature>();
-                let features = Box::leak(Box::new(
-                    vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
-                        .ray_tracing_position_fetch(true),
-                ));
-                *args.create_info = core::mem::take(args.create_info).push(features);
+                // Do NOT push `PhysicalDeviceRayTracingPositionFetchFeaturesKHR` here:
+                // wgpu's adapter adds + enables it itself for any enabled extension in
+                // the set (wgpu-hal `vulkan/adapter.rs` — `position_fetch` is built
+                // `if enabled_extensions.contains(ray_tracing_position_fetch::NAME)`,
+                // which is now true from the push above). Pushing our own copy too put
+                // the struct in the device `pNext` chain twice
+                // (VUID-VkDeviceCreateInfo-sType-unique). The extension name + marker
+                // are enough; wgpu chains the (enabled) feature struct.
             }
 
             // Shader clock — `shader_clock()` (OpReadClockKHR, Subgroup scope) for the
@@ -320,6 +323,33 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                         .shader_subgroup_clock(true),
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
+            }
+
+            // NV ray-tracing validation — the driver's own RT-specific checks (AS
+            // build/traversal sanity, SBT, invalid addresses during a trace) that
+            // the standard validation layers can't see. Reported through the
+            // VK_EXT_debug_utils messenger wgpu already registers, so the messages
+            // surface alongside the other `wgpu_hal::vulkan::instance` lines; the
+            // driver auto-flushes them at device idle / device lost. The driver
+            // only EXPOSES the extension when the developer sets
+            // `NV_ALLOW_RAYTRACING_VALIDATION=1`, so `supports()` gates it for free
+            // (no cost in normal runs).
+            if supports(nv::ray_tracing_validation::NAME) {
+                args.extensions.push(nv::ray_tracing_validation::NAME);
+                let features = Box::leak(Box::new(
+                    vk::PhysicalDeviceRayTracingValidationFeaturesNV::default()
+                        .ray_tracing_validation(true),
+                ));
+                *args.create_info = core::mem::take(args.create_info).push(features);
+                tracing::warn!(
+                    "VK_NV_ray_tracing_validation ENABLED — driver RT validation messages \
+                     (if any) will appear as wgpu_hal VALIDATION lines."
+                );
+            } else {
+                tracing::warn!(
+                    "VK_NV_ray_tracing_validation NOT exposed by the driver — set \
+                     NV_ALLOW_RAYTRACING_VALIDATION=1 (and the driver must support it)."
+                );
             }
         });
     }

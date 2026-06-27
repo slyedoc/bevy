@@ -13,7 +13,7 @@ mod reset;
 pub mod view;
 pub mod view_cull;
 
-use bevy_app::{App, Plugin};
+use bevy_app::{App, Plugin, Update};
 use bevy_camera::Hdr;
 use bevy_core_pipeline::{
     core_3d::{main_opaque_pass_3d, main_transparent_pass_3d},
@@ -65,6 +65,33 @@ impl Plugin for SolarRenderPlugin {
             .add_plugins(ExtractResourcePlugin::<dlss::SolariDlssMode>::default());
         app.init_resource::<rt_pipeline::SolariCostHeatmap>()
             .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariCostHeatmap>::default());
+        app.init_resource::<rt_pipeline::SolariShowDisplacement>()
+            .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariShowDisplacement>::default());
+        // The displacement (height) map the tessellation showcase samples — the app
+        // sets it (san_miguel → a floor displacement texture); extracted so the
+        // render-world self-test can resolve its `GpuImage`.
+        app.init_resource::<crate::geometry::tess_displace::TessShowcaseDisplacement>()
+            .add_plugins(
+                ExtractResourcePlugin::<crate::geometry::tess_displace::TessShowcaseDisplacement>::default(),
+            );
+        // In-situ tessellation showcase: pick a real displacement-mapped instance
+        // (main world) + extract its mesh/transform/texture for the render-world
+        // self-test to tessellate in place.
+        app.init_resource::<crate::geometry::tess_displace::TessShowcaseInstances>()
+            .add_plugins(
+                ExtractResourcePlugin::<crate::geometry::tess_displace::TessShowcaseInstances>::default(),
+            )
+            .add_systems(
+                Update,
+                (
+                    (
+                        crate::geometry::tess_displace::find_tess_showcase_instances,
+                        crate::geometry::tess_displace::reclassify_tess_levels,
+                    )
+                        .chain(),
+                    crate::geometry::tess_displace::hide_tessellated_base_instances,
+                ),
+            );
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app

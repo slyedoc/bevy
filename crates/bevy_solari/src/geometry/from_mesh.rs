@@ -23,7 +23,7 @@ use bevy_math::{Vec2, Vec3, Vec3Swizzles, Vec4};
 use bevy_mesh::{Mesh, MeshVertexAttributeId, VertexAttributeValues};
 use bevy_platform::collections::HashMap;
 use meshopt::{
-    build_meshlets, generate_position_remap, partition_clusters, simplify_with_locks,
+    build_meshlets_spatial, generate_position_remap, partition_clusters, simplify_with_locks,
     SimplifyOptions, VertexDataAdapter,
 };
 use thiserror::Error;
@@ -37,6 +37,14 @@ pub const MAX_CLUSTER_VERTICES: usize = 128;
 /// Max triangles per cluster. Must be divisible by 4 per meshopt;
 /// 124 is the largest valid value ≤ 128.
 pub const MAX_CLUSTER_TRIANGLES: usize = 124;
+/// Min triangles per cluster for `build_meshlets_spatial` (divisible by 4). A floor
+/// that keeps spatial clusters from collapsing into tiny CLASes; `SPATIAL_FILL_WEIGHT`
+/// trades cluster fullness against locality above it.
+pub const MIN_CLUSTER_TRIANGLES: usize = 60;
+/// Spatial-meshlet fill weight: `0.0` = purest spatial locality (tightest cluster
+/// bounds, more clusters), `1.0` = fullest clusters. `0.5` balances tight bounds (faster
+/// RT/CLAS traversal) against cluster count.
+pub const SPATIAL_FILL_WEIGHT: f32 = 0.5;
 /// Target clusters per group at partition time. Balances
 /// simplification quality against group count.
 pub const TARGET_GROUP_SIZE: usize = 8;
@@ -137,14 +145,18 @@ impl TryFrom<&Mesh> for ClusterMesh {
                 break;
             }
 
-            // 1. Cluster the current triangle stream.
-            // cone_weight 0: no cone optimization (ray tracing, not raster).
-            let meshlets = build_meshlets(
+            // 1. Cluster the current triangle stream SPATIALLY: tight cluster bounding
+            //    volumes speed up ray-tracing CLAS/BLAS traversal. `build_meshlets`
+            //    instead optimizes vertex-cache locality — a rasterization metric the
+            //    RT path doesn't benefit from. `SPATIAL_FILL_WEIGHT` balances bounds
+            //    tightness against cluster count.
+            let meshlets = build_meshlets_spatial(
                 &current_indices,
                 &vert_adapter,
                 MAX_CLUSTER_VERTICES,
+                MIN_CLUSTER_TRIANGLES,
                 MAX_CLUSTER_TRIANGLES,
-                0.0,
+                SPATIAL_FILL_WEIGHT,
             );
             if meshlets.len() == 0 {
                 break;

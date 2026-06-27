@@ -55,6 +55,10 @@ fn solari_material_from_gltf(
         nested_priority,
         alpha_mode: material.alpha_mode,
         normal_map_texture: material.normal_map_texture.clone(),
+        // No standard glTF displacement; authored on `SolariMaterial` directly.
+        depth_map: None,
+        depth_scale: 1.0,
+        depth_bias: 0.0,
         // No glTF portal concept; portal surfaces set `SolariMaterial::portal` directly.
         portal: false,
     }

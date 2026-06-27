@@ -99,6 +99,13 @@ pub struct RtGeometryAddresses {
     /// Byte stride of one material record (`GPU_MATERIAL_SIZE`).
     pub material_stride: u32,
     pub _pad: u32,
+    /// Base device address of the tessellation per-CLAS metadata table (one
+    /// `TessCluster` per sentinel tess CLAS: its per-instance smooth-normal buffer
+    /// address + primitive base). `0` when the smooth-tess path is off — the
+    /// closest-hit then shades tess hits with the facet normal. See
+    /// [`crate::geometry::tess_displace::TessShowcase`].
+    pub tess_clusters: u64,
+    pub _pad1: u64,
 }
 
 /// A raw host-visible buffer kept with its memory + mapping, for the SBT and the
@@ -837,10 +844,13 @@ impl RtPipeline {
             // page fault / device loss that CPU-side validation never catches.
             //   AS build write  -> RT-shader AS read
             //   compute storage write -> RT-shader storage read
+            //   transfer write -> RT-shader read (the tess smooth-normal metadata
+            //   table is uploaded via a staging copy before the trace reads it)
             let pre = vk::MemoryBarrier::default()
                 .src_access_mask(
                     vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR
-                        | vk::AccessFlags::SHADER_WRITE,
+                        | vk::AccessFlags::SHADER_WRITE
+                        | vk::AccessFlags::TRANSFER_WRITE,
                 )
                 .dst_access_mask(
                     vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
@@ -849,7 +859,8 @@ impl RtPipeline {
             self.device.cmd_pipeline_barrier(
                 command_buffer,
                 vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
-                    | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    | vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
                 vk::DependencyFlags::empty(),
                 &[pre],
