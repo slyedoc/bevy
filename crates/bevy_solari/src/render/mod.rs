@@ -38,7 +38,7 @@ use crate::bindings::RaytracingSceneBindings;
 use crate::ecs_gpu::SceneColumns;
 use crate::pipelines::SolariPipelines;
 use crate::render::view::{rt_pipeline_enabled, SolariViewState};
-pub use reset::CameraReset;
+pub use reset::{CameraReframe, CameraReset};
 
 pub struct SolarRenderPlugin;
 
@@ -81,6 +81,7 @@ impl Plugin for SolarRenderPlugin {
                         reset::reset_render_on_request,
                     )
                         .chain(),
+                    (reset::clear_camera_reframe, reset::extract_camera_reframe).chain(),
                     view_cull::extract_solari_view_cull_masks,
                     view_cull::extract_solari_skybox,
                     atmosphere::extract_solari_atmosphere,
@@ -177,5 +178,5 @@ impl Plugin for SolarRenderPlugin {
 
 #[derive(Component, Default, Reflect, Clone, ExtractComponent)]
 #[reflect(Component, Default, Clone)]
-#[require(Hdr, CameraReset)]
+#[require(Hdr, CameraReset, CameraReframe)]
 pub struct SolariCamera;

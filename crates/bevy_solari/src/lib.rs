@@ -117,7 +117,7 @@ pub enum SolariClusterSystems {
 pub mod prelude {
     pub use crate::{
         bindings::RaytracingMesh3d, bindings::SolariFogVolume, bindings::SolariPortal,
-        render::CameraReset, render::SolariCamera,
+        render::CameraReframe, render::CameraReset, render::SolariCamera,
         render::rt_pipeline::SolariCostHeatmap,
         render::atmosphere::{SolariAtmosphere, SolariGlobalFog},
         SolariInitPlugin, SolariPlugin,

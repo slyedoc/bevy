@@ -40,7 +40,7 @@ use crate::geometry::ClusterMeshManager;
 use crate::render::atmosphere::{AtmosphereSky, SolariAtmosphereView};
 use bevy_render::extract_resource::ExtractResource;
 use crate::render::view_cull::SolariEnvironmentMap;
-use crate::render::SolariCamera;
+use crate::render::{CameraReframe, SolariCamera};
 
 /// `RenderStartup`: build the RT pipeline (raygen/miss/chit + SBT) if the
 /// `VK_KHR_ray_tracing_pipeline` feature is present and the raw-VK allocator
@@ -314,6 +314,7 @@ pub(crate) fn rt_pipeline(
         Option<&SolariEnvironmentMap>,
         Option<&RtPrevViewProj>,
         Option<&SolariDlssJitter>,
+        Option<&CameraReframe>,
     )>,
     rt: Option<Res<RtPipeline>>,
     rt_blit: Res<RtBlit>,
@@ -342,6 +343,7 @@ pub(crate) fn rt_pipeline(
         environment_map,
         prev_view_proj,
         dlss_jitter,
+        reframe,
     ) = view.into_inner();
 
     // Environment cube the miss shader samples (same priority as the megakernel):
@@ -500,7 +502,15 @@ pub(crate) fn rt_pipeline(
     // Computed unconditionally (a few matrix ops) so the dlss/non-dlss camera path
     // stays identical; only the chit (under `#ifdef SOLARI_DLSS`) reads these.
     let clip_from_world = view.clip_from_view * view_from_world;
-    let prev_clip_from_world = prev_view_proj.map_or(clip_from_world, |p| p.clip_from_world);
+    // Cached previous clip-from-world (current ⇒ zero motion on the first frame). On a
+    // floating-origin frame handoff the cache is still in the OLD origin basis, so the
+    // bridge-supplied reframe re-expresses it in the new basis (post-multiply by
+    // prev_world_from_current_world) for this one frame — keeping motion vectors
+    // continuous across the discontinuity instead of dropping history.
+    let mut prev_clip_from_world = prev_view_proj.map_or(clip_from_world, |p| p.clip_from_world);
+    if let Some(reframe) = reframe.filter(|r| !r.is_identity()) {
+        prev_clip_from_world *= reframe.prev_from_current;
+    }
     let camera_inputs = RtCamera {
         inverse_view_proj: world_from_clip.to_cols_array(),
         view_from_world: view_from_world.to_cols_array(),

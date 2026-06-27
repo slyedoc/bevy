@@ -1,4 +1,5 @@
 use bevy_ecs::{change_detection::DetectChanges, component::Component, query::With, system::{Commands, Query, Res}, world::Ref};
+use bevy_math::Mat4;
 use bevy_reflect::Reflect;
 use bevy_render::{Extract, sync_world::RenderEntity};
 
@@ -88,5 +89,75 @@ pub fn reset_render_on_view_state_change(
     }
     for e in &cameras {
         commands.entity(e).insert(CameraReset::request());
+    }
+}
+
+/// A one-frame, **motion-vector-continuous** basis correction for a floating-origin
+/// frame handoff (the camera crossed from one [`SolariFrame`](crate::transform::SolariFrame)'s
+/// basis into another). Where [`CameraReset::reframe`] *drops* temporal history at the
+/// discontinuity, this **re-expresses** last frame's view-projection in the new origin
+/// basis, so motion vectors stay continuous through the handoff — prefer it when the
+/// source/destination frame poses are known, and fall back to the reset drop otherwise.
+///
+/// **Neutral by construction:** solari never names the physics layer. A bridge in the app
+/// (which depends on both crates) observes the handoff — e.g. avian's `WorldTransferred`
+/// fact event — reads the two frame anchors' poses (and `AngularVelocity` if it wants
+/// continuity *during* a spinning-frame handoff, not just at the jump), and writes
+/// `prev_from_current`: the rigid map taking a **current**-frame world point into the
+/// **previous** frame's basis. solari post-multiplies the cached `prev_clip_from_world`
+/// by it for exactly one frame (after which the prev cache is re-stored in the new basis).
+/// Identity (the default) = no correction.
+///
+/// Rotational part follows the handoff: `R = R_to⁻¹ · R_from` (the source basis seen from
+/// the destination); the translational part carries the anchors' relative offset at the
+/// handoff instant. Both come off the frame entities — the single shared seam.
+#[derive(Component, Clone, Copy, Debug, Reflect)]
+pub struct CameraReframe {
+    /// `prev_world_from_current_world`: cached `prev_clip_from_world` is post-multiplied
+    /// by this so a current-basis world point reprojects to its previous-frame screen pos.
+    pub prev_from_current: Mat4,
+}
+
+impl Default for CameraReframe {
+    fn default() -> Self {
+        Self { prev_from_current: Mat4::IDENTITY }
+    }
+}
+
+impl CameraReframe {
+    /// A correction from a `prev_world_from_current_world` rigid transform.
+    pub const fn from_prev_from_current(prev_from_current: Mat4) -> Self {
+        Self { prev_from_current }
+    }
+
+    /// No correction this frame (the default) — solari leaves `prev_clip_from_world` as-is.
+    #[inline]
+    pub fn is_identity(&self) -> bool {
+        self.prev_from_current == Mat4::IDENTITY
+    }
+}
+
+/// Clears any forwarded render-world [`CameraReframe`] at extract start (mirrors
+/// [`clear_camera_reset`]): the correction is one-frame, so a handoff that forwarded
+/// one last frame must not keep applying it. [`extract_camera_reframe`] re-forwards it
+/// only on the frame the main-world value actually changes.
+pub fn clear_camera_reframe(mut reframes: Query<&mut CameraReframe>) {
+    for mut reframe in &mut reframes {
+        *reframe = CameraReframe::default();
+    }
+}
+
+/// Forwards a main-world [`CameraReframe`] the app's handoff bridge set this frame to the
+/// camera's render entity (edge-triggered + non-identity, so a steady identity never
+/// touches the render world). The render-world copy is consumed by the rt_pipeline and
+/// cleared next frame by [`clear_camera_reframe`].
+pub fn extract_camera_reframe(
+    cameras: Extract<Query<(RenderEntity, Ref<CameraReframe>), With<SolariCamera>>>,
+    mut commands: Commands,
+) {
+    for (e, reframe) in &cameras {
+        if reframe.is_changed() && !reframe.is_identity() {
+            commands.entity(e).insert(*reframe);
+        }
     }
 }
