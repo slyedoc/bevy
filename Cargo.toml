@@ -1644,12 +1644,31 @@ required-features = [
     "bevy_solari",
     "bevy_solari_debug",
     "cluster_processor",
-    "free_camera",    
+    "free_camera",
+    "bevy_dev_tools",
 ]
 
 [package.metadata.example.solari_floating_origin]
 name = "Solari (floating origin)"
 description = "Galactic-scale ray tracing with no f32 collapse: solari's native GPU floating origin (big_space-style), camera parked 1 AU from the grid origin."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_frames"
+path = "examples/3d/solari/frames.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_frames]
+name = "Solari (reference frames)"
+description = "A moving SolariFrame whose children ride its pose on the GPU transform table — a spinning station against a fixed world; the foundation for co-resident multi-world (frame → PTLAS partition)."
 category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 

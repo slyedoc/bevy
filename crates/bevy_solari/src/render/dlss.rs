@@ -535,7 +535,7 @@ pub fn solari_dlss_render(
         screen_space_subsurface_scattering_guide: None,
         bias: None,
         dlss_output: post.destination,
-        reset: reset.0,
+        reset: reset.active(),
         jitter_offset: (-jitter.offset).to_array(),
         partial_texture_size: Some(render_resolution.to_array()),
         // MV are UV-space (NDC*0.5, y-flipped); RR wants pixel-space toward history.

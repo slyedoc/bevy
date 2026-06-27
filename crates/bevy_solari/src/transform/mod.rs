@@ -40,8 +40,8 @@ pub use gather::{
 };
 pub use graph::{
     extract_transform_graph, CellColumn, LocalColumn, NodeEntityColumn, ParentColumn,
-    SolariFloatingOrigin, SolariGridCell, StaticColumn, TransformGraph, TransformStatic,
-    TransformTablePlugin, ROOT_PARENT,
+    SolariFloatingOrigin, SolariFrame, SolariGridCell, StaticColumn, TransformGraph,
+    TransformStatic, TransformTablePlugin, ROOT_PARENT,
 };
 pub use propagate::{
     dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,
@@ -65,10 +65,12 @@ use readback::{
 /// path tracer jitter and pixelate).
 ///
 /// The origin jump re-worlds every instance for one frame (the propagate's
-/// `needs_full_rebuild` latch fires on the origin change), so we pulse [`CameraReset`]
-/// — a one-frame DLSS + ReSTIR history reset so reprojection doesn't smear across the
-/// discontinuity. No-op when no floating origin is configured (`cell_edge == 0`), so
-/// scenes without a floating origin pay only an early-returning query.
+/// `needs_full_rebuild` latch fires on the origin change), so we pulse a
+/// [`CameraReset::reframe`] — the previous frame's transforms and view-projection
+/// are in the OLD origin cell, so this is a basis rebase, not just a history smear:
+/// motion-vector reprojection is invalid this frame, not merely stale. No-op when no
+/// floating origin is configured (`cell_edge == 0`), so scenes without a floating
+/// origin pay only an early-returning query.
 pub fn recenter_floating_origin(
     mut origin: ResMut<SolariFloatingOrigin>,
     mut camera: Query<(&mut Transform, &mut CameraReset), With<SolariCamera>>,
@@ -90,7 +92,7 @@ pub fn recenter_floating_origin(
     origin.origin_cell[1] += drift.y as i32;
     origin.origin_cell[2] += drift.z as i32;
     transform.translation -= drift * edge;
-    reset.0 = true;
+    *reset = CameraReset::reframe();
 }
 
 /// The transform-table plugin: the macro-generated table (`local`/`parent`

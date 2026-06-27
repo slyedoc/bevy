@@ -19,7 +19,18 @@
 //! and credited).
 
 use bevy::{
-    camera::CameraMainTextureUsages, camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, math::{DVec3, IVec3}, pbr::PbrPlugin, prelude::*, render::render_resource::TextureUsages, solari::{prelude::*, transform::{SolariFloatingOrigin, SolariGridCell}},
+    camera::CameraMainTextureUsages,
+    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    dev_tools::render_debug::RenderDebugOverlayPlugin,
+    feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
+    math::{DVec3, IVec3},
+    pbr::PbrPlugin,
+    prelude::*,
+    render::render_resource::TextureUsages,
+    solari::prelude::*,
+    // The floating-origin types live in solari's transform module (not yet in the
+    // prelude); import them explicitly.
+    solari::transform::{SolariFloatingOrigin, SolariGridCell},
 };
 
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -45,7 +56,8 @@ fn main() {
             DefaultPlugins
                 .build()
                 .disable::<PbrPlugin>()
-                .disable::<TransformPlugin>(),                
+                .disable::<TransformPlugin>()
+                .disable::<RenderDebugOverlayPlugin>(),
             SolariPlugin,
             FeathersPlugins,
             FreeCameraPlugin,

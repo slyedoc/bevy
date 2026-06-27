@@ -9,7 +9,7 @@
 //! The propagation pass ([`super::propagate`]) reads the two columns and
 //! computes a world transform per node (an ancestor-walk over changed nodes).
 
-use bevy_ecs::hierarchy::ChildOf;
+use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::prelude::*;
 use bevy_ecs::query::Has;
 use bevy_render::extract_resource::ExtractResource;
@@ -146,6 +146,31 @@ crate::gpu_table! {
     }
 }
 
+/// A **reference frame**: a parent entity whose own `Transform` (rotation / scale /
+/// translation) plus an optional [`SolariGridCell`] (its big integer offset) defines a
+/// coordinate frame that its children are expressed **relative to**. Children carry small
+/// frame-local `Transform`s and **no** cell — the GPU ancestor-walk composes them through
+/// the frame, so they inherit its orientation and offset for free. This is solari's analog
+/// of `big_space`'s `Grid` (credited): a ship, a station, a planet, a surface tile, or — once
+/// PTLAS partition routing lands — one co-resident *world* (each frame → one PTLAS partition,
+/// the frame's big **translation** riding the per-partition translation while its rotation/scale
+/// fold into the children's per-instance matrices on the free walk).
+///
+/// **Why it's a distinct marker (not just a celled parent):** the change-driven propagate
+/// re-walks only nodes whose *own* `local` changed, so a frame that moves would leave its
+/// descendants with a **stale world** (they didn't move relative to the frame). Tagging a
+/// parent `SolariFrame` opts its subtree into a **descendant re-walk** when the frame moves —
+/// including `TransformStatic` static-local children the change filter otherwise skips. Only
+/// tag parents whose motion must drive their children on the RT path; a continuously rotating
+/// frame re-walks its subtree every frame (intrinsic — its geometry *is* moving in origin space).
+///
+/// Authoring rule: put the big offset / orientation on the **frame**, keep children frame-local
+/// with no [`SolariGridCell`] (one celled node per `ChildOf` chain — two would subtract the
+/// origin twice). Nest frames (planet → tile) to keep each child's frame-local offset small so
+/// the rotation fold stays f32-precise.
+#[derive(Component, Default, Clone, Copy, Debug)]
+pub struct SolariFrame;
+
 /// Opt **out** of per-frame transform extraction: this entity's local `Transform`
 /// is scattered to the GPU table **once** (first sight) and then never re-scanned
 /// for movement. Tag the known-static bulk (buildings, terrain, roads, props) so
@@ -255,6 +280,19 @@ pub fn extract_transform_graph(
         >,
     >,
     nodes: Extract<Query<&GpuSlot<TransformGraph>>>,
+    // Frames whose pose changed this frame — their subtree must re-walk (below).
+    moved_frames: Extract<
+        Query<
+            Entity,
+            (
+                With<SolariFrame>,
+                Or<(Changed<Transform>, Changed<SolariGridCell>, Changed<ChildOf>)>,
+            ),
+        >,
+    >,
+    // Hierarchy + per-descendant (local, slot) for the moved-frame subtree re-walk.
+    children_q: Extract<Query<&Children>>,
+    frame_descendants: Extract<Query<(&Transform, &GpuSlot<TransformGraph>)>>,
     marker_added: Extract<Query<&GpuSlot<TransformGraph>, Added<NoGpuGlobalTransformReadback>>>,
     mut marker_removed: Extract<RemovedComponents<NoGpuGlobalTransformReadback>>,
     mut table: ResMut<TransformGraph>,
@@ -350,7 +388,42 @@ pub fn extract_transform_graph(
     let Some(mut local_column) = local_column else {
         return;
     };
-    let parts: Vec<&[u32]> = queues.iter_mut().map(|b| b.local.as_slice()).collect();
+
+    // Moved-frame subtree re-walk. The change-driven propagate recomputes only
+    // nodes whose *own* `local` changed; a frame's descendants didn't move
+    // relative to the frame, so a rotating/translating frame would leave them
+    // with a stale world (this includes `TransformStatic` static-local children
+    // the change filter never visits). For each moved `SolariFrame`, re-push every
+    // descendant's (unchanged) `local` so its slot lands in this frame's dispatch
+    // and the ancestor walk recomposes it through the moved frame. Serial — frames
+    // are few; a continuously spinning frame pays its subtree every frame (the
+    // intrinsic cost of geometry that is genuinely moving in origin space).
+    let mut frame_subtree: Vec<u32> = Vec::new();
+    if !moved_frames.is_empty() {
+        let mut stack: Vec<Entity> = Vec::new();
+        for frame in &moved_frames {
+            if let Ok(children) = children_q.get(frame) {
+                stack.extend(children.iter());
+            }
+        }
+        while let Some(entity) = stack.pop() {
+            if let Ok((transform, slot)) = frame_descendants.get(entity) {
+                push_record(
+                    &mut frame_subtree,
+                    slot.index(),
+                    LocalTRS::from_transform(transform),
+                );
+            }
+            if let Ok(children) = children_q.get(entity) {
+                stack.extend(children.iter());
+            }
+        }
+    }
+
+    let mut parts: Vec<&[u32]> = queues.iter_mut().map(|b| b.local.as_slice()).collect();
+    if !frame_subtree.is_empty() {
+        parts.push(frame_subtree.as_slice());
+    }
     let total: usize = parts.iter().map(|s| s.len()).sum();
     if total > 0 {
         local_column.write_delta_direct(total, &render_device, &render_queue, |dst| {

@@ -122,7 +122,10 @@ pub mod prelude {
         render::atmosphere::{SolariAtmosphere, SolariGlobalFog},
         SolariInitPlugin, SolariPlugin,
         geometry::ClusterMesh,
-        transform::{NoGpuGlobalTransformReadback, TransformStatic},
+        transform::{
+            NoGpuGlobalTransformReadback, SolariFloatingOrigin, SolariFrame, SolariGridCell,
+            TransformStatic,
+        },
         material::{SolariMaterial, SolariMaterial3d},
         lights::SolariDirectionLight,
         hair::{Hair, HairMaterial, HairAsset, HairStrand, SolariBranches},
