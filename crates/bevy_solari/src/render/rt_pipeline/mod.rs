@@ -119,12 +119,24 @@ impl Default for SolariCostHeatmap {
     }
 }
 
+/// Debug view that shows each surface's displacement (height) map as grayscale — a validation
+/// for the displacement-map wiring BEFORE tessellation actually displaces geometry: confirms
+/// which map lands on which surface, the UV mapping, and the height sign. When `enabled`, the
+/// opaque closest-hit replaces shading with the sampled height (exposure-compensated) on surfaces
+/// that have a `displacement_texture`, and a dim grey elsewhere. Set it from the main world (e.g.
+/// on a keypress) — `bevy_solari::prelude::SolariShowDisplacement`.
+#[derive(Resource, Clone, Copy, Default, ExtractResource)]
+pub struct SolariShowDisplacement {
+    pub enabled: bool,
+}
+
 /// Debug/feature inputs bundled into one [`SystemParam`] to keep the dispatch under
 /// bevy's 16-system-param limit: the device feature set + the cost-heatmap toggle.
 #[derive(bevy_ecs::system::SystemParam)]
 pub(crate) struct RtDebug<'w> {
     additional: Res<'w, AdditionalVulkanFeatures>,
     cost_heatmap: Option<Res<'w, SolariCostHeatmap>>,
+    show_displacement: Option<Res<'w, SolariShowDisplacement>>,
 }
 
 /// Material routing inputs for the SBT, bundled into one [`SystemParam`] to keep
@@ -322,7 +334,11 @@ pub(crate) fn rt_pipeline(
     debug: RtDebug,
     scene_bindings: Res<RaytracingSceneBindings>,
     scene_columns: Res<SceneColumns>,
-    cluster_mesh_manager: Option<Res<ClusterMeshManager>>,
+    // Tupled into one system param (the system is at bevy's 16-param ceiling).
+    geometry_res: (
+        Option<Res<ClusterMeshManager>>,
+        Option<Res<crate::geometry::tess_displace::TessShowcase>>,
+    ),
     materials: RtMaterials,
     atmosphere_sky: Option<Res<AtmosphereSky>>,
     env_images: RtEnvImages,
@@ -332,6 +348,7 @@ pub(crate) fn rt_pipeline(
     mut commands: Commands,
     mut ctx: RenderContext,
 ) {
+    let (cluster_mesh_manager, tess_showcase) = geometry_res;
     let view_entity = view.entity();
     let (
         view,
@@ -528,7 +545,9 @@ pub(crate) fn rt_pipeline(
             // .z = cost-heatmap debug view (1 = on); the raygen colormaps the clock
             // delta when set (needs SOLARI_SHADER_CLOCK / VK_KHR_shader_clock).
             debug.cost_heatmap.as_deref().is_some_and(|h| h.enabled) as u32,
-            0,
+            // .w = displacement debug view (1 = on); the opaque chit shows each
+            // surface's height map (grayscale) to validate the displacement wiring.
+            debug.show_displacement.as_deref().is_some_and(|d| d.enabled) as u32,
         ],
         // .x = sky brightness; .yzw = clear color (black for bevy_city).
         sky: [environment_brightness, 0.0, 0.0, 0.0],
@@ -558,12 +577,23 @@ pub(crate) fn rt_pipeline(
     // stay valid for any in-flight trace — `trace_device_address` won't compile on a
     // reallocating buffer. The materials address is captured at bind time (binder.rs).
     if let Some(cluster_mesh_manager) = cluster_mesh_manager.as_deref() {
+        // Smooth-tess metadata table address (0 when the smooth path is off → the
+        // closest-hit falls back to the facet normal).
+        let tess_clusters = match (
+            tess_showcase.as_ref().and_then(|s| s.tess_clusters_meta.as_ref()),
+            allocator.as_ref(),
+        ) {
+            (Some(buf), Some(alloc)) => alloc.wgpu_buffer_device_address(buf),
+            _ => 0,
+        };
         view_bindings.set_geometry_addresses(&RtGeometryAddresses {
             vertex_packed: cluster_mesh_manager.vertex_packed.trace_device_address(),
             vertex_positions: cluster_mesh_manager.vertex_positions.trace_device_address(),
             materials: scene_bindings.materials_device_address,
             material_stride: crate::bindings::GPU_MATERIAL_SIZE,
             _pad: 0,
+            tess_clusters,
+            _pad1: 0,
         });
     }
 

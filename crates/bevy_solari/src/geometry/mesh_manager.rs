@@ -38,6 +38,12 @@ struct ClusterMeshSlices {
     mesh_max_error: f32,
     cluster_count: u32,
     total_triangle_count: u32,
+    /// Per-cluster global `[vertex_offset, index_offset, triangle_count]` for every
+    /// cluster in this mesh, retained for the tessellation showcase (which
+    /// subdivides a real instance's geometry in place; the per-cluster `Cluster`
+    /// records are consumed when the asset uploads, so this snapshot is the only
+    /// post-upload CPU access to them).
+    tess_clusters: Vec<[u32; 3]>,
     /// Dense, stable per-unique-geometry id assigned on first upload.
     /// BLAS sharing keys one shared BLAS per geometry on this (NOT on
     /// camera distance), so the BLAS count is bounded by the resident
@@ -314,6 +320,19 @@ impl ClusterMeshManager {
             mesh_max_error: mesh.mesh_max_error,
             cluster_count,
             total_triangle_count,
+            // Rebase each cluster's mesh-local vertex/index offsets to global pool
+            // offsets (the same +base the GPU `Cluster` records get on upload).
+            tess_clusters: mesh
+                .clusters
+                .iter()
+                .map(|c| {
+                    [
+                        vertex_base + c.vertex_offset,
+                        index_base + c.index_offset,
+                        c.triangle_count,
+                    ]
+                })
+                .collect(),
             geometry_id,
         };
 
@@ -347,6 +366,31 @@ impl ClusterMeshManager {
     #[inline]
     pub fn resident_mesh_count(&self) -> usize {
         self.cluster_mesh_slices.len()
+    }
+
+    /// Per-cluster global `[vertex_offset, index_offset, triangle_count]` for every
+    /// cluster of a resident mesh — the tessellation showcase subdivides this real
+    /// geometry in place. `None` if the mesh isn't resident yet.
+    #[inline]
+    pub fn tess_clusters(&self, asset_id: AssetId<ClusterMesh>) -> Option<&[[u32; 3]]> {
+        self.cluster_mesh_slices
+            .get(&asset_id)
+            .map(|s| s.tess_clusters.as_slice())
+    }
+
+    /// Object-space `(min, max)` AABB of a resident mesh — the tessellation showcase
+    /// derives its world bounds from this (+ the displacement margin) instead of a
+    /// per-frame readback of every displaced position. `None` if not resident.
+    #[inline]
+    pub fn mesh_aabb(&self, asset_id: AssetId<ClusterMesh>) -> Option<([f32; 3], [f32; 3])> {
+        self.cluster_mesh_slices.get(&asset_id).map(|s| {
+            let c = s.aabb.center;
+            let h = s.aabb.half_extent;
+            (
+                [c[0] - h[0], c[1] - h[1], c[2] - h[2]],
+                [c[0] + h[0], c[1] + h[1], c[2] + h[2]],
+            )
+        })
     }
 
     /// High-water count of dense geometry ids handed out — the size the

@@ -389,6 +389,7 @@ pub fn prepare_ptlas_params(
     allocator: Option<Res<Allocator>>,
     fns: Option<Res<ClusterExtensionFns>>,
     hair_instances: Option<Res<crate::hair::HairInstances>>,
+    tess_showcase: Option<Res<crate::geometry::tess_displace::TessShowcase>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
@@ -406,10 +407,14 @@ pub fn prepare_ptlas_params(
     // above the cluster slots, written by `ptlas_hair_write` each frame. They
     // expand the PTLAS instance space but use none of the cluster fill state.
     let hair_count = hair_instances.as_ref().map(|h| h.count).unwrap_or(0);
+    // The tessellated showcase instances occupy PTLAS slots above the cluster + hair
+    // slots, once their BLASes are armed. Read the armed-entry count directly (set in
+    // `PrepareAssets`, before this) so it matches `prepare_tess_ptlas_write`'s `tess_base`.
+    let tess_count = tess_showcase.as_ref().map_or(0, |s| s.entries.len() as u32);
 
     let cluster_high_water = instances.slot_high_water();
-    // Total PTLAS instance space (cluster slots + hair).
-    let high_water = cluster_high_water + hair_count;
+    // Total PTLAS instance space (cluster slots + hair + tessellation showcase).
+    let high_water = cluster_high_water + hair_count + tess_count;
     if high_water == 0 {
         resources.op_count = 0;
         return;
@@ -524,8 +529,9 @@ pub fn prepare_ptlas_params(
 
     // Worst-case record count = CPU delta + every active instance whose
     // geometry rebuilt this frame + every hair instance (re-specified each
-    // frame). Commit `write_data` for it.
-    let max_records = cpu_count as u64 + active_count as u64 + hair_count as u64;
+    // frame) + the tessellation showcase. Commit `write_data` for it.
+    let max_records =
+        cpu_count as u64 + active_count as u64 + hair_count as u64 + tess_count as u64;
     resources
         .write_data
         .commit(0..(max_records.max(1)) * WRITE_INSTANCE_DATA_SIZE);
@@ -753,6 +759,7 @@ pub fn dispatch_ptlas(
     instances: Option<Res<InstanceManager>>,
     hair_instances: Option<Res<crate::hair::HairInstances>>,
     hair_write: Option<Res<crate::hair::ptlas_hair::HairPtlasWrite>>,
+    tess_write: Option<Res<crate::geometry::tess_displace::TessPtlasWrite>>,
     additional: Res<AdditionalVulkanFeatures>,
     mut ctx: RenderContext,
 ) {
@@ -778,7 +785,13 @@ pub fn dispatch_ptlas(
         return;
     }
     let hair_count = hair_instances.as_ref().map(|h| h.count).unwrap_or(0);
-    let capacity = instances.slot_high_water() + hair_count;
+    // Must match `prepare_ptlas_params`'s `high_water`: the showcase tess instance
+    // occupies index `cluster_high_water + hair_count`, so the build's
+    // `instance_count` must include it. Omitting it makes that record's
+    // `instance_index` equal `instance_count` (one past the bound) → the build
+    // faults → device lost.
+    let tess_count = tess_write.as_ref().map_or(0, |t| t.tess_count);
+    let capacity = instances.slot_high_water() + hair_count + tess_count;
     if capacity == 0 {
         return;
     }
@@ -897,6 +910,24 @@ pub fn dispatch_ptlas(
                 pass.set_bind_group(0, hair_bg, &[]);
                 let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(hair_count.div_ceil(64));
                 pass.dispatch_workgroups(gx, gy, gz);
+            }
+        }
+        // Tessellation showcase (brick B4): append its single instance to the
+        // WRITE stream, after hair, before `finalize`.
+        if let Some(tw) = tess_write.as_ref() {
+            if tw.tess_count > 0 {
+                if let (Some(tess_bg), Some(tess_pipe)) = (
+                    tw.bind_group.as_ref(),
+                    pipeline_cache.get_compute_pipeline(tw.pipeline),
+                ) {
+                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                        label: Some("ptlas.tess_write"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(tess_pipe);
+                    pass.set_bind_group(0, tess_bg, &[]);
+                    pass.dispatch_workgroups(tw.tess_count.div_ceil(64), 1, 1);
+                }
             }
         }
         {

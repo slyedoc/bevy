@@ -17,6 +17,9 @@ pub mod clas_arena;
 pub mod from_mesh;
 pub mod indices;
 pub mod mesh_manager;
+pub mod tess_displace;
+pub mod tess_template;
+pub mod tessellation;
 
 
 pub use self::asset::{
@@ -53,7 +56,10 @@ pub struct GeometryPlugin;
 impl Plugin for GeometryPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<ClusterMesh>()
-            .init_asset_loader::<ClusterMeshLoader>();
+            .init_asset_loader::<ClusterMeshLoader>()
+            // `RaytracingMesh3d("path")` in `.bsn` resolves a `Handle<ClusterMesh>` from a string;
+            // that needs the `ReflectHandle` + `String -> HandleTemplate<ClusterMesh>` machinery.
+            .register_asset_reflect::<ClusterMesh>();
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -64,6 +70,10 @@ impl Plugin for GeometryPlugin {
                 (
                     init_cluster_mesh_manager.after(SolariSetup),
                     init_clas_arena.after(SolariSetup),
+                    tess_template::init_tessellation_templates.after(SolariSetup),
+                    tess_displace::init_tess_displace.after(SolariSetup),
+                    tess_displace::init_tess_normals.after(SolariSetup),
+                    tess_displace::init_tess_ptlas_write.after(SolariSetup),
                 ),
             )
             .add_systems(
@@ -73,6 +83,10 @@ impl Plugin for GeometryPlugin {
                     upload_pending_clas
                         .in_set(RenderSystems::PrepareAssets)
                         .after(perform_pending_cluster_mesh_writes),
+                    tess_displace::tess_displace_selftest.in_set(RenderSystems::PrepareAssets),
+                    tess_displace::prepare_tess_ptlas_write.in_set(RenderSystems::Prepare),
+                    tess_displace::prepare_tess_ptlas_write_bind_group
+                        .in_set(RenderSystems::PrepareBindGroups),
                 ),
             );
     }

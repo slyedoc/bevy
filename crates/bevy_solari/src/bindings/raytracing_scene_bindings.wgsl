@@ -50,6 +50,12 @@ struct Material {
     // `0.5·log2(w·h)` of the base-color texture — the texture-size term of the
     // ray-cone LOD, baked CPU-side so no per-hit `textureDimensions` query.
     texel_lod_bias: f32,
+    // Displacement (height) map; `TEXTURE_MAP_NONE` if absent. Sampled per
+    // generated micro-vertex during tessellation: offset along the normal by
+    // `height * displacement_scale + displacement_bias` (world units).
+    displacement_texture_id: u32,
+    displacement_scale: f32,
+    displacement_bias: f32,
 }
 
 const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
@@ -478,8 +484,28 @@ struct SolariGeometryAddresses {
     materials: u64,
     material_stride: u32,
     _pad: u32,
+    // Per-CLAS tessellation metadata table (`TessCluster` records). 0 = smooth-tess
+    // path off → tess hits shade with the facet normal.
+    tess_clusters: u64,
+    _pad1: u64,
 }
 @group(1) @binding(4) var<uniform> geometry_addresses: SolariGeometryAddresses;
+
+// Per-CLAS tessellation metadata (16 B, `geometry_addresses.tess_clusters` +
+// `(cluster_id - TESS_CLUSTER_ID_BASE) * 16`) is loaded field-wise in the closest-hit:
+// normal-buffer device address (two u32) + the CLAS's first micro-triangle.
+
+/// Tess CLAS `cluster_id` base — every tessellated CLAS bakes
+/// `TESS_CLUSTER_ID_BASE + global_tess_clas_index` as its ClusterIDNV, comfortably
+/// above any real cluster pool so the closest-hit detects the tess hit and recovers
+/// the tess index. Must match `tess_template::TESS_CLUSTER_ID_BASE`.
+const TESS_CLUSTER_ID_BASE: u32 = 0xF0000000u;
+
+/// Minimum perceptual roughness for tessellated displacement hits. Sub-pixel
+/// displacement detail acts as extra microfacet roughness; clamping the lobe wider
+/// keeps the direct-light specular from aliasing into DLSS flicker on the bumpy
+/// surface (physically: the geometry you can't resolve becomes roughness).
+const TESS_ROUGHNESS_FLOOR: f32 = 0.5;
 
 // Bindless material fetch: load the whole Material struct by buffer-device-address
 // (uniform across the warp after SER).
@@ -831,6 +857,86 @@ fn resolve_triangle_data_full_mat_fetch(
     barycentrics: vec3<f32>,
     object_positions: array<vec3<f32>, 3>,
 ) -> ResolvedRayHitFull {
+    // Tessellation showcase: its CLAS is instantiated with a ClusterIDNV above the
+    // real cluster pool, so it has no `clusters[]` entry and its displaced
+    // micro-vertices have no vertex-pool attributes. Two shading paths:
+    //   - SMOOTH (`geometry_addresses.tess_clusters != 0`): recover the three
+    //     micro-vertex smooth, displacement-aware normals from the per-CLAS metadata
+    //     table + per-instance normal buffer and let the core interpolate them, so the
+    //     displaced surface shades without micro-triangle faceting.
+    //   - FACET (table unwired): geometric normal from the position-fetch positions.
+    // UV is fixed (no per-micro-vertex UVs yet) in both; textured tess shading is a
+    // later brick.
+    if cluster_global_id >= arrayLength(&clusters) {
+        if geometry_addresses.tess_clusters != 0 {
+            // Per-CLAS metadata (16 B): normal-buffer address (lo/hi u32) + primitive
+            // base. Loaded field-wise (struct `physical_load` of a u64 member is risky).
+            let tc_addr = geometry_addresses.tess_clusters
+                + u64(cluster_global_id - TESS_CLUSTER_ID_BASE) * u64(16u);
+            let normals_lo = physical_load<u32>(tc_addr + u64(0u));
+            let normals_hi = physical_load<u32>(tc_addr + u64(4u));
+            let primitive_base = physical_load<u32>(tc_addr + u64(8u));
+            let attrs = u64(normals_lo) | (u64(normals_hi) << 32u);
+            // Denormalized per-vertex attrs: 3 × (packed normal @0 + UV @4) = 36 B / tri.
+            let base = attrs + u64(primitive_base + triangle_id) * u64(36u);
+            let a0 = base + u64(0u);
+            let a1 = base + u64(12u);
+            let a2 = base + u64(24u);
+            let n0 = octahedral_decode_signed(unpack2x16snorm(physical_load<u32>(a0)));
+            let n1 = octahedral_decode_signed(unpack2x16snorm(physical_load<u32>(a1)));
+            let n2 = octahedral_decode_signed(unpack2x16snorm(physical_load<u32>(a2)));
+            let uv0 = physical_load<vec2<f32>>(a0 + u64(4u));
+            let uv1 = physical_load<vec2<f32>>(a1 + u64(4u));
+            let uv2 = physical_load<vec2<f32>>(a2 + u64(4u));
+            // Arbitrary tangent (only consulted by normal maps).
+            let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n0.y) > 0.99);
+            let tangent = vec4<f32>(normalize(cross(up, n0)), 1.0);
+            let sv0 = Vertex(object_positions[0], n0, uv0, tangent);
+            let sv1 = Vertex(object_positions[1], n1, uv1, tangent);
+            let sv2 = Vertex(object_positions[2], n2, uv2, tangent);
+            var hit = resolve_triangle_data_core(
+                instance_id, material_id, transform, 1u, barycentrics, -1.0,
+                array<Vertex, 3>(sv0, sv1, sv2),
+            );
+            // Tess motion vectors: the per-instance previous-frame transform is
+            // unreliable for tessellated surfaces — the base mesh is hidden
+            // (`RenderLayers::none`), so its `previous_frame_transforms` slot is stale or
+            // unresolved (`instance_id` falls back to 0). The resulting previous position
+            // is garbage → wrong motion → DLSS can't accumulate the illumination and any
+            // shadows on the surface strobe. Treat the surface as STATIC: previous world
+            // position == current (motion = camera-only), which is exact for static
+            // displaced geometry (floors, planet terrain). MOVING tessellated surfaces
+            // would ghost and need the real per-instance previous transform — TODO.
+            hit.previous_frame_world_position = hit.world_position;
+            hit.material.perceptual_roughness = max(hit.material.perceptual_roughness, TESS_ROUGHNESS_FLOOR);
+            hit.material.roughness = hit.material.perceptual_roughness * hit.material.perceptual_roughness;
+            return hit;
+        }
+        let cr = cross(
+            object_positions[1] - object_positions[0],
+            object_positions[2] - object_positions[0],
+        );
+        let cl = length(cr);
+        let flat_normal = select(vec3<f32>(0.0, 0.0, 1.0), cr / cl, cl > 1e-12);
+        // Arbitrary tangent perpendicular to the normal (only consulted if the
+        // material carries a normal map).
+        let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(flat_normal.y) > 0.99);
+        let tangent = vec4<f32>(normalize(cross(up, flat_normal)), 1.0);
+        let tv0 = Vertex(object_positions[0], flat_normal, vec2<f32>(0.5), tangent);
+        let tv1 = Vertex(object_positions[1], flat_normal, vec2<f32>(0.5), tangent);
+        let tv2 = Vertex(object_positions[2], flat_normal, vec2<f32>(0.5), tangent);
+        var hit = resolve_triangle_data_core(
+            instance_id, material_id, transform, 1u, barycentrics, -1.0,
+            array<Vertex, 3>(tv0, tv1, tv2),
+        );
+        // Same tess motion fix as the smooth branch: static previous position
+        // (motion = camera-only) instead of the unreliable per-instance lookup.
+        hit.previous_frame_world_position = hit.world_position;
+        hit.material.perceptual_roughness = max(hit.material.perceptual_roughness, TESS_ROUGHNESS_FLOOR);
+        hit.material.roughness = hit.material.perceptual_roughness * hit.material.perceptual_roughness;
+        return hit;
+    }
+
     let cluster = clusters[cluster_global_id];
     let idx_base = cluster.index_offset + triangle_id * 3u;
     // Attrs-only fetch (skips the position head); the builtin supplies position.

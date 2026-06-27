@@ -88,6 +88,16 @@ pub struct SolariMaterial {
     pub alpha_mode: AlphaMode,
     /// Optional tangent-space normal map.
     pub normal_map_texture: Option<Handle<Image>>,
+    /// Optional depth map (bevy `StandardMaterial::depth_map` convention: a brighter
+    /// texel is DEEPER, so the surface recedes there). Sampled per generated vertex
+    /// during tessellation and used to offset the vertex along its interpolated normal
+    /// by `depth_bias - depth * depth_scale` (world units).
+    pub depth_map: Option<Handle<Image>>,
+    /// Scales the `[0, 1]` depth-map value before it offsets the surface.
+    pub depth_scale: f32,
+    /// Added to the (negated) scaled depth (so a mid-grey-centered map can push the
+    /// surface both inward and outward).
+    pub depth_bias: f32,
     /// Marks this as a ray-portal surface ([`SolariPortal`](crate::bindings::SolariPortal)):
     /// its hits route to the `chit_portal` SBT program, which teleports the ray
     /// to the paired portal instead of shading. The other fields are ignored.
@@ -144,6 +154,9 @@ impl Default for SolariMaterial {
             nested_priority: 0,
             alpha_mode: AlphaMode::Opaque,
             normal_map_texture: None,
+            depth_map: None,
+            depth_scale: 1.0,
+            depth_bias: 0.0,
             portal: false,
         }
     }
@@ -174,6 +187,11 @@ impl From<&StandardMaterial> for SolariMaterial {
             nested_priority: 0,
             alpha_mode: m.alpha_mode,
             normal_map_texture: m.normal_map_texture.clone(),
+            // `StandardMaterial` has no displacement concept — authored directly on
+            // `SolariMaterial` (or via the `.bsn` importer).
+            depth_map: None,
+            depth_scale: 1.0,
+            depth_bias: 0.0,
             // `StandardMaterial` has no portal concept — set `SolariMaterial::portal`
             // directly (or via a `SolariPortal` setup) for portal surfaces.
             portal: false,
@@ -219,8 +237,15 @@ impl Plugin for SolariMaterialPlugin {
         .init_asset::<StandardMaterial>()
         // our custom material
         .init_asset::<SolariMaterial>()
+            // `ReflectAsset` on `SolariMaterial` + `ReflectHandle` on its handle, so
+            // `.bsn` scenes can define materials inline (see `bevy_scene` dynamic BSN).
+            .register_asset_reflect::<SolariMaterial>()
             .register_type::<SolariMaterial>()
-            .register_type::<SolariMaterial3d>();
+            .register_type::<SolariMaterial3d>()
+            // `SolariMaterial.alpha_mode` is an `AlphaMode`; `.bsn` scenes name it as
+            // `bevy_material::alpha::AlphaMode::Mask(..)`, so it must be in the registry. PbrPlugin
+            // (which would otherwise register it) is disabled on the full-RT path.
+            .register_type::<AlphaMode>();
         app.world_mut()
             .resource_mut::<Assets<SolariMaterial>>()
             .insert(

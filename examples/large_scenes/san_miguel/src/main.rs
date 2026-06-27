@@ -13,6 +13,8 @@ use std::{
 };
 
 use argh::FromArgs;
+use bevy::image::{ImageAddressMode, ImageSamplerDescriptor};
+use bevy::log::LogPlugin;
 use bevy::pbr::ContactShadows;
 use bevy::{
     anti_alias::taa::TemporalAntiAliasing,
@@ -147,16 +149,41 @@ pub fn main() {
         bevy::asset::uuid::uuid!("b1f7d9e3-2a4c-4d6b-8f1e-3c5a7b9d0f2e"),
     ));
 
-    let default_plugins = DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "San Miguel".into(),
-            resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
-            present_mode: PresentMode::AutoNoVsync,
-            position: WindowPosition::Centered(MonitorSelection::Primary),
+    let default_plugins = DefaultPlugins
+        .set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "San Miguel".into(),
+                resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
+                present_mode: PresentMode::AutoNoVsync,
+                position: WindowPosition::Centered(MonitorSelection::Primary),
+                ..default()
+            }),
             ..default()
-        }),
-        ..default()
-    });
+        })
+        // San Miguel's floors/walls/columns tile their textures (UVs run well past [0,1]). The
+        // `.bsn` import path carries no per-texture wrap mode (unlike glTF, which sets a sampler per
+        // texture), so the scene's images fall back to this default — make it REPEAT. Without it a
+        // clamp-to-edge sampler shows one correct texture cell at [0,1] and smears the edge texel
+        // across the rest of the surface. (glTF-loaded textures on the raster path set their own
+        // sampler and are unaffected.)
+        .set(ImagePlugin {
+            default_sampler: ImageSamplerDescriptor {
+                address_mode_u: ImageAddressMode::Repeat,
+                address_mode_v: ImageAddressMode::Repeat,
+                address_mode_w: ImageAddressMode::Repeat,
+                ..ImageSamplerDescriptor::linear()
+            },
+            ..default()
+        })
+        // Drop a hand-maintained list of benign Vulkan validation VUIDs (see
+        // `tess_log_filter`) so real errors aren't buried while debugging the
+        // tessellation path. The `LogPlugin.filter` (EnvFilter) can't target a
+        // VUID — they all share the `wgpu_hal::vulkan::instance` target — so this
+        // goes through a custom `fmt_layer` that filters by message text.
+        .set(LogPlugin {
+            fmt_layer: tess_log_filter::fmt_layer,
+            ..default()
+        });
     // Under `solari` the full-RT path replaces the raster mesh/material stack, so
     // disable `PbrPlugin` (bevy_solari owns its material/lights + vendors the DfgLut
     // + pbr shader helpers) and `TransformPlugin` (the GPU transform table drives
@@ -204,27 +231,16 @@ pub fn main() {
         // PbrPlugin no longer registers `Assets<StandardMaterial>`, but proc_scene /
         // benchmark / mipmap systems still reference it.
         .init_asset::<StandardMaterial>()
-        // San Miguel is fully static — let the GPU transform extract skip the
-        // per-frame Changed<Transform> scan over its ~2.6k nodes.
-        .insert_resource(StaticTransformOptimizations::Enabled)
-        // The cluster bake is heavy and runs on the main thread. San Miguel has
-        // ~1000 unique high-poly meshes, so baking them all in one frame (the
-        // blanket `convert_meshes_to_raytracing`) blocks for seconds and the
-        // window goes unresponsive. Instead mark only `bake_per_frame` meshes per
-        // frame for `convert_marked_meshes_to_raytracing`, so frames keep pumping
-        // and the loading screen shows progress. `mark_static` tags each baked
-        // mesh `TransformStatic`; `update_loading_screen` removes the overlay once
-        // every mesh is baked. (glTF materials already arrive as SolariMaterial.)
+        // The `.bsn` already carries `RaytracingMesh3d` + `SolariMaterial3d` (the importer baked
+        // them), so there's no mesh/material conversion to run. No `TransformStatic` tagging
+        // either: these entities are *born* carrying `RaytracingMesh3d`, so tagging them static
+        // the same frame would exclude them from the transform extract before their first-sight
+        // scatter — leaving every instance at the zero default (degenerate, so nothing renders).
+        // The `Changed<Transform>` extract filter already makes a static scene cost ~0/frame, so
+        // the tag bought nothing here anyway (see bistro — it omits it too).
         .add_systems(
             Update,
-            (
-                mark_meshes_for_raytracing,
-                convert_marked_meshes_to_raytracing,
-                convert_standard_materials_to_solari,
-                mark_static,
-                update_loading_screen,
-            )
-                .chain(),
+            (ensure_visibility, update_loading_screen, debug_scene_info).chain(),
         );
 
     // Under `solari` the GLB ships KTX2 textures with their own mip chains and
@@ -289,54 +305,94 @@ fn mark_meshes_for_raytracing(
     }
 }
 
-/// Tag every baked mesh [`TransformStatic`] — San Miguel never moves, so the GPU
-/// transform extract can skip it. Archetype-filtered, so it idles once tagged.
+/// A cluster mesh is "ready" if it loaded (asset-server-managed) or was added directly (the debug
+/// spheres) — directly-added assets aren't managed, so `is_loaded_with_dependencies` is false.
 #[cfg(feature = "solari")]
-fn mark_static(
-    mut commands: Commands,
-    query: Query<Entity, (With<RaytracingMesh3d>, Without<TransformStatic>)>,
-) {
-    for entity in &query {
-        commands.entity(entity).insert(TransformStatic);
-    }
+fn cluster_ready(asset_server: &AssetServer, handle: &Handle<ClusterMesh>) -> bool {
+    !asset_server.is_managed(handle) || asset_server.is_loaded_with_dependencies(handle)
 }
 
-/// Report bake progress on the [`LoadingScreen`], and remove it once every mesh
-/// has a [`RaytracingMesh3d`] (i.e. nothing is left to bake).
+/// Report `.bsn` load progress on the [`LoadingScreen`], removing it once every
+/// spawned [`RaytracingMesh3d`] instance has its [`ClusterMesh`] asset loaded.
+///
+/// The `.bsn` spawns all instances atomically (each already carrying
+/// `RaytracingMesh3d`), so "spawned" is instant — the slow part is streaming in
+/// the per-submesh `.cluster_mesh` assets, which is what this tracks.
 #[cfg(feature = "solari")]
 fn update_loading_screen(
     mut commands: Commands,
     screen: Query<Entity, With<LoadingScreen>>,
     mut text: Query<&mut Text, With<LoadingText>>,
-    converted: Query<(), With<RaytracingMesh3d>>,
-    // Bake failures keep their `Mesh3d` (with `RaytracingBakeFailed`); exclude
-    // them so one bad mesh can't pin the overlay open forever.
-    remaining: Query<
-        (),
-        (
-            With<Mesh3d>,
-            Without<RaytracingMesh3d>,
-            Without<bevy::solari::helper::RaytracingBakeFailed>,
-        ),
-    >,
+    instances: Query<&RaytracingMesh3d>,
+    asset_server: Res<AssetServer>,
 ) {
     let Ok(screen) = screen.single() else {
         return;
     };
-    let done = converted.iter().count();
-    let left = remaining.iter().count();
-    // Scene loaded and everything baked — drop the overlay.
-    if done > 0 && left == 0 {
+    let total = instances.iter().count();
+    // Track the asset-server load state, NOT `Assets<ClusterMesh>`: solari consumes each
+    // `ClusterMesh` (`remove_untracked`) when it uploads to the GPU, so it vanishes from `Assets`
+    // immediately. `is_loaded_with_dependencies` persists past the upload — and is exactly what
+    // solari gates instance binding on. Directly-added meshes (the debug spheres) aren't
+    // asset-server-managed, so treat "unmanaged" as ready.
+    let loaded = instances
+        .iter()
+        .filter(|mesh| cluster_ready(&asset_server, &mesh.0))
+        .count();
+
+    // All instances spawned and every cluster mesh loaded — drop the overlay.
+    if total > 0 && loaded == total {
         commands.entity(screen).despawn();
         return;
     }
     if let Ok(mut text) = text.single_mut() {
-        text.0 = if done == 0 && left == 0 {
+        text.0 = if total == 0 {
             "Loading San Miguel...".into()
         } else {
-            format!("Baking clusters: {}/{}", done, done + left)
+            format!("Loading clusters: {loaded}/{total}")
         };
     }
+}
+
+/// TEST: the `.bsn` entities arrive with no visibility components (`RaytracingMesh3d` doesn't
+/// require them). The glb→RT helper path keeps `ViewVisibility`. Give the `.bsn` RT meshes the
+/// visibility chain to see whether solari's instance extract needs it present.
+#[cfg(feature = "solari")]
+fn ensure_visibility(
+    mut commands: Commands,
+    query: Query<Entity, (With<RaytracingMesh3d>, Without<Visibility>)>,
+) {
+    for entity in &query {
+        commands.entity(entity).insert(Visibility::Visible);
+    }
+}
+
+/// One-shot diagnostic: once every instance's cluster mesh is loaded, log the instance count,
+/// the camera transform, and a few instance world transforms — to sanity-check geometry placement.
+#[cfg(feature = "solari")]
+fn debug_scene_info(
+    instances: Query<(&RaytracingMesh3d, Option<&SolariMaterial3d>)>,
+    asset_server: Res<AssetServer>,
+    mut done: Local<bool>,
+) {
+    if *done {
+        return;
+    }
+    let total = instances.iter().count();
+    if total == 0 {
+        return;
+    }
+    let loaded = instances
+        .iter()
+        .filter(|(mesh, _)| cluster_ready(&asset_server, &mesh.0))
+        .count();
+    if loaded < total {
+        return;
+    }
+    *done = true;
+
+    let with_material = instances.iter().filter(|(_, m)| m.is_some()).count();
+    info!("San Miguel: {total} RaytracingMesh3d instances, {loaded} cluster meshes loaded, {with_material} have SolariMaterial3d");
 }
 
 pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<Args>) {
@@ -375,34 +431,59 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     // (`reclassify_alpha.py`) — BC7 on the GPU instead of uncompressed RGBA8.
     // The dense alpha-tested foliage is the point: it stresses the any-hit
     // alpha-test path. See the README for the pipeline.
-    let scene = asset_server.load("san_miguel/SanMiguel_ktx2.glb#Scene0");
-    commands
-        .spawn((WorldAssetRoot(scene.clone()), Spin))
-        .observe(proc_scene);
+    // glTF-free under solari: load the importer-baked `.bsn` (entities arrive with
+    // `RaytracingMesh3d` + inline `SolariMaterial` already — no runtime mesh conversion). Bake it
+    // with `san_miguel_import` and run with `BEVY_ASSET_ROOT` pointing at the directory that holds
+    // `assets/san_miguel/` (the `solari_files` tree).
+    // No `Spin`: San Miguel is static, and the OBJ geometry is offset from the world origin —
+    // spinning the root would orbit the whole scene around (0,0,0) and out of frame.
+    // `Visibility` on the root so the child instances' `InheritedVisibility` has a parent (avoids
+    // the B0004 hierarchy warning while we test whether the visibility chain matters).
+    // `SOLARI_TESS_FLOOR=1` loads the minimal floor-only scene (`Floor.bsn`, baked
+    // with `san_miguel_import --floor-only`) — one displacement-mapped surface,
+    // isolated, so the in-situ tessellation showcase is trivial to find.
+    #[cfg(feature = "solari")]
+    {
+        let scene = if std::env::var_os("SOLARI_TESS_FLOOR").is_some() {
+            "san_miguel/Floor.bsn"
+        } else {
+            "san_miguel/SanMiguel.bsn"
+        };
+        commands.spawn((
+            ScenePatchInstance(asset_server.load(scene)),
+            Visibility::Visible,
+        ));
+    }
 
+    // Raster path keeps the glTF (runtime `Mesh3d` conversion); `count > 1` tiles copies.
+    #[cfg(not(feature = "solari"))]
+    {
+        let scene = asset_server.load("san_miguel/SanMiguel_ktx2.glb#Scene0");
+        commands
+            .spawn((WorldAssetRoot(scene.clone()), Spin))
+            .observe(proc_scene);
 
-    let mut count = 0;
-    if args.count > 1 {
-        let quantity = args.count - 1;
-
-        let side = (quantity as f32).sqrt().ceil() as i32 / 2;
-
-        'outer: for x in -side..=side {
-            for z in -side..=side {
-                if count >= quantity {
-                    break 'outer;
+        let mut count = 0;
+        if args.count > 1 {
+            let quantity = args.count - 1;
+            let side = (quantity as f32).sqrt().ceil() as i32 / 2;
+            'outer: for x in -side..=side {
+                for z in -side..=side {
+                    if count >= quantity {
+                        break 'outer;
+                    }
+                    if x == 0 && z == 0 {
+                        continue;
+                    }
+                    commands
+                        .spawn((
+                            WorldAssetRoot(scene.clone()),
+                            Transform::from_xyz(x as f32 * 60.0, 0.0, z as f32 * 60.0),
+                            Spin,
+                        ))
+                        .observe(proc_scene);
+                    count += 1;
                 }
-                if x == 0 && z == 0 {
-                    continue;
-                }
-                commands
-                    .spawn((
-                        WorldAssetRoot(scene.clone()),
-                        Transform::from_xyz(x as f32 * 60.0, 0.0, z as f32 * 60.0),
-                        Spin,
-                    ))
-                    .observe(proc_scene);
-                count += 1;
             }
         }
     }
@@ -842,4 +923,81 @@ fn frame_time_system(
             t.0 = string.clone();
         }
     };
+}
+
+/// Custom `LogPlugin` fmt layer that drops a maintained list of benign Vulkan
+/// validation VUIDs by message text, so real errors aren't buried while
+/// debugging the tessellation path. `LogPlugin.filter` (an `EnvFilter`) can't
+/// target a single VUID — they all log under the `wgpu_hal::vulkan::instance`
+/// target — so the suppression is done here by inspecting the event message.
+/// Add VUIDs to `BENIGN` only once confirmed noise.
+mod tess_log_filter {
+    use bevy::app::App;
+    use bevy::log::{
+        tracing::{
+            field::{Field, Visit},
+            Event, Metadata,
+        },
+        tracing_subscriber::{
+            layer::{Context, Filter},
+            Layer,
+        },
+        BoxedFmtLayer,
+    };
+    use core::fmt::Debug;
+
+    /// VUIDs confirmed benign for the solari RT path (validation is overly strict,
+    /// or the fork knowingly diverges) — present in the working `SOLARI_TESS`-only
+    /// run too, so they're noise, not failures.
+    const BENIGN: &[&str] = &[
+        // Bindless `textures: binding_array<texture_2d>` → a runtime array; legal
+        // for the UniformConstant storage class, and the driver accepts it.
+        "VUID-StandaloneSpirv-OpTypeRuntimeArray-04680",
+        // The naga fork emits Device-scope atomics (see the atomic-scope note); the
+        // driver runs them fine without `vulkanMemoryModelDeviceScope`.
+        "VUID-RuntimeSpirv-vulkanMemoryModel-06265",
+        // The PTLAS full rebuild intentionally passes `srcAccelerationStructureData
+        // = 0` (build fresh — nothing to carry from a prior structure).
+        "VUID-VkBuildPartitionedAccelerationStructureInfoNV-srcAccelerationStructureData-parameter",
+        // Partitioned-AS build-info knob the validation layer flags; benign here.
+        "VUID-vkCmdBuildPartitionedAccelerationStructuresNV-pBuildInfo-10549",
+    ];
+
+    /// Per-layer filter: drop an event if any of its fields' text contains a
+    /// `BENIGN` VUID. The VUID rides in the event's `message` field, recorded via
+    /// `record_debug`; `record_str` is covered for robustness.
+    struct DropBenign;
+
+    impl<S> Filter<S> for DropBenign {
+        fn enabled(&self, _meta: &Metadata<'_>, _cx: &Context<'_, S>) -> bool {
+            true
+        }
+
+        fn event_enabled(&self, event: &Event<'_>, _cx: &Context<'_, S>) -> bool {
+            struct Scan(bool);
+            impl Visit for Scan {
+                fn record_debug(&mut self, _f: &Field, value: &dyn Debug) {
+                    if BENIGN.iter().any(|v| format!("{value:?}").contains(v)) {
+                        self.0 = true;
+                    }
+                }
+                fn record_str(&mut self, _f: &Field, value: &str) {
+                    if BENIGN.iter().any(|v| value.contains(v)) {
+                        self.0 = true;
+                    }
+                }
+            }
+            let mut scan = Scan(false);
+            event.record(&mut scan);
+            !scan.0
+        }
+    }
+
+    pub fn fmt_layer(_app: &mut App) -> Option<BoxedFmtLayer> {
+        Some(Box::new(
+            bevy::log::tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(DropBenign),
+        ))
+    }
 }
