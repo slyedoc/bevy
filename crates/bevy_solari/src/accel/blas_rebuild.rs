@@ -57,7 +57,10 @@ pub const BLAS_REGION_ALIGN: u64 = 256;
 /// transient (driver overwrites every frame), but keeping it sparse
 /// avoids committing memory for the maximum-bucket worst case when
 /// scenes start small.
-pub const BLAS_SCRATCH_VIRTUAL_BYTES: u64 = 1024 * 1024 * 1024;
+// 8 GB virtual (sparse — only the per-frame build's scratch commits). OMM-bearing
+// cluster builds + dedup-off geometry counts push the scratch past the old 1 GB
+// reservation; the bump is free until actually committed.
+pub const BLAS_SCRATCH_VIRTUAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// NV cluster-AS scratch alignment (`clusterScratchByteAlignment`).
 pub const BLAS_SCRATCH_ALIGN: u64 = 256;
@@ -91,6 +94,20 @@ pub fn init_blas_rebuild(
 /// Worst-case single-BLAS byte size for a mesh with `cluster_count`
 /// clusters (every cluster selected). Used to size a bucket's region.
 /// One-AS build-size query; results are cached by the caller.
+/// Build flags for the cluster→BLAS (CLUSTERS_BOTTOM_LEVEL) builds. When OMM is
+/// available the bottom-level build MUST declare OMM, or the driver under-sizes
+/// the per-geometry BLAS region (its referenced CLASes carry OMM) and the build
+/// overflows the committed pool region (VUID-...opMode-10471). Mirrors the CLAS
+/// build's OMM opt-in in `clas_arena`. Use for BOTH the stride-sizing query and
+/// the actual build so they agree.
+pub(crate) fn blas_build_flags() -> vk::BuildAccelerationStructureFlagsKHR {
+    let mut flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
+    if crate::gpu::extension::opacity_micromap_available() {
+        flags |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_OPACITY_MICROMAP_UPDATE_EXT;
+    }
+    flags
+}
+
 pub(crate) fn query_blas_size(
     cluster_fns: &nv::cluster_acceleration_structure::Device,
     cluster_count: u32,
@@ -103,7 +120,7 @@ pub(crate) fn query_blas_size(
     };
     let size_input = vk::ClusterAccelerationStructureInputInfoNV::default()
         .max_acceleration_structure_count(1)
-        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .flags(blas_build_flags())
         .op_type(vk::ClusterAccelerationStructureOpTypeNV::BUILD_CLUSTERS_BOTTOM_LEVEL)
         .op_mode(vk::ClusterAccelerationStructureOpModeNV::EXPLICIT_DESTINATIONS)
         .op_input(op_input);
@@ -173,7 +190,7 @@ pub fn dispatch_blas_rebuild(
     };
     let size_input = vk::ClusterAccelerationStructureInputInfoNV::default()
         .max_acceleration_structure_count(bucket_capacity)
-        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .flags(blas_build_flags())
         .op_type(vk::ClusterAccelerationStructureOpTypeNV::BUILD_CLUSTERS_BOTTOM_LEVEL)
         .op_mode(vk::ClusterAccelerationStructureOpModeNV::EXPLICIT_DESTINATIONS)
         .op_input(op_input);

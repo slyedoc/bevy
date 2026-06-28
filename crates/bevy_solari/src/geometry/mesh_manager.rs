@@ -1,7 +1,9 @@
 use super::asset::{
-    Cluster, ClusterBvhNode, ClusterLodGroup, ClusterMesh, ClusterMeshAabb, PackedVertex,
+    Cluster, ClusterBvhNode, ClusterLodGroup, ClusterMesh, ClusterMeshAabb, OmmDesc, OmmUsage,
+    PackedVertex,
 };
 use super::indices::{ClusterIndex, GroupIndex, NodeIndex};
+use crate::gpu::extension::opacity_micromap_available;
 use crate::gpu::allocator::Allocator;
 use crate::gpu::persistent_buffer::PersistentGpuBuffer;
 use alloc::sync::Arc;
@@ -17,6 +19,19 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
 };
 use core::ops::Range;
+
+/// Per-cluster snapshot the tessellation showcase consumes: global vertex / index
+/// offsets + triangle count (for the displace dispatch) plus the cluster's
+/// object-space bounds-sphere center, which drives **per-cluster** view-dependent
+/// LOD (so detail follows the camera across one surface, not the whole instance).
+#[derive(Clone, Copy, Debug)]
+pub struct TessCluster {
+    pub vertex_offset: u32,
+    pub index_offset: u32,
+    pub triangle_count: u32,
+    /// Object-space cluster centroid (`Cluster::bounds_sphere` xyz).
+    pub center: [f32; 3],
+}
 
 /// Per-asset slice ownership inside [`ClusterMeshManager`]'s buffers.
 #[derive(Clone)]
@@ -38,12 +53,12 @@ struct ClusterMeshSlices {
     mesh_max_error: f32,
     cluster_count: u32,
     total_triangle_count: u32,
-    /// Per-cluster global `[vertex_offset, index_offset, triangle_count]` for every
-    /// cluster in this mesh, retained for the tessellation showcase (which
+    /// Per-cluster [`TessCluster`] (global offsets + triangle count + centroid) for
+    /// every cluster in this mesh, retained for the tessellation showcase (which
     /// subdivides a real instance's geometry in place; the per-cluster `Cluster`
     /// records are consumed when the asset uploads, so this snapshot is the only
     /// post-upload CPU access to them).
-    tess_clusters: Vec<[u32; 3]>,
+    tess_clusters: Vec<TessCluster>,
     /// Dense, stable per-unique-geometry id assigned on first upload.
     /// BLAS sharing keys one shared BLAS per geometry on this (NOT on
     /// camera distance), so the BLAS count is bounded by the resident
@@ -86,6 +101,20 @@ pub struct ClusterMeshUpload {
 /// The manager queues a [`PendingClasUpload`] on every fresh mesh
 /// upload; [`crate::geometry::clas_arena`] drains the queue after the
 /// per-mesh vertex / index writes have landed.
+/// Opacity micro-map payload threaded from a [`ClusterMesh`] to the CLAS build
+/// (cheap `Arc` clones). Present only when the mesh carries a baked OMM *and*
+/// `VK_EXT_opacity_micromap` is available. The CLAS build (`clas_arena`) builds
+/// one `VkMicromapEXT` from `array_data` + `descs` and references it per cluster
+/// via the per-triangle `index`.
+#[derive(Clone, Debug)]
+pub struct OmmUploadData {
+    pub array_data: Arc<[u8]>,
+    pub descs: Arc<[OmmDesc]>,
+    /// Per-triangle OMM index, parallel to the mesh's triangles in cluster order.
+    pub index: Arc<[i32]>,
+    pub usage: Arc<[OmmUsage]>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PendingClasUpload {
     pub asset_id: AssetId<ClusterMesh>,
@@ -103,6 +132,9 @@ pub struct PendingClasUpload {
     /// keeps the cluster data alive past the `remove_untracked` that
     /// fires inside [`ClusterMeshManager::queue_upload_if_needed`].
     pub clusters: Arc<[Cluster]>,
+    /// Baked opacity micro-map for this mesh, or `None` (no OMM / extension
+    /// unavailable). Consumed by the CLAS build to attach the OMM per cluster.
+    pub omm: Option<OmmUploadData>,
 }
 
 /// Manages uploading [`ClusterMesh`] asset data to the GPU.
@@ -325,12 +357,11 @@ impl ClusterMeshManager {
             tess_clusters: mesh
                 .clusters
                 .iter()
-                .map(|c| {
-                    [
-                        vertex_base + c.vertex_offset,
-                        index_base + c.index_offset,
-                        c.triangle_count,
-                    ]
+                .map(|c| TessCluster {
+                    vertex_offset: vertex_base + c.vertex_offset,
+                    index_offset: index_base + c.index_offset,
+                    triangle_count: c.triangle_count,
+                    center: [c.bounds_sphere[0], c.bounds_sphere[1], c.bounds_sphere[2]],
                 })
                 .collect(),
             geometry_id,
@@ -350,12 +381,23 @@ impl ClusterMeshManager {
         };
 
         self.cluster_mesh_slices.insert(asset_id, slices);
+        // Thread the baked OMM through to the CLAS build, but only if the device
+        // can actually consume it — otherwise alpha cutouts fall back to any-hit.
+        let omm = (opacity_micromap_available() && mesh.has_opacity_micromap()).then(|| {
+            OmmUploadData {
+                array_data: Arc::clone(&mesh.omm_array_data),
+                descs: Arc::clone(&mesh.omm_descs),
+                index: Arc::clone(&mesh.omm_index),
+                usage: Arc::clone(&mesh.omm_usage),
+            }
+        });
         let pending = PendingClasUpload {
             asset_id,
             cluster_base,
             vertex_base,
             index_base,
             clusters: Arc::clone(&mesh.clusters),
+            omm,
         };
         self.pending_clas_uploads.push(pending);
         upload
@@ -372,7 +414,7 @@ impl ClusterMeshManager {
     /// cluster of a resident mesh — the tessellation showcase subdivides this real
     /// geometry in place. `None` if the mesh isn't resident yet.
     #[inline]
-    pub fn tess_clusters(&self, asset_id: AssetId<ClusterMesh>) -> Option<&[[u32; 3]]> {
+    pub fn tess_clusters(&self, asset_id: AssetId<ClusterMesh>) -> Option<&[TessCluster]> {
         self.cluster_mesh_slices
             .get(&asset_id)
             .map(|s| s.tess_clusters.as_slice())

@@ -180,7 +180,11 @@ pub fn init_ray_query(
     let params = allocator
         .create_buffer(
             &render_device,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            // TRANSFER_DST must be on the VK usage to match the wgpu `COPY_DST`:
+            // `write_buffer` stages this UBO via `vkCmdCopyBuffer`, which wgpu allows
+            // (COPY_DST on the wrapper) but VK rejects unless the VkBuffer itself
+            // carries TRANSFER_DST (VUID-vkCmdCopyBuffer-dstBuffer-00120).
+            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             size_of::<Params>() as u64,
             MemoryLocation::GpuOnly,

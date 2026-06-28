@@ -83,6 +83,21 @@ fn cost_heatmap(t: f32) -> vec3<f32> {
 }
 #endif
 
+// Hash an id (cluster or cluster⊕triangle) to a distinct, well-spread flat color for
+// the geometry-debug views. PCG-style integer hash → hue via three decorrelated bytes,
+// lifted off black so adjacent ids stay visually distinct.
+fn id_hash_color(id: u32) -> vec3<f32> {
+    var h = id * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    h = (h >> 22u) ^ h;
+    let rgb = vec3<f32>(
+        f32(h & 0xffu),
+        f32((h >> 8u) & 0xffu),
+        f32((h >> 16u) & 0xffu),
+    ) / 255.0;
+    return 0.15 + 0.85 * rgb;
+}
+
 @ray_generation
 fn raygen(
     @builtin(ray_invocation_id) id: vec3<u32>,
@@ -99,6 +114,13 @@ fn raygen(
     var radiance = vec3<f32>(0.0);
     var throughput = vec3<f32>(1.0);
     var captured = false;
+    // Total alpha any-hit invocations across all primary/bounce traces this pixel
+    // (the OMM-effectiveness heatmap). Shadow-ray any-hits use the shadow payload's
+    // own counter and aren't summed here.
+    var total_anyhit = 0u;
+    // Primary hit's cluster + triangle (geometry-debug views). Sentinel = primary miss.
+    var primary_cluster = 0xffffffffu;
+    var primary_primitive = 0u;
     // pdf of the BRDF sample that produced this segment (0 on the primary ray),
     // threaded into the hit shader so it can MIS-weight its emissive vs NEE.
     var p_bounce = 0.0;
@@ -157,6 +179,10 @@ fn raygen(
         payload.bounce = 0u;
         payload.rng = rng;
         payload.p_bounce = p_bounce;
+        payload.anyhit_count = 0u;
+        // Sentinel so a primary miss (sky) reads as "no cluster" (the miss shader
+        // doesn't write these); the closest-hit overwrites on a hit.
+        payload.hit_cluster = 0xffffffffu;
 #ifdef SOLARI_DLSS
         // Only the primary hit produces the visible guide; later bounces pass the
         // sentinel so their closest-hit leaves the G-buffer untouched.
@@ -184,6 +210,16 @@ fn raygen(
         reorderThread(&hit, material_hint, camera.frame.y);
         hitObjectExecuteShader(&hit, &payload);
         rng = payload.rng;
+        // Count any-hits on the PRIMARY ray only — its pass-through of unknown
+        // cutout micro-regions before it commits, i.e. the any-hit cost of the
+        // directly-visible pixel. Bounce (GI) rays would otherwise paint nearby
+        // foliage onto the surfaces they illuminate ("plants through walls").
+        if bounce == 0u {
+            total_anyhit = payload.anyhit_count;
+            // Capture the primary hit's cluster + triangle for the geometry-debug views.
+            primary_cluster = payload.hit_cluster;
+            primary_primitive = payload.hit_primitive;
+        }
 
         // Capture the PRIMARY hit's depth on bounce 0. A miss leaves
         // `payload.next_origin` at the camera ray origin (the miss shader doesn't
@@ -267,6 +303,29 @@ fn raygen(
         final_color = cost_heatmap(t);
     }
 #endif
+
+    // Any-hit invocation heatmap (frame.z == 2): overlay ONLY where the primary
+    // ray fired the alpha any-hit (unknown cutout micro-regions, or cutouts with no
+    // OMM). Zero-any-hit pixels — resolved in hardware (OMM opaque/transparent, or
+    // opaque geometry) — keep their real shaded color, so the scene reads naturally
+    // and the warm leaf-contour tracery stands out against it instead of a flat
+    // blue field. Warm ramp yellow → red by count; jitter.z scales count → [0, 1].
+    if camera.frame.z == 2u && total_anyhit > 0u {
+        let t = clamp(f32(total_anyhit) * camera.jitter.z, 0.0, 1.0);
+        final_color = mix(vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), t);
+    }
+
+    // Geometry-debug views: flat per-cluster (z==3) / per-triangle (z==4) color, a
+    // hash of the primary hit's ids → distinct hue. Tessellation density (clusters)
+    // and view-dependent LEVEL (triangles) read directly off the colors. A primary
+    // miss (sentinel cluster) keeps its real (sky) color.
+    if (camera.frame.z == 3u || camera.frame.z == 4u) && primary_cluster != 0xffffffffu {
+        var key = primary_cluster;
+        if camera.frame.z == 4u {
+            key = primary_cluster * 0x9e3779b1u + primary_primitive;
+        }
+        final_color = id_hash_color(key);
+    }
 
     let index = id.y * dims.x + id.x;
     // Alpha carries the primary-hit depth for the gizmo-depth bridge. The blit

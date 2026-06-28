@@ -44,8 +44,9 @@ use core::ops::Range;
 use range_alloc::RangeAllocator;
 use wgpu::CommandEncoderDescriptor;
 
-use crate::gpu::allocator::{Allocator, SparseBuffer};
+use crate::gpu::allocator::{Allocator, MemoryLocation, SparseBuffer};
 use crate::gpu::extension::ClusterExtensionFns;
+use super::mesh_manager::OmmUploadData;
 use super::{Cluster, ClusterIndex, ClusterMesh, ClusterMeshManager};
 
 /// Virtual address space reserved for the CLAS storage arena —
@@ -82,6 +83,58 @@ pub struct ClasMeshEntry {
     /// global address table on eviction. Per-cluster addresses
     /// themselves live only on GPU.
     pub cluster_count: u32,
+    /// Built opacity micro-map for this mesh (alpha-cutout meshes only). Keeps
+    /// the `VkMicromapEXT` + its backing/index buffers alive for as long as the
+    /// CLAS references them; `None` for opaque meshes.
+    pub omm: Option<MeshOmm>,
+}
+
+/// A built opacity micro-map kept alive for a mesh's lifetime. The CLAS
+/// references `backing` (via `opacity_micromap_array`) at traversal time and the
+/// per-triangle `index` at build time, so both buffers must outlive the CLAS.
+//
+// TODO(omm): `micromap` (a `VkMicromapEXT` handle) is never destroyed — it leaks
+// on mesh eviction. Acceptable while meshes live for the app lifetime (the arena
+// has no eviction yet, see module docs); add `vkDestroyMicromapEXT` alongside
+// CLAS eviction.
+#[derive(Debug)]
+pub struct MeshOmm {
+    pub micromap: vk::MicromapEXT,
+    /// Micro-map array storage (referenced by `opacity_micromap_array`).
+    pub backing: wgpu::Buffer,
+    /// Per-triangle OMM index buffer (referenced by `opacity_micromap_index_buffer`).
+    pub index: wgpu::Buffer,
+}
+
+/// All buffers + handle for one mesh's opacity micro-map, produced by
+/// [`ClasArena::create_micromap`] before the CLAS build records its build. The
+/// `*_addr` fields feed `VkMicromapBuildInfoEXT` / the per-cluster descriptors.
+/// The build inputs + scratch are transients (kept alive only until the build
+/// submit drains); [`Self::into_mesh_omm`] discards them and keeps the parts the
+/// CLAS references for its lifetime.
+struct MicromapBuild {
+    micromap: vk::MicromapEXT,
+    backing: wgpu::Buffer,
+    backing_addr: vk::DeviceAddress,
+    index: wgpu::Buffer,
+    index_addr: vk::DeviceAddress,
+    _array_input: wgpu::Buffer,
+    array_input_addr: vk::DeviceAddress,
+    _descs_input: wgpu::Buffer,
+    descs_addr: vk::DeviceAddress,
+    _scratch: wgpu::Buffer,
+    scratch_addr: vk::DeviceAddress,
+    usage_counts: Vec<vk::MicromapUsageEXT>,
+}
+
+impl MicromapBuild {
+    fn into_mesh_omm(self) -> MeshOmm {
+        MeshOmm {
+            micromap: self.micromap,
+            backing: self.backing,
+            index: self.index,
+        }
+    }
 }
 
 /// Render-world resource owning the CLAS storage pool, per-mesh
@@ -153,6 +206,163 @@ impl ClasArena {
         self.meshes.get(&asset_id)
     }
 
+    /// Create + size (not yet record the build of) one mesh's opacity micro-map:
+    /// uploads the baked array / descriptor / per-triangle-index inputs, queries
+    /// the build sizes, allocates the backing + scratch buffers, and creates the
+    /// `VkMicromapEXT` handle. The caller records `vkCmdBuildMicromapsEXT` into
+    /// the CLAS encoder (so it lands in the same submit, before the CLAS build).
+    fn create_micromap(
+        &self,
+        render_device: &RenderDevice,
+        render_queue: &RenderQueue,
+        allocator: &Allocator,
+        fns: &ClusterExtensionFns,
+        omm: &OmmUploadData,
+    ) -> MicromapBuild {
+        let omm_fns = fns
+            .opacity_micromap
+            .as_ref()
+            .expect("clas_arena.create_micromap: opacity-micromap extension not enabled");
+
+        // Build-input buffers need `MICROMAP_BUILD_INPUT_READ_ONLY_EXT` (wgpu
+        // can't express it → allocator path); `write_buffer` stages the upload
+        // into the device-local buffer, ordered before the raw build (same as the
+        // existing `src_infos` upload).
+        let make_input = |bytes: &[u8], label: &'static str| {
+            // `write_buffer` requires the copy size to respect `COPY_BUFFER_ALIGNMENT`
+            // (4). `array_data` is a raw byte blob of arbitrary length; pad up. The
+            // micromap build only reads bytes its `descArray` references, so trailing
+            // zero padding is inert.
+            let padded_len = bytes.len().next_multiple_of(4).max(4);
+            // TRANSFER_DST must be on the VK usage (the `wgpu_usage` arg only sets the
+            // wgpu wrapper's view) so `write_buffer`'s staged copy is valid.
+            let buf = allocator.create_buffer(
+                render_device,
+                vk::BufferUsageFlags::MICROMAP_BUILD_INPUT_READ_ONLY_EXT
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                wgpu::BufferUsages::COPY_DST,
+                padded_len as u64,
+                MemoryLocation::GpuOnly,
+                label,
+            );
+            if bytes.len() == padded_len {
+                render_queue.write_buffer(&buf, 0, bytes);
+            } else {
+                let mut padded = bytes.to_vec();
+                padded.resize(padded_len, 0);
+                render_queue.write_buffer(&buf, 0, &padded);
+            }
+            let addr = allocator.wgpu_buffer_device_address(&buf);
+            (buf, addr)
+        };
+        let (array_input, array_input_addr) = make_input(&omm.array_data[..], "omm.array_input");
+        let (descs_input, descs_addr) =
+            make_input(bytemuck::cast_slice(&omm.descs[..]), "omm.descs");
+        let (index, index_addr) = make_input(bytemuck::cast_slice(&omm.index[..]), "omm.index");
+
+        let usage_counts: Vec<vk::MicromapUsageEXT> = omm
+            .usage
+            .iter()
+            .map(|u| {
+                vk::MicromapUsageEXT::default()
+                    .count(u.count)
+                    .subdivision_level(u.subdivision_level as u32)
+                    .format(u.format as u32)
+            })
+            .collect();
+
+        // Size query: only the usage histogram determines the sizes.
+        let size_info_in = vk::MicromapBuildInfoEXT::default()
+            .ty(vk::MicromapTypeEXT::OPACITY_MICROMAP)
+            .flags(vk::BuildMicromapFlagsEXT::PREFER_FAST_TRACE)
+            .mode(vk::BuildMicromapModeEXT::BUILD)
+            .usage_counts(&usage_counts);
+        let mut sizes = vk::MicromapBuildSizesInfoEXT::default();
+        // SAFETY: omm_fns loaded (checked); size_info_in fully populated; the
+        // query only reads inputs and writes `sizes`. ash exposes only the raw
+        // fp for this extension, so we call it directly (device handle + ptrs).
+        unsafe {
+            (omm_fns.fp().get_micromap_build_sizes_ext)(
+                omm_fns.device(),
+                vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                &size_info_in,
+                &mut sizes,
+            );
+        }
+
+        // Backing storage (referenced at trace via `opacity_micromap_array`) +
+        // the micromap handle on it.
+        let (backing, backing_raw) = allocator.create_buffer_raw(
+            render_device,
+            vk::BufferUsageFlags::MICROMAP_STORAGE_EXT,
+            wgpu::BufferUsages::STORAGE,
+            sizes.micromap_size,
+            MemoryLocation::GpuOnly,
+            "omm.backing",
+        );
+        let backing_addr = allocator.wgpu_buffer_device_address(&backing);
+        let create_info = vk::MicromapCreateInfoEXT::default()
+            .buffer(backing_raw)
+            .offset(0)
+            .size(sizes.micromap_size)
+            .ty(vk::MicromapTypeEXT::OPACITY_MICROMAP);
+        // SAFETY: create_info references the backing buffer just created at a
+        // valid offset/size; omm_fns is loaded. Raw fp (no safe wrapper).
+        let mut micromap = vk::MicromapEXT::null();
+        let res = unsafe {
+            (omm_fns.fp().create_micromap_ext)(
+                omm_fns.device(),
+                &create_info,
+                core::ptr::null(),
+                &mut micromap,
+            )
+        };
+        assert_eq!(
+            res,
+            vk::Result::SUCCESS,
+            "clas_arena.create_micromap: vkCreateMicromapEXT failed: {res:?}"
+        );
+
+        // Micromap-build scratch must be aligned (minAccelerationStructureScratchOffsetAlignment,
+        // ≤256 on NV). Over-allocate by the alignment and round the device address up —
+        // an unaligned scratch makes vkCmdBuildMicromapsEXT emit garbage (all-unknown).
+        const OMM_SCRATCH_ALIGN: u64 = 256;
+        let scratch = allocator.create_buffer(
+            render_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            wgpu::BufferUsages::STORAGE,
+            sizes.build_scratch_size.max(1) + OMM_SCRATCH_ALIGN - 1,
+            MemoryLocation::GpuOnly,
+            "omm.scratch",
+        );
+        let scratch_base = allocator.wgpu_buffer_device_address(&scratch);
+        let scratch_addr = scratch_base.next_multiple_of(OMM_SCRATCH_ALIGN);
+
+        // tracing::info!(
+        //     "clas: micromap built — array_in={}B descs={} per_tri_idx={} micromap_size={} backing_addr={:#x}",
+        //     omm.array_data.len(),
+        //     omm.descs.len(),
+        //     omm.index.len(),
+        //     sizes.micromap_size,
+        //     backing_addr,
+        // );
+
+        MicromapBuild {
+            micromap,
+            backing,
+            backing_addr,
+            index,
+            index_addr,
+            _array_input: array_input,
+            array_input_addr,
+            _descs_input: descs_input,
+            descs_addr,
+            _scratch: scratch,
+            scratch_addr,
+            usage_counts,
+        }
+    }
+
     /// Build CLAS for every cluster in `mesh` and record the
     /// per-cluster device addresses. The 24-bit `geometry_index`
     /// slot of each CLAS carries the **global** cluster id
@@ -172,6 +382,11 @@ impl ClasArena {
     /// Panics if cluster_AS extension function table is missing, the
     /// arena is exhausted, the build submission fails, or readback
     /// mapping fails. All setup-time failure modes.
+    ///
+    /// `omm` (when `Some`) attaches a per-mesh opacity micro-map: a single
+    /// `VkMicromapEXT` is built from the baked array + descriptors and referenced
+    /// by every cluster's build descriptor, so the RT cores skip `ahit_alpha` on
+    /// resolved opaque/transparent micro-regions.
     pub fn upload_mesh(
         &mut self,
         render_device: &RenderDevice,
@@ -185,6 +400,7 @@ impl ClasArena {
         index_buffer_addr: vk::DeviceAddress,
         vertex_base: u32,
         index_base: u32,
+        omm: Option<&OmmUploadData>,
     ) {
         if self.meshes.contains_key(&asset_id) {
             return;
@@ -196,6 +412,7 @@ impl ClasArena {
                 ClasMeshEntry {
                     storage_range: 0..0,
                     cluster_count: 0,
+                    omm: None,
                 },
             );
             return;
@@ -205,6 +422,17 @@ impl ClasArena {
             .as_ref()
             .expect("clas_arena.upload_mesh: cluster-AS extension function table missing");
 
+        // 0. Opacity micro-map: build the per-mesh `VkMicromapEXT` + its input /
+        //    backing / index buffers up front so the per-cluster descriptors can
+        //    reference its device addresses. The build itself is recorded into the
+        //    same encoder as the CLAS build below (with a barrier between).
+        let omm_build = omm.map(|o| self.create_micromap(render_device, render_queue, allocator, fns, o));
+        if omm_build.is_some() {
+            // tracing::info!(
+            //     "clas: OMM attached to {asset_id:?} ({cluster_count} clusters)"
+            // );
+        }
+
         // 1. Per-cluster build descriptors. Cluster ids: cluster_id
         //    is mesh-local; geometry_index is global (matches aurora).
         //    NV index type 4 = 32-bit indices (the only index type the
@@ -213,6 +441,32 @@ impl ClasArena {
         //    `aurora_cluster_as_opaque.md`.
         const INDEX_TYPE_32BIT: u32 = 4;
         const OPAQUE_GEOMETRY_FLAG: u8 = 0b100;
+        // OMM per-triangle index is 32-bit signed (i32, negative = special index).
+        // The packed `opacity_micromap_index_type` subfield uses the same NV index
+        // encoding as the triangle index type (4 = 32-bit). 4-byte stride.
+        const OMM_INDEX_TYPE_32BIT: u32 = 4;
+        const OMM_INDEX_STRIDE: u16 = 4;
+
+        // OMM clusters must NOT be flagged OPAQUE: an opaque geometry commits in
+        // hardware WITHOUT consulting the micromap, so its transparent/unknown
+        // micro-regions would be ignored (card renders solid). The OMM provides the
+        // per-micro-triangle opacity instead. Non-OMM clusters keep OPAQUE for the
+        // RTCore fast path (any-hit is then driven by the instance FORCE_NO_OPAQUE).
+        let geometry_flags: u8 = if omm_build.is_some() {
+            0
+        } else {
+            OPAQUE_GEOMETRY_FLAG
+        };
+        // Per-cluster OMM opt-in. The NV cluster build REJECTS per-cluster
+        // opacity_micromap_array unless the cluster declares OMM participation
+        // (validation: CLUSTER_OP_OMM_NOT_ALLOWED). The only OMM cluster flag is
+        // ALLOW_DISABLE_OPACITY_MICROMAPS — setting it marks the cluster as
+        // OMM-bearing (and lets an instance disable it via the disable flag).
+        let cluster_flags = if omm_build.is_some() {
+            vk::ClusterAccelerationStructureClusterFlagsNV::ALLOW_DISABLE_OPACITY_MICROMAPS
+        } else {
+            vk::ClusterAccelerationStructureClusterFlagsNV::default()
+        };
 
         let (mut max_tris, mut max_verts) = (0u32, 0u32);
         let (mut total_tris, mut total_verts) = (0u32, 0u32);
@@ -229,31 +483,46 @@ impl ClasArena {
             } = *cluster;
             let global_id = cluster_base.0.wrapping_add(local_id as u32);
 
+            // OMM attach (this cluster's slice of the per-mesh micro-map). The
+            // OMM index buffer is mesh-local (one i32 per triangle, parallel to
+            // the mesh's index buffer / 3), so the cluster's triangle base is its
+            // mesh-local `index_offset / 3`.
+            let (omm_array_addr, omm_index_addr, omm_index_type, omm_index_stride) =
+                match &omm_build {
+                    Some(b) => (
+                        b.backing_addr,
+                        b.index_addr + u64::from(index_offset / 3) * u64::from(OMM_INDEX_STRIDE),
+                        OMM_INDEX_TYPE_32BIT,
+                        OMM_INDEX_STRIDE,
+                    ),
+                    None => (0, 0, 0, 0),
+                };
+
             descriptors.push(vk::ClusterAccelerationStructureBuildTriangleClusterInfoNV {
                 // Global cluster id so the RT-pipeline hit shader's
                 // `@builtin(cluster_id)` (ClusterIDNV) indexes `clusters[]`
                 // directly. The ray-query path uses the baked `base_geometry_index`
                 // instead, so this is free for it.
                 cluster_id: global_id,
-                cluster_flags: vk::ClusterAccelerationStructureClusterFlagsNV::default(),
+                cluster_flags,
                 triangle_cluster_info_packed: vk::Packed9_9_6_4_4::new(
                     triangle_count,
                     vertex_count,
                     0, // position_truncate_bit_count
                     INDEX_TYPE_32BIT,
-                    0, // opacity_micromap_index_type
+                    omm_index_type,
                 ),
                 base_geometry_index_and_geometry_flags:
                     vk::ClusterAccelerationStructureGeometryIndexAndGeometryFlagsNV {
                         geometry_index_and_geometry_flags: vk::Packed24_5_3::new(
                             global_id,
-                            OPAQUE_GEOMETRY_FLAG,
+                            geometry_flags,
                         ),
                     },
                 index_buffer_stride: 4,
                 vertex_buffer_stride: 12,
                 geometry_index_and_flags_buffer_stride: 0,
-                opacity_micromap_index_buffer_stride: 0,
+                opacity_micromap_index_buffer_stride: omm_index_stride,
                 // `cluster.vertex_offset` / `index_offset` are
                 // MESH-LOCAL — the global-slot rebase only happens
                 // during the GPU upload of `clusters` (see
@@ -270,8 +539,8 @@ impl ClasArena {
                 vertex_buffer: vertex_buffer_addr
                     + u64::from(vertex_base + vertex_offset) * 12,
                 geometry_index_and_flags_buffer: 0,
-                opacity_micromap_array: 0,
-                opacity_micromap_index_buffer: 0,
+                opacity_micromap_array: omm_array_addr,
+                opacity_micromap_index_buffer: omm_index_addr,
             });
 
             max_tris = max_tris.max(triangle_count);
@@ -335,12 +604,29 @@ impl ClasArena {
         // the cluster-referencing BLAS — so the flag belongs on this build. The same
         // flags drive the size query and the build (the size depends on them):
         // `size_input` is reused as `cmd_info.input` below.
+        // The cluster build operation must DECLARE OMM participation (validation:
+        // CLUSTER_OP_OMM_NOT_ALLOWED) or it rejects the per-cluster
+        // opacity_micromap_array. The build-op opt-in is on the InputInfo flags
+        // (shared by the size query + build); ALLOW_DISABLE_OPACITY_MICROMAPS_EXT
+        // marks the build as OMM-bearing. Only set it for OMM meshes so non-OMM
+        // builds keep the lean flag set.
+        let mut build_flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS;
+        if omm_build.is_some() {
+            // OMM opt-in for the cluster build (else CLUSTER_OP_OMM_NOT_ALLOWED).
+            // Use ONLY the lightest "update" flag — DATA_UPDATE (0x100) reserves
+            // space to rewrite the whole OMM and explodes the CLAS/BLAS size
+            // (saw 3.4 GB); our OMM is static (baked offline), no update needed.
+            build_flags |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_OPACITY_MICROMAP_UPDATE_EXT;
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::debug!("clas: OMM build_flags = {:#x}", build_flags.as_raw());
+            }
+        }
         let size_input = vk::ClusterAccelerationStructureInputInfoNV::default()
             .max_acceleration_structure_count(cluster_count as u32)
-            .flags(
-                vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
-                    | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS,
-            )
+            .flags(build_flags)
             .op_type(vk::ClusterAccelerationStructureOpTypeNV::BUILD_TRIANGLE_CLUSTER)
             .op_mode(vk::ClusterAccelerationStructureOpModeNV::IMPLICIT_DESTINATIONS)
             .op_input(op_input);
@@ -388,7 +674,7 @@ impl ClasArena {
             vk::BufferUsageFlags::STORAGE_BUFFER,
             wgpu::BufferUsages::STORAGE,
             scratch_size + CLAS_SCRATCH_ALIGN - 1,
-            crate::gpu::allocator::MemoryLocation::GpuOnly,
+            MemoryLocation::GpuOnly,
             "clas_arena.scratch",
         );
         let scratch_addr_base = allocator.wgpu_buffer_device_address(&scratch_buf);
@@ -412,7 +698,7 @@ impl ClasArena {
                 | vk::BufferUsageFlags::TRANSFER_SRC,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             dst_addresses_size,
-            crate::gpu::allocator::MemoryLocation::GpuOnly,
+            MemoryLocation::GpuOnly,
             "clas_arena.dst_addresses",
         );
         let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses_buf);
@@ -453,6 +739,29 @@ impl ClasArena {
         // created. We do NOT touch this encoder via wgpu commands
         // afterward — wgpu refuses to mix raw + high-level encoding.
         unsafe {
+            // Build the opacity micro-map FIRST, then barrier so the cluster
+            // build (which references it via `opacity_micromap_array`) sees the
+            // finished data. Same encoder/submit → ordered before the CLAS build.
+            if let Some(b) = &omm_build {
+                let build_info = vk::MicromapBuildInfoEXT::default()
+                    .ty(vk::MicromapTypeEXT::OPACITY_MICROMAP)
+                    .flags(vk::BuildMicromapFlagsEXT::PREFER_FAST_TRACE)
+                    .mode(vk::BuildMicromapModeEXT::BUILD)
+                    .usage_counts(&b.usage_counts)
+                    .data(vk::DeviceOrHostAddressConstKHR {
+                        device_address: b.array_input_addr,
+                    })
+                    .triangle_array(vk::DeviceOrHostAddressConstKHR {
+                        device_address: b.descs_addr,
+                    })
+                    .triangle_array_stride(size_of::<super::asset::OmmDesc>() as u64)
+                    .dst_micromap(b.micromap)
+                    .scratch_data(vk::DeviceOrHostAddressKHR {
+                        device_address: b.scratch_addr,
+                    });
+                crate::gpu::extension::cmd_build_micromaps(&mut encoder, fns, &build_info);
+                crate::gpu::extension::cmd_micromap_barrier(&mut encoder, &render_device);
+            }
             crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
                 &mut encoder,
                 fns,
@@ -506,11 +815,14 @@ impl ClasArena {
         );
         render_queue.submit([copy_encoder.finish()]);
 
+        // Build transients (input/descs/scratch) are now safe to drop after the
+        // poll-wait above; keep only the micromap + its backing/index buffers.
         self.meshes.insert(
             asset_id,
             ClasMeshEntry {
                 storage_range,
                 cluster_count: cluster_count as u32,
+                omm: omm_build.map(MicromapBuild::into_mesh_omm),
             },
         );
     }
@@ -569,6 +881,7 @@ impl ClasArena {
                 ClasMeshEntry {
                     storage_range: 0..0,
                     cluster_count: 0,
+                    omm: None,
                 },
             );
             return;
@@ -720,7 +1033,7 @@ impl ClasArena {
                 | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
             wgpu::BufferUsages::STORAGE,
             tmpl_sizes.acceleration_structure_size.max(1),
-            crate::gpu::allocator::MemoryLocation::GpuOnly,
+            MemoryLocation::GpuOnly,
             "clas_arena.template.storage",
         );
         let tmpl_storage_addr = allocator.wgpu_buffer_device_address(&tmpl_storage);
@@ -730,7 +1043,7 @@ impl ClasArena {
             vk::BufferUsageFlags::STORAGE_BUFFER,
             wgpu::BufferUsages::STORAGE,
             tmpl_sizes.build_scratch_size.max(1) + CLAS_SCRATCH_ALIGN - 1,
-            crate::gpu::allocator::MemoryLocation::GpuOnly,
+            MemoryLocation::GpuOnly,
             "clas_arena.template.scratch",
         );
         let tmpl_scratch_addr = align_up(
@@ -746,7 +1059,7 @@ impl ClasArena {
                 | vk::BufferUsageFlags::TRANSFER_SRC,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             addr_array_size,
-            crate::gpu::allocator::MemoryLocation::GpuOnly,
+            MemoryLocation::GpuOnly,
             "clas_arena.template.addresses",
         );
         let tmpl_addresses_addr = allocator.wgpu_buffer_device_address(&tmpl_addresses);
@@ -908,7 +1221,7 @@ impl ClasArena {
             vk::BufferUsageFlags::STORAGE_BUFFER,
             wgpu::BufferUsages::STORAGE,
             inst_sizes.build_scratch_size.max(1) + CLAS_SCRATCH_ALIGN - 1,
-            crate::gpu::allocator::MemoryLocation::GpuOnly,
+            MemoryLocation::GpuOnly,
             "clas_arena.instantiate.scratch",
         );
         let inst_scratch_addr = align_up(
@@ -923,7 +1236,7 @@ impl ClasArena {
                 | vk::BufferUsageFlags::TRANSFER_SRC,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             addr_array_size,
-            crate::gpu::allocator::MemoryLocation::GpuOnly,
+            MemoryLocation::GpuOnly,
             "clas_arena.instantiate.dst_addresses",
         );
         let inst_dst_addresses_addr = allocator.wgpu_buffer_device_address(&inst_dst_addresses);
@@ -989,6 +1302,9 @@ impl ClasArena {
             ClasMeshEntry {
                 storage_range,
                 cluster_count: cluster_count as u32,
+                // OMM not wired on the template A/B path (MVP); the default
+                // BUILD_TRIANGLE_CLUSTER path carries opacity micro-maps.
+                omm: None,
             },
         );
     }
@@ -1086,6 +1402,7 @@ pub fn upload_pending_clas(
                 index_addr,
                 entry.vertex_base,
                 entry.index_base,
+                entry.omm.as_ref(),
             );
         }
     }

@@ -39,13 +39,16 @@
 //! a BLAS address (it cannot change a transform), and stable per-slot
 //! addresses leave nothing to refresh — so it was removed.
 //!
-//! Build mode: incremental frames update the PTLAS **in place** —
-//! `src == dst == storage` (a single buffer). The NV spec permits equal
-//! `src`/`dst` ("if they are the same, the update happens in-place"), so the
-//! driver applies only the op-delta to the existing structure, with no copy
-//! into a second buffer. A full rebuild (`src = 0`, WRITE every active slot,
-//! built from scratch into the same buffer) happens on the first build and
-//! whenever capacity grows.
+//! Build mode: **double-buffered** incremental update. The NV partitioned
+//! build reads `src` (the previously-built PTLAS, "used as a basis") and
+//! writes a fresh structure to `dst`; the spec REQUIRES the two not overlap
+//! (VUID-...10549), so each build reads the last-built storage buffer and
+//! writes the other, then flips `current`. The driver carries unchanged
+//! partitions from `src` and applies only the op-delta. A full rebuild
+//! (`src = 0`, WRITE every active slot) happens on the first build and
+//! whenever capacity grows. Builds are skipped entirely on frames with no
+//! op-delta (`op_count == 0`), so the per-build migration cost is paid only
+//! when geometry actually changes.
 //!
 //! Partitioning
 //! ------------
@@ -166,6 +169,14 @@ pub struct PtlasFillParamsGpu {
     pub active_count: u32,
     pub cpu_count: u32,
     pub force_all: u32,
+    /// 1 → OMM-consult validation mode (drop FORCE_NO_OPAQUE so micromaps drive).
+    /// Set from `SOLARI_OMM_CONSULT` when the extension is available.
+    pub omm_consult: u32,
+    /// 1 → force the OMM to 2-state at traversal (collapse "unknown" micro-tris to
+    /// opaque/transparent via the bake's lean), so NO micro-triangle ever invokes
+    /// the any-hit. Trades a sub-micro-triangle-precise cutout edge for zero any-hit.
+    /// Set from `SOLARI_OMM_2STATE` when the extension is available.
+    pub omm_force_2_state: u32,
 }
 
 /// Render-world resource for the incremental partitioned-TLAS pass.
@@ -175,12 +186,23 @@ pub struct PtlasFillParamsGpu {
 /// bind-group layout, and the per-frame fill bind group.
 #[derive(Resource)]
 pub struct Ptlas {
-    /// PTLAS storage — a single sparse buffer. NV's partitioned build permits
-    /// `src == dst` (in-place update: "if they are the same, the update happens
-    /// in-place"), so an incremental update reads *and* writes this one buffer
-    /// (`src = dst = storage`), with no copy into a second buffer. A full rebuild
-    /// (`src = 0`) writes it from scratch in place.
-    pub storage: SparseBuffer,
+    /// PTLAS storage — **double-buffered** (`[src, dst]` flip). NV's partitioned
+    /// build reads `srcAccelerationStructureData` (the previous PTLAS, "used as a
+    /// basis") and writes a fresh structure to `dstAccelerationStructureData`;
+    /// the spec REQUIRES the two regions not overlap (VUID-...10549), so an
+    /// incremental update can't alias one buffer. Each build reads the
+    /// last-built buffer and writes the other, then flips [`Self::current`].
+    /// A full rebuild (`src = 0`) writes the destination from scratch.
+    pub storage: [SparseBuffer; 2],
+    /// Index of the most-recently-built storage buffer — the one the trace binds
+    /// (via [`Self::current_tlas`]). Flipped in `prepare_ptlas_params` on build
+    /// frames (BEFORE the bind group is built, so the bound TLAS matches the
+    /// buffer the build writes this frame). Static frames keep it (the prior
+    /// PTLAS is still valid).
+    pub current: usize,
+    /// The source buffer index for THIS frame's build (the prior `current`),
+    /// chosen in `prepare_ptlas_params` and consumed by `dispatch_ptlas`.
+    pub build_src_idx: usize,
     /// Sparse build scratch.
     pub scratch: SparseBuffer,
     /// Sparse `WriteInstanceData[]` (104 B records) filled by the fill
@@ -207,16 +229,17 @@ pub struct Ptlas {
     pub fill_params: UniformBuffer<PtlasFillParamsGpu>,
     /// `wgpu::Tlas` wrapper over [`Self::storage`] — so ray-trace shaders bind the
     /// PTLAS through wgpu's standard `accelerationStructureEXT` slot.
-    /// `current_tlas()` returns it. Wraps a `vkCreateAccelerationStructureKHR`
-    /// handle over the storage buffer via [`wgpu::Device::create_tlas_from_hal`],
-    /// recreated only when the build size changes (the old wrapper's Drop calls
-    /// `vkDestroyAccelerationStructureKHR`).
-    pub tlas: Option<Tlas>,
-    /// Build-size of [`Self::tlas`]; mismatch with this frame's
-    /// `sizes_info.acceleration_structure_size` recreates the handle.
+    /// `current_tlas()` returns the active one. Each wraps a
+    /// `vkCreateAccelerationStructureKHR` handle over its storage buffer via
+    /// [`wgpu::Device::create_tlas_from_hal`], recreated only when the build size
+    /// changes (the old wrapper's Drop calls `vkDestroyAccelerationStructureKHR`).
+    /// One per double-buffered storage buffer.
+    pub tlas: [Option<Tlas>; 2],
+    /// Build-size the [`Self::tlas`] handles were created for; mismatch with this
+    /// frame's `sizes_info.acceleration_structure_size` recreates BOTH handles.
     pub as_handle_size: u64,
-    /// `vkGetAccelerationStructureDeviceAddressKHR` for the handle.
-    pub as_handle_device_address: vk::DeviceAddress,
+    /// `vkGetAccelerationStructureDeviceAddressKHR` per handle.
+    pub as_handle_device_address: [vk::DeviceAddress; 2],
     /// Whether at least one PTLAS build has completed. Until then a
     /// full rebuild (`src = 0`) is forced.
     pub has_built: bool,
@@ -232,9 +255,9 @@ pub struct Ptlas {
     /// Live `src_infos` op count (0/1).
     pub op_count: u32,
     /// `true` → build from scratch (`src = 0`, WRITE every active slot
-    /// via `force_all`); `false` → incremental in-place (`src = dst = storage`,
-    /// WRITE only the CPU delta + GPU band-crossers, static instances
-    /// reused in place).
+    /// via `force_all`); `false` → incremental (`src` = last-built buffer as
+    /// basis, `dst` = the other; WRITE only the CPU delta + GPU band-crossers,
+    /// static instances carried from `src`).
     pub full_rebuild: bool,
 
     /// Per-frame fill bind group, rebuilt in `Render::PrepareBindGroups`. The fill
@@ -268,7 +291,7 @@ impl Ptlas {
     /// `None` until the first build has produced its handle.
     #[inline]
     pub fn current_tlas(&self) -> Option<&Tlas> {
-        self.tlas.as_ref()
+        self.tlas[self.current].as_ref()
     }
 }
 
@@ -284,14 +307,24 @@ pub fn init_ptlas(
         return;
     };
 
-    // Single storage buffer — incremental builds update it in place (src == dst).
-    let storage = allocator.create_sparse_buffer(
-        &render_device,
-        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
-        wgpu::BufferUsages::COPY_DST,
-        PTLAS_STORAGE_VIRTUAL_BYTES,
-        "ptlas.storage",
-    );
+    // Double-buffered storage — the partitioned build reads one (basis) and
+    // writes the other (spec forbids src/dst overlap, so no in-place aliasing).
+    let storage = [
+        allocator.create_sparse_buffer(
+            &render_device,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
+            wgpu::BufferUsages::COPY_DST,
+            PTLAS_STORAGE_VIRTUAL_BYTES,
+            "ptlas.storage.a",
+        ),
+        allocator.create_sparse_buffer(
+            &render_device,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
+            wgpu::BufferUsages::COPY_DST,
+            PTLAS_STORAGE_VIRTUAL_BYTES,
+            "ptlas.storage.b",
+        ),
+    ];
     let scratch = allocator.create_sparse_buffer(
         &render_device,
         vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -361,9 +394,11 @@ pub fn init_ptlas(
         src_infos,
         src_infos_count,
         fill_params,
-        tlas: None,
+        tlas: [None, None],
         as_handle_size: 0,
-        as_handle_device_address: 0,
+        as_handle_device_address: [0, 0],
+        current: 0,
+        build_src_idx: 0,
         has_built: false,
         as_capacity: 0,
         cpu_count: 0,
@@ -389,7 +424,8 @@ pub fn prepare_ptlas_params(
     allocator: Option<Res<Allocator>>,
     fns: Option<Res<ClusterExtensionFns>>,
     hair_instances: Option<Res<crate::hair::HairInstances>>,
-    tess_showcase: Option<Res<crate::geometry::tess_displace::TessShowcase>>,
+    tess_found: Option<Res<crate::geometry::tess_displace::TessShowcaseInstances>>,
+    tess_classify: Option<Res<crate::geometry::tess_classify::TessClassify>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
@@ -407,10 +443,14 @@ pub fn prepare_ptlas_params(
     // above the cluster slots, written by `ptlas_hair_write` each frame. They
     // expand the PTLAS instance space but use none of the cluster fill state.
     let hair_count = hair_instances.as_ref().map(|h| h.count).unwrap_or(0);
-    // The tessellated showcase instances occupy PTLAS slots above the cluster + hair
-    // slots, once their BLASes are armed. Read the armed-entry count directly (set in
-    // `PrepareAssets`, before this) so it matches `prepare_tess_ptlas_write`'s `tess_base`.
-    let tess_count = tess_showcase.as_ref().map_or(0, |s| s.entries.len() as u32);
+    // The GPU-tessellated instances occupy PTLAS slots above the cluster + hair slots,
+    // once `tess_classify` has built their per-instance BLAS. Gate + count identically to
+    // `prepare_tess_ptlas_write` so the slot reservation matches its `tess_base`.
+    let tess_blas_ready = tess_classify.as_ref().is_some_and(|c| c.blas_ready);
+    let tess_count = match (&tess_found, tess_blas_ready) {
+        (Some(f), true) if f.found => f.instances.len() as u32,
+        _ => 0,
+    };
 
     let cluster_high_water = instances.slot_high_water();
     // Total PTLAS instance space (cluster slots + hair + tessellation showcase).
@@ -540,6 +580,36 @@ pub fn prepare_ptlas_params(
         active_count,
         cpu_count,
         force_all: full_rebuild as u32,
+        // DEBUG: default ON whenever OMM is available so the micromap drives
+        // traversal (drops FORCE_NO_OPAQUE). SOLARI_OMM_CONSULT=0 forces it off.
+        // (Holes on non-OMM cutouts render solid under it — the per-geometry has_omm
+        // column is the correct always-on fix.)
+        omm_consult: {
+            let avail = crate::gpu::extension::opacity_micromap_available();
+            let off = std::env::var("SOLARI_OMM_CONSULT").as_deref() == Ok("0");
+            let on = (avail && !off) as u32;
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::debug!("ptlas: omm_consult={on} (omm_available={avail})");
+            }
+            on
+        },
+        // Force the micromap to 2-state at traversal (no any-hit on the unknown
+        // edge band). OFF by default: forcing 2-state on a 4-state-FORMAT micromap
+        // mis-resolves the cutout (the whole leaf collapses to transparent). The
+        // correct zero-any-hit path is a NATIVE 2-state bake (OC1_2_State) in the
+        // importer, not this runtime flag. Opt in with SOLARI_OMM_2STATE=1.
+        omm_force_2_state: {
+            let avail = crate::gpu::extension::opacity_micromap_available();
+            let on = (std::env::var("SOLARI_OMM_2STATE").as_deref() == Ok("1")) as u32;
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::debug!("ptlas: omm_force_2_state={on} (omm_available={avail})");
+            }
+            on
+        },
     };
     resources
         .fill_params
@@ -574,77 +644,93 @@ pub fn prepare_ptlas_params(
     );
     {
         let _span = tracing::info_span!("ptlas.commit").entered();
-        resources
-            .storage
-            .commit(0..sizes_info.acceleration_structure_size.max(1));
+        // Commit BOTH storage buffers — the build reads one and writes the other,
+        // and the bind group may reference either across frames.
+        for s in &resources.storage {
+            s.commit(0..sizes_info.acceleration_structure_size.max(1));
+        }
         let scratch_pad = PTLAS_SCRATCH_ALIGN - 1;
         resources
             .scratch
             .commit(0..(sizes_info.build_scratch_size.max(1) + scratch_pad));
     }
 
-    // (Re)create the AS handle if its build size changed.
-    if resources.tlas.is_none()
+    // (Re)create BOTH AS handles if the build size changed (one per
+    // double-buffered storage buffer). They share a single size.
+    if resources.tlas[0].is_none()
+        || resources.tlas[1].is_none()
         || resources.as_handle_size != sizes_info.acceleration_structure_size
     {
         let _span = tracing::info_span!("ptlas.create_as_handle").entered();
-        resources.tlas = None;
-        // SAFETY: as_hal yields the raw VkBuffer while the SparseBuffer
-        // is alive; created with ACCELERATION_STRUCTURE_STORAGE_KHR.
-        let storage_vk_buffer = unsafe {
-            resources
-                .storage
-                .wgpu_buffer
-                .as_hal::<VkApi>()
-                .expect("ptlas storage must be Vulkan-backed")
-                .raw_handle()
-        };
-        let create_info = vk::AccelerationStructureCreateInfoKHR::default()
-            .buffer(storage_vk_buffer)
-            .offset(0)
-            .size(sizes_info.acceleration_structure_size)
-            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL);
-        // SAFETY: buffer live + correct usage; offset 0 + matching size.
-        let new_handle = unsafe {
-            fns.acceleration_structure
-                .create_acceleration_structure(&create_info, None)
-                .expect("vkCreateAccelerationStructureKHR for PTLAS")
-        };
-        // SAFETY: handle is live.
-        let new_addr = unsafe {
-            fns.acceleration_structure
-                .get_acceleration_structure_device_address(
-                    &vk::AccelerationStructureDeviceAddressInfoKHR::default()
-                        .acceleration_structure(new_handle),
-                )
-        };
-        // SAFETY: handle + buffer created on this device; both outlive
-        // the wrapped Tlas (the storage SparseBuffer outlives this).
-        let hal_as = unsafe {
-            wgpu::hal::vulkan::AccelerationStructure::from_raw(new_handle, storage_vk_buffer)
-        };
-        let tlas_desc = CreateTlasDescriptor {
-            label: Some("cluster_ptlas"),
-            max_instances: capacity,
-            flags: AccelerationStructureFlags::PREFER_FAST_TRACE,
-            update_mode: AccelerationStructureUpdateMode::Build,
-        };
-        // SAFETY: hal_as from this device's hal; descriptor matches the
-        // TOP_LEVEL AS type.
-        let tlas = unsafe {
-            render_device
-                .wgpu_device()
-                .create_tlas_from_hal::<VkApi>(hal_as, &tlas_desc)
-        };
-        resources.tlas = Some(tlas);
+        for i in 0..2 {
+            resources.tlas[i] = None; // Drop old handle first (frees the VkAS).
+            // SAFETY: as_hal yields the raw VkBuffer while the SparseBuffer
+            // is alive; created with ACCELERATION_STRUCTURE_STORAGE_KHR.
+            let storage_vk_buffer = unsafe {
+                resources.storage[i]
+                    .wgpu_buffer
+                    .as_hal::<VkApi>()
+                    .expect("ptlas storage must be Vulkan-backed")
+                    .raw_handle()
+            };
+            let create_info = vk::AccelerationStructureCreateInfoKHR::default()
+                .buffer(storage_vk_buffer)
+                .offset(0)
+                .size(sizes_info.acceleration_structure_size)
+                .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL);
+            // SAFETY: buffer live + correct usage; offset 0 + matching size.
+            let new_handle = unsafe {
+                fns.acceleration_structure
+                    .create_acceleration_structure(&create_info, None)
+                    .expect("vkCreateAccelerationStructureKHR for PTLAS")
+            };
+            // SAFETY: handle is live.
+            let new_addr = unsafe {
+                fns.acceleration_structure
+                    .get_acceleration_structure_device_address(
+                        &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                            .acceleration_structure(new_handle),
+                    )
+            };
+            // SAFETY: handle + buffer created on this device; both outlive
+            // the wrapped Tlas (the storage SparseBuffer outlives this).
+            let hal_as = unsafe {
+                wgpu::hal::vulkan::AccelerationStructure::from_raw(new_handle, storage_vk_buffer)
+            };
+            let tlas_desc = CreateTlasDescriptor {
+                label: Some("cluster_ptlas"),
+                max_instances: capacity,
+                flags: AccelerationStructureFlags::PREFER_FAST_TRACE,
+                update_mode: AccelerationStructureUpdateMode::Build,
+            };
+            // SAFETY: hal_as from this device's hal; descriptor matches the
+            // TOP_LEVEL AS type.
+            let tlas = unsafe {
+                render_device
+                    .wgpu_device()
+                    .create_tlas_from_hal::<VkApi>(hal_as, &tlas_desc)
+            };
+            resources.tlas[i] = Some(tlas);
+            resources.as_handle_device_address[i] = new_addr;
+        }
         resources.as_handle_size = sizes_info.acceleration_structure_size;
-        resources.as_handle_device_address = new_addr;
     }
     resources.as_capacity = capacity;
 
     resources.cpu_count = cpu_count;
     resources.op_count = op_count;
     resources.full_rebuild = full_rebuild;
+
+    // Flip the double buffer for THIS frame's build, BEFORE the binder reads
+    // `current_tlas()` in PrepareBindGroups — so the bound TLAS is the one the
+    // build writes this frame. Only on build frames (`dispatch_ptlas` early-outs
+    // when `op_count == 0`, leaving the prior buffer bound and valid). The build
+    // reads `build_src_idx` (the prior `current`) as its basis and writes
+    // `current`; a full rebuild ignores the basis (`src = 0`).
+    if op_count > 0 {
+        resources.build_src_idx = resources.current;
+        resources.current = 1 - resources.current;
+    }
 }
 
 /// `Render::PrepareBindGroups`: rebuild the fill-compute bind group.
@@ -829,22 +915,15 @@ pub fn dispatch_ptlas(
     };
     let scratch_addr = scratch_base + scratch_offset;
 
-    // Incremental: in-place update — `src == dst == storage` (the spec permits
-    // equal src/dst, so the driver updates the structure in place instead of
-    // copying the whole thing into a fresh buffer every frame). Full rebuild
-    // keeps `src = 0` (built from scratch into the same buffer).
-    //
-    // EXPECTED VALIDATION NOISE: the in-place case trips
-    // `VUID-vkCmdBuildPartitionedAccelerationStructuresNV-pBuildInfo-10549`
-    // ("dst intersects src") every incremental frame. That VUID is the generic
-    // KHR-AS no-overlap rule; the NV partitioned-AS extension explicitly allows
-    // src == dst for in-place update, so it's a validation-layer false positive
-    // here, not a bug. Do not "fix" it by ping-ponging buffers.
-    let storage_addr = resources.storage.address;
+    // Double-buffered build (spec requires src/dst not overlap, VUID-...10549):
+    // read the previously-built buffer as the basis and write the other, which
+    // `prepare_ptlas_params` already flipped `current` to (so the bound TLAS
+    // matches). Full rebuild ignores the basis (`src = 0`, built from scratch).
+    let storage_addr = resources.storage[resources.current].address;
     let src_acceleration_structure_data = if resources.full_rebuild {
         0
     } else {
-        storage_addr
+        resources.storage[resources.build_src_idx].address
     };
     let build_info = vk::BuildPartitionedAccelerationStructureInfoNV {
         s_type: vk::BuildPartitionedAccelerationStructureInfoNV::STRUCTURE_TYPE,
@@ -965,7 +1044,7 @@ pub fn dispatch_ptlas(
     }
     ctx.add_command_buffer(build_encoder.finish());
 
-    // A PTLAS now exists in `storage`, so subsequent frames can build
-    // incrementally in place (`src = dst = storage`) instead of from scratch.
+    // A PTLAS now exists, so subsequent frames can build incrementally
+    // (`src` = the buffer just built, `dst` = the other) instead of from scratch.
     resources.has_built = true;
 }

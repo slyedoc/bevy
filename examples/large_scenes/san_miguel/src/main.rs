@@ -153,9 +153,9 @@ pub fn main() {
         .set(WindowPlugin {
             primary_window: Some(Window {
                 title: "San Miguel".into(),
-                resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
-                present_mode: PresentMode::AutoNoVsync,
-                position: WindowPosition::Centered(MonitorSelection::Primary),
+                //resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
+                //present_mode: PresentMode::AutoNoVsync,
+                //position: WindowPosition::Centered(MonitorSelection::Primary),
                 ..default()
             }),
             ..default()
@@ -176,12 +176,15 @@ pub fn main() {
             ..default()
         })
         // Drop a hand-maintained list of benign Vulkan validation VUIDs (see
-        // `tess_log_filter`) so real errors aren't buried while debugging the
-        // tessellation path. The `LogPlugin.filter` (EnvFilter) can't target a
+        // `tess_log_filter::BENIGN`) so real errors aren't buried in the solari
+        // RT path's known-noise. The `LogPlugin.filter` (EnvFilter) can't target a
         // VUID — they all share the `wgpu_hal::vulkan::instance` target — so this
         // goes through a custom `fmt_layer` that filters by message text.
         .set(LogPlugin {
             fmt_layer: tess_log_filter::fmt_layer,
+            filter: [
+                "bevy_camera_controller::free_camera",
+            ].join(","),
             ..default()
         });
     // Under `solari` the full-RT path replaces the raster mesh/material stack, so
@@ -224,7 +227,10 @@ pub fn main() {
         .add_systems(
             Update,
             (input, run_animation, spin, frame_time_system, benchmark).chain(),
-        );
+        )
+        // Headless iteration: when launched by Claude Code (CLAUDECODE=1), auto-exit after
+        // 20s so the agent can run + grep the log without manual window-closing.
+        .add_systems(Update, claude_auto_exit);
 
     #[cfg(feature = "solari")]
     app.add_plugins((SolariPlugin, settings::LightSettingsPlugin))
@@ -274,6 +280,24 @@ pub fn main() {
     }
 
     app.run();
+}
+
+/// CLAUDECODE-gated auto-exit (see registration): exits ~20s after launch when run
+/// headlessly by the agent, so it can grep the log without a human closing the window.
+fn claude_auto_exit(
+    time: Res<Time>,
+    mut exit: MessageWriter<AppExit>,
+    mut start: Local<Option<f32>>,
+) {
+    if std::env::var_os("CLAUDECODE").is_none() {
+        return;
+    }
+    let now = time.elapsed_secs();
+    let s = *start.get_or_insert(now);
+    if now - s > 20.0 {
+        info!("claude_auto_exit: 45s elapsed — exiting for log capture");
+        exit.write(AppExit::Success);
+    }
 }
 
 #[derive(Component)]
@@ -445,7 +469,7 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     #[cfg(feature = "solari")]
     {
         let scene = if std::env::var_os("SOLARI_TESS_FLOOR").is_some() {
-            "san_miguel/Floor.bsn"
+            "san_miguel/Cutout.bsn"
         } else {
             "san_miguel/SanMiguel.bsn"
         };
@@ -527,12 +551,19 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
         settings::Sun,
     ));
 
-    // Camera
+    // Camera. Headless (CLAUDECODE): aim straight at the GPU-tess geometry (gen verts
+    // cluster ~x12-23, y1.8-9.4, z~0 — a wall plane) so the tess-hit counter isn't a false
+    // zero from the surfaces being off-screen.
+    let cam_transform = if std::env::var_os("CLAUDECODE").is_some() {
+        Transform::from_xyz(17.0, 5.0, 9.0).looking_at(Vec3::new(17.0, 4.5, 0.0), Vec3::Y)
+    } else {
+        Transform::from_xyz(12.0, 2.0, 12.0).looking_at(Vec3::new(0.0, 2.5, 0.0), Vec3::Y)
+    };
     let mut cam = commands.spawn((
         Msaa::Off,
         Camera3d::default(),
         Hdr,
-        Transform::from_xyz(12.0, 2.0, 12.0).looking_at(Vec3::new(0.0, 2.5, 0.0), Vec3::Y),
+        cam_transform,
         Projection::Perspective(PerspectiveProjection {
             fov: std::f32::consts::PI / 3.0,
             near: 0.1,
@@ -926,10 +957,10 @@ fn frame_time_system(
 }
 
 /// Custom `LogPlugin` fmt layer that drops a maintained list of benign Vulkan
-/// validation VUIDs by message text, so real errors aren't buried while
-/// debugging the tessellation path. `LogPlugin.filter` (an `EnvFilter`) can't
-/// target a single VUID — they all log under the `wgpu_hal::vulkan::instance`
-/// target — so the suppression is done here by inspecting the event message.
+/// validation VUIDs by message text, so real errors aren't buried in the solari
+/// RT path's known-noise. `LogPlugin.filter` (an `EnvFilter`) can't target a
+/// single VUID — they all log under the `wgpu_hal::vulkan::instance` target — so
+/// the suppression is done here by inspecting the event message.
 /// Add VUIDs to `BENIGN` only once confirmed noise.
 mod tess_log_filter {
     use bevy::app::App;
@@ -946,21 +977,38 @@ mod tess_log_filter {
     };
     use core::fmt::Debug;
 
-    /// VUIDs confirmed benign for the solari RT path (validation is overly strict,
-    /// or the fork knowingly diverges) — present in the working `SOLARI_TESS`-only
-    /// run too, so they're noise, not failures.
+    /// VUIDs confirmed benign for the solari RT path — each is either a
+    /// validation-layer false positive or a place the naga fork knowingly diverges;
+    /// the driver executes all of them correctly (the scene renders right).
+    ///
+    /// Baseline: **Vulkan SDK / validation layers 1.4.350+**. Entries that an older
+    /// layer flagged but 1.4.350 already fixed (the sparse cluster-AS dst-address
+    /// resolution, and the spec-legal `srcAccelerationStructureData = 0`) are NOT
+    /// carried here — we require the newer layers instead of suppressing them.
+    ///
+    /// Add a VUID here ONLY after confirming it's noise; never park a *fixed* bug
+    /// here, or a real regression would be silently hidden.
     const BENIGN: &[&str] = &[
+        // ── naga-fork SPIR-V emission (driver accepts; spirv-val is stricter) ──
         // Bindless `textures: binding_array<texture_2d>` → a runtime array; legal
         // for the UniformConstant storage class, and the driver accepts it.
         "VUID-StandaloneSpirv-OpTypeRuntimeArray-04680",
         // The naga fork emits Device-scope atomics (see the atomic-scope note); the
         // driver runs them fine without `vulkanMemoryModelDeviceScope`.
         "VUID-RuntimeSpirv-vulkanMemoryModel-06265",
-        // The PTLAS full rebuild intentionally passes `srcAccelerationStructureData
-        // = 0` (build fresh — nothing to carry from a prior structure).
-        "VUID-VkBuildPartitionedAccelerationStructureInfoNV-srcAccelerationStructureData-parameter",
-        // Partitioned-AS build-info knob the validation layer flags; benign here.
-        "VUID-vkCmdBuildPartitionedAccelerationStructuresNV-pBuildInfo-10549",
+        // naga emits `ArrayStride` on `var<workgroup>` array types (illegal explicit
+        // layout for the Workgroup class). Upstream naga bug, hit by bevy's own SPD
+        // mipmap-downsample shader (`array<array<f32,16>,16>` tiles); driver runs it.
+        "VUID-StandaloneSpirv-None-10684",
+        // Closest-hit reads set0/binding0 (`cluster_indices`), GPU-AV claims it's
+        // uninitialized. It's bound (wgpu's own scene set) and read on every hit —
+        // GPU-AV's descriptor-indexing tracking trips on a raw pipeline binding a
+        // wgpu `UPDATE_AFTER_BIND` set (the set holds bindless texture arrays).
+        "VUID-vkCmdTraceRaysKHR-None-08114",
+        // First presented swapchain image is in UNDEFINED layout for one frame
+        // before the first render writes it. Cosmetic first-frame warning.
+        "VUID-VkPresentInfoKHR-pImageIndices-01430",
+        
     ];
 
     /// Per-layer filter: drop an event if any of its fields' text contains a

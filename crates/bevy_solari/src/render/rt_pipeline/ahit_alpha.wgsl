@@ -14,12 +14,14 @@ enable primitive_index;
 
 #import bevy_solari::scene_bindings::{alpha_passes, material_ids}
 
-// An any-hit entry point requires an incoming payload, but this shader never reads
-// or writes it — it only alpha-tests and ignores. Kept to a single word so it's safe
-// whichever ray invokes the any-hit: primary/bounce rays carry `RtPayload`, shadow
-// rays `ShadowPayload`; either way this just aliases a prefix it never touches.
+// Single-word payload alias: `RtPayload` and `ShadowPayload` both keep
+// `anyhit_count` as their first word, so this safely targets the counter whichever
+// ray invoked the any-hit. Incrementing it per invocation drives the
+// OMM-effectiveness heatmap (raygen colormaps the per-pixel total) — with OMM, the
+// RT cores resolve opaque/transparent micro-regions in hardware and the any-hit
+// never runs there, so OMM-covered foliage reads "cold".
 struct AlphaHitPayload {
-    unused: u32,
+    anyhit_count: u32,
 }
 var<incoming_ray_payload> payload: AlphaHitPayload;
 // Driver-provided triangle barycentrics (the fixed-function intersection's u, v).
@@ -40,6 +42,8 @@ fn ahit_alpha(
     // Cluster-local triangle index, pairing with `cluster_id` (as in the chit).
     @builtin(primitive_index) primitive_index: u32,
 ) {
+    // Count every any-hit invocation (the cost OMM removes), pass or fail.
+    payload.anyhit_count += 1u;
     if !alpha_passes(material_ids[instance_id], cluster_id, primitive_index, bary) {
         ignoreIntersection();
     }

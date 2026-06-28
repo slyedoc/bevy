@@ -314,6 +314,12 @@ pub fn prepare_blas_sharing(
         .next_multiple_of(BLAS_REGION_ALIGN);
     let stride_changed = want_stride > resources.worst_case_stride;
     resources.worst_case_stride = resources.worst_case_stride.max(want_stride);
+    if stride_changed {
+        tracing::debug!(
+            "blas_sharing: worst_case_stride -> {} bytes (max_per={max_per} clusters, omm-aware)",
+            resources.worst_case_stride,
+        );
+    }
 
     // Geometry capacity == resident geometry high-water (bounded set).
     let geometry_count = cluster_meshes.geometry_count().min(MAX_GEOMETRIES);

@@ -130,13 +130,56 @@ pub struct SolariShowDisplacement {
     pub enabled: bool,
 }
 
+/// Debug view that colormaps the per-pixel count of alpha any-hit shader
+/// invocations — the OMM-effectiveness view. Cold (blue) = the hit resolved in
+/// hardware with no any-hit (opacity-micromap opaque/transparent micro-regions,
+/// or plain opaque geometry); hot (red) = many any-hit invocations (unknown
+/// micro-regions, or alpha cutouts with no baked OMM). With OMM working, foliage
+/// interiors go cold and only the silhouette edges stay warm. Unlike the cost
+/// heatmap this needs no `shader_clock`. Mutually exclusive with the other views.
+#[derive(Resource, Clone, Copy, ExtractResource)]
+pub struct SolariAnyHitHeatmap {
+    pub enabled: bool,
+    /// Count → colormap scale: `color = cost_heatmap(count * scale)`. Default 0.1
+    /// (≈10 any-hits saturates to red). Tune per scene.
+    pub scale: f32,
+}
+
+impl Default for SolariAnyHitHeatmap {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scale: 0.1,
+        }
+    }
+}
+
+/// Debug view: flat per-CLUSTER color (a hash of the global cluster id). Shows the
+/// cluster decomposition directly — each cluster a distinct hue — so tessellation
+/// density (CLAS count) is visible at a glance. Mutually exclusive with the other views.
+#[derive(Resource, Clone, Copy, Default, ExtractResource)]
+pub struct SolariClusterView {
+    pub enabled: bool,
+}
+
+/// Debug view: flat per-TRIANGLE color (a hash of cluster id + primitive index). Each
+/// (micro-)triangle gets a distinct hue, so view-dependent tessellation LEVEL reads
+/// directly as triangle density. Mutually exclusive with the other views.
+#[derive(Resource, Clone, Copy, Default, ExtractResource)]
+pub struct SolariTriangleView {
+    pub enabled: bool,
+}
+
 /// Debug/feature inputs bundled into one [`SystemParam`] to keep the dispatch under
-/// bevy's 16-system-param limit: the device feature set + the cost-heatmap toggle.
+/// bevy's 16-system-param limit: the device feature set + the debug-view toggles.
 #[derive(bevy_ecs::system::SystemParam)]
 pub(crate) struct RtDebug<'w> {
     additional: Res<'w, AdditionalVulkanFeatures>,
     cost_heatmap: Option<Res<'w, SolariCostHeatmap>>,
+    anyhit_heatmap: Option<Res<'w, SolariAnyHitHeatmap>>,
     show_displacement: Option<Res<'w, SolariShowDisplacement>>,
+    cluster_view: Option<Res<'w, SolariClusterView>>,
+    triangle_view: Option<Res<'w, SolariTriangleView>>,
 }
 
 /// Material routing inputs for the SBT, bundled into one [`SystemParam`] to keep
@@ -337,7 +380,7 @@ pub(crate) fn rt_pipeline(
     // Tupled into one system param (the system is at bevy's 16-param ceiling).
     geometry_res: (
         Option<Res<ClusterMeshManager>>,
-        Option<Res<crate::geometry::tess_displace::TessShowcase>>,
+        Option<Res<crate::geometry::tess_classify::TessClassify>>,
     ),
     materials: RtMaterials,
     atmosphere_sky: Option<Res<AtmosphereSky>>,
@@ -348,7 +391,7 @@ pub(crate) fn rt_pipeline(
     mut commands: Commands,
     mut ctx: RenderContext,
 ) {
-    let (cluster_mesh_manager, tess_showcase) = geometry_res;
+    let (cluster_mesh_manager, tess_classify) = geometry_res;
     let view_entity = view.entity();
     let (
         view,
@@ -542,9 +585,21 @@ pub(crate) fn rt_pipeline(
         frame: [
             *frame_counter,
             (u32::BITS - materials.len().max(1).leading_zeros()),
-            // .z = cost-heatmap debug view (1 = on); the raygen colormaps the clock
-            // delta when set (needs SOLARI_SHADER_CLOCK / VK_KHR_shader_clock).
-            debug.cost_heatmap.as_deref().is_some_and(|h| h.enabled) as u32,
+            // .z = debug view selector: 0 = normal, 1 = cost (clock) heatmap (needs
+            // SOLARI_SHADER_CLOCK), 2 = any-hit-count heatmap (OMM effectiveness),
+            // 3 = per-cluster color, 4 = per-triangle color. The view dropdown keeps
+            // these mutually exclusive.
+            if debug.cost_heatmap.as_deref().is_some_and(|h| h.enabled) {
+                1u32
+            } else if debug.anyhit_heatmap.as_deref().is_some_and(|h| h.enabled) {
+                2u32
+            } else if debug.cluster_view.as_deref().is_some_and(|v| v.enabled) {
+                3u32
+            } else if debug.triangle_view.as_deref().is_some_and(|v| v.enabled) {
+                4u32
+            } else {
+                0u32
+            },
             // .w = displacement debug view (1 = on); the opaque chit shows each
             // surface's height map (grayscale) to validate the displacement wiring.
             debug.show_displacement.as_deref().is_some_and(|d| d.enabled) as u32,
@@ -557,9 +612,15 @@ pub(crate) fn rt_pipeline(
         jitter: {
             let j = dlss_jitter.map_or(Vec2::ZERO, |j| j.offset);
             // .zw = cost-heatmap log2 center + contrast (read by the raygen colormap).
+            // The any-hit heatmap reuses .z as its count→colormap scale (only one
+            // debug view is active at a time, so the slot is unambiguous).
             let hm = debug.cost_heatmap.as_deref();
-            let center = hm.map_or(0.0, |h| h.center);
-            let contrast = hm.map_or(0.0, |h| h.contrast);
+            let anyhit = debug.anyhit_heatmap.as_deref();
+            let (center, contrast) = if anyhit.is_some_and(|h| h.enabled) {
+                (anyhit.map_or(0.1, |h| h.scale), 0.0)
+            } else {
+                (hm.map_or(0.0, |h| h.center), hm.map_or(0.0, |h| h.contrast))
+            };
             [j.x, j.y, center, contrast]
         },
     };
@@ -578,14 +639,9 @@ pub(crate) fn rt_pipeline(
     // reallocating buffer. The materials address is captured at bind time (binder.rs).
     if let Some(cluster_mesh_manager) = cluster_mesh_manager.as_deref() {
         // Smooth-tess metadata table address (0 when the smooth path is off → the
-        // closest-hit falls back to the facet normal).
-        let tess_clusters = match (
-            tess_showcase.as_ref().and_then(|s| s.tess_clusters_meta.as_ref()),
-            allocator.as_ref(),
-        ) {
-            (Some(buf), Some(alloc)) => alloc.wgpu_buffer_device_address(buf),
-            _ => 0,
-        };
+        // closest-hit falls back to the facet normal). The GPU-classify path's per-part
+        // metadata (real UVs + smooth normals) reached via `geometry_addresses.tess_clusters`.
+        let tess_clusters = tess_classify.as_ref().map_or(0, |c| c.gen_attrs_meta_addr);
         view_bindings.set_geometry_addresses(&RtGeometryAddresses {
             vertex_packed: cluster_mesh_manager.vertex_packed.trace_device_address(),
             vertex_positions: cluster_mesh_manager.vertex_positions.trace_device_address(),

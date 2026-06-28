@@ -197,6 +197,24 @@ impl Allocator {
         location: MemoryLocation,
         label: &'static str,
     ) -> wgpu::Buffer {
+        self.create_buffer_raw(render_device, vk_flags, wgpu_usage, size, location, label)
+            .0
+    }
+
+    /// Like [`create_buffer`](Self::create_buffer) but also returns the raw
+    /// `vk::Buffer` handle backing the wgpu buffer — needed by raw-VK APIs that
+    /// take a `VkBuffer` directly (e.g. `vkCreateMicromapEXT`'s `buffer` field),
+    /// which can't be recovered from the wgpu wrapper. The handle's lifetime is
+    /// tied to the returned `wgpu::Buffer` (which owns + drops it).
+    pub fn create_buffer_raw(
+        &self,
+        render_device: &RenderDevice,
+        vk_flags: vk::BufferUsageFlags,
+        wgpu_usage: wgpu::BufferUsages,
+        size: u64,
+        location: MemoryLocation,
+        label: &'static str,
+    ) -> (wgpu::Buffer, vk::Buffer) {
         let size = size.max(4);
         let device = &self.inner.device;
 
@@ -276,7 +294,7 @@ impl Allocator {
         //   that's a strict superset of wgpu's view of the buffer).
         // - hal_buffer is initialized (vkCreateBuffer + bind).
         // - size > 0.
-        unsafe {
+        let wgpu_buffer = unsafe {
             render_device.wgpu_device().create_buffer_from_hal::<VkApi>(
                 hal_buffer,
                 &wgpu::BufferDescriptor {
@@ -286,7 +304,8 @@ impl Allocator {
                     mapped_at_creation: false,
                 },
             )
-        }
+        };
+        (wgpu_buffer, raw_buffer)
     }
 
     /// Allocate a sparse `wgpu::Buffer`. Reserves a virtual address
@@ -535,19 +554,30 @@ impl SparseBuffer {
             let run_pages = p - run_start;
             let run_bytes = run_pages * page_size;
 
-            // Allocate a fresh VkDeviceMemory sized for this run.
-            // Sub-allocating from a shared pool would reduce
+            // Allocate fresh VkDeviceMemory for this run, split into chunks no
+            // larger than `MAX_CHUNK_BYTES`: a single `vkAllocateMemory` must stay
+            // under `maxMemoryAllocationSize` (~4 GB on NV), and large OMM-bearing
+            // BLAS pools blow past that in one run. Page-aligned so each bind lands
+            // on a page boundary. Sub-allocating from a shared pool would reduce the
             // VkDeviceMemory count; first-version keeps it dumb.
-            let memory = self.allocate_chunk(run_bytes);
-            new_memories.push(memory);
-
-            binds.push(vk::SparseMemoryBind {
-                resource_offset: run_start * page_size,
-                size: run_bytes,
-                memory,
-                memory_offset: 0,
-                flags: vk::SparseMemoryBindFlags::empty(),
-            });
+            const MAX_CHUNK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+            let max_chunk = (MAX_CHUNK_BYTES / page_size) * page_size;
+            let mut chunk_offset = run_start * page_size;
+            let mut remaining = run_bytes;
+            while remaining > 0 {
+                let chunk = remaining.min(max_chunk);
+                let memory = self.allocate_chunk(chunk);
+                new_memories.push(memory);
+                binds.push(vk::SparseMemoryBind {
+                    resource_offset: chunk_offset,
+                    size: chunk,
+                    memory,
+                    memory_offset: 0,
+                    flags: vk::SparseMemoryBindFlags::empty(),
+                });
+                chunk_offset += chunk;
+                remaining -= chunk;
+            }
         }
 
         if binds.is_empty() {

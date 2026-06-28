@@ -150,7 +150,10 @@ pub use view_panel::{spawn_view_panels, toggle_heatmap_controls, update_view_lab
 
 mod view_panel {
     use super::*;
-    use crate::render::rt_pipeline::{SolariCostHeatmap, SolariShowDisplacement};
+    use crate::render::rt_pipeline::{
+        SolariAnyHitHeatmap, SolariClusterView, SolariCostHeatmap, SolariShowDisplacement,
+        SolariTriangleView,
+    };
     use crate::render::SolariCamera;
     use bevy_ecs::system::{Res, ResMut};
     use bevy_feathers::controls::FeathersSlider;
@@ -171,18 +174,31 @@ mod view_panel {
     #[derive(Component, Default, Clone)]
     pub struct HeatmapControls;
 
-    /// One view menu item: selects the active debug view by setting the two view toggles (they're
-    /// mutually exclusive — `normal` clears both, `heatmap`/`displacement` set exactly one).
-    fn view_item(heatmap_on: bool, displacement_on: bool, label: &'static str) -> impl Scene {
+    /// One view menu item: selects the active debug view by setting the view toggles (mutually
+    /// exclusive — `normal` clears all, every other item sets exactly one).
+    fn view_item(
+        heatmap_on: bool,
+        anyhit_on: bool,
+        displacement_on: bool,
+        cluster_on: bool,
+        triangle_on: bool,
+        label: &'static str,
+    ) -> impl Scene {
         bsn! {
             @FeathersMenuItem {
                 @caption: bsn! { Text({label.to_string()}) ThemedText }
             }
             on(move |_: On<Activate>,
                      mut heatmap: ResMut<SolariCostHeatmap>,
-                     mut displacement: ResMut<SolariShowDisplacement>| {
+                     mut anyhit: ResMut<SolariAnyHitHeatmap>,
+                     mut displacement: ResMut<SolariShowDisplacement>,
+                     mut cluster: ResMut<SolariClusterView>,
+                     mut triangle: ResMut<SolariTriangleView>| {
                 heatmap.enabled = heatmap_on;
+                anyhit.enabled = anyhit_on;
                 displacement.enabled = displacement_on;
+                cluster.enabled = cluster_on;
+                triangle.enabled = triangle_on;
             })
         }
     }
@@ -223,9 +239,12 @@ mod view_panel {
                             (
                                 @FeathersMenuPopup
                                 Children [
-                                    view_item(false, false, "normal"),
-                                    view_item(true, false, "time heatmap"),
-                                    view_item(false, true, "displacement"),
+                                    view_item(false, false, false, false, false, "normal"),
+                                    view_item(true, false, false, false, false, "time heatmap"),
+                                    view_item(false, true, false, false, false, "any-hit count"),
+                                    view_item(false, false, true, false, false, "displacement"),
+                                    view_item(false, false, false, true, false, "clusters"),
+                                    view_item(false, false, false, false, true, "triangles"),
                                 ]
                             )
                         ]
@@ -266,13 +285,22 @@ mod view_panel {
     /// Keep the view button caption in sync with the active view toggle.
     pub fn update_view_label(
         heatmap: Res<SolariCostHeatmap>,
+        anyhit: Res<SolariAnyHitHeatmap>,
         displacement: Res<SolariShowDisplacement>,
+        cluster: Res<SolariClusterView>,
+        triangle: Res<SolariTriangleView>,
         mut labels: Query<&mut Text, With<ViewLabel>>,
     ) {
         let want = if heatmap.enabled {
             "view: time heatmap"
+        } else if anyhit.enabled {
+            "view: any-hit count"
         } else if displacement.enabled {
             "view: displacement"
+        } else if cluster.enabled {
+            "view: clusters"
+        } else if triangle.enabled {
+            "view: triangles"
         } else {
             "view: normal"
         };

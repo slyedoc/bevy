@@ -888,9 +888,29 @@ fn resolve_triangle_data_full_mat_fetch(
             let uv0 = physical_load<vec2<f32>>(a0 + u64(4u));
             let uv1 = physical_load<vec2<f32>>(a1 + u64(4u));
             let uv2 = physical_load<vec2<f32>>(a2 + u64(4u));
-            // Arbitrary tangent (only consulted by normal maps).
-            let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n0.y) > 0.99);
-            let tangent = vec4<f32>(normalize(cross(up, n0)), 1.0);
+            // Real UV-gradient tangent (needed for normal maps) derived from the
+            // micro-triangle's positions + UVs — the tess attrs carry no tangent, and a
+            // fixed `cross(up,n)` tangent makes normal maps light wrong. The positions
+            // are world-space (gen bakes world; inject is identity) and so is the result;
+            // the identity `transform` leaves it world below. Gram-Schmidt against n0 +
+            // handedness sign; fall back to an arbitrary tangent on degenerate UVs.
+            let e1 = object_positions[1] - object_positions[0];
+            let e2 = object_positions[2] - object_positions[0];
+            let duv1 = uv1 - uv0;
+            let duv2 = uv2 - uv0;
+            let det = duv1.x * duv2.y - duv2.x * duv1.y;
+            var tangent: vec4<f32>;
+            if abs(det) > 1e-12 {
+                let r = 1.0 / det;
+                let t = (e1 * duv2.y - e2 * duv1.y) * r;
+                let bt = (e2 * duv1.x - e1 * duv2.x) * r;
+                let tan = normalize(t - n0 * dot(n0, t));
+                let w = select(-1.0, 1.0, dot(cross(n0, tan), bt) > 0.0);
+                tangent = vec4<f32>(tan, w);
+            } else {
+                let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n0.y) > 0.99);
+                tangent = vec4<f32>(normalize(cross(up, n0)), 1.0);
+            }
             let sv0 = Vertex(object_positions[0], n0, uv0, tangent);
             let sv1 = Vertex(object_positions[1], n1, uv1, tangent);
             let sv2 = Vertex(object_positions[2], n2, uv2, tangent);

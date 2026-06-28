@@ -8,6 +8,12 @@
 // a hit shader fills `emitted` + (if continuing) `attenuation` and the next ray,
 // and threads the RNG back out.
 struct RtPayload {
+    // Any-hit invocation counter for the OMM-effectiveness debug heatmap. MUST be
+    // the first field: `ahit_alpha` aliases the payload's first word (it runs for
+    // both `RtPayload` and `ShadowPayload` rays), so keeping the counter first in
+    // BOTH lets the any-hit increment it safely whichever ray invoked it. raygen
+    // resets it before each trace and sums across bounces.
+    anyhit_count: u32,
     emitted: vec3<f32>,        // radiance contributed at this vertex (sky at miss)
     attenuation: vec3<f32>,    // throughput multiplier for the next segment
     next_origin: vec3<f32>,
@@ -18,6 +24,12 @@ struct RtPayload {
     // primary ray). Threaded out by a hit shader so the NEXT vertex can MIS-weight
     // its emissive against next-event estimation (the BSDF-vs-NEE pair).
     p_bounce: f32,
+    // Geometry-debug views (cluster / triangle color). The closest-hit writes the
+    // global cluster id + cluster-local primitive index of the hit; raygen captures
+    // them on the PRIMARY hit and hashes them to a flat color. `hit_cluster` carries
+    // a sentinel (set by raygen before the trace) when the primary ray missed.
+    hit_cluster: u32,
+    hit_primitive: u32,
 #ifdef SOLARI_DLSS
     // Pixel index (row-major `y*width + x`) the primary-hit closest-hit writes its
     // ray-reconstruction G-buffer to, or `NO_GBUFFER` on secondary bounces (no
@@ -34,6 +46,10 @@ struct RtPayload {
 // dedicated `miss_shadow` program clears it to 0 when the ray reaches the light
 // unobstructed. Tiny on purpose — fixed-function traversal keeps the chit lean.
 struct ShadowPayload {
+    // First word mirrors `RtPayload.anyhit_count` so `ahit_alpha`'s single-word
+    // alias targets the counter whichever ray type invoked it (shadow-ray any-hits
+    // land here and are discarded — raygen only reads the primary/bounce count).
+    anyhit_count: u32,
     occluded: u32,
 }
 

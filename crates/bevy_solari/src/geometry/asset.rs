@@ -23,8 +23,41 @@ use thiserror::Error;
 const CLUSTER_MESH_ASSET_MAGIC: u64 = u64::from_le_bytes(*b"CLUSTERS");
 
 /// Current version of the [`ClusterMesh`] asset format. Bump on
-/// incompatible struct-layout changes.
-pub const CLUSTER_MESH_ASSET_VERSION: u64 = 2;
+/// incompatible struct-layout changes. v3 appends optional opacity
+/// micro-map (OMM) slices; v2 files still load (with no OMM).
+pub const CLUSTER_MESH_ASSET_VERSION: u64 = 3;
+
+/// Oldest format version this loader still accepts. Versions in
+/// `[MIN, VERSION]` load; older/newer are rejected.
+const CLUSTER_MESH_ASSET_MIN_VERSION: u64 = 2;
+
+/// First version carrying the optional OMM slices.
+const CLUSTER_MESH_ASSET_OMM_VERSION: u64 = 3;
+
+/// One baked opacity micro-map's location/shape within
+/// [`ClusterMesh::omm_array_data`]. Field layout matches
+/// `VkMicromapTriangleEXT` (offset, subdivisionLevel, format) so it feeds
+/// the micromap build's triangle array directly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct OmmDesc {
+    /// Byte offset into `omm_array_data`.
+    pub offset: u32,
+    /// Micro-triangle count is `4^subdivision_level`.
+    pub subdivision_level: u16,
+    /// OMM format: 1 = OC1 2-state, 2 = OC1 4-state.
+    pub format: u16,
+}
+
+/// Histogram entry: how many OMMs share a (subdivision, format). Field layout
+/// matches `VkMicromapUsageEXT`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct OmmUsage {
+    pub count: u32,
+    pub subdivision_level: u16,
+    pub format: u16,
+}
 
 /// A mesh pre-processed into a DAG of clusters for hardware
 /// ray-traced LOD selection.
@@ -91,6 +124,21 @@ pub struct ClusterMesh {
     pub(crate) root_node_id: u32,
     /// Max LOD level present (== bake recursion depth).
     pub(crate) lod_levels: u32,
+    /// Opacity micro-map array build data (`VkMicromapEXT` input), or empty
+    /// when this mesh has no baked OMM. Baked offline from the material's
+    /// alpha texture — see the `solari-omm-cluster-path` plan.
+    pub(crate) omm_array_data: Arc<[u8]>,
+    /// Per-OMM descriptors into `omm_array_data` (micromap triangle array).
+    pub(crate) omm_descs: Arc<[OmmDesc]>,
+    /// Per-triangle OMM index, parallel to `indices` / 3 in the SAME
+    /// (post-cluster) triangle order, so each cluster's index range slices it
+    /// directly at CLAS-attach time. Negative = special index (-1 transparent,
+    /// -2 opaque, -3 unknown-transparent, -4 unknown-opaque).
+    pub(crate) omm_index: Arc<[i32]>,
+    /// Usage histogram for the micromap build.
+    pub(crate) omm_usage: Arc<[OmmUsage]>,
+    /// Usage histogram for the BLAS/CLAS OMM attach.
+    pub(crate) omm_index_usage: Arc<[OmmUsage]>,
 }
 
 impl ClusterMesh {
@@ -153,6 +201,51 @@ impl ClusterMesh {
     #[inline]
     pub fn lod_levels(&self) -> u32 {
         self.lod_levels
+    }
+
+    /// Whether this mesh carries a baked opacity micro-map.
+    #[inline]
+    pub fn has_opacity_micromap(&self) -> bool {
+        !self.omm_array_data.is_empty()
+    }
+    #[inline]
+    pub fn omm_array_data(&self) -> &[u8] {
+        &self.omm_array_data
+    }
+    #[inline]
+    pub fn omm_descs(&self) -> &[OmmDesc] {
+        &self.omm_descs
+    }
+    #[inline]
+    pub fn omm_index(&self) -> &[i32] {
+        &self.omm_index
+    }
+    #[inline]
+    pub fn omm_usage(&self) -> &[OmmUsage] {
+        &self.omm_usage
+    }
+    #[inline]
+    pub fn omm_index_usage(&self) -> &[OmmUsage] {
+        &self.omm_index_usage
+    }
+
+    /// Attach an offline-baked opacity micro-map. `per_tri_index` must be
+    /// parallel to the mesh's triangles in the SAME order as [`Self::indices`]
+    /// (post-cluster), so cluster index ranges slice it directly. See the
+    /// `solari-omm-cluster-path` plan.
+    pub fn set_opacity_micromap(
+        &mut self,
+        array_data: Vec<u8>,
+        descs: Vec<OmmDesc>,
+        per_tri_index: Vec<i32>,
+        usage: Vec<OmmUsage>,
+        index_usage: Vec<OmmUsage>,
+    ) {
+        self.omm_array_data = array_data.into();
+        self.omm_descs = descs.into();
+        self.omm_index = per_tri_index.into();
+        self.omm_usage = usage.into();
+        self.omm_index_usage = index_usage.into();
     }
 }
 
@@ -330,6 +423,12 @@ pub fn write_cluster_mesh_sync<W: Write>(
     write_slice(&asset.nodes, &mut encoder)?;
     write_slice(&asset.child_table, &mut encoder)?;
     write_slice(&asset.cluster_to_group, &mut encoder)?;
+    // v3: optional OMM slices (empty for non-cutout meshes).
+    write_slice(&asset.omm_array_data, &mut encoder)?;
+    write_slice(&asset.omm_descs, &mut encoder)?;
+    write_slice(&asset.omm_index, &mut encoder)?;
+    write_slice(&asset.omm_usage, &mut encoder)?;
+    write_slice(&asset.omm_index_usage, &mut encoder)?;
     encoder.finish()?;
     Ok(())
 }
@@ -377,6 +476,12 @@ impl AssetSaver for ClusterMeshSaver {
         write_slice(&asset.nodes, &mut writer)?;
         write_slice(&asset.child_table, &mut writer)?;
         write_slice(&asset.cluster_to_group, &mut writer)?;
+        // v3: optional OMM slices (empty for non-cutout meshes).
+        write_slice(&asset.omm_array_data, &mut writer)?;
+        write_slice(&asset.omm_descs, &mut writer)?;
+        write_slice(&asset.omm_index, &mut writer)?;
+        write_slice(&asset.omm_usage, &mut writer)?;
+        write_slice(&asset.omm_index_usage, &mut writer)?;
         writer.finish()?;
 
         Ok(())
@@ -403,9 +508,10 @@ impl AssetLoader for ClusterMeshLoader {
             return Err(ClusterMeshSaveOrLoadError::WrongFileType);
         }
         let version = async_read_u64(reader).await?;
-        if version != CLUSTER_MESH_ASSET_VERSION {
+        if !(CLUSTER_MESH_ASSET_MIN_VERSION..=CLUSTER_MESH_ASSET_VERSION).contains(&version) {
             return Err(ClusterMeshSaveOrLoadError::WrongVersion { found: version });
         }
+        let has_omm = version >= CLUSTER_MESH_ASSET_OMM_VERSION;
 
         let mut bytes = [0u8; size_of::<ClusterMeshAabb>()];
         reader.read_exact(&mut bytes).await?;
@@ -427,6 +533,24 @@ impl AssetLoader for ClusterMeshLoader {
         let nodes = read_slice(reader)?;
         let child_table = read_slice(reader)?;
         let cluster_to_group = read_slice(reader)?;
+        // v3+ appends the optional OMM slices; v2 files have none.
+        let (omm_array_data, omm_descs, omm_index, omm_usage, omm_index_usage) = if has_omm {
+            (
+                read_slice(reader)?,
+                read_slice(reader)?,
+                read_slice(reader)?,
+                read_slice(reader)?,
+                read_slice(reader)?,
+            )
+        } else {
+            (
+                Arc::from(&[][..]),
+                Arc::from(&[][..]),
+                Arc::from(&[][..]),
+                Arc::from(&[][..]),
+                Arc::from(&[][..]),
+            )
+        };
 
         Ok(ClusterMesh {
             vertex_positions,
@@ -444,6 +568,11 @@ impl AssetLoader for ClusterMeshLoader {
             root_group_id,
             root_node_id,
             lod_levels,
+            omm_array_data,
+            omm_descs,
+            omm_index,
+            omm_usage,
+            omm_index_usage,
         })
     }
 

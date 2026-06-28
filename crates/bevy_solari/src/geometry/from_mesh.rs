@@ -555,6 +555,13 @@ impl TryFrom<&Mesh> for ClusterMesh {
             root_group_id,
             root_node_id: u32::MAX,
             lod_levels: lod_level + 1,
+            // OMM is baked separately (offline, from the alpha texture) and
+            // attached via `ClusterMesh::set_opacity_micromap`.
+            omm_array_data: Arc::from(&[][..]),
+            omm_descs: Arc::from(&[][..]),
+            omm_index: Arc::from(&[][..]),
+            omm_usage: Arc::from(&[][..]),
+            omm_index_usage: Arc::from(&[][..]),
         })
 
     }

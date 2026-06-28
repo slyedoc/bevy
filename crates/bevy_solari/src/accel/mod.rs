@@ -101,7 +101,12 @@ impl Plugin for AccelPlugin {
                         .after(prepare_blas_sharing),
                     prepare_ptlas_params
                         .in_set(RenderSystems::Prepare)
-                        .after(prepare_selector_params),
+                        .after(prepare_selector_params)
+                        // The tess slot reservation reads `TessClassify::blas_ready`, which
+                        // `run_tess_classify` latches — order after it so the reservation
+                        // and `prepare_tess_ptlas_write`'s record count never disagree on
+                        // the transition frame (mismatch → out-of-bounds PTLAS write).
+                        .after(crate::geometry::tess_classify::run_tess_classify),
                     prepare_selector_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     prepare_blas_sharing_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     prepare_ptlas_fill_bind_group.in_set(RenderSystems::PrepareBindGroups),

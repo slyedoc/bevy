@@ -65,18 +65,17 @@ impl Plugin for SolarRenderPlugin {
             .add_plugins(ExtractResourcePlugin::<dlss::SolariDlssMode>::default());
         app.init_resource::<rt_pipeline::SolariCostHeatmap>()
             .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariCostHeatmap>::default());
+        app.init_resource::<rt_pipeline::SolariAnyHitHeatmap>()
+            .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariAnyHitHeatmap>::default());
+        app.init_resource::<rt_pipeline::SolariClusterView>()
+            .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariClusterView>::default());
+        app.init_resource::<rt_pipeline::SolariTriangleView>()
+            .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariTriangleView>::default());
         app.init_resource::<rt_pipeline::SolariShowDisplacement>()
             .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariShowDisplacement>::default());
-        // The displacement (height) map the tessellation showcase samples — the app
-        // sets it (san_miguel → a floor displacement texture); extracted so the
-        // render-world self-test can resolve its `GpuImage`.
-        app.init_resource::<crate::geometry::tess_displace::TessShowcaseDisplacement>()
-            .add_plugins(
-                ExtractResourcePlugin::<crate::geometry::tess_displace::TessShowcaseDisplacement>::default(),
-            );
-        // In-situ tessellation showcase: pick a real displacement-mapped instance
-        // (main world) + extract its mesh/transform/texture for the render-world
-        // self-test to tessellate in place.
+        // In-situ tessellation: collect every displacement-mapped instance (main
+        // world) + extract its mesh/transform/texture for the render-world
+        // GPU tessellation path to tessellate in place.
         app.init_resource::<crate::geometry::tess_displace::TessShowcaseInstances>()
             .add_plugins(
                 ExtractResourcePlugin::<crate::geometry::tess_displace::TessShowcaseInstances>::default(),
@@ -84,11 +83,7 @@ impl Plugin for SolarRenderPlugin {
             .add_systems(
                 Update,
                 (
-                    (
-                        crate::geometry::tess_displace::find_tess_showcase_instances,
-                        crate::geometry::tess_displace::reclassify_tess_levels,
-                    )
-                        .chain(),
+                    crate::geometry::tess_displace::find_tess_showcase_instances,
                     crate::geometry::tess_displace::hide_tessellated_base_instances,
                 ),
             );

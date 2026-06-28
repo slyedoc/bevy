@@ -103,7 +103,7 @@ pub struct RtGeometryAddresses {
     /// `TessCluster` per sentinel tess CLAS: its per-instance smooth-normal buffer
     /// address + primitive base). `0` when the smooth-tess path is off — the
     /// closest-hit then shades tess hits with the facet normal. See
-    /// [`crate::geometry::tess_displace::TessShowcase`].
+    /// [`crate::geometry::tess_classify::TessClassify`].
     pub tess_clusters: u64,
     pub _pad1: u64,
 }
@@ -433,7 +433,18 @@ impl RtPipeline {
         let cluster_info =
             vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV::default()
                 .allow_cluster_acceleration_structure(true);
+        // Opt into opacity micromaps. Unlike ray queries (which honor OMM straight
+        // from the AS), a ray-tracing *pipeline* ignores opacity micromaps entirely
+        // unless created with this flag — the driver invokes the any-hit shader on
+        // every micro-triangle as if no OMM were present. Gate on the extension so
+        // pipeline creation stays valid where OMM is unsupported.
+        let pipeline_flags = if crate::gpu::extension::opacity_micromap_available() {
+            vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT
+        } else {
+            vk::PipelineCreateFlags::empty()
+        };
         let mut pipeline_info = vk::RayTracingPipelineCreateInfoKHR::default()
+            .flags(pipeline_flags)
             .stages(&stages)
             .groups(&groups)
             // Depth 2: raygen's hit object executes the closest-hit (1), which

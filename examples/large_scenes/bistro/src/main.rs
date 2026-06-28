@@ -52,6 +52,7 @@ use bevy::{
     camera::CameraMainTextureUsages,
     light::cluster::ClusterConfig,
     render::render_resource::TextureUsages,
+    scene::{ScenePatch, ScenePatchInstance},
     solari::prelude::*,
 };
 
@@ -256,11 +257,35 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     // to UASTC KTX2 (`KHR_texture_basisu`) with mip chains + alpha modes
     // restored (`reclassify_alpha.py`) — BC7 on the GPU instead of uncompressed
     // RGBA8. See the README for the pipeline.
-    let bistro = asset_server.load("bistro/Bistro_ktx2.glb#Scene0");
-    commands
-        .spawn((WorldAssetRoot(bistro.clone()), Spin))
-        .observe(proc_scene);
+    // Solari: load the pre-baked `.bsn` straight from the offline importer — its entities already
+    // carry `RaytracingMesh3d` + `SolariMaterial3d`, so no runtime mesh/material conversion or
+    // `proc_scene` raster fix-up is needed. Point `BEVY_ASSET_ROOT` at the dir holding
+    // `bistro/bistro.bsn` (alongside its `meshes/` and `textures/`).
+    //
+    // Raster: load the glTF (KTX2 GLB) and post-process its `StandardMaterial`s via `proc_scene`.
+    #[cfg(feature = "solari")]
+    let spawn_bistro = {
+        let bistro: Handle<ScenePatch> = asset_server.load("bistro/bistro.bsn");
+        move |commands: &mut Commands, offset: Option<Transform>| {
+            let mut e = commands.spawn((ScenePatchInstance(bistro.clone()), Spin));
+            if let Some(t) = offset {
+                e.insert(t);
+            }
+        }
+    };
+    #[cfg(not(feature = "solari"))]
+    let spawn_bistro = {
+        let bistro = asset_server.load("bistro/Bistro_ktx2.glb#Scene0");
+        move |commands: &mut Commands, offset: Option<Transform>| {
+            let mut e = commands.spawn((WorldAssetRoot(bistro.clone()), Spin));
+            if let Some(t) = offset {
+                e.insert(t);
+            }
+            e.observe(proc_scene);
+        }
+    };
 
+    spawn_bistro(&mut commands, None);
 
     let mut count = 0;
     if args.count > 1 {
@@ -276,13 +301,10 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
                 if x == 0 && z == 0 {
                     continue;
                 }
-                commands
-                    .spawn((
-                        WorldAssetRoot(bistro.clone()),
-                        Transform::from_xyz(x as f32 * 150.0, 0.0, z as f32 * 150.0),
-                        Spin,
-                    ))
-                    .observe(proc_scene);
+                spawn_bistro(
+                    &mut commands,
+                    Some(Transform::from_xyz(x as f32 * 150.0, 0.0, z as f32 * 150.0)),
+                );
                 count += 1;
             }
         }

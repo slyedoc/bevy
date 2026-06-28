@@ -84,6 +84,11 @@ fn chit_opaque(
     @builtin(hit_triangle_vertex_positions) hit_positions: array<vec3<f32>, 3>,
 ) {
     var rng = payload.rng;
+    // Geometry-debug views (cluster / triangle color): record this hit's global
+    // cluster id + cluster-local triangle so raygen can hash them to a flat color on
+    // the primary hit. Cheap; ignored unless `camera.frame.z` selects those views.
+    payload.hit_cluster = cluster_id;
+    payload.hit_primitive = primitive_index;
     let barycentrics = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
     // Row-form affine (m[r] = (basis_row_r, translation_r)) the resolve expects.
     let transform = mat3x4<f32>(

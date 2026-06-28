@@ -41,7 +41,7 @@
 //! [`SolariInitPlugin`]: crate::SolariInitPlugin
 
 use ash::vk::TaggedStructure;
-use ash::{khr, nv, vk};
+use ash::{ext, khr, nv, vk};
 use bevy_ecs::{
     resource::Resource,
     system::{Commands, Res},
@@ -108,11 +108,11 @@ pub struct RayTracingInvocationReorderFeature;
 /// shader def gate on this marker; absent → the chit falls back to the pool load.
 pub struct RayTracingPositionFetchFeature;
 
-/// Marker registered when `VK_KHR_shader_clock` is enabled (`shaderSubgroupClock`).
-/// The raygen reads the shader clock (`shader_clock()` → `OpReadClockKHR`) around the
-/// trace to write a per-pixel cost value for the debug heatmap. Absent → the heatmap
-/// pass is skipped and the raygen's clock reads compile out (`SOLARI_SHADER_CLOCK`
-/// shader def gates them).
+/// Marker registered when `VK_KHR_shader_clock` is enabled (`shaderSubgroupClock`
+/// + `shaderDeviceClock`). The raygen reads the shader clock (`shader_clock()` →
+/// Device-scope `OpReadClockKHR`) around the trace to write a per-pixel cost value
+/// for the debug heatmap. Absent → the heatmap pass is skipped and the raygen's
+/// clock reads compile out (`SOLARI_SHADER_CLOCK` shader def gates them).
 pub struct ShaderClockFeature;
 
 /// `true` once `VK_KHR_shader_clock` has been enabled on the device. The free
@@ -125,6 +125,25 @@ static SHADER_CLOCK_AVAILABLE: core::sync::atomic::AtomicBool =
 /// Whether `VK_KHR_shader_clock` was enabled at device creation.
 pub fn shader_clock_available() -> bool {
     SHADER_CLOCK_AVAILABLE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Marker registered when `VK_EXT_opacity_micromap` is enabled. Alpha-cutout
+/// meshes carry a baked opacity micro-map (see [`ClusterMesh`]); with this
+/// extension the RT cores resolve known opaque/transparent micro-regions in
+/// hardware, skipping the `ahit_alpha` any-hit invocation. Absent → the OMM
+/// build/attach is skipped and alpha cutouts fall back to pure any-hit.
+///
+/// [`ClusterMesh`]: crate::geometry::ClusterMesh
+pub struct OpacityMicromapFeature;
+
+/// `true` once `VK_EXT_opacity_micromap` has been enabled on the device. Read by
+/// the micromap build / CLAS-attach paths to decide whether to wire OMM at all.
+static OPACITY_MICROMAP_AVAILABLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether `VK_EXT_opacity_micromap` was enabled at device creation.
+pub fn opacity_micromap_available() -> bool {
+    OPACITY_MICROMAP_AVAILABLE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Register the cluster-AS + partitioned-AS Vulkan device-creation
@@ -310,17 +329,21 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 // are enough; wgpu chains the (enabled) feature struct.
             }
 
-            // Shader clock — `shader_clock()` (OpReadClockKHR, Subgroup scope) for the
-            // per-pixel cost heatmap. `shaderSubgroupClock` is the widely-supported
-            // form (per-SM realtime counter); the SPIR-V capability the shader emits
-            // needs the extension enabled here.
+            // Shader clock — `shader_clock()` (OpReadClockKHR) for the per-pixel cost
+            // heatmap. The naga fork emits **Device** scope (globally-monotonic
+            // counter), which the heatmap needs because it reads the clock across a
+            // Shader-Execution-Reordering boundary that migrates the invocation
+            // between SMs — a per-SM subgroup clock would give garbage there. So
+            // enable `shaderDeviceClock` (not just `shaderSubgroupClock`); emitting
+            // Device-scope `OpReadClockKHR` without it is a device error.
             if supports(khr::shader_clock::NAME) {
                 args.extensions.push(khr::shader_clock::NAME);
                 additional.insert::<ShaderClockFeature>();
                 SHADER_CLOCK_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
                 let features = Box::leak(Box::new(
                     vk::PhysicalDeviceShaderClockFeaturesKHR::default()
-                        .shader_subgroup_clock(true),
+                        .shader_subgroup_clock(true)
+                        .shader_device_clock(true),
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
             }
@@ -334,6 +357,27 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
             // only EXPOSES the extension when the developer sets
             // `NV_ALLOW_RAYTRACING_VALIDATION=1`, so `supports()` gates it for free
             // (no cost in normal runs).
+            // Opacity micro-maps — alpha-cutout meshes carry a baked OMM so the RT
+            // cores skip the `ahit_alpha` any-hit on resolved opaque/transparent
+            // micro-regions. The NV cluster CLAS build references the OMM array +
+            // per-triangle index buffer (see `clas_arena`). Needs the extension here;
+            // `VK_KHR_acceleration_structure` (enabled by wgpu) is the other half.
+            if supports(ext::opacity_micromap::NAME) {
+                args.extensions.push(ext::opacity_micromap::NAME);
+                additional.insert::<OpacityMicromapFeature>();
+                OPACITY_MICROMAP_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
+                let features = Box::leak(Box::new(
+                    vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true),
+                ));
+                *args.create_info = core::mem::take(args.create_info).push(features);
+                tracing::info!("VK_EXT_opacity_micromap ENABLED — OMM-accelerated alpha cutouts available.");
+            } else {
+                tracing::warn!(
+                    "VK_EXT_opacity_micromap NOT exposed by this device — alpha cutouts fall back to \
+                     pure any-hit (no OMM acceleration)."
+                );
+            }
+
             if supports(nv::ray_tracing_validation::NAME) {
                 args.extensions.push(nv::ray_tracing_validation::NAME);
                 let features = Box::leak(Box::new(
@@ -376,6 +420,12 @@ pub struct ClusterExtensionFns {
     /// ray-tracing features are requested; loading the function
     /// table here matches the pattern used for the NV extensions.
     pub acceleration_structure: khr::acceleration_structure::Device,
+    /// Per-device function table for `VK_EXT_opacity_micromap`
+    /// (`vkGetMicromapBuildSizesEXT` / `vkCreateMicromapEXT` /
+    /// `vkCmdBuildMicromapsEXT`). `None` if the extension wasn't enabled
+    /// at device creation. Used to build the per-mesh opacity micro-map
+    /// the NV cluster CLAS references (see `geometry::clas_arena`).
+    pub opacity_micromap: Option<ext::opacity_micromap::Device>,
 }
 
 impl ClusterExtensionFns {
@@ -395,6 +445,7 @@ impl ClusterExtensionFns {
     pub fn load(render_device: &RenderDevice, additional: &AdditionalVulkanFeatures) -> Self {
         let has_cluster = additional.has::<ClusterAccelerationStructureFeature>();
         let has_partitioned = additional.has::<PartitionedAccelerationStructureFeature>();
+        let has_opacity_micromap = additional.has::<OpacityMicromapFeature>();
 
         // SAFETY: as_hal yields the raw Vulkan device only while the
         // wgpu Device is alive; we only read function pointers and
@@ -419,6 +470,8 @@ impl ClusterExtensionFns {
                 nv::partitioned_acceleration_structure::Device::load(raw_instance, raw_device)
             }),
             acceleration_structure,
+            opacity_micromap: has_opacity_micromap
+                .then(|| ext::opacity_micromap::Device::load(raw_instance, raw_device)),
         }
     }
 }
@@ -622,6 +675,84 @@ pub unsafe fn cmd_build_acceleration_structures(
                 core::slice::from_ref(build_info),
                 &[Some(range_infos)],
             );
+        });
+    }
+}
+
+/// Barrier making a freshly-built opacity micro-map (`MICROMAP_BUILD_EXT` /
+/// `MICROMAP_WRITE_EXT`) visible to the cluster/AS build that references it
+/// (`ACCELERATION_STRUCTURE_BUILD_KHR` / `ACCELERATION_STRUCTURE_READ_KHR`) and
+/// to later traversals (`MEMORY_READ`). Emit between `cmd_build_micromaps` and
+/// the CLAS build in the same encoder.
+///
+/// # Safety
+///
+/// Caller must hold an open Vulkan-backed encoder and pass the matching device.
+pub unsafe fn cmd_micromap_barrier(
+    encoder: &mut wgpu::CommandEncoder,
+    render_device: &RenderDevice,
+) {
+    let _span = tracing::info_span!("vk.micromap_barrier").entered();
+    unsafe {
+        let hal_device = render_device
+            .wgpu_device()
+            .as_hal::<VkApi>()
+            .expect("cmd_micromap_barrier requires Vulkan backend");
+        let raw_device = hal_device.raw_device();
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder =
+                hal_encoder.expect("cmd_micromap_barrier requires Vulkan backend");
+            let command_buffer = hal_encoder.raw_handle();
+            // Legacy sync (sync2 isn't enabled): a micro-map build executes in the
+            // ACCELERATION_STRUCTURE_BUILD stage with AS-write access in the
+            // legacy fallback mapping (there is no legacy MICROMAP stage/access).
+            raw_device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
+                    .dst_access_mask(
+                        vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                            | vk::AccessFlags::MEMORY_READ,
+                    )],
+                &[],
+                &[],
+            );
+        });
+    }
+}
+
+/// Issue `vkCmdBuildMicromapsEXT` against the active Vulkan command buffer
+/// underlying `encoder` — builds the opacity micro-maps the NV cluster CLAS
+/// references. `build_info`'s `dst_micromap` must be a created handle, its
+/// `data` / `triangle_array` device addresses point at committed
+/// `MICROMAP_BUILD_INPUT_READ_ONLY_EXT` buffers, and `scratch_data` at a
+/// committed scratch buffer. Pair with a barrier before the CLAS build / trace
+/// that reads the result.
+///
+/// # Safety
+///
+/// Caller must uphold every Vulkan rule of `vkCmdBuildMicromapsEXT` and ensure
+/// `fns.opacity_micromap` is `Some`.
+pub unsafe fn cmd_build_micromaps(
+    encoder: &mut wgpu::CommandEncoder,
+    fns: &ClusterExtensionFns,
+    build_info: &vk::MicromapBuildInfoEXT<'_>,
+) {
+    let _span = tracing::info_span!("vk.build_micromaps").entered();
+    let omm = fns
+        .opacity_micromap
+        .as_ref()
+        .expect("cmd_build_micromaps: opacity-micromap extension not enabled");
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder =
+                hal_encoder.expect("cmd_build_micromaps requires Vulkan backend");
+            let command_buffer = hal_encoder.raw_handle();
+            // ash exposes only the raw fp for this extension (no safe wrapper).
+            (omm.fp().cmd_build_micromaps_ext)(command_buffer, 1, build_info);
         });
     }
 }
