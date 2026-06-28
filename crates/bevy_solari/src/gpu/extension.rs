@@ -370,7 +370,6 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                     vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true),
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
-                tracing::info!("VK_EXT_opacity_micromap ENABLED — OMM-accelerated alpha cutouts available.");
             } else {
                 tracing::warn!(
                     "VK_EXT_opacity_micromap NOT exposed by this device — alpha cutouts fall back to \
@@ -385,10 +384,6 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                         .ray_tracing_validation(true),
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
-                tracing::warn!(
-                    "VK_NV_ray_tracing_validation ENABLED — driver RT validation messages \
-                     (if any) will appear as wgpu_hal VALIDATION lines."
-                );
             } else {
                 tracing::warn!(
                     "VK_NV_ray_tracing_validation NOT exposed by the driver — set \

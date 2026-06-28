@@ -204,7 +204,6 @@ pub fn init_dlss(app: &mut App) -> bool {
     match DlssSdk::new(project_id, wgpu_device) {
         Ok(sdk) => {
             app.sub_app_mut(RenderApp).insert_resource(SolariDlssSdk(sdk));
-            info!("SolariPlugin: DLSS Ray Reconstruction enabled.");
             true
         }
         Err(error) => {
