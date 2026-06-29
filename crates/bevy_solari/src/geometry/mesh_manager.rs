@@ -37,6 +37,9 @@ pub struct TessCluster {
 #[derive(Clone)]
 struct ClusterMeshSlices {
     vertex_positions: Range<BufferAddress>,
+    /// Freed in lockstep with `vertex_positions` to keep both pools' per-mesh
+    /// element index identical (the resolve indexes both with one global index).
+    vertex_packed: Range<BufferAddress>,
     vertex_normals: Range<BufferAddress>,
     vertex_tangents: Range<BufferAddress>,
     vertex_uvs: Range<BufferAddress>,
@@ -336,6 +339,7 @@ impl ClusterMeshManager {
 
         let slices = ClusterMeshSlices {
             vertex_positions,
+            vertex_packed,
             vertex_normals,
             vertex_tangents,
             vertex_uvs,
@@ -449,6 +453,7 @@ impl ClusterMeshManager {
             return;
         };
         self.vertex_positions.mark_slice_unused(slices.vertex_positions);
+        self.vertex_packed.mark_slice_unused(slices.vertex_packed);
         self.vertex_normals.mark_slice_unused(slices.vertex_normals);
         self.vertex_tangents.mark_slice_unused(slices.vertex_tangents);
         self.vertex_uvs.mark_slice_unused(slices.vertex_uvs);
