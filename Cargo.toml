@@ -1544,6 +1544,25 @@ category = "3D Rendering"
 wasm = true
 
 [[example]]
+name = "solari_animation"
+path = "examples/3d/solari/animation.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "cluster_processor",
+    "https",
+    "free_camera",
+    "bevy_feathers",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_animation]
+name = "Solari (animation)"
+description = "Ray-traced GPU skeletal animation of a skinned glTF (Bevy Solari)."
+category = "3D Rendering"
+wasm = false
+
+[[example]]
 name = "solari_pica_pica"
 path = "examples/3d/solari/pica_pica.rs"
 doc-scrape-examples = true

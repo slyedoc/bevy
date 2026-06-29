@@ -13,6 +13,7 @@
 
 pub mod asset;
 pub mod clas_arena;
+pub mod clas_template;
 #[cfg(feature = "cluster_processor")]
 pub mod from_mesh;
 pub mod indices;
@@ -25,11 +26,14 @@ pub mod tess_template;
 
 
 pub use self::asset::{
-    write_cluster_mesh_sync, Cluster, ClusterBvhNode, ClusterLodGroup, ClusterMesh,
-    ClusterMeshAabb, ClusterMeshLoader, ClusterMeshSaveOrLoadError, ClusterMeshSaver, OmmDesc,
-    OmmUsage, CLUSTER_MESH_ASSET_VERSION,
+    write_cluster_mesh_sync, Cluster, ClusterBloatAabb, ClusterBvhNode, ClusterLodGroup,
+    ClusterMesh, ClusterMeshAabb, ClusterMeshLoader, ClusterMeshSaveOrLoadError, ClusterMeshSaver,
+    OmmDesc, OmmUsage, CLUSTER_MESH_ASSET_VERSION,
 };
 pub use self::clas_arena::{init_clas_arena, upload_pending_clas, ClasArena};
+pub use self::clas_template::{
+    init_clas_template_arena, upload_pending_templates, ClusterTemplateArena,
+};
 pub use self::indices::{ClusterIndex, GroupIndex, GpuEntity, NodeIndex};
 pub use self::mesh_manager::{
     init_cluster_mesh_manager, perform_pending_cluster_mesh_writes, ClusterMeshManager,
@@ -72,6 +76,7 @@ impl Plugin for GeometryPlugin {
                 (
                     init_cluster_mesh_manager.after(SolariSetup),
                     init_clas_arena.after(SolariSetup),
+                    init_clas_template_arena.after(SolariSetup),
                     tess_table::init_tessellation_table.after(SolariSetup),
                     tess_classify::init_tess_classify.after(SolariSetup),
                     tess_displace::init_tess_ptlas_write.after(SolariSetup),
@@ -81,9 +86,12 @@ impl Plugin for GeometryPlugin {
                 Render,
                 (
                     perform_pending_cluster_mesh_writes.in_set(RenderSystems::PrepareAssets),
-                    upload_pending_clas
+                    upload_pending_templates
                         .in_set(RenderSystems::PrepareAssets)
                         .after(perform_pending_cluster_mesh_writes),
+                    upload_pending_clas
+                        .in_set(RenderSystems::PrepareAssets)
+                        .after(upload_pending_templates),
                     tess_classify::run_tess_classify
                         .in_set(RenderSystems::Prepare),
                     tess_displace::prepare_tess_ptlas_write

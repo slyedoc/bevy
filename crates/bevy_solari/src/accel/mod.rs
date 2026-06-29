@@ -19,14 +19,16 @@ use bevy_core_pipeline::schedule::camera_driver;
 use bevy_ecs::schedule::{common_conditions::resource_exists, IntoScheduleConfigs};
 use bevy_render::{
     renderer::{RenderGraph, RenderGraphSystems},
-    Render, RenderApp, RenderStartup, RenderSystems,
+    ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
 };
 
 use crate::pipelines::SolariPipelines;
 use crate::{SolariClusterSystems, SolariSetup};
 
+pub mod animated_blas;
 pub mod blas_rebuild;
 pub mod blas_sharing;
+pub mod deform;
 pub mod partition_alloc;
 pub mod pipelines;
 pub mod ptlas;
@@ -73,9 +75,11 @@ impl Plugin for AccelPlugin {
                 (
                     SolariClusterSystems::Scatter,
                     SolariClusterSystems::Propagate,
+                    SolariClusterSystems::Deform,
                     SolariClusterSystems::Classify,
                     SolariClusterSystems::Select,
                     SolariClusterSystems::BuildBlas,
+                    SolariClusterSystems::BuildAnimatedBlas,
                     SolariClusterSystems::BuildTlas,
                     SolariClusterSystems::Cleanup,
                 )
@@ -90,8 +94,11 @@ impl Plugin for AccelPlugin {
                     init_blas_sharing.after(SolariSetup),
                     init_blas_rebuild.after(SolariSetup),
                     init_ptlas.after(SolariSetup),
+                    deform::init_deform.after(SolariSetup),
+                    animated_blas::init_animated_blas.after(SolariSetup),
                 ),
             )
+            .add_systems(ExtractSchedule, deform::extract_animated_skins)
             .add_systems(
                 Render,
                 (
@@ -110,6 +117,14 @@ impl Plugin for AccelPlugin {
                     prepare_selector_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     prepare_blas_sharing_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     prepare_ptlas_fill_bind_group.in_set(RenderSystems::PrepareBindGroups),
+                    deform::prepare_deform.in_set(RenderSystems::Prepare),
+                    deform::prepare_deform_bind_group.in_set(RenderSystems::PrepareBindGroups),
+                    animated_blas::prepare_animated_blas.in_set(RenderSystems::Prepare),
+                    animated_blas::prepare_animated_blas_params
+                        .in_set(RenderSystems::Prepare)
+                        .after(animated_blas::prepare_animated_blas),
+                    animated_blas::prepare_animated_blas_bind_group
+                        .in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
             .add_systems(
@@ -121,7 +136,13 @@ impl Plugin for AccelPlugin {
                     dispatch_selector
                         .run_if(resource_exists::<SolariPipelines>)
                         .in_set(SolariClusterSystems::Select),
+                    deform::dispatch_deform
+                        .run_if(resource_exists::<SolariPipelines>)
+                        .in_set(SolariClusterSystems::Deform),
                     dispatch_blas_rebuild.in_set(SolariClusterSystems::BuildBlas),
+                    animated_blas::dispatch_animated_blas
+                        .run_if(resource_exists::<SolariPipelines>)
+                        .in_set(SolariClusterSystems::BuildAnimatedBlas),
                     dispatch_ptlas
                         .run_if(resource_exists::<SolariPipelines>)
                         .in_set(SolariClusterSystems::BuildTlas),

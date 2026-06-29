@@ -60,6 +60,10 @@ pub struct SolariPipelines {
 
     /// Reusable inline-`rayQuery` batch trace (`ray_query/ray_query.wgsl`).
     pub ray_query: CachedComputePipelineId,
+    /// Skeletal LBS deform of animated cluster meshes (`accel/deform.wgsl`).
+    pub deform: CachedComputePipelineId,
+    /// Per-instance animated CLAS instantiate + BLAS args (`accel/instantiate.wgsl`).
+    pub animated_blas: CachedComputePipelineId,
     /// Fullscreen depth-write bridging RT primary-hit depth into the hardware depth
     /// buffer so gizmos occlude against the ray-traced scene (`render/gizmo_depth.wgsl`).
     pub gizmo_depth: CachedRenderPipelineId,
@@ -84,6 +88,8 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "geometry/tess_instantiate.wgsl");
     embedded_asset!(app, "geometry/tess_scatter.wgsl");
     embedded_asset!(app, "geometry/tess_ptlas_write.wgsl");
+    embedded_asset!(app, "accel/deform.wgsl");
+    embedded_asset!(app, "accel/instantiate.wgsl");
     embedded_asset!(app, "accel/selector.wgsl");
     embedded_asset!(app, "accel/blas_sharing.wgsl");
     embedded_asset!(app, "accel/ptlas_fill.wgsl");
@@ -258,6 +264,28 @@ pub fn init_solari_pipelines(
         resource_manager.gizmo_depth.clone(),
     );
 
+    let deform = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("deform".into()),
+        layout: vec![resource_manager.deform.clone()],
+        shader: load_embedded_asset!(asset_server.as_ref(), "accel/deform.wgsl"),
+        shader_defs: vec![],
+        entry_point: Some("deform".into()),
+        immediate_size: 0,
+        zero_initialize_workgroup_memory: false,
+        constants: vec![],
+    });
+
+    let animated_blas = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("animated_instantiate".into()),
+        layout: vec![resource_manager.animated_blas.clone()],
+        shader: load_embedded_asset!(asset_server.as_ref(), "accel/instantiate.wgsl"),
+        shader_defs: vec![],
+        entry_point: Some("instantiate".into()),
+        immediate_size: 0,
+        zero_initialize_workgroup_memory: false,
+        constants: vec![],
+    });
+
     commands.insert_resource(SolariPipelines {
         transform_propagate,
         transform_gather,
@@ -276,6 +304,8 @@ pub fn init_solari_pipelines(
         ptlas_finalize,
         ptlas_hair_write,
         ray_query,
+        deform,
+        animated_blas,
         gizmo_depth,
     });
 }

@@ -310,7 +310,9 @@ struct Portal {
 @group(#{SOLARI_SCENE_COLUMNS_GROUP}) @binding(5) var<storage> portals: array<Portal>;
 
 const RAY_T_MIN = 0.001f;
-const RAY_T_MAX = 100000.0f;
+// Effectively infinite ray length (primary, shadow, GI). Finite, not `inf`: an `inf`
+// tmax produces NaN in the slab test (`inf * 0`) and silently drops hits.
+const RAY_T_MAX = 1.0e30f;
 
 // Self-intersection-free ray origin for continuation rays (Wächter & Binder,
 // "A Fast and Robust Method for Avoiding Self-Intersection", Ray Tracing
@@ -492,6 +494,12 @@ struct SolariGeometryAddresses {
     // Optional per-vertex custom-data pool (stride 4). A custom closest-hit reads
     // it via `load_vertex_custom` / `load_triangle_custom`; built-in chits ignore it.
     vertex_custom: u64,
+    // Deformed normals (u32 octa) + tangents (vec4) pools, and the slot-indexed
+    // animated table (16 B/instance: flag, deform_pool_base, mesh_vertex_base). 0 =
+    // no animation; the resolve then shades animated hits with rest-pose attrs.
+    deform_normals: u64,
+    deform_tangents: u64,
+    animated_table: u64,
 }
 @group(1) @binding(4) var<uniform> geometry_addresses: SolariGeometryAddresses;
 
@@ -575,6 +583,17 @@ fn load_cluster_vertex_attrs(vertex_index: u32) -> Vertex {
     v.tangent = unpack_tangent(physical_load<u32>(base + u64(4u)));
     v.uv = physical_load<vec2<f32>>(base + u64(8u));
     return v;
+}
+
+/// Override a vertex's normal/tangent with the deformed values at deform-pool slot
+/// `di` (positions come from the hit; uv is deform-invariant).
+fn apply_deform_attrs(v: Vertex, di: u32) -> Vertex {
+    var out = v;
+    out.normal = octahedral_decode_signed(unpack2x16snorm(
+        physical_load<u32>(geometry_addresses.deform_normals + u64(di) * u64(4u)),
+    ));
+    out.tangent = physical_load<vec4<f32>>(geometry_addresses.deform_tangents + u64(di) * u64(16u));
+    return out;
 }
 
 /// Just the UV of a packed vertex (the alpha-test fast path needs no other field).
@@ -981,13 +1000,28 @@ fn resolve_triangle_data_full_mat_fetch(
 
     let cluster = clusters[cluster_global_id];
     let idx_base = cluster.index_offset + triangle_id * 3u;
+    let gvi0 = cluster.vertex_offset + cluster_indices[idx_base + 0u];
+    let gvi1 = cluster.vertex_offset + cluster_indices[idx_base + 1u];
+    let gvi2 = cluster.vertex_offset + cluster_indices[idx_base + 2u];
     // Attrs-only fetch (skips the position head); the builtin supplies position.
-    var v0 = load_cluster_vertex_attrs(cluster.vertex_offset + cluster_indices[idx_base + 0u]);
-    var v1 = load_cluster_vertex_attrs(cluster.vertex_offset + cluster_indices[idx_base + 1u]);
-    var v2 = load_cluster_vertex_attrs(cluster.vertex_offset + cluster_indices[idx_base + 2u]);
+    var v0 = load_cluster_vertex_attrs(gvi0);
+    var v1 = load_cluster_vertex_attrs(gvi1);
+    var v2 = load_cluster_vertex_attrs(gvi2);
     v0.position = object_positions[0];
     v1.position = object_positions[1];
     v2.position = object_positions[2];
+    // Animated instance: positions already come from the deformed hit triangle, but
+    // the pooled attrs are rest-pose — swap normal/tangent for the deformed values.
+    if geometry_addresses.animated_table != 0 {
+        let a = geometry_addresses.animated_table + u64(instance_id) * u64(16u);
+        if physical_load<u32>(a) == 1u {
+            let pool_base = physical_load<u32>(a + u64(4u));
+            let mvb = physical_load<u32>(a + u64(8u));
+            v0 = apply_deform_attrs(v0, pool_base + (gvi0 - mvb));
+            v1 = apply_deform_attrs(v1, pool_base + (gvi1 - mvb));
+            v2 = apply_deform_attrs(v2, pool_base + (gvi2 - mvb));
+        }
+    }
     return resolve_triangle_data_core(
         instance_id,
         material_id,

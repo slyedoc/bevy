@@ -109,6 +109,12 @@ pub struct RtGeometryAddresses {
     /// (`ClusterMeshManager::vertex_custom`, stride 4). A custom closest-hit reads
     /// `vertex_custom[global_vertex_index]`; the built-in chits never touch it.
     pub vertex_custom: u64,
+    /// Deformed octahedral normals + tangents pools (`Deform`), and the slot-indexed
+    /// animated table (flag/deform_pool_base/mesh_vertex_base per instance). `0` when
+    /// no animation — the resolve then shades animated hits with rest-pose attrs.
+    pub deform_normals: u64,
+    pub deform_tangents: u64,
+    pub animated_table: u64,
 }
 
 /// One RT closest-hit program; its registry index is its SBT class. WGSL is `&'static`

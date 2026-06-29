@@ -451,6 +451,7 @@ pub(crate) fn rt_pipeline(
         Option<Res<ClusterMeshManager>>,
         Option<Res<crate::geometry::tess_classify::TessClassify>>,
         Option<Res<SolariHitGroupRegistry>>,
+        Option<Res<crate::accel::deform::Deform>>,
     ),
     materials: RtMaterials,
     atmosphere_sky: Option<Res<AtmosphereSky>>,
@@ -461,7 +462,7 @@ pub(crate) fn rt_pipeline(
     mut commands: Commands,
     mut ctx: RenderContext,
 ) {
-    let (cluster_mesh_manager, tess_classify, hit_group_registry) = geometry_res;
+    let (cluster_mesh_manager, tess_classify, hit_group_registry, deform) = geometry_res;
     let view_entity = view.entity();
     let (
         view,
@@ -725,6 +726,9 @@ pub(crate) fn rt_pipeline(
             _pad: 0,
             tess_clusters,
             vertex_custom: cluster_mesh_manager.vertex_custom.trace_device_address(),
+            deform_normals: deform.as_ref().map_or(0, |d| d.normals_addr),
+            deform_tangents: deform.as_ref().map_or(0, |d| d.tangents_addr),
+            animated_table: deform.as_ref().map_or(0, |d| d.animated_table_addr),
         });
     }
 

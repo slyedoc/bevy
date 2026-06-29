@@ -426,6 +426,7 @@ pub fn prepare_ptlas_params(
     hair_instances: Option<Res<crate::hair::HairInstances>>,
     tess_found: Option<Res<crate::geometry::tess_displace::TessShowcaseInstances>>,
     tess_classify: Option<Res<crate::geometry::tess_classify::TessClassify>>,
+    deform: Option<Res<super::deform::Deform>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
@@ -538,6 +539,17 @@ pub fn prepare_ptlas_params(
                 slot: slot.0,
                 null_flag: PAIR_NULL,
             });
+        }
+        // Animated instances rebuild their per-instance BLAS in place every frame
+        // (stable address, new content), which `fill_incremental` can't detect — a
+        // still fox wouldn't "move". Force-rewrite them so the partition re-reads.
+        if let Some(deform) = deform.as_ref() {
+            for s in deform.active_slots() {
+                resources.write_slots_cpu.push(PtlasWritePair {
+                    slot: s.instance_slot,
+                    null_flag: PAIR_NORMAL,
+                });
+            }
         }
     }
     let cpu_count = resources.write_slots_cpu.len() as u32;

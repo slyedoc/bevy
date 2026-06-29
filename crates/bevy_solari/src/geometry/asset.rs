@@ -27,6 +27,10 @@ const CLUSTER_MESH_ASSET_MAGIC: u64 = u64::from_le_bytes(*b"CLUSTERS");
 /// micro-map (OMM) slices; v2 files still load (with no OMM).
 pub const CLUSTER_MESH_ASSET_VERSION: u64 = 3;
 
+/// Max joint count the runtime deform path addresses per mesh; matches
+/// `bevy_pbr::skin::MAX_JOINTS`. Skin streams are runtime-only (not serialized).
+pub const MAX_JOINTS_PER_MESH: u32 = 256;
+
 /// Oldest format version this loader still accepts. Versions in
 /// `[MIN, VERSION]` load; older/newer are rejected.
 const CLUSTER_MESH_ASSET_MIN_VERSION: u64 = 2;
@@ -91,6 +95,14 @@ pub struct ClusterMesh {
     pub vertex_uvs: Arc<[Vec2]>,
     /// Optional per-vertex `u32` user data (empty = unused); a custom closest-hit reads it.
     pub vertex_custom: Arc<[u32]>,
+    /// Per-vertex joint indices (`[u16; 4]`), parallel to positions. Empty = static.
+    pub vertex_joint_indices: Arc<[[u16; 4]]>,
+    /// Per-vertex joint weights (sum ≈ 1.0), parallel to positions. Empty = static.
+    pub vertex_joint_weights: Arc<[Vec4]>,
+    /// Per-cluster deform envelope for NV `instantiationBoundingBoxLimit`. Empty = static.
+    pub cluster_bloat_aabbs: Arc<[ClusterBloatAabb]>,
+    /// Inverse-bind-matrix count (== rig joint count); 0 for static meshes.
+    pub inverse_bind_count: u32,
     /// Per-triangle indices (3 `u32`s/tri), cluster-local: 0 = the cluster's own `vertex_offset`.
     pub indices: Arc<[u32]>,
     /// All clusters across all LOD levels, flat. DAG connectivity
@@ -160,6 +172,27 @@ impl ClusterMesh {
     }
     pub fn vertex_custom(&self) -> &[u32] {
         &self.vertex_custom
+    }
+    #[inline]
+    pub fn vertex_joint_indices(&self) -> &[[u16; 4]] {
+        &self.vertex_joint_indices
+    }
+    #[inline]
+    pub fn vertex_joint_weights(&self) -> &[Vec4] {
+        &self.vertex_joint_weights
+    }
+    #[inline]
+    pub fn cluster_bloat_aabbs(&self) -> &[ClusterBloatAabb] {
+        &self.cluster_bloat_aabbs
+    }
+    #[inline]
+    pub fn inverse_bind_count(&self) -> u32 {
+        self.inverse_bind_count
+    }
+    /// True when the mesh carries per-vertex joint data → deform/instantiate path.
+    #[inline]
+    pub fn is_animated(&self) -> bool {
+        !self.vertex_joint_indices.is_empty()
     }
     #[inline]
     pub fn indices(&self) -> &[u32] {
@@ -398,6 +431,14 @@ pub struct ClusterMeshAabb {
     pub half_extent: [f32; 4],
 }
 
+/// Per-cluster deform envelope for NV `instantiationBoundingBoxLimit` at template build.
+#[derive(Copy, Clone, Default, Pod, Zeroable, Debug)]
+#[repr(C)]
+pub struct ClusterBloatAabb {
+    pub min: [f32; 4],
+    pub max: [f32; 4],
+}
+
 /// Synchronous writer for offline CLI tools — same wire format as
 /// [`ClusterMeshSaver`], but bypasses bevy_asset's async I/O so
 /// bake binaries can stream directly to a [`std::io::Write`].
@@ -562,6 +603,11 @@ impl AssetLoader for ClusterMeshLoader {
             vertex_uvs,
             // Not disk-serialized — runtime generators set it; loaded meshes have none.
             vertex_custom: Arc::from(&[][..]),
+            // Skin streams are runtime-only (set by the bake); loaded meshes are static.
+            vertex_joint_indices: Arc::from(&[][..]),
+            vertex_joint_weights: Arc::from(&[][..]),
+            cluster_bloat_aabbs: Arc::from(&[][..]),
+            inverse_bind_count: 0,
             indices,
             clusters,
             groups,

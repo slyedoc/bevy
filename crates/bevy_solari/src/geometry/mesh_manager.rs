@@ -1,6 +1,6 @@
 use super::asset::{
-    Cluster, ClusterBvhNode, ClusterLodGroup, ClusterMesh, ClusterMeshAabb, OmmDesc, OmmUsage,
-    PackedVertex,
+    Cluster, ClusterBloatAabb, ClusterBvhNode, ClusterLodGroup, ClusterMesh, ClusterMeshAabb,
+    OmmDesc, OmmUsage, PackedVertex,
 };
 use super::indices::{ClusterIndex, GroupIndex, NodeIndex};
 use crate::gpu::extension::opacity_micromap_available;
@@ -44,6 +44,9 @@ struct ClusterMeshSlices {
     vertex_tangents: Range<BufferAddress>,
     vertex_uvs: Range<BufferAddress>,
     vertex_custom: Range<BufferAddress>,
+    vertex_joint_indices: Range<BufferAddress>,
+    vertex_joint_weights: Range<BufferAddress>,
+    cluster_bloat_aabbs: Range<BufferAddress>,
     indices: Range<BufferAddress>,
     child_table: Range<BufferAddress>,
     clusters: Range<BufferAddress>,
@@ -69,6 +72,16 @@ struct ClusterMeshSlices {
     /// geometry universe. Monotonic for now (not recycled on remove —
     /// eviction is a follow-up).
     geometry_id: u32,
+}
+
+/// Global pool bases for an animated mesh, returned by
+/// [`ClusterMeshManager::animated_mesh_pointers`]. The deform pass indexes the
+/// rest-position / joint streams by these bases + per-vertex id.
+#[derive(Copy, Clone, Debug)]
+pub struct AnimatedMeshPointers {
+    pub vertex_base: u32,
+    pub vertex_count: u32,
+    pub joint_base: u32,
 }
 
 /// Per-asset metadata returned from [`ClusterMeshManager::queue_upload_if_needed`].
@@ -139,6 +152,8 @@ pub struct PendingClasUpload {
     /// Baked opacity micro-map for this mesh, or `None` (no OMM / extension
     /// unavailable). Consumed by the CLAS build to attach the OMM per cluster.
     pub omm: Option<OmmUploadData>,
+    /// Per-cluster deform envelope (`instantiationBoundingBoxLimit`); empty = static.
+    pub bloat_aabbs: Arc<[ClusterBloatAabb]>,
 }
 
 /// Manages uploading [`ClusterMesh`] asset data to the GPU.
@@ -161,6 +176,9 @@ pub struct ClusterMeshManager {
     pub clusters: PersistentGpuBuffer<Arc<[Cluster]>>,
     pub groups: PersistentGpuBuffer<Arc<[ClusterLodGroup]>>,
     pub nodes: PersistentGpuBuffer<Arc<[ClusterBvhNode]>>,
+    pub vertex_joint_indices: PersistentGpuBuffer<Arc<[[u16; 4]]>>,
+    pub vertex_joint_weights: PersistentGpuBuffer<Arc<[Vec4]>>,
+    pub cluster_bloat_aabbs: PersistentGpuBuffer<Arc<[ClusterBloatAabb]>>,
     /// Parallel to `clusters` — per-cluster group id, rebased to
     /// global group ids before queueing.
     pub cluster_to_group: PersistentGpuBuffer<Arc<[u32]>>,
@@ -195,6 +213,9 @@ pub fn init_cluster_mesh_manager(
         clusters: PersistentGpuBuffer::new("clusters", &render_device, &allocator),
         groups: PersistentGpuBuffer::new("cluster_groups", &render_device, &allocator),
         nodes: PersistentGpuBuffer::new("cluster_nodes", &render_device, &allocator),
+        vertex_joint_indices: PersistentGpuBuffer::new("cluster_vertex_joint_indices", &render_device, &allocator),
+        vertex_joint_weights: PersistentGpuBuffer::new("cluster_vertex_joint_weights", &render_device, &allocator),
+        cluster_bloat_aabbs: PersistentGpuBuffer::new("cluster_bloat_aabbs", &render_device, &allocator),
         cluster_to_group: PersistentGpuBuffer::new("cluster_to_group", &render_device, &allocator),
         cluster_mesh_slices: HashMap::default(),
         next_geometry_id: 0,
@@ -257,6 +278,25 @@ impl ClusterMeshManager {
             vec![0u32; mesh.vertex_positions.len()].into()
         };
         let vertex_custom = self.vertex_custom.queue_write(custom_src, ());
+        // Skin streams — empty for static meshes (`queue_write` panics on 0 bytes).
+        let vertex_joint_indices = if mesh.vertex_joint_indices.is_empty() {
+            0..0
+        } else {
+            self.vertex_joint_indices
+                .queue_write(Arc::clone(&mesh.vertex_joint_indices), ())
+        };
+        let vertex_joint_weights = if mesh.vertex_joint_weights.is_empty() {
+            0..0
+        } else {
+            self.vertex_joint_weights
+                .queue_write(Arc::clone(&mesh.vertex_joint_weights), ())
+        };
+        let cluster_bloat_aabbs = if mesh.cluster_bloat_aabbs.is_empty() {
+            0..0
+        } else {
+            self.cluster_bloat_aabbs
+                .queue_write(Arc::clone(&mesh.cluster_bloat_aabbs), ())
+        };
         // Interleaved AoS copy for the bindless RT resolve. Built parallel to the
         // SoA streams above; since every pool gets exactly one bump-allocated
         // append per mesh in the same order, the packed pool's element base equals
@@ -362,6 +402,9 @@ impl ClusterMeshManager {
             vertex_tangents,
             vertex_uvs,
             vertex_custom,
+            vertex_joint_indices,
+            vertex_joint_weights,
+            cluster_bloat_aabbs,
             indices,
             child_table,
             clusters,
@@ -421,6 +464,7 @@ impl ClusterMeshManager {
             index_base,
             clusters: Arc::clone(&mesh.clusters),
             omm,
+            bloat_aabbs: Arc::clone(&mesh.cluster_bloat_aabbs),
         };
         self.pending_clas_uploads.push(pending);
         upload
@@ -431,6 +475,25 @@ impl ClusterMeshManager {
     #[inline]
     pub fn resident_mesh_count(&self) -> usize {
         self.cluster_mesh_slices.len()
+    }
+
+    /// Rest-pose vertex base/count + joint-stream base for a resident animated
+    /// mesh; `None` if not resident or static (no joint streams).
+    #[inline]
+    pub fn animated_mesh_pointers(
+        &self,
+        asset_id: AssetId<ClusterMesh>,
+    ) -> Option<AnimatedMeshPointers> {
+        let s = self.cluster_mesh_slices.get(&asset_id)?;
+        if s.vertex_joint_indices.is_empty() {
+            return None;
+        }
+        let vsize = size_of::<Vec3>() as u64;
+        Some(AnimatedMeshPointers {
+            vertex_base: (s.vertex_positions.start / vsize) as u32,
+            vertex_count: ((s.vertex_positions.end - s.vertex_positions.start) / vsize) as u32,
+            joint_base: (s.vertex_joint_indices.start / size_of::<[u16; 4]>() as u64) as u32,
+        })
     }
 
     /// Per-cluster global `[vertex_offset, index_offset, triangle_count]` for every
@@ -482,6 +545,11 @@ impl ClusterMeshManager {
         self.clusters.mark_slice_unused(slices.clusters);
         self.groups.mark_slice_unused(slices.groups);
         self.nodes.mark_slice_unused(slices.nodes);
+        if !slices.vertex_joint_indices.is_empty() {
+            self.vertex_joint_indices.mark_slice_unused(slices.vertex_joint_indices);
+            self.vertex_joint_weights.mark_slice_unused(slices.vertex_joint_weights);
+            self.cluster_bloat_aabbs.mark_slice_unused(slices.cluster_bloat_aabbs);
+        }
         self.cluster_to_group.mark_slice_unused(slices.cluster_to_group);
     }
 }
@@ -538,4 +606,7 @@ pub fn perform_pending_cluster_mesh_writes(
     manager
         .cluster_to_group
         .perform_writes(&render_queue);
+    manager.vertex_joint_indices.perform_writes(&render_queue);
+    manager.vertex_joint_weights.perform_writes(&render_queue);
+    manager.cluster_bloat_aabbs.perform_writes(&render_queue);
 }

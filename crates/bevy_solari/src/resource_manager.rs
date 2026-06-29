@@ -62,6 +62,10 @@ pub struct SolariResourceManager {
     pub ray_query_io: BindGroupLayoutDescriptor,
     /// The fullscreen gizmo-depth bridge `@group(0)` layout (rt output + view).
     pub gizmo_depth: BindGroupLayoutDescriptor,
+    /// The skeletal-deform compute `@group(0)` layout.
+    pub deform: BindGroupLayoutDescriptor,
+    /// The animated CLAS-instantiate compute `@group(0)` layout.
+    pub animated_blas: BindGroupLayoutDescriptor,
 }
 
 /// `RenderStartup` (after `SolariSetup`): build every pass's bind-group layout.
@@ -84,5 +88,7 @@ pub fn init_solari_resource_manager(mut commands: Commands, allocator: Option<Re
         ptlas_hair_write: crate::hair::ptlas_hair::ptlas_hair_write_bind_group_layout(),
         ray_query_io: crate::ray_query::ray_query_io_bind_group_layout(),
         gizmo_depth: crate::render::gizmo_depth::gizmo_depth_bind_group_layout(),
+        deform: crate::accel::deform::deform_bind_group_layout(),
+        animated_blas: crate::accel::animated_blas::animated_blas_bind_group_layout(),
     });
 }

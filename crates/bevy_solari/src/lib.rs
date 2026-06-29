@@ -152,12 +152,16 @@ pub enum SolariClusterSystems {
     /// GPU transform propagation (Jacobi) — reads the scattered local/parent
     /// columns, writes the per-node world buffer.
     Propagate,
+    /// Skin animated instances into the deform pool (LBS from the transform table).
+    Deform,
     /// Classify instances → LOD bands; elect per-geometry dirty BLAS builds.
     Classify,
     /// Per-bucket object-space DAG cut → CLAS ref lists.
     Select,
     /// Build the per-geometry shared BLASes.
     BuildBlas,
+    /// Instantiate per-instance animated CLAS → per-instance BLAS; repoint addresses.
+    BuildAnimatedBlas,
     /// Incremental partitioned-TLAS fill + build.
     BuildTlas,
     /// Reusable batch ray-query trace against the built TLAS (no-op until a
