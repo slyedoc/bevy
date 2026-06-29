@@ -357,17 +357,19 @@ pub fn prepare_rt_output(
     }
 }
 
-/// `RenderGraph`: cast primary rays through the RT pipeline and blit the result
-/// into the view. Lazily builds the RT pipeline on the first frame the scene +
-/// columns bind groups (and their layouts) are ready — its layout must match
-/// wgpu's exact descriptor set layouts, which only exist once those are built.
-/// Built-in RT hit groups Solari registers by default — opaque (with the
-/// alpha-cutout any-hit), glass, hair, portal. Each entry's index is its SBT class
-/// (matches `material_sbt_class`); downstream crates append their own (e.g. a planet
-/// surface) via [`App::register_solari_chit`](crate::SolariChitRegistryAppExt).
-/// Solari thus consumes the same registry it exposes — no hardcoded hit groups.
-pub fn default_hit_groups() -> Vec<SolariHitGroupDef> {
-    vec![
+// ── Built-in surfaces ──────────────────────────────────────────────────────────
+// Solari's own hit groups are `SolariMaterial`s registered through the same
+// `SolariMaterialPlugin` path any downstream surface uses (see `SolariPlugin`). There
+// is no hardcoded hit-group list. REGISTRATION ORDER IS LOAD-BEARING: opaque must be
+// class 0 (the default/fallback `material_sbt_class` returns) and glass class 1 (the
+// transmission routing), so `SolariPlugin` registers them first, in this order.
+
+/// Built-in opaque surface — the default closest-hit (full BRDF + NEE) with the
+/// alpha-cutout any-hit attached. Class 0: the fallback for any non-special material.
+pub struct OpaqueSurface;
+
+impl crate::SolariMaterial for OpaqueSurface {
+    fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "opaque",
             closest_hit_wgsl: include_str!("chit_opaque.wgsl"),
@@ -378,31 +380,65 @@ pub fn default_hit_groups() -> Vec<SolariHitGroupDef> {
                 file: "ahit_alpha.wgsl",
                 entry: "ahit_alpha",
             }),
-        },
+        }
+    }
+}
+
+/// Built-in glass surface — Fresnel reflect/refract. Class 1: `material_sbt_class`
+/// routes a transmissive material (`specular_transmission > 0`) here.
+pub struct GlassSurface;
+
+impl crate::SolariMaterial for GlassSurface {
+    fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "glass",
             closest_hit_wgsl: include_str!("chit_glass.wgsl"),
             closest_hit_file: "chit_glass.wgsl",
             closest_hit_entry: "chit_glass",
             any_hit: None,
-        },
+        }
+    }
+}
+
+/// Built-in hair surface — Chiang fiber BSDF / LSS bark. Class 2: hair instances
+/// route to it via the reserved SBT record (keyed by the "hair" label), not a material.
+pub struct HairSurface;
+
+impl crate::SolariMaterial for HairSurface {
+    fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "hair",
             closest_hit_wgsl: include_str!("chit_hair.wgsl"),
             closest_hit_file: "chit_hair.wgsl",
             closest_hit_entry: "chit_hair",
             any_hit: None,
-        },
+        }
+    }
+}
+
+/// The built-in ray-portal surface — a [`SolariMaterial`](crate::SolariMaterial) Solari
+/// registers itself (via `SolariMaterialPlugin::<PortalSurface>` in `SolariPlugin`),
+/// dogfooding the same path downstream surfaces use. A material routes to `chit_portal`
+/// by setting its `chit_class` to `SolariMaterialClass<PortalSurface>` (teleport, no
+/// shading; pair the instance with a [`SolariPortal`](crate::bindings::SolariPortal)).
+pub struct PortalSurface;
+
+impl crate::SolariMaterial for PortalSurface {
+    fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "portal",
             closest_hit_wgsl: include_str!("chit_portal.wgsl"),
             closest_hit_file: "chit_portal.wgsl",
             closest_hit_entry: "chit_portal",
             any_hit: None,
-        },
-    ]
+        }
+    }
 }
 
+/// `RenderGraph`: cast primary rays through the RT pipeline and blit the result into
+/// the view. Lazily builds the RT pipeline on the first frame the scene + columns bind
+/// groups (and their layouts) exist — its layout must match wgpu's exact descriptor
+/// set layouts, which only exist once those are built.
 pub(crate) fn rt_pipeline(
     view: ViewQuery<(
         &ExtractedView,

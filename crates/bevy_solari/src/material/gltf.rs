@@ -59,9 +59,7 @@ fn solari_material_from_gltf(
         depth_map: None,
         depth_scale: 1.0,
         depth_bias: 0.0,
-        // No glTF portal concept; portal surfaces set `StandardSolariMaterial::portal` directly.
-        portal: false,
-        // Custom hit-group routing is opt-in via `StandardSolariMaterial::chit_class`.
+        // Custom hit-group routing (portal, planet, …) is opt-in via `chit_class`.
         chit_class: 0,
     }
 }

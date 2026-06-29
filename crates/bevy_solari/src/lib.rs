@@ -78,6 +78,7 @@ use crate::transform::SolariTransformPlugin;
 use crate::debug::SolariDebugPlugin;
 
 pub use crate::gpu::rt_pipeline::{SolariAnyHitDef, SolariHitGroupDef, SolariHitGroupRegistry};
+pub use crate::render::rt_pipeline::{GlassSurface, HairSurface, OpaqueSurface, PortalSurface};
 
 /// Register a custom RT closest-hit ("hit group") with Solari and get its SBT
 /// **class** back. Set that class on a material's
@@ -275,6 +276,18 @@ impl Plugin for SolariPlugin {
             SolariLightsPlugin,
 
             HairPlugin,
+        ));
+
+        // Solari's own hit groups, registered through the SAME `SolariMaterialPlugin`
+        // path any downstream surface uses — no hardcoded hit-group list. ORDER IS
+        // LOAD-BEARING: opaque=class 0 (default/fallback), glass=1 (transmission route),
+        // hair=2 (reserved record), portal=3. Must follow the tuple above (it seeds the
+        // empty registry via `SolarRenderPlugin`).
+        app.add_plugins((
+            SolariMaterialPlugin::<OpaqueSurface>::default(),
+            SolariMaterialPlugin::<GlassSurface>::default(),
+            SolariMaterialPlugin::<HairSurface>::default(),
+            SolariMaterialPlugin::<PortalSurface>::default(),
         ));
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {

@@ -98,15 +98,12 @@ pub struct StandardSolariMaterial {
     /// Added to the (negated) scaled depth (so a mid-grey-centered map can push the
     /// surface both inward and outward).
     pub depth_bias: f32,
-    /// Marks this as a ray-portal surface ([`SolariPortal`](crate::bindings::SolariPortal)):
-    /// its hits route to the `chit_portal` SBT program, which teleports the ray
-    /// to the paired portal instead of shading. The other fields are ignored.
-    pub portal: bool,
-    /// Explicit SBT hit-group class (`0` = derive from the built-in flags:
-    /// opaque / glass / portal). A downstream crate registers a closest-hit via
-    /// [`App::register_solari_chit`](crate::SolariChitRegistryAppExt), gets a class
-    /// back, and sets it here to route this material's instances to that program —
-    /// no fork edit. See [`SolariHitGroupRegistry`](crate::gpu::rt_pipeline::SolariHitGroupRegistry).
+    /// Explicit SBT hit-group class (`0` = the built-in opaque/glass routing). Set it
+    /// to a registered surface's class — from [`SolariMaterialClass<S>`](crate::SolariMaterialClass)
+    /// after adding [`SolariMaterialPlugin<S>`](crate::SolariMaterialPlugin) — to route
+    /// this material's instances to that program. This is how both the built-in portal
+    /// ([`PortalSurface`](crate::render::rt_pipeline::PortalSurface)) and downstream
+    /// surfaces (e.g. a planet) reach their closest-hit — no fork edit, no special flag.
     pub chit_class: u32,
 }
 
@@ -163,7 +160,6 @@ impl Default for StandardSolariMaterial {
             depth_map: None,
             depth_scale: 1.0,
             depth_bias: 0.0,
-            portal: false,
             chit_class: 0,
         }
     }
@@ -199,10 +195,7 @@ impl From<&StandardMaterial> for StandardSolariMaterial {
             depth_map: None,
             depth_scale: 1.0,
             depth_bias: 0.0,
-            // `StandardMaterial` has no portal concept — set `StandardSolariMaterial::portal`
-            // directly (or via a `SolariPortal` setup) for portal surfaces.
-            portal: false,
-            // Custom hit-group routing is opt-in via `StandardSolariMaterial::chit_class`.
+            // Custom hit-group routing (portal, planet, …) is opt-in via `chit_class`.
             chit_class: 0,
         }
     }
