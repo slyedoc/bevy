@@ -39,7 +39,7 @@ pub use gather::{
     prepare_transform_gather_bind_group, transform_gather_bind_group_layout, TransformGather,
 };
 pub use graph::{
-    extract_transform_graph, CellColumn, LocalColumn, NodeEntityColumn, ParentColumn,
+    extract_transform_graph, CellColumn, CellScalar, LocalColumn, NodeEntityColumn, ParentColumn,
     SolariFloatingOrigin, SolariFrame, SolariGridCell, StaticColumn, TransformGraph,
     TransformStatic, TransformTablePlugin, ROOT_PARENT,
 };
