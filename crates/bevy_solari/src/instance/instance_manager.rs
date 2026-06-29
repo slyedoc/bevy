@@ -115,8 +115,11 @@ const _: () = assert!(size_of::<InstanceLodInputGpu>() == 16);
 /// [`RaytracingMesh3d`] entities.
 #[derive(Resource)]
 pub struct InstanceManager {
-    /// Free-list of slot indices for reuse after release.
+    /// Free-list of slot indices available for reuse.
     free_slots: Vec<u32>,
+    /// Slots freed this frame, quarantined until `clear_deltas` releases them to
+    /// `free_slots` — a slot is never re-bound the frame it's freed (no aliasing).
+    pending_free: Vec<u32>,
     /// Next slot index when the free-list is empty.
     next_slot: u32,
     /// Per-slot mesh-pool pointers cached at slot bind
@@ -204,6 +207,7 @@ impl InstanceManager {
     pub fn new() -> Self {
         Self {
             free_slots: Vec::new(),
+            pending_free: Vec::new(),
             next_slot: 0,
             slot_mesh_pointers: Vec::new(),
             instance_material_asset_ids: Vec::new(),
@@ -374,6 +378,11 @@ impl InstanceManager {
     /// + despawn observer accumulate into a clean slate. `active_slots`
     /// and the per-slot data persist (event-driven model).
     fn clear_deltas(&mut self) {
+        // Tripwire: the quarantine must keep added/disabled slot-disjoint each frame.
+        debug_assert!(
+            !self.added_slots.iter().any(|s| self.disabled_slots.contains(s)),
+            "slot aliased added+disabled in one frame — quarantine invariant broken",
+        );
         self.added_slots.clear();
         self.rewrite_slots.clear();
         self.disabled_slots.clear();
@@ -381,6 +390,8 @@ impl InstanceManager {
         self.material_delta.clear();
         self.instance_mask_delta.clear();
         self.material_dirty.clear();
+        // Release this frame's quarantined slots now that all delta consumers ran.
+        self.free_slots.append(&mut self.pending_free);
     }
 
     /// Bind a newly-seen instance: allocate a slot, add it to the persistent active
@@ -460,7 +471,9 @@ impl InstanceManager {
             }
             self.slot_active_pos[idx] = NOT_ACTIVE;
         }
-        self.free_slots.push(slot.0);
+        // Quarantine the slot — it returns to `free_slots` in `clear_deltas`, so it
+        // can't be re-bound (and alias `disabled_slots`) until next frame.
+        self.pending_free.push(slot.0);
         self.disabled_slots.push(slot);
         self.released_slots.push(slot);
     }
