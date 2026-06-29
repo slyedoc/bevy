@@ -101,6 +101,52 @@ impl SolariChitRegistryAppExt for App {
     }
 }
 
+/// A registrable ray-traced surface program — the `MaterialPlugin`-style wrapper
+/// over [`SolariChitRegistryAppExt::register_solari_chit`]. Implement it on a marker
+/// type, add [`SolariSurfacePlugin<S>`], then read the assigned SBT class from
+/// [`SolariSurfaceClass<S>`] to set a material's
+/// [`chit_class`](crate::material::SolariMaterial::chit_class).
+pub trait SolariSurface: Send + Sync + 'static {
+    /// This surface's hit-group definition (closest-hit `.wgsl` + optional any-hit).
+    fn hit_group() -> SolariHitGroupDef;
+}
+
+/// The SBT class assigned to surface `S` when [`SolariSurfacePlugin<S>`] registered
+/// it. Read it (a `Res`) to set a material's `chit_class`.
+#[derive(bevy_ecs::resource::Resource)]
+pub struct SolariSurfaceClass<S: SolariSurface> {
+    class: u32,
+    _marker: core::marker::PhantomData<fn() -> S>,
+}
+
+impl<S: SolariSurface> SolariSurfaceClass<S> {
+    /// The SBT class to put on a material's `chit_class`.
+    pub fn get(&self) -> u32 {
+        self.class
+    }
+}
+
+/// Registers surface `S`'s closest-hit with Solari and exposes its class as
+/// [`SolariSurfaceClass<S>`]. Add after [`SolariPlugin`]. The Bevy-`MaterialPlugin`
+/// analog for the RT pipeline: one plugin, no manual registry calls.
+pub struct SolariSurfacePlugin<S: SolariSurface>(core::marker::PhantomData<fn() -> S>);
+
+impl<S: SolariSurface> Default for SolariSurfacePlugin<S> {
+    fn default() -> Self {
+        Self(core::marker::PhantomData)
+    }
+}
+
+impl<S: SolariSurface> Plugin for SolariSurfacePlugin<S> {
+    fn build(&self, app: &mut App) {
+        let class = app.register_solari_chit(S::hit_group());
+        app.insert_resource(SolariSurfaceClass::<S> {
+            class,
+            _marker: core::marker::PhantomData,
+        });
+    }
+}
+
 /// `RenderStartup` ordering anchor: the foundational resources (raw-VK
 /// allocator + extension fn tables, the cluster scene bind-group layout)
 /// every other init reads. Resource inits that need them join
