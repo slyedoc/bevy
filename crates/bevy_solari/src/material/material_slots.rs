@@ -87,9 +87,10 @@ pub const MATERIAL_TRAVERSAL_GLASS: u32 = 0x2;
 /// [`MaterialTraversalFlags`] bit: the material is a ray-portal surface, so its
 /// instances route to the `chit_portal` hit group (teleport, no shading).
 pub const MATERIAL_TRAVERSAL_PORTAL: u32 = 0x4;
-/// [`MaterialTraversalFlags`] bit: the material is a planet surface, so its instances
-/// route to the `chit_planet` hit group (biome albedo from `vertex_custom`).
-pub const MATERIAL_TRAVERSAL_PLANET: u32 = 0x8;
+/// An explicit [`SolariMaterial::chit_class`] is packed into the traversal-flags
+/// word above this shift, so the per-slot word carries both the low traversal bits
+/// (read by the PTLAS fill) and the registry class (read by `material_sbt_class`).
+pub const MATERIAL_CHIT_CLASS_SHIFT: u32 = 16;
 
 /// The RT-pipeline SBT hit-group CLASS an instance's material selects, from its
 /// [`MaterialTraversalFlags`] word: portal → 3 (`chit_portal`), glass → 1
@@ -100,8 +101,10 @@ pub const MATERIAL_TRAVERSAL_PLANET: u32 = 0x8;
 /// → shader routing key; add a class by extending this and the pipeline's hit
 /// groups in lockstep.
 pub fn material_sbt_class(traversal_flags: u32) -> u32 {
-    if traversal_flags & MATERIAL_TRAVERSAL_PLANET != 0 {
-        return 4;
+    // An explicit registered class (packed high) wins; else the built-in routing.
+    let explicit = traversal_flags >> MATERIAL_CHIT_CLASS_SHIFT;
+    if explicit != 0 {
+        return explicit;
     }
     if traversal_flags & MATERIAL_TRAVERSAL_PORTAL != 0 {
         return 3;
@@ -149,8 +152,8 @@ pub fn prepare_material_traversal_flags(
                 u32::from(material.traversal_alpha_cutoff() >= 0.0) * MATERIAL_TRAVERSAL_ALPHA_TESTED;
             let glass = u32::from(material.specular_transmission > 0.0) * MATERIAL_TRAVERSAL_GLASS;
             let portal = u32::from(material.portal) * MATERIAL_TRAVERSAL_PORTAL;
-            let planet = u32::from(material.planet) * MATERIAL_TRAVERSAL_PLANET;
-            list[slot as usize] = alpha | glass | portal | planet;
+            let explicit = material.chit_class << MATERIAL_CHIT_CLASS_SHIFT;
+            list[slot as usize] = alpha | glass | portal | explicit;
         }
     }
     flags.buffer.write_buffer(&render_device, &render_queue);

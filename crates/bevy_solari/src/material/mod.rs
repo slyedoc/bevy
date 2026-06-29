@@ -102,10 +102,12 @@ pub struct SolariMaterial {
     /// its hits route to the `chit_portal` SBT program, which teleports the ray
     /// to the paired portal instead of shading. The other fields are ignored.
     pub portal: bool,
-    /// Marks this as a planet surface: its hits route to the `chit_planet` SBT
-    /// program, which takes albedo from the mesh's `vertex_custom` (baked biome
-    /// color) instead of `base_color`. All other shading matches the opaque program.
-    pub planet: bool,
+    /// Explicit SBT hit-group class (`0` = derive from the built-in flags:
+    /// opaque / glass / portal). A downstream crate registers a closest-hit via
+    /// [`App::register_solari_chit`](crate::SolariChitRegistryAppExt), gets a class
+    /// back, and sets it here to route this material's instances to that program —
+    /// no fork edit. See [`SolariHitGroupRegistry`](crate::gpu::rt_pipeline::SolariHitGroupRegistry).
+    pub chit_class: u32,
 }
 
 impl SolariMaterial {
@@ -162,7 +164,7 @@ impl Default for SolariMaterial {
             depth_scale: 1.0,
             depth_bias: 0.0,
             portal: false,
-            planet: false,
+            chit_class: 0,
         }
     }
 }
@@ -200,8 +202,8 @@ impl From<&StandardMaterial> for SolariMaterial {
             // `StandardMaterial` has no portal concept — set `SolariMaterial::portal`
             // directly (or via a `SolariPortal` setup) for portal surfaces.
             portal: false,
-            // Likewise, planet surfaces are opt-in via `SolariMaterial::planet`.
-            planet: false,
+            // Custom hit-group routing is opt-in via `SolariMaterial::chit_class`.
+            chit_class: 0,
         }
     }
 }

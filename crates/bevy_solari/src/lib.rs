@@ -77,6 +77,30 @@ use crate::transform::SolariTransformPlugin;
 #[cfg(feature = "bevy_solari_debug")]
 use crate::debug::SolariDebugPlugin;
 
+pub use crate::gpu::rt_pipeline::{SolariAnyHitDef, SolariHitGroupDef, SolariHitGroupRegistry};
+
+/// Register a custom RT closest-hit ("hit group") with Solari and get its SBT
+/// **class** back. Set that class on a material's
+/// [`chit_class`](crate::material::SolariMaterial::chit_class) to route its
+/// instances to the program. The chit `.wgsl` lives in the caller's crate and may
+/// `#import bevy_solari::*` — so a downstream surface needs no fork edit.
+///
+/// Call during plugin `build`, after [`SolariPlugin`] is added (the render app +
+/// [`SolariHitGroupRegistry`] must exist) and before the first frame builds the
+/// pipeline. [`SolariMaterialPlugin`](crate::material::SolariMaterialPlugin) wraps this.
+pub trait SolariChitRegistryAppExt {
+    fn register_solari_chit(&mut self, def: SolariHitGroupDef) -> u32;
+}
+
+impl SolariChitRegistryAppExt for App {
+    fn register_solari_chit(&mut self, def: SolariHitGroupDef) -> u32 {
+        self.sub_app_mut(RenderApp)
+            .world_mut()
+            .resource_mut::<SolariHitGroupRegistry>()
+            .register(def)
+    }
+}
+
 /// `RenderStartup` ordering anchor: the foundational resources (raw-VK
 /// allocator + extension fn tables, the cluster scene bind-group layout)
 /// every other init reads. Resource inits that need them join

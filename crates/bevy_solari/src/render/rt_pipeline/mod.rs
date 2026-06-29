@@ -362,10 +362,10 @@ pub fn prepare_rt_output(
 /// columns bind groups (and their layouts) are ready — its layout must match
 /// wgpu's exact descriptor set layouts, which only exist once those are built.
 /// Built-in RT hit groups Solari registers by default — opaque (with the
-/// alpha-cutout any-hit), glass, hair, portal, planet. Each entry's index is its
-/// SBT class (matches `material_sbt_class`); downstream crates append after these.
-/// Solari thus consumes the same registry it exposes — no hardcoded hit groups in
-/// the pipeline builder.
+/// alpha-cutout any-hit), glass, hair, portal. Each entry's index is its SBT class
+/// (matches `material_sbt_class`); downstream crates append their own (e.g. a planet
+/// surface) via [`App::register_solari_chit`](crate::SolariChitRegistryAppExt).
+/// Solari thus consumes the same registry it exposes — no hardcoded hit groups.
 pub fn default_hit_groups() -> Vec<SolariHitGroupDef> {
     vec![
         SolariHitGroupDef {
@@ -398,13 +398,6 @@ pub fn default_hit_groups() -> Vec<SolariHitGroupDef> {
             closest_hit_wgsl: include_str!("chit_portal.wgsl"),
             closest_hit_file: "chit_portal.wgsl",
             closest_hit_entry: "chit_portal",
-            any_hit: None,
-        },
-        SolariHitGroupDef {
-            label: "planet",
-            closest_hit_wgsl: include_str!("chit_planet.wgsl"),
-            closest_hit_file: "chit_planet.wgsl",
-            closest_hit_entry: "chit_planet",
             any_hit: None,
         },
     ]
