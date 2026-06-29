@@ -105,6 +105,11 @@ pub struct StandardSolariMaterial {
     /// ([`PortalSurface`](crate::render::rt_pipeline::PortalSurface)) and downstream
     /// surfaces (e.g. a planet) reach their closest-hit — no fork edit, no special flag.
     pub chit_class: u32,
+    /// Opaque per-material data for a custom closest-hit (4×`u32`, interpreted by the
+    /// chit selected via [`Self::chit_class`]). Lets a registered surface carry uniform
+    /// config — e.g. a planet's debug-view + sea/snow levels — without a per-type asset.
+    /// Read in WGSL as `load_material_bindless(id).chit_data`. Zero for built-ins.
+    pub chit_data: [u32; 4],
 }
 
 impl StandardSolariMaterial {
@@ -161,6 +166,7 @@ impl Default for StandardSolariMaterial {
             depth_scale: 1.0,
             depth_bias: 0.0,
             chit_class: 0,
+            chit_data: [0; 4],
         }
     }
 }
@@ -197,6 +203,7 @@ impl From<&StandardMaterial> for StandardSolariMaterial {
             depth_bias: 0.0,
             // Custom hit-group routing (portal, planet, …) is opt-in via `chit_class`.
             chit_class: 0,
+            chit_data: [0; 4],
         }
     }
 }

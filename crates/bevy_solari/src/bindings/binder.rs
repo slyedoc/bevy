@@ -12,7 +12,7 @@ use bevy_ecs::{
 use crate::gpu::allocator::Allocator;
 use crate::gpu::stable_storage_buffer::StableStorageBuffer;
 use crate::gpu::RawTraceBindable;
-use bevy_math::Vec3;
+use bevy_math::{UVec4, Vec3};
 use bevy_pbr::DfgLut;
 
 use crate::lights::{GpuLightSource, LightSources};
@@ -264,6 +264,7 @@ pub fn prepare_raytracing_scene_bindings(
             displacement_texture_id,
             displacement_scale: material.depth_scale,
             displacement_bias: material.depth_bias,
+            chit_data: UVec4::from_array(material.chit_data),
         };
     }
 
@@ -470,6 +471,8 @@ struct GpuMaterial {
     displacement_texture_id: u32,
     displacement_scale: f32,
     displacement_bias: f32,
+    // Opaque per-material data for a custom closest-hit (StandardSolariMaterial::chit_data).
+    chit_data: UVec4,
 }
 
 impl Default for GpuMaterial {
@@ -495,6 +498,7 @@ impl Default for GpuMaterial {
             displacement_texture_id: TEXTURE_MAP_NONE,
             displacement_scale: 0.0,
             displacement_bias: 0.0,
+            chit_data: UVec4::ZERO,
         }
     }
 }

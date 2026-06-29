@@ -61,6 +61,7 @@ fn solari_material_from_gltf(
         depth_bias: 0.0,
         // Custom hit-group routing (portal, planet, …) is opt-in via `chit_class`.
         chit_class: 0,
+        chit_data: [0; 4],
     }
 }
 

@@ -56,6 +56,8 @@ struct Material {
     displacement_texture_id: u32,
     displacement_scale: f32,
     displacement_bias: f32,
+    // Opaque per-material data for a custom closest-hit (StandardSolariMaterial::chit_data).
+    chit_data: vec4<u32>,
 }
 
 const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
