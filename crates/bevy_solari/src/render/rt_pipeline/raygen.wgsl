@@ -9,7 +9,7 @@ enable wgpu_ray_tracing_pipeline;
 
 // The scene TLAS lives in the shared scene bind group (set 0) — imported so the
 // pipeline layout matches the wgpu-built scene bind group bound at trace time.
-#import bevy_solari::scene_bindings::tlas
+#import bevy_solari::scene_bindings::{tlas, RAY_T_MIN, RAY_T_MAX}
 #import bevy_solari::rt_payload::{RtPayload, RtCamera}
 #import bevy_solari::pbr::rand_f
 
@@ -203,7 +203,7 @@ fn raygen(
         hitObjectTraceRay(
             &hit,
             tlas,
-            RayDesc(RAY_FLAG_NONE, 0xffu, 0.001, 1.0e9, origin, direction),
+            RayDesc(RAY_FLAG_NONE, 0xffu, RAY_T_MIN, RAY_T_MAX, origin, direction),
             &payload,
         );
         let material_hint = hitObjectGetSbtRecordIndex(&hit);

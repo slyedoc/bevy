@@ -64,7 +64,7 @@ const HITS_VIRTUAL_BYTES: u64 = 256 * 1024 * 1024;
 /// Default ray `t_min` / `t_max` for a producer with no closer bound — mirrors
 /// `scene_bindings::RAY_T_MIN` / `RAY_T_MAX`.
 pub const RAY_T_MIN_DEFAULT: f32 = 0.001;
-pub const RAY_T_MAX_DEFAULT: f32 = 100000.0;
+pub const RAY_T_MAX_DEFAULT: f32 = 1.0e30;
 
 /// One ray to trace — mirrors `ray_query.wgsl::Ray` (std430, 32 B).
 #[repr(C)]

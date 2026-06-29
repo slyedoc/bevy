@@ -289,7 +289,7 @@ fn sync_hair_appearance(
         h.material = material;
     }
     for mut reset in &mut resets {
-        reset.0 = true;
+        reset.history = true;
     }
 }
 

@@ -76,12 +76,12 @@ fn setup_scene(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut solari_materials: ResMut<Assets<SolariMaterial>>,
+    mut solari_materials: ResMut<Assets<StandardSolariMaterial>>,
 ) {
     // BK7 crown glass, authored as `SolariMaterial` for its dispersion field
     // (Abbe 64.2 → 20/64.2): an uncorrected singlet telescope fringes color
     // at high-contrast edges — real chromatic aberration, not a post effect.
-    let glass = solari_materials.add(SolariMaterial {
+    let glass = solari_materials.add(StandardSolariMaterial {
         base_color: Color::WHITE,
         specular_transmission: 1.0,
         ior: LENS_IOR,
@@ -164,17 +164,6 @@ fn setup_scene(
                 .with_rotation(Quat::from_rotation_x(PI / 2.0)),
         ));
     }
-
-    // The glass dragon at 7 m, just off-axis — organic detail to magnify.
-    commands.spawn((
-        WorldAssetRoot(
-            asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/DragonAttenuation.glb")),
-        ),
-        Transform::from_xyz(1.2, 0.7306 * 0.5, -7.0)
-            .with_scale(Vec3::splat(0.5))
-            .with_rotation(Quat::from_rotation_y(PI / 2.0)),
-    ));
-    // (Its backdrop cloth stays — a checkered surface downrange is useful.)
 
     // Ground.
     commands.spawn((
