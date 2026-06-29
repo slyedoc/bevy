@@ -80,65 +80,65 @@ pub struct ClusterMesh {
     /// `[f32; 3]` positions, one entry per vertex. 12-byte stride
     /// keeps the stream tight; shaders read via an `array<f32>`
     /// accessor function in `cluster_bindings.wgsl`.
-    pub(crate) vertex_positions: Arc<[Vec3]>,
+    pub vertex_positions: Arc<[Vec3]>,
     /// Octahedral-encoded normals packed as 2x16snorm in a `u32`,
     /// parallel to `vertex_positions`. Shaders decode via
     /// `octahedral_decode_signed(unpack2x16snorm(packed))`.
-    pub(crate) vertex_normals: Arc<[u32]>,
+    pub vertex_normals: Arc<[u32]>,
     /// `[f32; 4]` tangents (xyz tangent, w bitangent sign, mikktspace).
-    pub(crate) vertex_tangents: Arc<[Vec4]>,
+    pub vertex_tangents: Arc<[Vec4]>,
     /// `[f32; 2]` UVs, parallel to `vertex_positions`.
-    pub(crate) vertex_uvs: Arc<[Vec2]>,
+    pub vertex_uvs: Arc<[Vec2]>,
     /// Per-triangle vertex indices (three `u32`s per triangle).
     /// Indices are mesh-local: they point into `vertex_positions`,
     /// not into a cluster-local table.
-    pub(crate) indices: Arc<[u32]>,
+    pub indices: Arc<[u32]>,
     /// All clusters across all LOD levels, flat. DAG connectivity
     /// lives in `groups` / `nodes`.
-    pub(crate) clusters: Arc<[Cluster]>,
+    pub clusters: Arc<[Cluster]>,
     /// DAG-cut units. The selector evaluates a group's screen-space
     /// error and either descends (emit child groups) or accepts
     /// (emit all clusters in the group).
-    pub(crate) groups: Arc<[ClusterLodGroup]>,
+    pub groups: Arc<[ClusterLodGroup]>,
     /// Optional interior node tree built spatially over groups.
     /// Empty for small meshes that root directly at a group.
-    pub(crate) nodes: Arc<[ClusterBvhNode]>,
+    pub nodes: Arc<[ClusterBvhNode]>,
     /// Flat child-id table referenced by `groups` and `nodes` via
     /// `children_offset` / `children_count` — keeps the node and
     /// group structs fixed-size.
-    pub(crate) child_table: Arc<[u32]>,
+    pub child_table: Arc<[u32]>,
     /// Parallel to `clusters` — `cluster_to_group[i]` is the group
     /// id that owns `clusters[i]`. Moved out of [`Cluster`] so the
     /// GPU manager can queue clusters before groups (group ids are
     /// rebased separately during this slice's upload).
-    pub(crate) cluster_to_group: Arc<[u32]>,
+    pub cluster_to_group: Arc<[u32]>,
     /// World-space AABB of the mesh.
-    pub(crate) aabb: ClusterMeshAabb,
+    pub aabb: ClusterMeshAabb,
     /// Root group's quadric error. Lets the selector reject distant
     /// instances without descending.
-    pub(crate) mesh_max_error: f32,
+    pub mesh_max_error: f32,
     /// Root group id (entry point for the DAG cut).
-    pub(crate) root_group_id: u32,
+    pub root_group_id: u32,
     /// Root node id, or `u32::MAX` if there is no interior node
     /// tree (selector enters at `root_group_id` directly).
-    pub(crate) root_node_id: u32,
+    pub root_node_id: u32,
     /// Max LOD level present (== bake recursion depth).
-    pub(crate) lod_levels: u32,
+    pub lod_levels: u32,
     /// Opacity micro-map array build data (`VkMicromapEXT` input), or empty
     /// when this mesh has no baked OMM. Baked offline from the material's
     /// alpha texture — see the `solari-omm-cluster-path` plan.
-    pub(crate) omm_array_data: Arc<[u8]>,
+    pub omm_array_data: Arc<[u8]>,
     /// Per-OMM descriptors into `omm_array_data` (micromap triangle array).
-    pub(crate) omm_descs: Arc<[OmmDesc]>,
+    pub omm_descs: Arc<[OmmDesc]>,
     /// Per-triangle OMM index, parallel to `indices` / 3 in the SAME
     /// (post-cluster) triangle order, so each cluster's index range slices it
     /// directly at CLAS-attach time. Negative = special index (-1 transparent,
     /// -2 opaque, -3 unknown-transparent, -4 unknown-opaque).
-    pub(crate) omm_index: Arc<[i32]>,
+    pub omm_index: Arc<[i32]>,
     /// Usage histogram for the micromap build.
-    pub(crate) omm_usage: Arc<[OmmUsage]>,
+    pub omm_usage: Arc<[OmmUsage]>,
     /// Usage histogram for the BLAS/CLAS OMM attach.
-    pub(crate) omm_index_usage: Arc<[OmmUsage]>,
+    pub omm_index_usage: Arc<[OmmUsage]>,
 }
 
 impl ClusterMesh {
