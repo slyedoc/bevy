@@ -43,6 +43,7 @@ struct ClusterMeshSlices {
     vertex_normals: Range<BufferAddress>,
     vertex_tangents: Range<BufferAddress>,
     vertex_uvs: Range<BufferAddress>,
+    vertex_custom: Range<BufferAddress>,
     indices: Range<BufferAddress>,
     child_table: Range<BufferAddress>,
     clusters: Range<BufferAddress>,
@@ -147,6 +148,11 @@ pub struct ClusterMeshManager {
     pub vertex_normals: PersistentGpuBuffer<Arc<[u32]>>,
     pub vertex_tangents: PersistentGpuBuffer<Arc<[Vec4]>>,
     pub vertex_uvs: PersistentGpuBuffer<Arc<[Vec2]>>,
+    /// Optional per-vertex user data (one `u32`/vertex), parallel to `vertex_positions`
+    /// (same global vertex index). Generic — a custom closest-hit reads it via
+    /// `geometry_addresses.vertex_custom`. Meshes without custom data upload zeros to
+    /// keep the global indexing aligned (so `custom_base == vertex_base`).
+    pub vertex_custom: PersistentGpuBuffer<Arc<[u32]>>,
     /// Interleaved (AoS) copy of the four vertex streams above, parallel to
     /// `vertex_positions` (same global vertex index). One contiguous 28-byte
     /// [`PackedVertex`] per vertex for the bindless RT-pipeline resolve's
@@ -185,6 +191,7 @@ pub fn init_cluster_mesh_manager(
         vertex_normals: PersistentGpuBuffer::new("cluster_vertex_normals", &render_device, &allocator),
         vertex_tangents: PersistentGpuBuffer::new("cluster_vertex_tangents", &render_device, &allocator),
         vertex_uvs: PersistentGpuBuffer::new("cluster_vertex_uvs", &render_device, &allocator),
+        vertex_custom: PersistentGpuBuffer::new("cluster_vertex_custom", &render_device, &allocator),
         vertex_packed: PersistentGpuBuffer::new("cluster_vertex_packed", &render_device, &allocator),
         indices: PersistentGpuBuffer::new("cluster_indices", &render_device, &allocator),
         child_table: PersistentGpuBuffer::new("cluster_child_table", &render_device, &allocator),
@@ -244,6 +251,15 @@ impl ClusterMeshManager {
         let vertex_uvs = self
             .vertex_uvs
             .queue_write(Arc::clone(&mesh.vertex_uvs), ());
+        // Per-vertex custom data, parallel to positions. Empty asset field → upload
+        // zeros of the same length so this pool's element base stays equal to
+        // `vertex_base` (the resolve indexes it with the global vertex index).
+        let custom_src: Arc<[u32]> = if mesh.vertex_custom.len() == mesh.vertex_positions.len() {
+            Arc::clone(&mesh.vertex_custom)
+        } else {
+            vec![0u32; mesh.vertex_positions.len()].into()
+        };
+        let vertex_custom = self.vertex_custom.queue_write(custom_src, ());
         // Interleaved AoS copy for the bindless RT resolve. Built parallel to the
         // SoA streams above; since every pool gets exactly one bump-allocated
         // append per mesh in the same order, the packed pool's element base equals
@@ -276,6 +292,11 @@ impl ClusterMeshManager {
             vertex_base,
             (vertex_packed.start / size_of::<PackedVertex>() as u64) as u32,
             "vertex_packed pool diverged from vertex_positions indexing",
+        );
+        debug_assert_eq!(
+            vertex_base,
+            (vertex_custom.start / size_of::<u32>() as u64) as u32,
+            "vertex_custom pool diverged from vertex_positions indexing",
         );
         let index_base = (indices.start / size_of::<u32>() as u64) as u32;
         let child_table_base = (child_table.start / size_of::<u32>() as u64) as u32;
@@ -343,6 +364,7 @@ impl ClusterMeshManager {
             vertex_normals,
             vertex_tangents,
             vertex_uvs,
+            vertex_custom,
             indices,
             child_table,
             clusters,
@@ -457,6 +479,7 @@ impl ClusterMeshManager {
         self.vertex_normals.mark_slice_unused(slices.vertex_normals);
         self.vertex_tangents.mark_slice_unused(slices.vertex_tangents);
         self.vertex_uvs.mark_slice_unused(slices.vertex_uvs);
+        self.vertex_custom.mark_slice_unused(slices.vertex_custom);
         self.indices.mark_slice_unused(slices.indices);
         self.child_table.mark_slice_unused(slices.child_table);
         self.clusters.mark_slice_unused(slices.clusters);
@@ -501,6 +524,9 @@ pub fn perform_pending_cluster_mesh_writes(
         .perform_writes(&render_queue);
     manager
         .vertex_uvs
+        .perform_writes(&render_queue);
+    manager
+        .vertex_custom
         .perform_writes(&render_queue);
     manager
         .vertex_packed

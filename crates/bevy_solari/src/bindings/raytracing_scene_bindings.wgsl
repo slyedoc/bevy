@@ -487,9 +487,29 @@ struct SolariGeometryAddresses {
     // Per-CLAS tessellation metadata table (`TessCluster` records). 0 = smooth-tess
     // path off → tess hits shade with the facet normal.
     tess_clusters: u64,
-    _pad1: u64,
+    // Optional per-vertex custom-data pool (stride 4). A custom closest-hit reads
+    // it via `load_vertex_custom` / `load_triangle_custom`; built-in chits ignore it.
+    vertex_custom: u64,
 }
 @group(1) @binding(4) var<uniform> geometry_addresses: SolariGeometryAddresses;
+
+// Load one vertex's custom `u32` (generic user data baked into the mesh) by global
+// vertex index. Zero for meshes that didn't author the attribute.
+fn load_vertex_custom(vertex_index: u32) -> u32 {
+    return physical_load<u32>(geometry_addresses.vertex_custom + u64(vertex_index) * u64(4u));
+}
+
+// The custom `u32` of a triangle's three vertices (real-cluster path only — same
+// index math as the resolve). A custom closest-hit unpacks + barycentric-blends.
+fn load_triangle_custom(cluster_global_id: u32, triangle_id: u32) -> vec3<u32> {
+    let cluster = clusters[cluster_global_id];
+    let idx_base = cluster.index_offset + triangle_id * 3u;
+    return vec3<u32>(
+        load_vertex_custom(cluster.vertex_offset + cluster_indices[idx_base + 0u]),
+        load_vertex_custom(cluster.vertex_offset + cluster_indices[idx_base + 1u]),
+        load_vertex_custom(cluster.vertex_offset + cluster_indices[idx_base + 2u]),
+    );
+}
 
 // Per-CLAS tessellation metadata (16 B, `geometry_addresses.tess_clusters` +
 // `(cluster_id - TESS_CLUSTER_ID_BASE) * 16`) is loaded field-wise in the closest-hit:

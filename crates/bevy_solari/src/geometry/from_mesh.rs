@@ -544,6 +544,7 @@ impl TryFrom<&Mesh> for ClusterMesh {
             vertex_normals: out_normals.into(),
             vertex_tangents: out_tangents.into(),
             vertex_uvs: out_uvs.into(),
+            vertex_custom: Arc::from(&[][..]),
             indices: out_indices.into(),
             clusters: out_clusters.into(),
             groups: out_groups.into(),

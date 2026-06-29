@@ -649,7 +649,7 @@ pub(crate) fn rt_pipeline(
             material_stride: crate::bindings::GPU_MATERIAL_SIZE,
             _pad: 0,
             tess_clusters,
-            _pad1: 0,
+            vertex_custom: cluster_mesh_manager.vertex_custom.trace_device_address(),
         });
     }
 

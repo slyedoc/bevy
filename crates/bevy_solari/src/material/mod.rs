@@ -102,6 +102,10 @@ pub struct SolariMaterial {
     /// its hits route to the `chit_portal` SBT program, which teleports the ray
     /// to the paired portal instead of shading. The other fields are ignored.
     pub portal: bool,
+    /// Marks this as a planet surface: its hits route to the `chit_planet` SBT
+    /// program, which takes albedo from the mesh's `vertex_custom` (baked biome
+    /// color) instead of `base_color`. All other shading matches the opaque program.
+    pub planet: bool,
 }
 
 impl SolariMaterial {
@@ -158,6 +162,7 @@ impl Default for SolariMaterial {
             depth_scale: 1.0,
             depth_bias: 0.0,
             portal: false,
+            planet: false,
         }
     }
 }
@@ -195,6 +200,8 @@ impl From<&StandardMaterial> for SolariMaterial {
             // `StandardMaterial` has no portal concept — set `SolariMaterial::portal`
             // directly (or via a `SolariPortal` setup) for portal surfaces.
             portal: false,
+            // Likewise, planet surfaces are opt-in via `SolariMaterial::planet`.
+            planet: false,
         }
     }
 }
