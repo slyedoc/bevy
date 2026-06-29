@@ -89,10 +89,7 @@ pub struct ClusterMesh {
     pub vertex_tangents: Arc<[Vec4]>,
     /// `[f32; 2]` UVs, parallel to `vertex_positions`.
     pub vertex_uvs: Arc<[Vec2]>,
-    /// Optional per-vertex user data (one `u32`/vertex, parallel to `vertex_positions`),
-    /// generic like `Mesh::insert_attribute`. Empty = unused (the manager uploads zeros
-    /// to keep the pool's global vertex indexing aligned). A custom closest-hit reads it
-    /// via `geometry_addresses.vertex_custom`; the built-in chits ignore it.
+    /// Optional per-vertex `u32` user data (empty = unused); a custom closest-hit reads it.
     pub vertex_custom: Arc<[u32]>,
     /// Per-triangle indices (3 `u32`s/tri), cluster-local: 0 = the cluster's own `vertex_offset`.
     pub indices: Arc<[u32]>,

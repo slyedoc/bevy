@@ -90,10 +90,7 @@ impl Plugin for SolarRenderPlugin {
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
-            // The RT hit-group registry the pipeline builds its SBT from. Empty here;
-            // `SolariPlugin` registers the built-in surfaces (opaque/glass/hair/portal)
-            // through `SolariMaterialPlugin`, and downstream crates append their own —
-            // all before the pipeline first builds.
+            // Empty; surfaces register into it (built-ins via `SolariPlugin`).
             .init_resource::<crate::gpu::rt_pipeline::SolariHitGroupRegistry>()
             .init_resource::<view_cull::SolariViewUniforms>()
             .init_resource::<atmosphere::SolariAtmosphereGpu>()

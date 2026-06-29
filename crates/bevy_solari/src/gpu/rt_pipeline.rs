@@ -111,21 +111,14 @@ pub struct RtGeometryAddresses {
     pub vertex_custom: u64,
 }
 
-/// One registered RT closest-hit program ("hit group"). Its index in
-/// [`SolariHitGroupRegistry`] IS its SBT class (the `material_sbt_class` value):
-/// the pipeline bakes `handle(2 + class)` into each material record. WGSL is held
-/// as `&'static str` (typically `include_str!`) so a downstream crate registers a
-/// hit group — and its `#import bevy_solari::*` chit — without forking.
+/// One RT closest-hit program; its registry index is its SBT class. WGSL is `&'static`
+/// (usually `include_str!`) so downstream crates register without forking.
 #[derive(Clone)]
 pub struct SolariHitGroupDef {
     pub label: &'static str,
-    /// Closest-hit WGSL source (composed with the registered shader libraries).
     pub closest_hit_wgsl: &'static str,
-    /// File name for naga error messages / import resolution.
     pub closest_hit_file: &'static str,
-    /// Closest-hit entry-point function name.
     pub closest_hit_entry: &'static str,
-    /// Optional any-hit (e.g. alpha cutout), attached to this group.
     pub any_hit: Option<SolariAnyHitDef>,
 }
 
@@ -137,17 +130,14 @@ pub struct SolariAnyHitDef {
     pub entry: &'static str,
 }
 
-/// Ordered registry of RT hit groups, consumed by [`RtPipeline::new`]. Built-in
-/// programs (opaque/glass/hair/portal) are registered by `SolariPlugin`; downstream
-/// crates append their own via [`Self::register`]. Index = SBT class.
+/// Ordered RT hit groups consumed by [`RtPipeline::new`]; index = SBT class.
 #[derive(bevy_ecs::resource::Resource, Default, Clone)]
 pub struct SolariHitGroupRegistry {
     pub groups: Vec<SolariHitGroupDef>,
 }
 
 impl SolariHitGroupRegistry {
-    /// Append a hit group; returns its SBT class (its index). Set this on a
-    /// material's routing (`material_sbt_class`) so its instances reach this program.
+    /// Append a hit group; returns its SBT class (its index).
     pub fn register(&mut self, group: SolariHitGroupDef) -> u32 {
         let class = self.groups.len() as u32;
         self.groups.push(group);

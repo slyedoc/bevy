@@ -98,17 +98,9 @@ pub struct StandardSolariMaterial {
     /// Added to the (negated) scaled depth (so a mid-grey-centered map can push the
     /// surface both inward and outward).
     pub depth_bias: f32,
-    /// Explicit SBT hit-group class (`0` = the built-in opaque/glass routing). Set it
-    /// to a registered surface's class — from [`SolariMaterialClass<S>`](crate::SolariMaterialClass)
-    /// after adding [`SolariMaterialPlugin<S>`](crate::SolariMaterialPlugin) — to route
-    /// this material's instances to that program. This is how both the built-in portal
-    /// ([`PortalSurface`](crate::render::rt_pipeline::PortalSurface)) and downstream
-    /// surfaces (e.g. a planet) reach their closest-hit — no fork edit, no special flag.
+    /// SBT hit-group class (`0` = opaque/glass routing); set from a [`SolariMaterialClass<S>`](crate::SolariMaterialClass).
     pub chit_class: u32,
-    /// Opaque per-material data for a custom closest-hit (4×`u32`, interpreted by the
-    /// chit selected via [`Self::chit_class`]). Lets a registered surface carry uniform
-    /// config — e.g. a planet's debug-view + sea/snow levels — without a per-type asset.
-    /// Read in WGSL as `load_material_bindless(id).chit_data`. Zero for built-ins.
+    /// Per-material data for the `chit_class` shader, read as `load_material_bindless(id).chit_data`.
     pub chit_data: [u32; 4],
 }
 

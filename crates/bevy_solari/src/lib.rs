@@ -80,15 +80,8 @@ use crate::debug::SolariDebugPlugin;
 pub use crate::gpu::rt_pipeline::{SolariAnyHitDef, SolariHitGroupDef, SolariHitGroupRegistry};
 pub use crate::render::rt_pipeline::{GlassSurface, HairSurface, OpaqueSurface, PortalSurface};
 
-/// Register a custom RT closest-hit ("hit group") with Solari and get its SBT
-/// **class** back. Set that class on a material's
-/// [`chit_class`](crate::material::StandardSolariMaterial::chit_class) to route its
-/// instances to the program. The chit `.wgsl` lives in the caller's crate and may
-/// `#import bevy_solari::*` — so a downstream surface needs no fork edit.
-///
-/// Call during plugin `build`, after [`SolariPlugin`] is added (the render app +
-/// [`SolariHitGroupRegistry`] must exist) and before the first frame builds the
-/// pipeline. [`StandardSolariMaterialPlugin`](crate::material::StandardSolariMaterialPlugin) wraps this.
+/// Register an RT closest-hit; returns its SBT class for a material's `chit_class`.
+/// Call during plugin `build`, after [`SolariPlugin`].
 pub trait SolariChitRegistryAppExt {
     fn register_solari_chit(&mut self, def: SolariHitGroupDef) -> u32;
 }
@@ -102,18 +95,13 @@ impl SolariChitRegistryAppExt for App {
     }
 }
 
-/// A registrable ray-traced surface program — the `MaterialPlugin`-style wrapper
-/// over [`SolariChitRegistryAppExt::register_solari_chit`]. Implement it on a marker
-/// type, add [`SolariMaterialPlugin<S>`], then read the assigned SBT class from
-/// [`SolariMaterialClass<S>`] to set a material's
-/// [`chit_class`](crate::material::StandardSolariMaterial::chit_class).
+/// A registrable ray-traced surface: add [`SolariMaterialPlugin<S>`], then set a
+/// material's `chit_class` from [`SolariMaterialClass<S>`].
 pub trait SolariMaterial: Send + Sync + 'static {
-    /// This surface's hit-group definition (closest-hit `.wgsl` + optional any-hit).
     fn hit_group() -> SolariHitGroupDef;
 }
 
-/// The SBT class assigned to surface `S` when [`SolariMaterialPlugin<S>`] registered
-/// it. Read it (a `Res`) to set a material's `chit_class`.
+/// SBT class assigned to surface `S`; read to set a material's `chit_class`.
 #[derive(bevy_ecs::resource::Resource)]
 pub struct SolariMaterialClass<S: SolariMaterial> {
     class: u32,
@@ -121,15 +109,12 @@ pub struct SolariMaterialClass<S: SolariMaterial> {
 }
 
 impl<S: SolariMaterial> SolariMaterialClass<S> {
-    /// The SBT class to put on a material's `chit_class`.
     pub fn get(&self) -> u32 {
         self.class
     }
 }
 
-/// Registers surface `S`'s closest-hit with Solari and exposes its class as
-/// [`SolariMaterialClass<S>`]. Add after [`SolariPlugin`]. The Bevy-`MaterialPlugin`
-/// analog for the RT pipeline: one plugin, no manual registry calls.
+/// Registers surface `S` and exposes [`SolariMaterialClass<S>`]. Add after [`SolariPlugin`].
 pub struct SolariMaterialPlugin<S: SolariMaterial>(core::marker::PhantomData<fn() -> S>);
 
 impl<S: SolariMaterial> Default for SolariMaterialPlugin<S> {
@@ -278,11 +263,7 @@ impl Plugin for SolariPlugin {
             HairPlugin,
         ));
 
-        // Solari's own hit groups, registered through the SAME `SolariMaterialPlugin`
-        // path any downstream surface uses — no hardcoded hit-group list. ORDER IS
-        // LOAD-BEARING: opaque=class 0 (default/fallback), glass=1 (transmission route),
-        // hair=2 (reserved record), portal=3. Must follow the tuple above (it seeds the
-        // empty registry via `SolarRenderPlugin`).
+        // Built-in surfaces; order sets SBT class: opaque=0 (default), glass=1, hair=2, portal=3.
         app.add_plugins((
             SolariMaterialPlugin::<OpaqueSurface>::default(),
             SolariMaterialPlugin::<GlassSurface>::default(),

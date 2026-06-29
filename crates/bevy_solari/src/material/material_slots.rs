@@ -84,17 +84,11 @@ pub const MATERIAL_TRAVERSAL_ALPHA_TESTED: u32 = 0x1;
 /// [`MaterialTraversalFlags`] bit: the material is glass/transmissive, so its
 /// instances route to the glass RT-pipeline hit group.
 pub const MATERIAL_TRAVERSAL_GLASS: u32 = 0x2;
-/// An explicit [`StandardSolariMaterial::chit_class`] is packed into the traversal-flags
-/// word above this shift, so the per-slot word carries both the low traversal bits
-/// (read by the PTLAS fill) and the registry class (read by `material_sbt_class`).
+/// `chit_class` is packed above this shift, sharing the word with the low traversal bits.
 pub const MATERIAL_CHIT_CLASS_SHIFT: u32 = 16;
 
-/// The RT-pipeline SBT hit-group CLASS an instance's material selects: an explicit
-/// registered `chit_class` (packed high — portal, planet, any downstream surface)
-/// wins; otherwise glass → 1 (`chit_glass`) else 0 (`chit_opaque`). The SBT bakes
-/// `handle(2 + class)` into that material's hit record (class 2 = hair is reached via
-/// a reserved record, not a material). All non-built-in routing now flows through the
-/// `chit_class` registry — no per-surface branch here.
+/// SBT hit-group class for a material: explicit `chit_class` (packed high) wins, else
+/// glass → 1, else opaque → 0.
 pub fn material_sbt_class(traversal_flags: u32) -> u32 {
     // An explicit registered class (packed high) wins; else the built-in routing.
     let explicit = traversal_flags >> MATERIAL_CHIT_CLASS_SHIFT;

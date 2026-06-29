@@ -148,10 +148,7 @@ pub struct ClusterMeshManager {
     pub vertex_normals: PersistentGpuBuffer<Arc<[u32]>>,
     pub vertex_tangents: PersistentGpuBuffer<Arc<[Vec4]>>,
     pub vertex_uvs: PersistentGpuBuffer<Arc<[Vec2]>>,
-    /// Optional per-vertex user data (one `u32`/vertex), parallel to `vertex_positions`
-    /// (same global vertex index). Generic — a custom closest-hit reads it via
-    /// `geometry_addresses.vertex_custom`. Meshes without custom data upload zeros to
-    /// keep the global indexing aligned (so `custom_base == vertex_base`).
+    /// Per-vertex `u32` user data, parallel to `vertex_positions` (zeros when a mesh has none).
     pub vertex_custom: PersistentGpuBuffer<Arc<[u32]>>,
     /// Interleaved (AoS) copy of the four vertex streams above, parallel to
     /// `vertex_positions` (same global vertex index). One contiguous 28-byte

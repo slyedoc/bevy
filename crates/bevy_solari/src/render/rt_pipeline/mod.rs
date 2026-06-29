@@ -357,15 +357,9 @@ pub fn prepare_rt_output(
     }
 }
 
-// ── Built-in surfaces ──────────────────────────────────────────────────────────
-// Solari's own hit groups are `SolariMaterial`s registered through the same
-// `SolariMaterialPlugin` path any downstream surface uses (see `SolariPlugin`). There
-// is no hardcoded hit-group list. REGISTRATION ORDER IS LOAD-BEARING: opaque must be
-// class 0 (the default/fallback `material_sbt_class` returns) and glass class 1 (the
-// transmission routing), so `SolariPlugin` registers them first, in this order.
+// Built-in surfaces, registered (in order, by `SolariPlugin`) like any downstream one.
 
-/// Built-in opaque surface — the default closest-hit (full BRDF + NEE) with the
-/// alpha-cutout any-hit attached. Class 0: the fallback for any non-special material.
+/// Default opaque surface (class 0) — BRDF + NEE + alpha-cutout any-hit.
 pub struct OpaqueSurface;
 
 impl crate::SolariMaterial for OpaqueSurface {
@@ -384,8 +378,7 @@ impl crate::SolariMaterial for OpaqueSurface {
     }
 }
 
-/// Built-in glass surface — Fresnel reflect/refract. Class 1: `material_sbt_class`
-/// routes a transmissive material (`specular_transmission > 0`) here.
+/// Glass surface (class 1) — Fresnel reflect/refract; routed by `specular_transmission > 0`.
 pub struct GlassSurface;
 
 impl crate::SolariMaterial for GlassSurface {
@@ -400,8 +393,7 @@ impl crate::SolariMaterial for GlassSurface {
     }
 }
 
-/// Built-in hair surface — Chiang fiber BSDF / LSS bark. Class 2: hair instances
-/// route to it via the reserved SBT record (keyed by the "hair" label), not a material.
+/// Hair surface (class 2) — Chiang fiber BSDF / LSS bark; reached via the reserved hair record.
 pub struct HairSurface;
 
 impl crate::SolariMaterial for HairSurface {
@@ -416,11 +408,7 @@ impl crate::SolariMaterial for HairSurface {
     }
 }
 
-/// The built-in ray-portal surface — a [`SolariMaterial`](crate::SolariMaterial) Solari
-/// registers itself (via `SolariMaterialPlugin::<PortalSurface>` in `SolariPlugin`),
-/// dogfooding the same path downstream surfaces use. A material routes to `chit_portal`
-/// by setting its `chit_class` to `SolariMaterialClass<PortalSurface>` (teleport, no
-/// shading; pair the instance with a [`SolariPortal`](crate::bindings::SolariPortal)).
+/// Portal surface (class 3) — teleports rays; pair the instance with a [`SolariPortal`](crate::bindings::SolariPortal).
 pub struct PortalSurface;
 
 impl crate::SolariMaterial for PortalSurface {
