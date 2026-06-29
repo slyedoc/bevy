@@ -40,12 +40,12 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::ecs_gpu::GpuSlot;
 use crate::material::material_slots::MaterialSlots;
-use crate::material::SolariMaterial;
+use crate::material::StandardSolariMaterial;
 use crate::transform::TransformGraph;
 use crate::{SolariClusterSystems, SolariSetup};
 
 /// [`GpuHairInstance::material_id`] sentinel: shade as fiber hair (Chiang BSDF),
-/// not as an opaque [`SolariMaterial`] surface. Mirrors WGSL `HAIR_MATERIAL_NONE`.
+/// not as an opaque [`StandardSolariMaterial`] surface. Mirrors WGSL `HAIR_MATERIAL_NONE`.
 pub const HAIR_MATERIAL_NONE: u32 = 0xFFFF_FFFF;
 
 /// A hair/fur groom on an entity. The entity's [`GlobalTransform`] places the
@@ -61,7 +61,7 @@ pub struct Hair {
 
 /// Branches/twigs (or any opaque swept-sphere geometry) rendered as ray-traced
 /// linear swept spheres — the **same** LSS geometry as [`Hair`], but shaded as an
-/// opaque BRDF surface with a normal [`SolariMaterial`] (bark/wood) and the
+/// opaque BRDF surface with a normal [`StandardSolariMaterial`] (bark/wood) and the
 /// round-cone surface normal, instead of the fiber BSDF. The entity's
 /// [`GlobalTransform`] places it; the [`HairAsset`] supplies the strands (each a
 /// node polyline with per-point radii). Blackwell-only, like [`Hair`].
@@ -71,7 +71,7 @@ pub struct SolariBranches {
     /// Swept-sphere strand geometry (branch polylines + pipe radii).
     pub strands: Handle<HairAsset>,
     /// Opaque surface material (bark/wood/etc).
-    pub material: Handle<SolariMaterial>,
+    pub material: Handle<StandardSolariMaterial>,
 }
 
 /// Physically-based hair appearance, parameterized by melanin like UE / NVIDIA
@@ -192,7 +192,7 @@ pub struct ExtractedHairInstance {
     /// Fiber appearance (used only for [`Hair`]; ignored when `surface` is set).
     pub material: HairMaterial,
     /// Opaque surface material for [`SolariBranches`] (`None` = fiber hair).
-    pub surface: Option<AssetId<SolariMaterial>>,
+    pub surface: Option<AssetId<StandardSolariMaterial>>,
 }
 
 /// Render-world list of this frame's hair entities (rebuilt each frame — hair

@@ -19,7 +19,7 @@ use crate::material::SolariMaterial3d;
 /// partitioned TLAS traverses for ray hits.
 ///
 /// Pairs with [`SolariMaterial3d`] — `bevy_solari` owns its material type
-/// (`SolariMaterial`) rather than depending on `bevy_pbr`'s raster material
+/// (`StandardSolariMaterial`) rather than depending on `bevy_pbr`'s raster material
 /// infrastructure, so the RT path can run with `PbrPlugin` disabled.
 #[derive(
     Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From,

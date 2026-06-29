@@ -1,11 +1,11 @@
-//! glTF → [`SolariMaterial`] loading (a `bevy_gltf` extension handler).
+//! glTF → [`StandardSolariMaterial`] loading (a `bevy_gltf` extension handler).
 //!
 //! With `PbrPlugin` disabled, bevy_pbr's glTF→`StandardMaterial` handler isn't
 //! registered, so glTF scenes would get no materials. This handler emits a
-//! [`SolariMaterial`] for each glTF material at load — at the same `{material}/std`
+//! [`StandardSolariMaterial`] for each glTF material at load — at the same `{material}/std`
 //! label bevy_pbr uses, since under the full-RT path only this handler runs — and
 //! assigns [`SolariMaterial3d`] to the spawned mesh entities. Registered by
-//! [`SolariMaterialPlugin`](super::SolariMaterialPlugin) under the `gltf` feature.
+//! [`StandardSolariMaterialPlugin`](super::StandardSolariMaterialPlugin) under the `gltf` feature.
 
 use bevy_app::App;
 use bevy_asset::{Handle, LoadContext};
@@ -15,9 +15,9 @@ use bevy_gltf::{
     gltf, GltfAssetLabel, GltfLoaderSettings, GltfMaterial,
 };
 
-use crate::material::{SolariMaterial, SolariMaterial3d};
+use crate::material::{StandardSolariMaterial, SolariMaterial3d};
 
-/// Convert a [`GltfMaterial`] to a [`SolariMaterial`] — the fields the RT path
+/// Convert a [`GltfMaterial`] to a [`StandardSolariMaterial`] — the fields the RT path
 /// reads. Mirrors `bevy_pbr::standard_material_from_gltf_material`, minus the
 /// raster-only fields. `GltfMaterial`'s field types line up exactly.
 ///
@@ -28,7 +28,7 @@ use crate::material::{SolariMaterial, SolariMaterial3d};
 fn solari_material_from_gltf(
     material: &GltfMaterial,
     gltf_material: Option<&gltf::Material>,
-) -> SolariMaterial {
+) -> StandardSolariMaterial {
     let nested_priority = gltf_material
         .and_then(|m| m.extras().as_ref())
         .map_or(0, |extras| nested_priority_from_extras(extras.get()));
@@ -38,7 +38,7 @@ fn solari_material_from_gltf(
         .and_then(|m| m.extras().as_ref())
         .map_or(0.0, |extras| dispersion_from_extras(extras.get()));
 
-    SolariMaterial {
+    StandardSolariMaterial {
         base_color: material.base_color,
         base_color_texture: material.base_color_texture.clone(),
         emissive: material.emissive,
@@ -55,19 +55,19 @@ fn solari_material_from_gltf(
         nested_priority,
         alpha_mode: material.alpha_mode,
         normal_map_texture: material.normal_map_texture.clone(),
-        // No standard glTF displacement; authored on `SolariMaterial` directly.
+        // No standard glTF displacement; authored on `StandardSolariMaterial` directly.
         depth_map: None,
         depth_scale: 1.0,
         depth_bias: 0.0,
-        // No glTF portal concept; portal surfaces set `SolariMaterial::portal` directly.
+        // No glTF portal concept; portal surfaces set `StandardSolariMaterial::portal` directly.
         portal: false,
-        // Custom hit-group routing is opt-in via `SolariMaterial::chit_class`.
+        // Custom hit-group routing is opt-in via `StandardSolariMaterial::chit_class`.
         chit_class: 0,
     }
 }
 
 /// Parse `nested_priority` out of a material's extras JSON (see
-/// [`SolariMaterial::nested_priority`]) — there is no standard glTF extension
+/// [`StandardSolariMaterial::nested_priority`]) — there is no standard glTF extension
 /// for nested-dielectric priorities, so they travel in `extras`. Used by both
 /// the glTF handler (raw extras at load) and the `StandardMaterial` conversion
 /// helper (the `GltfMaterialExtras` component on spawned mesh entities).
@@ -79,7 +79,7 @@ pub(crate) fn nested_priority_from_extras(extras: &str) -> u32 {
 }
 
 /// Parse `dispersion` out of a material's extras JSON (see
-/// [`SolariMaterial::dispersion`]).
+/// [`StandardSolariMaterial::dispersion`]).
 pub(crate) fn dispersion_from_extras(extras: &str) -> f32 {
     serde_json::from_str::<serde_json::Value>(extras)
         .ok()
@@ -130,13 +130,13 @@ impl GltfExtensionHandler for SolariGltfMaterialHandler {
         material_label: &str,
     ) {
         let label = format!("{material_label}/std");
-        let handle = load_context.get_label_handle::<SolariMaterial>(label);
+        let handle = load_context.get_label_handle::<StandardSolariMaterial>(label);
         entity.insert(SolariMaterial3d(handle));
     }
 }
 
-/// Register the glTF → [`SolariMaterial`] handler into `bevy_gltf`'s handler list.
-/// Called by [`SolariMaterialPlugin`](super::SolariMaterialPlugin) when PbrPlugin's
+/// Register the glTF → [`StandardSolariMaterial`] handler into `bevy_gltf`'s handler list.
+/// Called by [`StandardSolariMaterialPlugin`](super::StandardSolariMaterialPlugin) when PbrPlugin's
 /// own glTF handler is absent (the full-RT path). No-op if `GltfPlugin` isn't
 /// present (no `GltfExtensionHandlers` resource) — solari works without glTF.
 ///

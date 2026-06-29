@@ -5,7 +5,7 @@
 //!   (group bases, LOD inputs, geometry ids) and per-frame deltas.
 //! - [`gpu_instances`] — the diff-driven GPU-scatter columns
 //!   (transforms / previous transforms / material ids), keyed by slot.
-//! - [`material_slots`] — stable `SolariMaterial` → slot allocation the
+//! - [`material_slots`] — stable `StandardSolariMaterial` → slot allocation the
 //!   column scatter resolves `material_id` against.
 
 use bevy_app::{App, Plugin};

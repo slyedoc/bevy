@@ -33,7 +33,7 @@ use crate::instance::RaytracingGpuEntity;
 
 /// Marks a ray-traced surface as a portal showing the view out of `target`'s
 /// front face (see the module docs for the exact mapping). The surface's
-/// material should be flagged `portal` ([`SolariMaterial::portal`](crate::material::SolariMaterial))
+/// material should be flagged `portal` ([`StandardSolariMaterial::portal`](crate::material::StandardSolariMaterial))
 /// so the SBT routes its hits to `chit_portal`; rays redirect on hit, never shade.
 #[derive(Component, Reflect, Clone, Copy)]
 #[reflect(Component)]

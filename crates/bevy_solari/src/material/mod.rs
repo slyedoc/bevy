@@ -1,9 +1,9 @@
 //! `bevy_solari`'s own material type and its plugin to avoid bevy_pbr systems and cpu time
 //!
-//! While `PbrPlugin` is still enabled, [`SolariMaterial`] also provides a
+//! While `PbrPlugin` is still enabled, [`StandardSolariMaterial`] also provides a
 //! `From<&StandardMaterial>` bridge so existing content (code-authored or
 //! glTF-loaded — both arrive as `StandardMaterial`) can be converted to a
-//! `SolariMaterial` at ray-tracing conversion time without re-authoring assets.
+//! `StandardSolariMaterial` at ray-tracing conversion time without re-authoring assets.
 
 use bevy_app::{App, Plugin};
 use bevy_asset::{Asset, AssetApp, AssetId, Assets, Handle, RenderAssetUsages};
@@ -35,7 +35,7 @@ pub(crate) use gltf::nested_priority_from_extras;
 /// Pair with [`SolariMaterial3d`] and [`crate::bindings::RaytracingMesh3d`].
 #[derive(Asset, Clone, Debug, Reflect)]
 #[reflect(Default, Clone)]
-pub struct SolariMaterial {
+pub struct StandardSolariMaterial {
     /// Base ("albedo") color. Linearized into the `GpuMaterial`.
     pub base_color: Color,
     /// Optional base-color texture (sampled at the ray hit's UV).
@@ -110,7 +110,7 @@ pub struct SolariMaterial {
     pub chit_class: u32,
 }
 
-impl SolariMaterial {
+impl StandardSolariMaterial {
     /// A material with the given base color and otherwise-default properties.
     /// Mirrors `StandardMaterial::from_color`.
     pub fn from_color(color: impl Into<Color>) -> Self {
@@ -139,7 +139,7 @@ impl SolariMaterial {
     }
 }
 
-impl Default for SolariMaterial {
+impl Default for StandardSolariMaterial {
     fn default() -> Self {
         // Match `StandardMaterial`'s defaults so ported content and struct-literal
         // authoring behave identically.
@@ -171,10 +171,10 @@ impl Default for SolariMaterial {
 
 /// Bridge from `bevy_pbr`'s `StandardMaterial` (transitional — lets existing
 /// `StandardMaterial`-authored or glTF-loaded content be converted to a
-/// `SolariMaterial` while `PbrPlugin` is still enabled). Copies exactly the
-/// fields the binder reads. Remove once content authors `SolariMaterial`
+/// `StandardSolariMaterial` while `PbrPlugin` is still enabled). Copies exactly the
+/// fields the binder reads. Remove once content authors `StandardSolariMaterial`
 /// directly and `bevy_pbr` is dropped from the dependency graph.
-impl From<&StandardMaterial> for SolariMaterial {
+impl From<&StandardMaterial> for StandardSolariMaterial {
     fn from(m: &StandardMaterial) -> Self {
         Self {
             base_color: m.base_color,
@@ -195,20 +195,20 @@ impl From<&StandardMaterial> for SolariMaterial {
             alpha_mode: m.alpha_mode,
             normal_map_texture: m.normal_map_texture.clone(),
             // `StandardMaterial` has no displacement concept — authored directly on
-            // `SolariMaterial` (or via the `.bsn` importer).
+            // `StandardSolariMaterial` (or via the `.bsn` importer).
             depth_map: None,
             depth_scale: 1.0,
             depth_bias: 0.0,
-            // `StandardMaterial` has no portal concept — set `SolariMaterial::portal`
+            // `StandardMaterial` has no portal concept — set `StandardSolariMaterial::portal`
             // directly (or via a `SolariPortal` setup) for portal surfaces.
             portal: false,
-            // Custom hit-group routing is opt-in via `SolariMaterial::chit_class`.
+            // Custom hit-group routing is opt-in via `StandardSolariMaterial::chit_class`.
             chit_class: 0,
         }
     }
 }
 
-/// Component holding a [`SolariMaterial`] handle for a ray-tracing instance — the
+/// Component holding a [`StandardSolariMaterial`] handle for a ray-tracing instance — the
 /// `Material`-free counterpart to `MeshMaterial3d`.
 ///
 /// Modeled on `bevy_pbr::MeshMaterial3d` (newtype over a `Handle`) but with no
@@ -217,53 +217,53 @@ impl From<&StandardMaterial> for SolariMaterial {
     Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From,
 )]
 #[reflect(Component, Default, Clone, PartialEq)]
-pub struct SolariMaterial3d(pub Handle<SolariMaterial>);
+pub struct SolariMaterial3d(pub Handle<StandardSolariMaterial>);
 
-impl From<SolariMaterial3d> for AssetId<SolariMaterial> {
+impl From<SolariMaterial3d> for AssetId<StandardSolariMaterial> {
     fn from(material: SolariMaterial3d) -> Self {
         material.id()
     }
 }
 
-impl From<&SolariMaterial3d> for AssetId<SolariMaterial> {
+impl From<&SolariMaterial3d> for AssetId<StandardSolariMaterial> {
     fn from(material: &SolariMaterial3d) -> Self {
         material.id()
     }
 }
 
-/// Registers [`SolariMaterial`]. Added by [`crate::SolariPlugin`] ahead of the
+/// Registers [`StandardSolariMaterial`]. Added by [`crate::SolariPlugin`] ahead of the
 /// binding/instance plugins so the asset exists before anything binds it.
 ///
 /// Independent of `PbrPlugin`: a single `init_asset` plus a default material at
 /// the default handle (mirroring how `PbrPlugin` seeds `StandardMaterial`) —
 /// instances with no explicit material resolve here.
-pub struct SolariMaterialPlugin;
+pub struct StandardSolariMaterialPlugin;
 
-impl Plugin for SolariMaterialPlugin {
+impl Plugin for StandardSolariMaterialPlugin {
     fn build(&self, app: &mut App) {
         app
         // add since we are disabling `PbrPlugin` under solari, so it doesn't register `Assets<StandardMaterial>`
         .init_asset::<StandardMaterial>()
         // our custom material
-        .init_asset::<SolariMaterial>()
-            // `ReflectAsset` on `SolariMaterial` + `ReflectHandle` on its handle, so
+        .init_asset::<StandardSolariMaterial>()
+            // `ReflectAsset` on `StandardSolariMaterial` + `ReflectHandle` on its handle, so
             // `.bsn` scenes can define materials inline (see `bevy_scene` dynamic BSN).
-            .register_asset_reflect::<SolariMaterial>()
-            .register_type::<SolariMaterial>()
+            .register_asset_reflect::<StandardSolariMaterial>()
+            .register_type::<StandardSolariMaterial>()
             .register_type::<SolariMaterial3d>()
-            // `SolariMaterial.alpha_mode` is an `AlphaMode`; `.bsn` scenes name it as
+            // `StandardSolariMaterial.alpha_mode` is an `AlphaMode`; `.bsn` scenes name it as
             // `bevy_material::alpha::AlphaMode::Mask(..)`, so it must be in the registry. PbrPlugin
             // (which would otherwise register it) is disabled on the full-RT path.
             .register_type::<AlphaMode>();
         app.world_mut()
-            .resource_mut::<Assets<SolariMaterial>>()
+            .resource_mut::<Assets<StandardSolariMaterial>>()
             .insert(
-                &Handle::<SolariMaterial>::default(),
-                SolariMaterial::default(),
+                &Handle::<StandardSolariMaterial>::default(),
+                StandardSolariMaterial::default(),
             )
             .unwrap();
 
-        // Emit `SolariMaterial` from glTF only when bevy_pbr's own glTF→`StandardMaterial`
+        // Emit `StandardSolariMaterial` from glTF only when bevy_pbr's own glTF→`StandardMaterial`
         // handler is absent — i.e. `PbrPlugin` disabled (the full-RT path). With both
         // present they'd race to produce the same `{material}/std` label.
         #[cfg(feature = "gltf")]

@@ -53,7 +53,7 @@ use core::f32::consts::TAU;
 use crate::bindings::SolariMaterialAssets;
 use crate::ecs_gpu::{GpuColumn, GpuSlot, GpuTable, SlotPool};
 use crate::instance::InstanceManager;
-use crate::material::SolariMaterial;
+use crate::material::StandardSolariMaterial;
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 use crate::transform::{dispatch_transform_propagate, TransformGraph, TransformPropagate};
@@ -243,7 +243,7 @@ pub struct LightSources {
     pool: SlotPool<LightKey>,
     /// The emissive material set the table was built against — a diff catches a
     /// material whose `emissive` was edited without any instance changing.
-    cached_assets: HashSet<AssetId<SolariMaterial>, FixedHasher>,
+    cached_assets: HashSet<AssetId<StandardSolariMaterial>, FixedHasher>,
     /// The directional lights-table slots the table was built against.
     cached_directional: Vec<u32>,
 }
@@ -261,7 +261,7 @@ pub fn prepare_light_sources(
     active_directional: Res<ActiveDirectionalLights>,
 ) {
     // Material assets whose `emissive` is non-black.
-    let mut emissive_assets = HashSet::<AssetId<SolariMaterial>, FixedHasher>::default();
+    let mut emissive_assets = HashSet::<AssetId<StandardSolariMaterial>, FixedHasher>::default();
     for (asset_id, material) in materials.iter() {
         if material.emissive.to_vec3() != Vec3::ZERO {
             emissive_assets.insert(*asset_id);

@@ -6,7 +6,7 @@
 
 use crate::geometry::ClusterMesh;
 use crate::bindings::RaytracingMesh3d;
-use crate::material::{SolariMaterial, SolariMaterial3d};
+use crate::material::{StandardSolariMaterial, SolariMaterial3d};
 use bevy_asset::{AssetId, Assets, Handle};
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
 use bevy_camera::visibility::{InheritedVisibility, NoCpuCulling, Visibility};
@@ -90,8 +90,8 @@ pub fn convert_meshes_to_raytracing(
 }
 
 /// Bridge existing [`StandardMaterial`]-authored content onto `bevy_solari`'s
-/// own [`SolariMaterial`]. [`RaytracingMesh3d`] requires [`SolariMaterial3d`]
-/// (the path tracer reads `SolariMaterial`, not `bevy_pbr`'s raster material),
+/// own [`StandardSolariMaterial`]. [`RaytracingMesh3d`] requires [`SolariMaterial3d`]
+/// (the path tracer reads `StandardSolariMaterial`, not `bevy_pbr`'s raster material),
 /// but most scenes — code-authored or glTF-loaded — arrive as `StandardMaterial`.
 /// Add this to [`Update`] alongside [`convert_meshes_to_raytracing`] to convert
 /// each ray-traced mesh's material:
@@ -110,13 +110,13 @@ pub fn convert_meshes_to_raytracing(
 /// and stops it re-matching.
 ///
 /// Transitional: it exists to bridge `StandardMaterial` content while `bevy_pbr`
-/// is still a dependency. Author [`SolariMaterial`] directly to skip it entirely.
+/// is still a dependency. Author [`StandardSolariMaterial`] directly to skip it entirely.
 pub fn convert_standard_materials_to_solari(
     mut commands: Commands,
     query: Query<(Entity, &MeshMaterial3d<StandardMaterial>), With<RaytracingMesh3d>>,
     std_materials: Res<Assets<StandardMaterial>>,
-    mut solari_materials: ResMut<Assets<SolariMaterial>>,
-    mut cache: Local<HashMap<AssetId<StandardMaterial>, Handle<SolariMaterial>>>,
+    mut solari_materials: ResMut<Assets<StandardSolariMaterial>>,
+    mut cache: Local<HashMap<AssetId<StandardMaterial>, Handle<StandardSolariMaterial>>>,
     #[cfg(feature = "gltf")] extras_query: Query<&bevy_gltf::GltfMaterialExtras>,
 ) {
     for (entity, mesh_material) in &query {
@@ -128,7 +128,7 @@ pub fn convert_standard_materials_to_solari(
                 continue; // asset not loaded yet — retry next frame
             };
             #[allow(unused_mut)]
-            let mut material = SolariMaterial::from(std_material);
+            let mut material = StandardSolariMaterial::from(std_material);
             // Solari-only authoring with no glTF extension (nested-dielectric
             // priorities) rides the material's extras — `StandardMaterial`
             // drops them, but bevy_gltf leaves the raw JSON on the entity.

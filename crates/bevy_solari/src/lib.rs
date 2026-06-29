@@ -70,7 +70,7 @@ use crate::geometry::GeometryPlugin;
 use crate::instance::InstancePlugin;
 use crate::lights::SolariLightsPlugin;
 use crate::ray_query::RayQueryPlugin;
-use crate::material::SolariMaterialPlugin;
+use crate::material::StandardSolariMaterialPlugin;
 use crate::render::SolarRenderPlugin;
 use crate::transform::SolariTransformPlugin;
 
@@ -81,13 +81,13 @@ pub use crate::gpu::rt_pipeline::{SolariAnyHitDef, SolariHitGroupDef, SolariHitG
 
 /// Register a custom RT closest-hit ("hit group") with Solari and get its SBT
 /// **class** back. Set that class on a material's
-/// [`chit_class`](crate::material::SolariMaterial::chit_class) to route its
+/// [`chit_class`](crate::material::StandardSolariMaterial::chit_class) to route its
 /// instances to the program. The chit `.wgsl` lives in the caller's crate and may
 /// `#import bevy_solari::*` — so a downstream surface needs no fork edit.
 ///
 /// Call during plugin `build`, after [`SolariPlugin`] is added (the render app +
 /// [`SolariHitGroupRegistry`] must exist) and before the first frame builds the
-/// pipeline. [`SolariMaterialPlugin`](crate::material::SolariMaterialPlugin) wraps this.
+/// pipeline. [`StandardSolariMaterialPlugin`](crate::material::StandardSolariMaterialPlugin) wraps this.
 pub trait SolariChitRegistryAppExt {
     fn register_solari_chit(&mut self, def: SolariHitGroupDef) -> u32;
 }
@@ -103,23 +103,23 @@ impl SolariChitRegistryAppExt for App {
 
 /// A registrable ray-traced surface program — the `MaterialPlugin`-style wrapper
 /// over [`SolariChitRegistryAppExt::register_solari_chit`]. Implement it on a marker
-/// type, add [`SolariSurfacePlugin<S>`], then read the assigned SBT class from
-/// [`SolariSurfaceClass<S>`] to set a material's
-/// [`chit_class`](crate::material::SolariMaterial::chit_class).
-pub trait SolariSurface: Send + Sync + 'static {
+/// type, add [`SolariMaterialPlugin<S>`], then read the assigned SBT class from
+/// [`SolariMaterialClass<S>`] to set a material's
+/// [`chit_class`](crate::material::StandardSolariMaterial::chit_class).
+pub trait SolariMaterial: Send + Sync + 'static {
     /// This surface's hit-group definition (closest-hit `.wgsl` + optional any-hit).
     fn hit_group() -> SolariHitGroupDef;
 }
 
-/// The SBT class assigned to surface `S` when [`SolariSurfacePlugin<S>`] registered
+/// The SBT class assigned to surface `S` when [`SolariMaterialPlugin<S>`] registered
 /// it. Read it (a `Res`) to set a material's `chit_class`.
 #[derive(bevy_ecs::resource::Resource)]
-pub struct SolariSurfaceClass<S: SolariSurface> {
+pub struct SolariMaterialClass<S: SolariMaterial> {
     class: u32,
     _marker: core::marker::PhantomData<fn() -> S>,
 }
 
-impl<S: SolariSurface> SolariSurfaceClass<S> {
+impl<S: SolariMaterial> SolariMaterialClass<S> {
     /// The SBT class to put on a material's `chit_class`.
     pub fn get(&self) -> u32 {
         self.class
@@ -127,20 +127,20 @@ impl<S: SolariSurface> SolariSurfaceClass<S> {
 }
 
 /// Registers surface `S`'s closest-hit with Solari and exposes its class as
-/// [`SolariSurfaceClass<S>`]. Add after [`SolariPlugin`]. The Bevy-`MaterialPlugin`
+/// [`SolariMaterialClass<S>`]. Add after [`SolariPlugin`]. The Bevy-`MaterialPlugin`
 /// analog for the RT pipeline: one plugin, no manual registry calls.
-pub struct SolariSurfacePlugin<S: SolariSurface>(core::marker::PhantomData<fn() -> S>);
+pub struct SolariMaterialPlugin<S: SolariMaterial>(core::marker::PhantomData<fn() -> S>);
 
-impl<S: SolariSurface> Default for SolariSurfacePlugin<S> {
+impl<S: SolariMaterial> Default for SolariMaterialPlugin<S> {
     fn default() -> Self {
         Self(core::marker::PhantomData)
     }
 }
 
-impl<S: SolariSurface> Plugin for SolariSurfacePlugin<S> {
+impl<S: SolariMaterial> Plugin for SolariMaterialPlugin<S> {
     fn build(&self, app: &mut App) {
         let class = app.register_solari_chit(S::hit_group());
-        app.insert_resource(SolariSurfaceClass::<S> {
+        app.insert_resource(SolariMaterialClass::<S> {
             class,
             _marker: core::marker::PhantomData,
         });
@@ -200,7 +200,7 @@ pub mod prelude {
             NoGpuGlobalTransformReadback, SolariFloatingOrigin, SolariFrame, SolariGridCell,
             TransformStatic,
         },
-        material::{SolariMaterial, SolariMaterial3d},
+        material::{StandardSolariMaterial, SolariMaterial3d},
         lights::SolariDirectionLight,
         hair::{Hair, HairMaterial, HairAsset, HairStrand, SolariBranches},
         ray_query::picking::SolariPickingPlugin,
@@ -271,7 +271,7 @@ impl Plugin for SolariPlugin {
 
             // ecs gpu tables
             SolariTransformPlugin,
-            SolariMaterialPlugin,
+            StandardSolariMaterialPlugin,
             SolariLightsPlugin,
 
             HairPlugin,

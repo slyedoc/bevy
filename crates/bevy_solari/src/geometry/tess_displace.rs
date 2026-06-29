@@ -28,7 +28,7 @@ use bevy_math::Vec4;
 
 use crate::bindings::RaytracingMesh3d;
 use crate::gpu::allocator::Allocator;
-use crate::material::{SolariMaterial, SolariMaterial3d};
+use crate::material::{StandardSolariMaterial, SolariMaterial3d};
 use super::asset::ClusterMesh;
 
 /// One real displacement-mapped scene instance the tessellation path tessellates
@@ -38,7 +38,7 @@ pub struct TessShowcaseInstanceData {
     pub mesh: AssetId<ClusterMesh>,
     /// The instance's material — its SBT hit-group record (= material slot) so the
     /// tessellated hit shades with this surface's textures, not material 0's.
-    pub material: AssetId<SolariMaterial>,
+    pub material: AssetId<StandardSolariMaterial>,
     /// The source entity — resolved to its cluster slot at PTLAS-write time so the
     /// tess hit reads that entity's real previous-frame transform (correct motion
     /// vectors / no DLSS flicker), rather than assuming the surface is static.
@@ -66,7 +66,7 @@ pub struct TessShowcaseInstances {
 /// latched once all materials are loaded. Gated on `SOLARI_TESS`.
 pub fn find_tess_showcase_instances(
     mut found: ResMut<TessShowcaseInstances>,
-    materials: Res<Assets<SolariMaterial>>,
+    materials: Res<Assets<StandardSolariMaterial>>,
     cluster_meshes: Res<Assets<ClusterMesh>>,
     query: Query<(Entity, &SolariMaterial3d, &RaytracingMesh3d, &Transform)>,
 ) {
@@ -142,7 +142,7 @@ pub struct TessBaseHidden;
 /// tessellation can read the base geometry.
 pub fn hide_tessellated_base_instances(
     mut commands: Commands,
-    materials: Res<Assets<SolariMaterial>>,
+    materials: Res<Assets<StandardSolariMaterial>>,
     query: Query<
         (Entity, &SolariMaterial3d),
         (With<RaytracingMesh3d>, bevy_ecs::query::Without<TessBaseHidden>),

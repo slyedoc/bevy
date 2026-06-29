@@ -47,7 +47,7 @@ use crate::render::view_cull::render_layers_to_mask;
 use bevy_camera::visibility::RenderLayers;
 use bevy_platform::collections::HashSet;
 
-use crate::material::{SolariMaterial, SolariMaterial3d};
+use crate::material::{StandardSolariMaterial, SolariMaterial3d};
 use bevy_render::{
     render_resource::ShaderType, renderer::RenderDevice, sync_world::RenderEntity, MainWorld,
 };
@@ -134,7 +134,7 @@ pub struct InstanceManager {
     /// mirrored CPU-side at all — they are scattered delta-direct (see the
     /// per-column deltas below); the GPU buffer is their only home and is
     /// preserved across a growth by GPU buffer copy.
-    instance_material_asset_ids: Vec<AssetId<SolariMaterial>>,
+    instance_material_asset_ids: Vec<AssetId<StandardSolariMaterial>>,
 
     /// Per-slot 8-bit RT cull mask (from `RenderLayers`). CPU mirror kept
     /// only to diff against on an update — a transform-only move must not
@@ -403,7 +403,7 @@ impl InstanceManager {
     fn bind(
         &mut self,
         ptrs: SlotMeshPointers,
-        material_asset_id: AssetId<SolariMaterial>,
+        material_asset_id: AssetId<StandardSolariMaterial>,
         cull_mask: u32,
     ) -> GpuEntity {
         let slot = self.allocate_slot(ptrs);
@@ -428,7 +428,7 @@ impl InstanceManager {
     fn update(
         &mut self,
         slot: GpuEntity,
-        material_asset_id: AssetId<SolariMaterial>,
+        material_asset_id: AssetId<StandardSolariMaterial>,
         cull_mask: u32,
     ) {
         let idx = slot.0 as usize;
@@ -478,11 +478,11 @@ impl InstanceManager {
         self.released_slots.push(slot);
     }
 
-    /// Per-slot material `AssetId<SolariMaterial>`. The raytracing
+    /// Per-slot material `AssetId<StandardSolariMaterial>`. The raytracing
     /// scene binder resolves this to a local material-array index
     /// each frame.
     #[inline]
-    pub fn instance_material_asset_id(&self, slot: GpuEntity) -> AssetId<SolariMaterial> {
+    pub fn instance_material_asset_id(&self, slot: GpuEntity) -> AssetId<StandardSolariMaterial> {
         self.instance_material_asset_ids[slot.0 as usize]
     }
 
@@ -766,7 +766,7 @@ fn push_instance_upsert(
     material_slots: Option<&MaterialSlots>,
     slot: GpuEntity,
     pointers: &SlotMeshPointers,
-    material: AssetId<SolariMaterial>,
+    material: AssetId<StandardSolariMaterial>,
     node_slot: u32,
     cull_mask: u32,
 ) {
@@ -797,7 +797,7 @@ fn try_bind_instance(
     assets: &mut Assets<ClusterMesh>,
     asset_server: &AssetServer,
     mesh_id: AssetId<ClusterMesh>,
-    material: AssetId<SolariMaterial>,
+    material: AssetId<StandardSolariMaterial>,
     cull_mask: u32,
 ) -> Option<(GpuEntity, SlotMeshPointers)> {
     if asset_server.is_managed(mesh_id) && !asset_server.is_loaded_with_dependencies(mesh_id) {

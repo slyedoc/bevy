@@ -1,6 +1,6 @@
 //! Stable material-slot allocation.
 //!
-//! Assigns each [`SolariMaterial`] asset a **stable** `u32` slot that persists
+//! Assigns each [`StandardSolariMaterial`] asset a **stable** `u32` slot that persists
 //! across frames (append-only, reused via a free-list on unload) — the asset-keyed
 //! use of [`SlotPool`](crate::ecs_gpu::SlotPool). The `materials[]` GPU array is
 //! indexed by this slot, and the per-instance `material_id` column stores it per
@@ -18,18 +18,18 @@ use bevy_ecs::{
 
 use crate::bindings::SolariMaterialAssets;
 use crate::ecs_gpu::SlotPool;
-use crate::material::SolariMaterial;
+use crate::material::StandardSolariMaterial;
 
 /// Persistent `material asset → stable slot` map — an asset-keyed
 /// [`SlotPool`]. Slot `0..len()` index the `materials[]` GPU array; freed slots
 /// are reused before `len` grows.
 #[derive(Resource, Default)]
-pub struct MaterialSlots(SlotPool<AssetId<SolariMaterial>>);
+pub struct MaterialSlots(SlotPool<AssetId<StandardSolariMaterial>>);
 
 impl MaterialSlots {
     /// Stable slot for `asset`, if it has one this frame.
     #[inline]
-    pub fn slot_of(&self, asset: AssetId<SolariMaterial>) -> Option<u32> {
+    pub fn slot_of(&self, asset: AssetId<StandardSolariMaterial>) -> Option<u32> {
         self.0.slot_of(asset)
     }
 
@@ -53,7 +53,7 @@ impl MaterialSlots {
     }
 
     /// Iterate `(asset, slot)` for every currently-bound material.
-    pub fn iter(&self) -> impl Iterator<Item = (AssetId<SolariMaterial>, u32)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (AssetId<StandardSolariMaterial>, u32)> + '_ {
         self.0.iter()
     }
 }
@@ -87,7 +87,7 @@ pub const MATERIAL_TRAVERSAL_GLASS: u32 = 0x2;
 /// [`MaterialTraversalFlags`] bit: the material is a ray-portal surface, so its
 /// instances route to the `chit_portal` hit group (teleport, no shading).
 pub const MATERIAL_TRAVERSAL_PORTAL: u32 = 0x4;
-/// An explicit [`SolariMaterial::chit_class`] is packed into the traversal-flags
+/// An explicit [`StandardSolariMaterial::chit_class`] is packed into the traversal-flags
 /// word above this shift, so the per-slot word carries both the low traversal bits
 /// (read by the PTLAS fill) and the registry class (read by `material_sbt_class`).
 pub const MATERIAL_CHIT_CLASS_SHIFT: u32 = 16;
@@ -114,7 +114,7 @@ pub fn material_sbt_class(traversal_flags: u32) -> u32 {
 
 /// Per-material-slot traversal flags consumed by the PTLAS fill (bit 0 =
 /// the material needs candidate-hit inspection, i.e. it alpha-tests — see
-/// [`SolariMaterial::traversal_alpha_cutoff`]). Slot-aligned with
+/// [`StandardSolariMaterial::traversal_alpha_cutoff`]). Slot-aligned with
 /// `materials[]`. The fill derives each instance's `FORCE_NO_OPAQUE` flag
 /// from this **on the GPU** (via the instance's `material_id` column) and
 /// detects changes by comparing against the record it last wrote — so a
