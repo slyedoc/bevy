@@ -336,6 +336,7 @@ impl ClusterMeshManager {
         // Hand out a dense geometry id for this brand-new mesh.
         let geometry_id = self.next_geometry_id;
         self.next_geometry_id += 1;
+        tracing::info!("cluster geometry_id assigned = {geometry_id} (cap 65535)");
 
         let slices = ClusterMeshSlices {
             vertex_positions,
