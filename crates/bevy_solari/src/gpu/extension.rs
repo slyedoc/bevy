@@ -61,28 +61,8 @@ pub struct ClusterAccelerationStructureFeature;
 /// Marker type for `VK_NV_partitioned_acceleration_structure`.
 pub struct PartitionedAccelerationStructureFeature;
 
-/// Device `maxPartitionCount` for `VK_NV_partitioned_acceleration_structure`
-/// (`VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV`), queried once at
-/// device creation. `0` until queried / when the extension is absent. The PTLAS build
-/// clamps its `partition_count` to this (floating-origin Stage 3 — block partitions
-/// must fit). Read via [`max_partition_count`].
-static MAX_PARTITION_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-/// Device `maxPartitionCount`, or `0` if the partitioned-AS extension is unsupported
-/// or the device hasn't been created yet.
-pub fn max_partition_count() -> u32 {
-    MAX_PARTITION_COUNT.load(core::sync::atomic::Ordering::Relaxed)
-}
 
 /// Marker type registered in [`AdditionalVulkanFeatures`] when
-/// `VK_NV_ray_tracing_linear_swept_spheres` is enabled on the device.
-/// The hair pipeline (LSS BLAS build + shading) checks
-/// `additional_features.has::<LinearSweptSpheresFeature>()` to know
-/// whether ray-traced hair is usable on the current adapter (Blackwell /
-/// RTX 50-series + driver ≥ 572.63). The extension adds no new commands —
-/// LSS geometry is built through the standard `khr::acceleration_structure`
-/// path and intersected from the existing compute `rayQuery` traversal —
-/// so there is no per-device function table to load.
 pub struct LinearSweptSpheresFeature;
 
 /// Marker registered in [`AdditionalVulkanFeatures`] when
@@ -250,13 +230,7 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 let mut props2 = vk::PhysicalDeviceProperties2::default();
                 props2.p_next = &mut pas_props as *mut _ as *mut core::ffi::c_void;
                 instance.get_physical_device_properties2(physical_device, &mut props2);
-                MAX_PARTITION_COUNT
-                    .store(pas_props.max_partition_count, core::sync::atomic::Ordering::Relaxed);
-                tracing::info!(
-                    target: "bevy_solari",
-                    "VK_NV_partitioned_acceleration_structure: maxPartitionCount = {}",
-                    pas_props.max_partition_count
-                );
+
             }
 
             // Ray-traced hair via linear swept spheres. Blackwell-only; on
@@ -362,34 +336,34 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
             // micro-regions. The NV cluster CLAS build references the OMM array +
             // per-triangle index buffer (see `clas_arena`). Needs the extension here;
             // `VK_KHR_acceleration_structure` (enabled by wgpu) is the other half.
-            if supports(ext::opacity_micromap::NAME) {
-                args.extensions.push(ext::opacity_micromap::NAME);
-                additional.insert::<OpacityMicromapFeature>();
-                OPACITY_MICROMAP_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
-                let features = Box::leak(Box::new(
-                    vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true),
-                ));
-                *args.create_info = core::mem::take(args.create_info).push(features);
-            } else {
-                tracing::warn!(
-                    "VK_EXT_opacity_micromap NOT exposed by this device — alpha cutouts fall back to \
-                     pure any-hit (no OMM acceleration)."
-                );
-            }
+            // if supports(ext::opacity_micromap::NAME) {
+            //     args.extensions.push(ext::opacity_micromap::NAME);
+            //     additional.insert::<OpacityMicromapFeature>();
+            //     OPACITY_MICROMAP_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
+            //     let features = Box::leak(Box::new(
+            //         vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true),
+            //     ));
+            //     *args.create_info = core::mem::take(args.create_info).push(features);
+            // } else {
+            //     tracing::warn!(
+            //         "VK_EXT_opacity_micromap NOT exposed by this device — alpha cutouts fall back to \
+            //          pure any-hit (no OMM acceleration)."
+            //     );
+            // }
 
-            if supports(nv::ray_tracing_validation::NAME) {
-                args.extensions.push(nv::ray_tracing_validation::NAME);
-                let features = Box::leak(Box::new(
-                    vk::PhysicalDeviceRayTracingValidationFeaturesNV::default()
-                        .ray_tracing_validation(true),
-                ));
-                *args.create_info = core::mem::take(args.create_info).push(features);
-            } else {
-                tracing::warn!(
-                    "VK_NV_ray_tracing_validation NOT exposed by the driver — set \
-                     NV_ALLOW_RAYTRACING_VALIDATION=1 (and the driver must support it)."
-                );
-            }
+            // if supports(nv::ray_tracing_validation::NAME) {
+            //     args.extensions.push(nv::ray_tracing_validation::NAME);
+            //     let features = Box::leak(Box::new(
+            //         vk::PhysicalDeviceRayTracingValidationFeaturesNV::default()
+            //             .ray_tracing_validation(true),
+            //     ));
+            //     *args.create_info = core::mem::take(args.create_info).push(features);
+            // } else {
+            //     tracing::warn!(
+            //         "VK_NV_ray_tracing_validation NOT exposed by the driver — set \
+            //          NV_ALLOW_RAYTRACING_VALIDATION=1 (and the driver must support it)."
+            //     );
+            // }
         });
     }
 }

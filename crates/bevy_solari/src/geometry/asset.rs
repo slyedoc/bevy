@@ -89,9 +89,7 @@ pub struct ClusterMesh {
     pub vertex_tangents: Arc<[Vec4]>,
     /// `[f32; 2]` UVs, parallel to `vertex_positions`.
     pub vertex_uvs: Arc<[Vec2]>,
-    /// Per-triangle vertex indices (three `u32`s per triangle).
-    /// Indices are mesh-local: they point into `vertex_positions`,
-    /// not into a cluster-local table.
+    /// Per-triangle indices (3 `u32`s/tri), cluster-local: 0 = the cluster's own `vertex_offset`.
     pub indices: Arc<[u32]>,
     /// All clusters across all LOD levels, flat. DAG connectivity
     /// lives in `groups` / `nodes`.
