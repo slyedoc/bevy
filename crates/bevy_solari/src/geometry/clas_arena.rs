@@ -206,6 +206,17 @@ impl ClasArena {
         self.meshes.get(&asset_id)
     }
 
+    /// Evict a removed/modified mesh's CLAS so a later upload (incl. a recycled
+    /// `AssetId`) rebuilds instead of hitting the `contains_key` skip and serving
+    /// a stale CLAS over reused pool memory. Frees its storage-pool range.
+    pub fn remove(&mut self, asset_id: &AssetId<ClusterMesh>) {
+        if let Some(entry) = self.meshes.remove(asset_id) {
+            if entry.storage_range.end > entry.storage_range.start {
+                self.allocator.free_range(entry.storage_range);
+            }
+        }
+    }
+
     /// Create + size (not yet record the build of) one mesh's opacity micro-map:
     /// uploads the baked array / descriptor / per-triangle-index inputs, queries
     /// the build sizes, allocates the backing + scratch buffers, and creates the

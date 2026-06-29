@@ -23,7 +23,7 @@
 //!   `ClusterMesh` asset becomes ready — see the `pending` retry set).
 //! - Freed on `RemovedComponents<RaytracingMesh3d>` / despawn.
 
-use crate::geometry::{ClusterMeshManager, ClusterMeshUpload};
+use crate::geometry::{ClasArena, ClusterMeshManager, ClusterMeshUpload};
 use crate::geometry::{ClusterIndex, GroupIndex, GpuEntity};
 use crate::bindings::RaytracingMesh3d;
 use crate::geometry::ClusterMesh;
@@ -611,6 +611,7 @@ pub fn flush_cluster_instances(
     mut commands: Commands,
     mut manager: ResMut<InstanceManager>,
     mut cluster_meshes: ResMut<ClusterMeshManager>,
+    mut clas_arena: ResMut<ClasArena>,
     mut slot_map: ResMut<RtSlotMap>,
     mut main_world: ResMut<MainWorld>,
     // GPU instance-change journal — an absolute-state UPSERT is appended per bind
@@ -650,6 +651,7 @@ pub fn flush_cluster_instances(
     for ev in asset_events.read() {
         if let AssetEvent::Unused { id } | AssetEvent::Modified { id } = ev {
             cluster_meshes.remove(&id);
+            clas_arena.remove(&id);
         }
     }
 
