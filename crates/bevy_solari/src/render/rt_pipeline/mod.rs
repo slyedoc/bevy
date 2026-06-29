@@ -35,7 +35,10 @@ use crate::material::{material_sbt_class, MaterialSlots, MaterialTraversalFlags}
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::extension::RayTracingPipelineFeature;
 use crate::gpu::RawTraceBindable;
-use crate::gpu::rt_pipeline::{RtCamera, RtGeometryAddresses, RtPipeline, RtViewBindings};
+use crate::gpu::rt_pipeline::{
+    RtCamera, RtGeometryAddresses, RtPipeline, RtViewBindings, SolariAnyHitDef, SolariHitGroupDef,
+    SolariHitGroupRegistry,
+};
 use crate::geometry::ClusterMeshManager;
 use crate::render::atmosphere::{AtmosphereSky, SolariAtmosphereView};
 use bevy_render::extract_resource::ExtractResource;
@@ -358,6 +361,55 @@ pub fn prepare_rt_output(
 /// into the view. Lazily builds the RT pipeline on the first frame the scene +
 /// columns bind groups (and their layouts) are ready — its layout must match
 /// wgpu's exact descriptor set layouts, which only exist once those are built.
+/// Built-in RT hit groups Solari registers by default — opaque (with the
+/// alpha-cutout any-hit), glass, hair, portal, planet. Each entry's index is its
+/// SBT class (matches `material_sbt_class`); downstream crates append after these.
+/// Solari thus consumes the same registry it exposes — no hardcoded hit groups in
+/// the pipeline builder.
+pub fn default_hit_groups() -> Vec<SolariHitGroupDef> {
+    vec![
+        SolariHitGroupDef {
+            label: "opaque",
+            closest_hit_wgsl: include_str!("chit_opaque.wgsl"),
+            closest_hit_file: "chit_opaque.wgsl",
+            closest_hit_entry: "chit_opaque",
+            any_hit: Some(SolariAnyHitDef {
+                wgsl: include_str!("ahit_alpha.wgsl"),
+                file: "ahit_alpha.wgsl",
+                entry: "ahit_alpha",
+            }),
+        },
+        SolariHitGroupDef {
+            label: "glass",
+            closest_hit_wgsl: include_str!("chit_glass.wgsl"),
+            closest_hit_file: "chit_glass.wgsl",
+            closest_hit_entry: "chit_glass",
+            any_hit: None,
+        },
+        SolariHitGroupDef {
+            label: "hair",
+            closest_hit_wgsl: include_str!("chit_hair.wgsl"),
+            closest_hit_file: "chit_hair.wgsl",
+            closest_hit_entry: "chit_hair",
+            any_hit: None,
+        },
+        SolariHitGroupDef {
+            label: "portal",
+            closest_hit_wgsl: include_str!("chit_portal.wgsl"),
+            closest_hit_file: "chit_portal.wgsl",
+            closest_hit_entry: "chit_portal",
+            any_hit: None,
+        },
+        SolariHitGroupDef {
+            label: "planet",
+            closest_hit_wgsl: include_str!("chit_planet.wgsl"),
+            closest_hit_file: "chit_planet.wgsl",
+            closest_hit_entry: "chit_planet",
+            any_hit: None,
+        },
+    ]
+}
+
 pub(crate) fn rt_pipeline(
     view: ViewQuery<(
         &ExtractedView,
@@ -381,6 +433,7 @@ pub(crate) fn rt_pipeline(
     geometry_res: (
         Option<Res<ClusterMeshManager>>,
         Option<Res<crate::geometry::tess_classify::TessClassify>>,
+        Option<Res<SolariHitGroupRegistry>>,
     ),
     materials: RtMaterials,
     atmosphere_sky: Option<Res<AtmosphereSky>>,
@@ -391,7 +444,7 @@ pub(crate) fn rt_pipeline(
     mut commands: Commands,
     mut ctx: RenderContext,
 ) {
-    let (cluster_mesh_manager, tess_classify) = geometry_res;
+    let (cluster_mesh_manager, tess_classify, hit_group_registry) = geometry_res;
     let view_entity = view.entity();
     let (
         view,
@@ -458,14 +511,19 @@ pub(crate) fn rt_pipeline(
     // via commands → live next frame.
     let Some(rt) = rt else {
         if debug.additional.has::<RayTracingPipelineFeature>() && materials.len() > 0 {
-            if let (Some(allocator), Some(scene_layout), Some(columns_layout)) = (
+            if let (Some(allocator), Some(scene_layout), Some(columns_layout), Some(registry)) = (
                 allocator.as_deref(),
                 raw_bgl(&pipeline_cache, &scene_bindings.bind_group_layout),
                 raw_bgl(&pipeline_cache, columns_layout_desc),
+                hit_group_registry.as_deref(),
             ) {
-                if let Some(built) =
-                    RtPipeline::new(allocator, scene_layout, columns_layout, &material_classes)
-                {
+                if let Some(built) = RtPipeline::new(
+                    allocator,
+                    scene_layout,
+                    columns_layout,
+                    &material_classes,
+                    &registry.groups,
+                ) {
                     commands.insert_resource(built);
                 }
             }

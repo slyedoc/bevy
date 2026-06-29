@@ -111,6 +111,50 @@ pub struct RtGeometryAddresses {
     pub vertex_custom: u64,
 }
 
+/// One registered RT closest-hit program ("hit group"). Its index in
+/// [`SolariHitGroupRegistry`] IS its SBT class (the `material_sbt_class` value):
+/// the pipeline bakes `handle(2 + class)` into each material record. WGSL is held
+/// as `&'static str` (typically `include_str!`) so a downstream crate registers a
+/// hit group — and its `#import bevy_solari::*` chit — without forking.
+#[derive(Clone)]
+pub struct SolariHitGroupDef {
+    pub label: &'static str,
+    /// Closest-hit WGSL source (composed with the registered shader libraries).
+    pub closest_hit_wgsl: &'static str,
+    /// File name for naga error messages / import resolution.
+    pub closest_hit_file: &'static str,
+    /// Closest-hit entry-point function name.
+    pub closest_hit_entry: &'static str,
+    /// Optional any-hit (e.g. alpha cutout), attached to this group.
+    pub any_hit: Option<SolariAnyHitDef>,
+}
+
+/// An any-hit program attached to a [`SolariHitGroupDef`] (alpha cutout, etc.).
+#[derive(Clone)]
+pub struct SolariAnyHitDef {
+    pub wgsl: &'static str,
+    pub file: &'static str,
+    pub entry: &'static str,
+}
+
+/// Ordered registry of RT hit groups, consumed by [`RtPipeline::new`]. Built-in
+/// programs (opaque/glass/hair/portal) are registered by `SolariPlugin`; downstream
+/// crates append their own via [`Self::register`]. Index = SBT class.
+#[derive(bevy_ecs::resource::Resource, Default, Clone)]
+pub struct SolariHitGroupRegistry {
+    pub groups: Vec<SolariHitGroupDef>,
+}
+
+impl SolariHitGroupRegistry {
+    /// Append a hit group; returns its SBT class (its index). Set this on a
+    /// material's routing (`material_sbt_class`) so its instances reach this program.
+    pub fn register(&mut self, group: SolariHitGroupDef) -> u32 {
+        let class = self.groups.len() as u32;
+        self.groups.push(group);
+        class
+    }
+}
+
 /// A raw host-visible buffer kept with its memory + mapping, for the SBT and the
 /// camera UBO (which `Allocator::create_buffer` can't expose — it hides the
 /// `VkDeviceMemory`).
@@ -225,6 +269,7 @@ impl RtPipeline {
         scene_layout: vk::DescriptorSetLayout,
         columns_layout: vk::DescriptorSetLayout,
         material_classes: &[u32],
+        hit_groups: &[SolariHitGroupDef],
     ) -> Option<Self> {
         // One hit record per material slot; `material_classes[slot]` selects the
         // record's hit-group handle (opaque/glass/hair).
@@ -254,9 +299,10 @@ impl RtPipeline {
             .max(1);
 
         // --- Shaders: WGSL -> SPIR-V -> VkShaderModule -------------------------
-        // raygen, miss, and THREE closest-hit programs (opaque / glass / hair) —
-        // one per material class. Separate SBT programs are the multi-material
-        // win: a hit pays only its own shader's register footprint.
+        // Fixed general programs (raygen + the two miss shaders); every closest-hit
+        // ("hit group", + optional any-hit) comes from `hit_groups` (the registry), so
+        // adding a surface shader needs no edit here — Solari's own opaque/glass/hair/
+        // portal register the same way as any downstream material (see SolariPlugin).
         let raygen_mod = create_shader_module(
             &device,
             &compile_rt_wgsl(include_str!("../render/rt_pipeline/raygen.wgsl"), "raygen.wgsl")?,
@@ -265,96 +311,70 @@ impl RtPipeline {
             &device,
             &compile_rt_wgsl(include_str!("../render/rt_pipeline/miss.wgsl"), "miss.wgsl")?,
         )?;
-        let chit_opaque_mod = create_shader_module(
-            &device,
-            &compile_rt_wgsl(include_str!("../render/rt_pipeline/chit_opaque.wgsl"), "chit_opaque.wgsl")?,
-        )?;
-        let chit_glass_mod = create_shader_module(
-            &device,
-            &compile_rt_wgsl(include_str!("../render/rt_pipeline/chit_glass.wgsl"), "chit_glass.wgsl")?,
-        )?;
-        let chit_hair_mod = create_shader_module(
-            &device,
-            &compile_rt_wgsl(include_str!("../render/rt_pipeline/chit_hair.wgsl"), "chit_hair.wgsl")?,
-        )?;
-        // Dedicated shadow miss for NEE visibility rays (miss index 1).
         let miss_shadow_mod = create_shader_module(
             &device,
-            &compile_rt_wgsl(
-                include_str!("../render/rt_pipeline/miss_shadow.wgsl"),
-                "miss_shadow.wgsl",
-            )?,
+            &compile_rt_wgsl(include_str!("../render/rt_pipeline/miss_shadow.wgsl"), "miss_shadow.wgsl")?,
         )?;
-        // Any-hit alpha-cutout test (foliage / fences), attached to the OPAQUE hit
-        // group. Runs only for PTLAS-`FORCE_NO_OPAQUE` (alpha-masked) instances; opaque
-        // geometry commits in hardware and skips it.
-        let ahit_alpha_mod = create_shader_module(
-            &device,
-            &compile_rt_wgsl(
-                include_str!("../render/rt_pipeline/ahit_alpha.wgsl"),
-                "ahit_alpha.wgsl",
-            )?,
-        )?;
-        // Portal closest-hit — teleports rays (no shading); SBT-routed for
-        // portal-flagged materials so its scan/redirect math stays off chit_opaque.
-        let chit_portal_mod = create_shader_module(
-            &device,
-            &compile_rt_wgsl(
-                include_str!("../render/rt_pipeline/chit_portal.wgsl"),
-                "chit_portal.wgsl",
-            )?,
-        )?;
-        // Planet-surface closest-hit (biome albedo from `vertex_custom`); SBT class 4.
-        let chit_planet_mod = create_shader_module(
-            &device,
-            &compile_rt_wgsl(
-                include_str!("../render/rt_pipeline/chit_planet.wgsl"),
-                "chit_planet.wgsl",
-            )?,
-        )?;
-        let modules = vec![
-            raygen_mod,
-            miss_mod,
-            chit_opaque_mod,
-            chit_glass_mod,
-            chit_hair_mod,
-            miss_shadow_mod,
-            ahit_alpha_mod,
-            chit_portal_mod,
-            chit_planet_mod,
-        ];
 
-        // naga emits each entry point under its WGSL function name. Stage 6 is the
-        // alpha-cutout any-hit (referenced by the opaque hit group, no group of its
-        // own); stage 7 is the portal closest-hit.
-        let stages = [
-            shader_stage(vk::ShaderStageFlags::RAYGEN_KHR, raygen_mod, c"raygen"),
-            shader_stage(vk::ShaderStageFlags::MISS_KHR, miss_mod, c"miss_primary"),
-            shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_opaque_mod, c"chit_opaque"),
-            shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_glass_mod, c"chit_glass"),
-            shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_hair_mod, c"chit_hair"),
-            shader_stage(vk::ShaderStageFlags::MISS_KHR, miss_shadow_mod, c"miss_shadow"),
-            shader_stage(vk::ShaderStageFlags::ANY_HIT_KHR, ahit_alpha_mod, c"ahit_alpha"),
-            shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_portal_mod, c"chit_portal"),
-            shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_planet_mod, c"chit_planet"),
+        // Stage table: (flags, module, entry). Fixed stages first (raygen 0, primary
+        // miss 1, shadow miss 2), then each hit group's chit (+ any-hit). Entry names
+        // are `&'static`; CString'd just before pipeline create (kept alive there).
+        let mut modules = vec![raygen_mod, miss_mod, miss_shadow_mod];
+        let mut stage_specs: Vec<(vk::ShaderStageFlags, vk::ShaderModule, &'static str)> = vec![
+            (vk::ShaderStageFlags::RAYGEN_KHR, raygen_mod, "raygen"),
+            (vk::ShaderStageFlags::MISS_KHR, miss_mod, "miss_primary"),
+            (vk::ShaderStageFlags::MISS_KHR, miss_shadow_mod, "miss_shadow"),
         ];
+        // Per hit group: compile chit (+ any-hit), recording their stage indices.
+        let mut hit_group_stages: Vec<(u32, Option<u32>)> = Vec::with_capacity(hit_groups.len());
+        for hg in hit_groups {
+            let chit_mod =
+                create_shader_module(&device, &compile_rt_wgsl(hg.closest_hit_wgsl, hg.closest_hit_file)?)?;
+            let chit_stage = stage_specs.len() as u32;
+            modules.push(chit_mod);
+            stage_specs.push((vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, hg.closest_hit_entry));
+            let any_hit_stage = if let Some(ah) = &hg.any_hit {
+                let ah_mod = create_shader_module(&device, &compile_rt_wgsl(ah.wgsl, ah.file)?)?;
+                let s = stage_specs.len() as u32;
+                modules.push(ah_mod);
+                stage_specs.push((vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, ah.entry));
+                Some(s)
+            } else {
+                None
+            };
+            hit_group_stages.push((chit_stage, any_hit_stage));
+        }
 
-        // Group 0 = raygen, 1 = primary miss (both general); 2/3/4/5/6 = the
-        // opaque/glass/hair/portal/planet triangle hit groups (their order IS the
-        // per-class SBT handle `handle(2 + class)`, class from `material_sbt_class`;
-        // hair class 2 reaches group 4 via a reserved record); 7 = shadow miss (miss
-        // index 1, general). The opaque hit group also carries the alpha-cutout any-hit
-        // (stage 6); chit_portal (stage 7) teleports; chit_planet (stage 8) shades biomes.
-        let groups = [
-            general_group(0),
-            general_group(1),
-            hit_group_with_any_hit(2, 6),
-            hit_group(3),
-            hit_group(4),
-            hit_group(7),
-            hit_group(8),
-            general_group(5),
-        ];
+        // CStrings outlive the stage create-infos (which hold raw ptrs) until create.
+        let entry_cstrings: Vec<std::ffi::CString> = stage_specs
+            .iter()
+            .map(|(_, _, e)| std::ffi::CString::new(*e).expect("shader entry name has interior NUL"))
+            .collect();
+        let stages: Vec<vk::PipelineShaderStageCreateInfo> = stage_specs
+            .iter()
+            .zip(entry_cstrings.iter())
+            .map(|((flags, module, _), name)| shader_stage(*flags, *module, name.as_c_str()))
+            .collect();
+
+        // Groups: raygen (0), primary miss (1), one hit group per registry entry (its
+        // index = its SBT class; class c -> group 2+c -> handle(2+c)), shadow miss LAST.
+        let mut groups = vec![general_group(0), general_group(1)];
+        for (chit, any_hit) in &hit_group_stages {
+            groups.push(match any_hit {
+                Some(a) => hit_group_with_any_hit(*chit, *a),
+                None => hit_group(*chit),
+            });
+        }
+        let shadow_miss_group = groups.len() as u32; // = 2 + hit_groups.len()
+        groups.push(general_group(2)); // shadow miss (miss index 1)
+        let group_count = groups.len() as u32;
+        // The hair hit group's SBT handle index, for the reserved hair record below.
+        let hair_group = hit_groups
+            .iter()
+            .position(|g| g.label == "hair")
+            .map_or(2u32, |i| 2 + i as u32);
+        // Max valid SBT class (registry index); out-of-range material classes fall back.
+        let max_class = (hit_groups.len() as u32).saturating_sub(1);
 
         // --- Descriptor set layout (set 1: output + camera) --------------------
         // TLAS is NOT here — it comes from the scene bind group (set 0). raygen
@@ -496,7 +516,7 @@ impl RtPipeline {
         // reads as the canonical material binding (uniform per record → uniform
         // per warp after SER). Distinct per-material records also give SER a
         // per-material reorder key and a slot for future per-class handles.
-        const GROUP_COUNT: u32 = 8; // raygen, primary miss, opaque, glass, hair, portal, planet, shadow miss
+        // raygen, primary miss, N hit groups (registry), shadow miss — computed above.
         const MISS_COUNT: u64 = 2; // miss index 0 = primary, 1 = shadow
         const HIT_RECORD_DATA: u64 = 4; // bytes of shader-record data (u32 material id)
         const RECORD_HEADROOM: u32 = 64; // absorb a little material growth post-build
@@ -523,23 +543,23 @@ impl RtPipeline {
             vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR,
         )?;
 
-        // SAFETY: pipeline live; handle data sized to GROUP_COUNT * handle_size.
+        // SAFETY: pipeline live; handle data sized to group_count * handle_size.
         let handles = unsafe {
             rt.get_ray_tracing_shader_group_handles(
                 pipeline,
                 0,
-                GROUP_COUNT,
-                (GROUP_COUNT as u64 * handle_size) as usize,
+                group_count,
+                (group_count as u64 * handle_size) as usize,
             )
         }
         .ok()?;
         let handle = |g: usize| &handles[g * handle_size as usize..(g + 1) * handle_size as usize];
         // raygen (group 0), primary miss (group 1 → miss index 0), shadow miss
-        // (group 7 → miss index 1).
+        // (last group → miss index 1).
         for &(g, off) in [
             (0usize, raygen_offset),
             (1usize, miss_offset),
-            (7usize, miss_offset + handle_stride),
+            (shadow_miss_group as usize, miss_offset + handle_stride),
         ]
         .iter()
         {
@@ -567,13 +587,13 @@ impl RtPipeline {
             // the hair closest-hit (group 4); every other record picks its material
             // class handle (headroom / out-of-range → opaque).
             let group_handle = if record == record_capacity as u64 {
-                handle(4)
+                handle(hair_group as usize)
             } else {
                 let class = material_classes
                     .get(record as usize)
                     .copied()
                     .unwrap_or(0)
-                    .min(4);
+                    .min(max_class);
                 handle(2 + class as usize)
             };
             // SAFETY: rec_off + handle_size + 4 within the record.
