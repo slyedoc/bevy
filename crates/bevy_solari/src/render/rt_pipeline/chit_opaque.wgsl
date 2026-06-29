@@ -22,12 +22,15 @@ var<ray_payload> shadow_payload: ShadowPayload;
 // fixed-function triangle intersection writes (u, v); w = 1 - u - v.
 var<hit_attribute> bary: vec2<f32>;
 
+// Camera UBO (set 1, binding 1) — always present in the layout. Used by the
+// displacement-debug view (`camera.frame.w`) regardless of DLSS, and by the DLSS
+// guide writes below; declared unconditionally so a non-DLSS build still compiles.
+@group(1) @binding(1) var<uniform> camera: RtCamera;
 #ifdef SOLARI_DLSS
 // DLSS Ray Reconstruction guide G-buffer (set 1) — written for the primary hit only
 // (chit-direct), indexed by the launch pixel the raygen threads through the payload.
 // Same bindings/packing as raygen's declarations; the camera supplies the view +
 // motion matrices for the depth and motion-vector guides.
-@group(1) @binding(1) var<uniform> camera: RtCamera;
 @group(1) @binding(5) var<storage, read_write> gbuffer_normal_roughness: array<vec4<f32>>;
 @group(1) @binding(6) var<storage, read_write> gbuffer_diffuse: array<vec4<f32>>;
 @group(1) @binding(7) var<storage, read_write> gbuffer_specular: array<vec4<f32>>;
