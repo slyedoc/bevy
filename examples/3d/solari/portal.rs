@@ -72,7 +72,8 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut solari_materials: ResMut<Assets<SolariMaterial>>,
+    mut solari_materials: ResMut<Assets<StandardSolariMaterial>>,
+    portal_class: Res<bevy::solari::SolariMaterialClass<bevy::solari::PortalSurface>>,
 ) {
     // ── Two portals, FACING EACH OTHER ─────────────────────────────────────
     //
@@ -88,10 +89,10 @@ fn setup_scene(
         .with_rotation(Quat::from_rotation_y(-FRAC_PI_2)); // front (+Z) → -X, toward orange
 
     let portal_surface = meshes.add(Plane3d::new(Vec3::Z, Vec2::new(PORTAL_HX, PORTAL_HY)));
-    // Never shaded — rays redirect on hit. The `portal` flag is the only field
-    // that matters.
-    let portal_material = solari_materials.add(SolariMaterial {
-        portal: true,
+    // Never shaded — rays redirect on hit. Route to the built-in `chit_portal` via the
+    // registered `PortalSurface` class (the same mechanism any custom surface uses).
+    let portal_material = solari_materials.add(StandardSolariMaterial {
+        chit_class: portal_class.get(),
         ..default()
     });
 
@@ -261,7 +262,7 @@ fn walk_through_portals(
 
         // The teleport is a camera jump: restart the pathtracer accumulation.
         for mut reset in &mut cameras_reset {
-            reset.0 = true;
+            reset.history = true;
         }
 
         *previous_position = Some(translation);
