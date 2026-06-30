@@ -13,7 +13,8 @@ use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::prelude::*;
 use bevy_ecs::query::Has;
 use bevy_render::extract_resource::ExtractResource;
-use bevy_render::Extract;
+use bevy_render::render_resource::PipelineCache;
+use bevy_render::{Extract, MainWorld};
 use bevy_tasks::ComputeTaskPool;
 use bevy_transform::components::{GlobalTransform, Transform};
 use bevy_utils::Parallel;
@@ -195,6 +196,53 @@ impl crate::ecs_gpu::GpuPresenceColumn for StaticColumn {
     const LABEL: &'static str = "transform.static";
 }
 
+/// First-sight queue for entities **born** static. The change-driven extract excludes
+/// `TransformStatic` at archetype granularity (the per-frame prune), so an entity tagged
+/// *before* its first extract would never scatter its `local`/`parent`/`cell` and render
+/// at the origin. The [`enqueue_static_first_sight`] observer pushes here on tag-add;
+/// [`extract_transform_graph`] does the one-time upload (merged into its single local
+/// write), then [`clear_static_first_sight`] drains the queue — both under the same
+/// cold-start gate, so events accumulate (never lost) until the pipelines compile.
+#[derive(Resource, Default)]
+pub struct StaticFirstSightQueue {
+    entities: Vec<Entity>,
+}
+
+/// Observer: a `TransformStatic` was added → queue the entity for its one-time first-sight
+/// upload (idempotent — re-uploading an already-extracted static writes identical records).
+pub fn enqueue_static_first_sight(
+    add: On<Add, TransformStatic>,
+    mut queue: ResMut<StaticFirstSightQueue>,
+) {
+    queue.entities.push(add.entity);
+}
+
+/// `ExtractSchedule` (gated like the extract, ordered after it): empty the queue the extract
+/// just consumed. The main world is stalled during extract, so no observer can enqueue
+/// between the read and this clear.
+pub fn clear_static_first_sight(mut main_world: ResMut<MainWorld>) {
+    if let Some(mut queue) = main_world.get_resource_mut::<StaticFirstSightQueue>() {
+        queue.entities.clear();
+    }
+}
+
+/// All transform columns' scatter pipelines compiled — the same cold-start gate the macro
+/// puts on [`extract_transform_graph`], reused to hold the queue clear back in lockstep.
+pub fn transform_columns_ready(
+    local: Res<GpuColumn<LocalColumn>>,
+    parent: Res<GpuColumn<ParentColumn>>,
+    no_readback: Res<GpuColumn<NoReadbackColumn>>,
+    entity: Res<GpuColumn<NodeEntityColumn>>,
+    cell: Res<GpuColumn<CellColumn>>,
+    cache: Res<PipelineCache>,
+) -> bool {
+    local.scatter_pipeline_ready(&cache)
+        && parent.scatter_pipeline_ready(&cache)
+        && no_readback.scatter_pipeline_ready(&cache)
+        && entity.scatter_pipeline_ready(&cache)
+        && cell.scatter_pipeline_ready(&cache)
+}
+
 /// Spatial entities whose local transform or parentage changed (or just appeared).
 /// `&GpuSlot<TransformGraph>` in the fetch means only already-slotted entities are
 /// seen — true the same frame, since the assign system runs in `PostUpdate`.
@@ -202,11 +250,10 @@ impl crate::ecs_gpu::GpuPresenceColumn for StaticColumn {
 /// `Without<TransformStatic>` is on the **whole** filter (not a sub-branch), so the
 /// static bulk is excluded at *archetype* granularity — the query never visits
 /// those entities. (Skipping only the tick *reads* didn't help: the cost is the
-/// per-entity visit over 2M, not the comparison.) First sight is covered by
-/// `Changed<Transform>` including `is_added`: an entity is extracted the frame its
-/// `Transform` appears, before [`TransformStatic`] is tagged (tagging lags spawn —
-/// it runs after the mesh converts). A `TransformStatic` added *before* an entity's
-/// first extract would leave it at identity, so tag only post-spawn.
+/// per-entity visit over 2M, not the comparison.) An entity tagged *after* its first
+/// extract was already scattered while still a mover; one tagged *before* (born static)
+/// is caught instead by the [`StaticFirstSightQueue`] path below, so `TransformStatic`
+/// is safe to add at spawn.
 type TransformChangeFilter = (
     With<GlobalTransform>,
     Without<TransformStatic>,
@@ -295,6 +342,18 @@ pub fn extract_transform_graph(
     frame_descendants: Extract<Query<(&Transform, &GpuSlot<TransformGraph>)>>,
     marker_added: Extract<Query<&GpuSlot<TransformGraph>, Added<NoGpuGlobalTransformReadback>>>,
     mut marker_removed: Extract<RemovedComponents<NoGpuGlobalTransformReadback>>,
+    // Born-static first sight: entities the change query skips (archetype prune) get their one
+    // upload here. `static_data` is unfiltered so it can fetch any queued entity by id.
+    static_queue: Extract<Res<StaticFirstSightQueue>>,
+    static_data: Extract<
+        Query<(
+            &Transform,
+            Option<&ChildOf>,
+            Option<&SolariGridCell>,
+            &GpuSlot<TransformGraph>,
+            Has<NoGpuGlobalTransformReadback>,
+        )>,
+    >,
     mut table: ResMut<TransformGraph>,
     local_column: Option<ResMut<GpuColumn<LocalColumn>>>,
     render_device: Res<RenderDevice>,
@@ -420,9 +479,41 @@ pub fn extract_transform_graph(
         }
     }
 
+    // Born-static first sight: entities tagged `TransformStatic` before their first extract are
+    // skipped by the change query (archetype prune), so do their one upload here. Idempotent for
+    // statics tagged late (re-scatters identical records). Merged into the single `local` write.
+    let mut static_local: Vec<u32> = Vec::new();
+    for &entity in &static_queue.entities {
+        let Ok((transform, child_of, grid_cell, slot, no_cpu_global)) = static_data.get(entity)
+        else {
+            continue; // despawned / lost its slot before we ran
+        };
+        let slot = slot.index();
+        push_record(&mut static_local, slot, LocalTRS::from_transform(transform));
+        let cell = match grid_cell {
+            Some(gc) => [gc.cell[0] as i32, gc.cell[1] as i32, gc.cell[2] as i32, 1],
+            None => [0, 0, 0, 0],
+        };
+        push_record(&mut table.cell, slot, cell);
+        push_record(&mut table.no_readback, slot, no_cpu_global as u32);
+        let bits = entity.to_bits();
+        push_record(&mut table.entity, slot, [bits as u32, (bits >> 32) as u32]);
+        let parent = match child_of {
+            Some(child_of) => nodes
+                .get(child_of.parent())
+                .map(GpuSlot::index)
+                .unwrap_or(ROOT_PARENT),
+            None => ROOT_PARENT,
+        };
+        push_record(&mut table.parent, slot, parent);
+    }
+
     let mut parts: Vec<&[u32]> = queues.iter_mut().map(|b| b.local.as_slice()).collect();
     if !frame_subtree.is_empty() {
         parts.push(frame_subtree.as_slice());
+    }
+    if !static_local.is_empty() {
+        parts.push(static_local.as_slice());
     }
     let total: usize = parts.iter().map(|s| s.len()).sum();
     if total > 0 {

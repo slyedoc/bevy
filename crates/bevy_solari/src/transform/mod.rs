@@ -17,8 +17,8 @@ use bevy_ecs::{
 };
 use bevy_math::{Quat, Vec3};
 use bevy_render::{
-    extract_resource::ExtractResourcePlugin, renderer::RenderGraph, Render, RenderApp,
-    RenderStartup, RenderSystems,
+    extract_resource::ExtractResourcePlugin, renderer::RenderGraph, ExtractSchedule, Render,
+    RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_transform::components::{GlobalTransform, Transform};
 use bevy_transform::systems::{propagate_transforms_for, sync_simple_transforms};
@@ -39,9 +39,10 @@ pub use gather::{
     prepare_transform_gather_bind_group, transform_gather_bind_group_layout, TransformGather,
 };
 pub use graph::{
-    extract_transform_graph, CellColumn, CellScalar, LocalColumn, NodeEntityColumn, ParentColumn,
-    SolariFloatingOrigin, SolariFrame, SolariGridCell, StaticColumn, TransformGraph,
-    TransformStatic, TransformTablePlugin, ROOT_PARENT,
+    clear_static_first_sight, enqueue_static_first_sight, extract_transform_graph,
+    transform_columns_ready, CellColumn, CellScalar, LocalColumn, NodeEntityColumn, ParentColumn,
+    SolariFloatingOrigin, SolariFrame, SolariGridCell, StaticColumn, StaticFirstSightQueue,
+    TransformGraph, TransformStatic, TransformTablePlugin, ROOT_PARENT,
 };
 pub use propagate::{
     dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,
@@ -119,6 +120,10 @@ impl Plugin for SolariTransformPlugin {
         // The TransformStatic presence flag (node-slot indexed) the PTLAS fill
         // reads to choose an instance's partition. Observer-fed, zero per-frame cost.
         .add_plugins(GpuPresenceColumnPlugin::<StaticColumn>::default())
+        // Born-static first-sight queue: makes `TransformStatic` safe to add at spawn
+        // (the observer queues it; the extract does the one-time upload, see `graph`).
+        .init_resource::<StaticFirstSightQueue>()
+        .add_observer(enqueue_static_first_sight)
         // Solari's native floating origin (the GPU-table reimplementation of big_space's
         // grid; credited). Default (origin 0, edge 0) = no offset, so non-floating-origin
         // scenes are unaffected. Mirrored to the render world for the propagate pass.
@@ -141,6 +146,14 @@ impl Plugin for SolariTransformPlugin {
             return;
         };
         render_app
+            // Drain the born-static first-sight queue the extract just consumed. Same cold-start
+            // gate as the extract (so events accumulate until pipelines compile), ordered after it.
+            .add_systems(
+                ExtractSchedule,
+                clear_static_first_sight
+                    .after(extract_transform_graph)
+                    .run_if(transform_columns_ready),
+            )
             .add_systems(
                 RenderStartup,
                 (
