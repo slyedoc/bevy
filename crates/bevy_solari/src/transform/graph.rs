@@ -217,6 +217,17 @@ pub fn enqueue_static_first_sight(
     queue.entities.push(add.entity);
 }
 
+/// Observer: a node's slot was assigned (`GpuSlot` added) → queue its one-time first-sight upload.
+/// Main-world observer-fed, so it fires deterministically when the slot lands — unlike the
+/// change-driven extract, which can miss the cross-world `is_added` edge and never upload `local`.
+/// Idempotent with [`enqueue_static_first_sight`] (a born-static node is queued by both).
+pub fn enqueue_node_first_sight(
+    add: On<Add, GpuSlot<TransformGraph>>,
+    mut queue: ResMut<StaticFirstSightQueue>,
+) {
+    queue.entities.push(add.entity);
+}
+
 /// `ExtractSchedule` (gated like the extract, ordered after it): empty the queue the extract
 /// just consumed. The main world is stalled during extract, so no observer can enqueue
 /// between the read and this clear.
@@ -258,6 +269,9 @@ type TransformChangeFilter = (
     With<GlobalTransform>,
     Without<TransformStatic>,
     Or<(
+        // First sight: the slot is inserted via deferred commands, so it can land a frame after
+        // the `Changed<Transform>` edge went stale — key off the slot so the node still uploads.
+        Added<GpuSlot<TransformGraph>>,
         Changed<Transform>,
         Changed<ChildOf>,
         Changed<SolariGridCell>,
@@ -320,7 +334,7 @@ pub fn extract_transform_graph(
                 Ref<Transform>,
                 Option<Ref<ChildOf>>,
                 Option<Ref<SolariGridCell>>,
-                &GpuSlot<TransformGraph>,
+                Ref<GpuSlot<TransformGraph>>,
                 Has<NoGpuGlobalTransformReadback>,
             ),
             TransformChangeFilter,
@@ -363,14 +377,16 @@ pub fn extract_transform_graph(
     members.par_iter().for_each_init(
         || queues.borrow_local_mut(),
         |buf, (entity, transform, child_of, grid_cell, slot, no_cpu_global)| {
+            // First sight = the frame the slot landed; drives the one-time uploads below. Keyed on
+            // the slot (not `transform.is_added()`) so a node whose slot arrives after its
+            // Transform-change edge went stale still uploads exactly once.
+            let first = slot.is_added();
             let slot = slot.index();
-            // Mirror the integer grid cell + presence flag. Scattered at first sight
-            // (so every slot is initialized — absent → all-zero → no offset) and when
-            // `SolariGridCell` changes (`Changed<SolariGridCell>` is in the filter, so a
-            // cell-only change still visits the node). The propagate pass turns this into
-            // `(cell − origin) × cell_edge` per node.
+            // Integer grid cell + presence flag. Pushed at first sight (so every slot is
+            // initialized — absent → all-zero → no offset) and whenever `SolariGridCell`
+            // changes. The propagate pass turns this into `(cell − origin) × cell_edge`.
             let cell_changed = grid_cell.as_ref().is_some_and(Ref::is_changed);
-            if transform.is_added() || cell_changed {
+            if first || cell_changed {
                 // Truncate the (possibly wide) cell to its low 32 bits — the GPU only
                 // needs `(cell − origin)`, which the i32 wraparound subtract recovers
                 // exactly for any renderable near-camera object (see `CellScalar`).
@@ -380,28 +396,23 @@ pub fn extract_transform_graph(
                 };
                 buf.push_cell(slot, cell);
             }
-            // `is_changed()` includes the frame the component was added.
-            if transform.is_changed() {
-                // Raw TRS — the propagate shader builds the matrix (no CPU pack).
+            // Raw TRS — re-pushed whenever the node moves, and once at first sight (so a node
+            // whose Transform-change edge was consumed before its slot existed still uploads).
+            if first || transform.is_changed() {
                 buf.push_local(slot, LocalTRS::from_transform(&transform));
-                // The readback opt-out flag + the owning entity's bits scatter at
-                // first sight only — neither changes over an occupant's lifetime, so
-                // movers never re-send them. A reused slot is "first seen" by its new
-                // occupant (it's `Added`), which scatters the new entity, overwriting
-                // the previous occupant's. Later marker adds/removes are caught by the
-                // dedicated passes below.
-                if transform.is_added() {
-                    buf.push_no_readback(slot, no_cpu_global as u32);
-                    let bits = entity.to_bits();
-                    buf.push_entity(slot, [bits as u32, (bits >> 32) as u32]);
-                }
             }
-            let parent_changed = match &child_of {
-                Some(child_of) => child_of.is_changed(),
-                // A root scatters its `ROOT_PARENT` once, the frame it appears.
-                None => transform.is_added(),
-            };
-            if parent_changed {
+            // Readback opt-out flag + owning-entity bits: first sight only — neither changes
+            // over an occupant's lifetime, so movers never re-send them. A reused slot is
+            // "first seen" by its new occupant (its `GpuSlot` is freshly `Added`), overwriting
+            // the previous occupant's. Later marker adds/removes are caught by the passes below.
+            if first {
+                buf.push_no_readback(slot, no_cpu_global as u32);
+                let bits = entity.to_bits();
+                buf.push_entity(slot, [bits as u32, (bits >> 32) as u32]);
+            }
+            // Parent slot: at first sight and on reparent. Roots (no `ChildOf`) → `ROOT_PARENT`.
+            let parent_changed = child_of.as_ref().is_some_and(Ref::is_changed);
+            if first || parent_changed {
                 let parent = match &child_of {
                     Some(child_of) => nodes
                         .get(child_of.parent())

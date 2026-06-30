@@ -77,6 +77,14 @@ const RECORD_WORDS: u32 = 15;
 /// 131072). A frame whose changed set exceeds it drops the overflow (warning).
 /// Tune to the scene's moving set; count-scoping the transfer is a follow-up.
 const READBACK_CAPACITY: u32 = 131072;
+/// Idle frames to retain a gather's records (keep the count header) after it ran. The transfer
+/// window is sized reactively from the previous delivery's count (see
+/// [`write_readback_global_transforms`]), so a burst landing after a low-count idle — a `.bsn`
+/// spawning all its static parts at once — is delivered through a too-small window and the overflow
+/// dropped. Statics upload `local` once, so a dropped first-sight record would never retry and the
+/// node's `GlobalTransform` stays default forever. Retaining lets the now-grown window re-read the
+/// same records until all are delivered; covers the 1–3 frame readback latency twice over.
+const HEADER_RETAIN_FRAMES: u32 = 8;
 
 /// Opt **out** of `GlobalTransform` readback: this entity's transform is
 /// render-only (lives only on the GPU), so the CPU `GlobalTransform` is never
@@ -119,6 +127,8 @@ pub struct TransformReadback {
     params: bevy_render::render_resource::UniformBuffer<ReadbackParams>,
     bind_group: Option<BindGroup>,
     changed_count: u32,
+    /// Idle frames left to retain the last gather's records (see [`HEADER_RETAIN_FRAMES`]).
+    header_retain: u32,
 }
 
 /// The readback bind-group layout. Owned by
@@ -173,6 +183,7 @@ pub fn init_transform_readback(mut commands: Commands) {
         params,
         bind_group: None,
         changed_count: 0,
+        header_retain: 0,
     });
 }
 
@@ -200,9 +211,23 @@ pub fn prepare_transform_readback(
     };
     readback.params.write_buffer(&render_device, &render_queue);
 
-    // Reset the atomic count header for this frame's atomic-append.
-    if let Some(out) = gpu_buffers.get(&target.buffer) {
-        render_queue.write_buffer(&out.buffer, 0, bytemuck::bytes_of(&0u32));
+    // Reset the atomic count header before a gather that repopulates it; otherwise
+    // RETAIN the last gather's records for a few idle frames so a transfer window that
+    // throttled the burst can re-deliver the dropped first-sight records (see
+    // `HEADER_RETAIN_FRAMES` — statics upload `local` once, so a drop is never retried).
+    let reset_header = if readback.changed_count > 0 {
+        readback.header_retain = HEADER_RETAIN_FRAMES;
+        true
+    } else if readback.header_retain > 0 {
+        readback.header_retain -= 1;
+        false
+    } else {
+        true
+    };
+    if reset_header {
+        if let Some(out) = gpu_buffers.get(&target.buffer) {
+            render_queue.write_buffer(&out.buffer, 0, bytemuck::bytes_of(&0u32));
+        }
     }
 }
 

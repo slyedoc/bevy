@@ -20,6 +20,7 @@ use bevy_render::{
     extract_resource::ExtractResourcePlugin, renderer::RenderGraph, ExtractSchedule, Render,
     RenderApp, RenderStartup, RenderSystems,
 };
+use bevy_ecs::name::{HashedStr, Name};
 use bevy_transform::components::{GlobalTransform, Transform};
 use bevy_transform::systems::{propagate_transforms_for, sync_simple_transforms};
 use bevy_ui::Node;
@@ -39,7 +40,8 @@ pub use gather::{
     prepare_transform_gather_bind_group, transform_gather_bind_group_layout, TransformGather,
 };
 pub use graph::{
-    clear_static_first_sight, enqueue_static_first_sight, extract_transform_graph,
+    clear_static_first_sight, enqueue_node_first_sight, enqueue_static_first_sight,
+    extract_transform_graph,
     transform_columns_ready, CellColumn, CellScalar, LocalColumn, NodeEntityColumn, ParentColumn,
     SolariFloatingOrigin, SolariFrame, SolariGridCell, StaticColumn, StaticFirstSightQueue,
     TransformGraph, TransformStatic, TransformTablePlugin, ROOT_PARENT,
@@ -111,7 +113,13 @@ impl Plugin for SolariTransformPlugin {
         app.register_type::<Transform>()
             .register_type::<GlobalTransform>()
             .register_type::<Vec3>()
-            .register_type::<Quat>();
+            .register_type::<Quat>()
+            // Let dynamic `.bsn` scenes carry a `Name("...")`. `Name(HashedStr)` — register both,
+            // plus a `String -> HashedStr` conversion so the loader builds the field from a string
+            // literal (the same `ReflectConvert` path `Handle<T>` uses for asset-path strings).
+            .register_type::<Name>()
+            .register_type::<HashedStr>()
+            .register_type_conversion::<String, HashedStr, _>(|s| Ok(s.into()));
 
         // The transform pass shaders are embedded centrally in `crate::pipelines`,
         // co-located with their `SolariPipelines` builds.
@@ -124,6 +132,9 @@ impl Plugin for SolariTransformPlugin {
         // (the observer queues it; the extract does the one-time upload, see `graph`).
         .init_resource::<StaticFirstSightQueue>()
         .add_observer(enqueue_static_first_sight)
+        // Reliable first-sight for every node: queue it when its slot is assigned, so the `local`
+        // upload never depends on the extract catching a cross-world change edge.
+        .add_observer(enqueue_node_first_sight)
         // Solari's native floating origin (the GPU-table reimplementation of big_space's
         // grid; credited). Default (origin 0, edge 0) = no offset, so non-floating-origin
         // scenes are unaffected. Mirrored to the render world for the propagate pass.
