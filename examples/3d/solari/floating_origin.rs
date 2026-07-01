@@ -1,42 +1,38 @@
 //! Bevy Solari **native floating origin** — galactic-scale ray tracing without f32
-//! collapse, done entirely in solari's GPU transform table.
+//! collapse, done entirely in solari's GPU transform table via **double-single (`df64`)**
+//! frame worlds.
 //!
-//! The camera sits **1 AU from the grid origin** (the classic floating-origin stress
-//! test). A handful of small reference cubes sit in the camera's own grid cell, and a
-//! glowing "sun" marks the grid origin one AU away. With the floating origin ON, the
-//! near cubes render rock-steady and sub-meter crisp while the sun is a distant glint;
-//! turn it off (don't set [`SolariGridCell`]) and the whole scene collapses toward the
-//! f32 origin and shimmers. Fly toward the sun (WASD) — the world recenters cell by cell
-//! and stays precise the whole way.
+//! The camera sits **1 AU from the world origin** (the classic floating-origin stress
+//! test). A cloud of glowing markers and a set of near reference cubes are placed at their
+//! true `f64` world positions. With the floating origin working, the near cubes render
+//! rock-steady and sub-meter crisp while the far markers streak past as you fly; drop the
+//! [`SolariFrameWorld`] and the whole scene collapses toward the f32 origin and shimmers.
+//! Fly toward the far markers (WASD) — the world stays precise the whole way, with no cells
+//! and no quantized recenter.
 //!
-//! How it works: each body carries an integer [`SolariGridCell`] plus a small local
-//! `Transform`; solari's GPU propagate pass adds `(cell − origin) × cell_edge` to the
-//! node's world (computed with the integer subtraction FIRST, so a 1-AU cell index never
-//! costs near-camera precision). The acceleration structure is therefore built in
-//! camera-cell-relative space — no CPU per-object work, the change-only propagate keeps
-//! static geometry free at steady state. This is the GPU-table reimplementation of
-//! `big_space`'s floating origin (Aevyrie, MIT/Apache — used as the reference algorithm
-//! and credited).
+//! How it works: each body carries a [`SolariFrameWorld`] — its absolute `f64` position,
+//! split into two `f32` lanes (`hi + lo`). Solari's GPU propagate subtracts the **`df64`
+//! origin** (the camera's own world) from each body's `df64` world, so the huge shared
+//! magnitude cancels *before* it reaches the `f32` the acceleration structure is built
+//! from — a metre-scale offset survives even at 1 AU, where a naive `f32` subtract would
+//! round to zero. The camera folds its per-frame motion into a `df64` accumulator and
+//! renders at exactly 0 by construction, so there is no `cell_edge` knob, no `i32` range
+//! ceiling, and no recenter. Successor to the integer-cell floating origin (which was
+//! itself the GPU-table reimplementation of `big_space`, Aevyrie MIT/Apache — credited).
 
 use bevy::{
-    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    camera_controller::free_camera::{run_freecamera_controller, FreeCamera, FreeCameraPlugin},
     dev_tools::render_debug::RenderDebugOverlayPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
-    math::{DVec3, IVec3},
+    math::DVec3,
     pbr::PbrPlugin,
     prelude::*,
     solari::prelude::*,
-    // The floating-origin types live in solari's transform module (not yet in the
-    // prelude); import them explicitly.
-    solari::transform::{SolariFloatingOrigin, SolariGridCell},
 };
 
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy::anti_alias::dlss::DlssProjectId;
 
-/// Metres per grid cell. 1 km cells put 1 AU at cell index ~1.5e8 — comfortably inside
-/// `i32` (≈4 ly is the i32 ceiling at this edge; wider needs the i64 cell column).
-const CELL_EDGE: f32 = 1000.0;
 const AU_M: f64 = 1.496e11;
 
 fn main() {
@@ -61,8 +57,9 @@ fn main() {
             FreeCameraPlugin,
         ))
         .add_systems(Startup, setup)
-        // The camera-follow recenter is built into `SolariTransformPlugin` now — the
-        // example only has to set the initial origin cell + `cell_edge` (see `setup`).
+        // Fold the camera's per-frame motion into its df64 world and point the floating
+        // origin at it (after the free-camera controller has moved the camera this frame).
+        .add_systems(Update, fly_origin.after(run_freecamera_controller))
         .add_systems(
             Update,
             (
@@ -74,33 +71,31 @@ fn main() {
         .run();
 }
 
-/// Split an absolute metre position into `(cell, local)` so `cell × edge + local == pos`,
-/// with `local` kept within half a cell (the floating-origin invariant). The same helper
-/// `big_space::Grid::translation_to_grid` provides.
-fn to_grid(pos: DVec3) -> (IVec3, Vec3) {
-    let edge = CELL_EDGE as f64;
-    let cell = (pos / edge).round();
-    let local = pos - cell * edge;
-    (
-        IVec3::new(cell.x as i32, cell.y as i32, cell.z as i32),
-        local.as_vec3(),
-    )
+/// Fold the camera's per-frame motion into its own `SolariFrameWorld`. `FreeCamera` moved
+/// the camera by `transform.translation` this frame (world space); add that to the camera's
+/// df64 world and re-zero the local transform, so the camera stays at 0. The camera *is* the
+/// origin (the propagate reads `frame_world[camera_slot]` as the df64 origin on the GPU), so
+/// moving its frame world re-expresses every body against it — no cells, no recenter, no
+/// separate origin resource. Only touch it when the camera actually moved, else we'd mark it
+/// Changed every frame and force a full re-walk while stationary.
+fn fly_origin(mut camera: Query<(&mut Transform, &mut SolariFrameWorld), With<SolariCamera>>) {
+    let Ok((mut transform, mut world)) = camera.single_mut() else {
+        return;
+    };
+    if transform.translation != Vec3::ZERO {
+        world.world += transform.translation.as_dvec3();
+        transform.translation = Vec3::ZERO;
+    }
 }
 
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut origin: ResMut<SolariFloatingOrigin>,
 ) {
     // The camera lives 1 AU out along +X — the stress test. Everything is expressed
-    // relative to its cell, so this is the floating origin.
+    // relative to the camera's df64 world (its `SolariFrameWorld`), so this is the origin.
     let camera_pos = DVec3::new(AU_M, 0.0, 0.0);
-    let (camera_cell, camera_local) = to_grid(camera_pos);
-    *origin = SolariFloatingOrigin {
-        origin_cell: [camera_cell.x, camera_cell.y, camera_cell.z],
-        cell_edge: CELL_EDGE,
-    };
 
     // Sunlight from the grid origin toward the camera, plus a faint fill so the cubes'
     // shaded sides aren't pure black.
@@ -139,21 +134,17 @@ fn setup(
         })
     })
     .collect();
-    let spacing = 2; // cells between markers → 2 km
-    for i in -3..=3 {
-        for j in -1..=1 {
-            for k in -3..=3 {
+    let spacing = 2000.0; // metres between markers → 2 km lattice
+    for i in -3i32..=3 {
+        for j in -1i32..=1 {
+            for k in -3i32..=3 {
                 if i == 0 && j == 0 && k == 0 {
-                    continue; // leave the camera's own cell clear
+                    continue; // leave the camera's own spot clear
                 }
-                let cell = IVec3::new(
-                    camera_cell.x + i * spacing,
-                    camera_cell.y + j * spacing,
-                    camera_cell.z + k * spacing,
-                );
+                let pos = camera_pos + DVec3::new(i as f64, j as f64, k as f64) * spacing;
                 let mat = palette[(i + j + k).rem_euclid(palette.len() as i32) as usize].clone();
                 commands.spawn((
-                    SolariGridCell::new(cell.x, cell.y, cell.z),
+                    SolariFrameWorld::new(pos),
                     Mesh3d(marker.clone()),
                     MeshMaterial3d(mat),
                     Transform::IDENTITY,
@@ -162,9 +153,10 @@ fn setup(
         }
     }
 
-    // Near-field reference cubes — in the CAMERA's cell, small local offsets. These are
-    // the precision witnesses: 1 AU from the grid origin, yet they must be crisp and
-    // stationary. A 3×3 grid of 2 m cubes a few metres in front of the camera.
+    // Near-field reference cubes — right next to the camera. These are the precision
+    // witnesses: 1 AU from the world origin, yet they must be crisp and stationary. A 3×3
+    // grid of 2 m cubes a few metres in front of the camera, placed at their true world
+    // position so the df64 subtract resolves them sub-mm.
     let cube = meshes.add(Cuboid::new(2.0, 2.0, 2.0));
     for iy in -1..=1 {
         for iz in -1..=1 {
@@ -174,24 +166,22 @@ fn setup(
                 ..default()
             });
             commands.spawn((
-                SolariGridCell::new(camera_cell.x, camera_cell.y, camera_cell.z),
+                // 12 m in front of the camera (it looks −X), spread across Y/Z.
+                SolariFrameWorld::new(
+                    camera_pos + DVec3::new(-12.0, iy as f64 * 5.0, iz as f64 * 5.0),
+                ),
                 Mesh3d(cube.clone()),
                 MeshMaterial3d(mat),
-                // 12 m in front of the camera (it looks −X), spread across Y/Z. Local
-                // offsets are small (metres), well within a cell.
-                Transform::from_translation(
-                    camera_local + Vec3::new(-12.0, iy as f32 * 5.0, iz as f32 * 5.0),
-                ),
+                Transform::IDENTITY,
             ));
         }
     }
 
-    // The camera, parked at its cell's local position, looking toward the grid origin.
-    // It carries NO `SolariGridCell`: the camera *is* the floating origin, and its cell
-    // lives in `SolariFloatingOrigin`, not on the entity. No transform markers are needed —
-    // solari derives the render view from the GPU transform table (`world[camera_slot]`),
-    // so the camera's CPU `GlobalTransform` never feeds rendering; the recenter reads only
-    // the camera's local `Transform`.
+    // The camera, rendering at the origin (translation 0), looking toward the world origin.
+    // Its `SolariFrameWorld` holds its absolute df64 world and *is* the floating origin — the
+    // propagate reads `frame_world[camera_slot]` as the origin, so the camera renders at 0 (it
+    // subtracts its own world) and [`fly_origin`] folds its motion into that same frame world.
+    // No separate origin resource. Solari derives the render view from the GPU transform table.
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -200,12 +190,12 @@ fn setup(
         },
         Msaa::Off,
         SolariCamera,
-        // Fast enough to fly across cells (1 km each) and watch the world recenter.
+        SolariFrameWorld::new(camera_pos),
         FreeCamera {
             walk_speed: 100.0,
             run_speed: 2000.0,
             ..Default::default()
         },
-        Transform::from_translation(camera_local).looking_to(Vec3::NEG_X, Vec3::Y),
+        Transform::default().looking_to(Vec3::NEG_X, Vec3::Y),
     ));
 }

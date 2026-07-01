@@ -187,7 +187,7 @@ pub mod prelude {
         SolariInitPlugin, SolariPlugin,
         geometry::ClusterMesh,
         transform::{
-            NoGpuGlobalTransformReadback, SolariFloatingOrigin, SolariFrame, SolariGridCell,
+            NoGpuGlobalTransformReadback, SolariFrame, SolariFrameWorld, SolariGpuFrame,
             TransformStatic,
         },
         material::{StandardSolariMaterial, SolariMaterial3d},

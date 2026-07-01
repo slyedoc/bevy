@@ -12,7 +12,7 @@
 use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::prelude::*;
 use bevy_ecs::query::Has;
-use bevy_render::extract_resource::ExtractResource;
+use bevy_math::DVec3;
 use bevy_render::render_resource::PipelineCache;
 use bevy_render::{Extract, MainWorld};
 use bevy_tasks::ComputeTaskPool;
@@ -24,6 +24,7 @@ use bevy_render::renderer::{RenderDevice, RenderQueue};
 
 use crate::ecs_gpu::{push_record, GpuColumn, GpuSlot};
 
+use super::df64::Df64Vec3;
 use super::readback::NoGpuGlobalTransformReadback;
 
 /// Root sentinel in the `parent` column: no parent, so propagation takes
@@ -52,70 +53,40 @@ impl LocalTRS {
     }
 }
 
-/// The integer type each grid-cell axis is stored as — solari's analog of
-/// `big_space`'s `GridPrecision`, selected by cargo feature so the app manages range vs
-/// memory. Default `i32` (~solar-system range at km cells); `grid_i64` / `grid_i128`
-/// extend it. **Only the CPU side widens:** the GPU propagate uses the camera-relative
-/// *low 32 bits* (`(cell − origin)` fits `i32` for any renderable near-camera object, and
-/// the low word of a two's-complement subtraction equals the true difference when it
-/// fits), so a wider scalar costs nothing on the GPU and just raises the absolute range
-/// you can place geometry at.
-#[cfg(all(not(feature = "grid_i64"), not(feature = "grid_i128")))]
-pub type CellScalar = i32;
-#[cfg(all(feature = "grid_i64", not(feature = "grid_i128")))]
-pub type CellScalar = i64;
-#[cfg(feature = "grid_i128")]
-pub type CellScalar = i128;
-
-/// A node's **integer grid cell** — solari's native floating-origin coordinate, the
-/// GPU-table reimplementation of `big_space`'s `CellCoord` (Aevyrie, MIT/Apache; used
-/// as the reference algorithm, credited). A spatial body carries an integer cell here
-/// **plus** a small local `Transform`; its true position is `cell × cell_edge + local`.
-/// solari's GPU propagation adds `(cell − origin_cell) × cell_edge` to this node's world
-/// (see `transform_propagate.wgsl` + [`SolariFloatingOrigin`]), so the acceleration
-/// structure is built in **camera-cell-relative** space — sub-meter precise near the
-/// origin, far-but-finite at AU scale — without ever leaving the GPU transform table
-/// (the per-frame win solari is built on).
+/// A node's **absolute world translation in double-single (`df64`) precision** — solari's
+/// native floating-origin coordinate, the GPU-table successor to `big_space`'s integer
+/// `CellCoord` (Aevyrie, MIT/Apache; used as the reference algorithm, credited). Where a
+/// cell split a large position into `(integer cell, f32 residual)`, this carries the full
+/// `f64` position and the GPU emits the small origin-relative `f32` by subtracting the
+/// origin node's `df64` world — the primary camera's own `SolariFrameWorld`, read on the GPU
+/// (see `transform_propagate.wgsl` + [`SolariOriginSlot`](super::SolariOriginSlot)).
+/// No `cell_edge` knob, no `i32` range ceiling, no recenter — the camera sits at 0 by
+/// construction because the origin *is* its own `df64` world.
 ///
-/// Set it only on leaf spatial bodies (one cell-bearing node per `ChildOf` chain): the
-/// integer `cell − origin` subtraction is exact, but two cell-bearing nodes in one chain
-/// would subtract the origin twice. Absent → the node carries no offset (world = local
-/// composition, exactly as in a scene with no floating origin). Change-detected, so a
-/// static body's cell scatters once and never re-uploads.
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SolariGridCell {
-    /// Integer cell coordinate of the body within its grid (width = [`CellScalar`]).
-    pub cell: [CellScalar; 3],
+/// The value is split into `hi + lo` `f32` lanes on extract ([`Df64Vec3`]) and stored in the
+/// `frame_world` column. Author it on a frame body (a [`SolariFrame`], so its subtree
+/// re-walks when the world moves); rotation/scale still come from the node's `Transform`
+/// (only the translation needs `df64`). A GPU pass may also write this column directly —
+/// e.g. an orbital solver computing a planet's world each frame — instead of this component.
+/// Absent → the node adds no offset (world = local composition), exactly as with no origin.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct SolariFrameWorld {
+    /// Absolute world-space translation of the frame (metres), full `f64` precision.
+    pub world: DVec3,
 }
 
-impl SolariGridCell {
-    /// A cell from raw integer coordinates.
+impl SolariFrameWorld {
+    /// A frame world from an absolute `f64` position.
     #[inline]
-    pub fn new(x: CellScalar, y: CellScalar, z: CellScalar) -> Self {
-        Self { cell: [x, y, z] }
+    pub fn new(world: DVec3) -> Self {
+        Self { world }
     }
-}
 
-/// The floating origin shared with the GPU propagate pass: the cell every node is
-/// expressed relative to (normally the camera's cell) and the grid's metres-per-cell.
-/// Update it each frame (e.g. from the camera's [`SolariGridCell`]); the default
-/// (origin `0`, edge `0`) makes the offset identically zero, so a scene with no floating
-/// origin renders exactly as before. Extracted to the render world. Modelled on
-/// `big_space`'s `LocalFloatingOrigin` + `Grid::cell_edge_length` (credited).
-#[derive(Resource, Clone, Copy, Debug, ExtractResource, PartialEq)]
-pub struct SolariFloatingOrigin {
-    /// The cell every celled node is expressed relative to (width = [`CellScalar`]).
-    pub origin_cell: [CellScalar; 3],
-    /// Metres per cell edge.
-    pub cell_edge: f32,
-}
-
-impl Default for SolariFloatingOrigin {
-    fn default() -> Self {
-        Self {
-            origin_cell: [0; 3],
-            cell_edge: 0.0,
-        }
+    /// The flat `[hi.xyz, lo.xyz, has_frame, pad]` `frame_world` column payload.
+    #[inline]
+    fn to_column(self) -> [f32; 8] {
+        let c = Df64Vec3::from_dvec3(self.world).to_columns();
+        [c[0], c[1], c[2], c[3], c[4], c[5], 1.0, 0.0]
     }
 }
 
@@ -138,19 +109,20 @@ crate::gpu_table! {
             // readback ABA-proof: a recycled slot's new occupant has a different entity,
             // and a despawned occupant's `get_mut` simply fails — no stale splat.
             NodeEntityColumn => entity: [u32; 2] = "transform.entity",
-            // Integer grid cell + presence flag `[cell.x, cell.y, cell.z, has_cell]`,
-            // mirrored from [`SolariGridCell`]. `has_cell == 0` (no component) → the node
-            // adds no floating-origin offset. The propagate shader reads this to apply
-            // `(cell − origin) × cell_edge` during its ancestor walk.
-            CellColumn => cell: [i32; 4] = "transform.cell",
+            // Absolute world translation in double-single precision + presence flag,
+            // `[hi.x, hi.y, hi.z, lo.x, lo.y, lo.z, has_frame, pad]`, mirrored from
+            // [`SolariFrameWorld`] (or written by a GPU pass). `has_frame == 0` (no component)
+            // → the node adds no floating-origin offset. The propagate shader subtracts the
+            // `df64` origin from this to emit the origin-relative `f32` translation.
+            FrameWorldColumn => frame_world: [f32; 8] = "transform.frame_world",
         }
     }
 }
 
 /// A **reference frame**: a parent entity whose own `Transform` (rotation / scale /
-/// translation) plus an optional [`SolariGridCell`] (its big integer offset) defines a
+/// translation) plus an optional [`SolariFrameWorld`] (its big `df64` offset) defines a
 /// coordinate frame that its children are expressed **relative to**. Children carry small
-/// frame-local `Transform`s and **no** cell — the GPU ancestor-walk composes them through
+/// frame-local `Transform`s and **no** frame world — the GPU ancestor-walk composes them through
 /// the frame, so they inherit its orientation and offset for free. This is solari's analog
 /// of `big_space`'s `Grid` (credited): a ship, a station, a planet, a surface tile, or — once
 /// PTLAS partition routing lands — one co-resident *world* (each frame → one PTLAS partition,
@@ -166,11 +138,30 @@ crate::gpu_table! {
 /// frame re-walks its subtree every frame (intrinsic — its geometry *is* moving in origin space).
 ///
 /// Authoring rule: put the big offset / orientation on the **frame**, keep children frame-local
-/// with no [`SolariGridCell`] (one celled node per `ChildOf` chain — two would subtract the
-/// origin twice). Nest frames (planet → tile) to keep each child's frame-local offset small so
-/// the rotation fold stays f32-precise.
+/// with no [`SolariFrameWorld`] (one frame-world node per `ChildOf` chain — two would subtract
+/// the origin twice). Nest frames (planet → tile) to keep each child's frame-local offset small
+/// so the rotation fold stays f32-precise.
 #[derive(Component, Default, Clone, Copy, Debug)]
 pub struct SolariFrame;
+
+/// A **GPU-driven reference frame**: like [`SolariFrame`], but its world is written on the
+/// GPU each frame (into the [`FrameWorldColumn`] — e.g. by an orbital-mechanics compute pass
+/// computing a planet's `df64` world from its elements + time), with **no CPU-side change**.
+///
+/// The change-driven propagate dispatches only nodes whose `local` changed on the CPU, so a
+/// GPU-moved frame — and its whole subtree, which composes through it — would freeze. Tagging
+/// it `SolariGpuFrame` opts the frame **and its descendants** into an **unconditional re-walk
+/// every frame**: the extract seeds the frame itself (so its own `local` lands in the dispatch,
+/// recomputing its origin-relative world from the freshly GPU-written `frame_world`) and walks
+/// its current children (so streamed-in LOD tiles are picked up the frame after they spawn).
+///
+/// Use this **instead of** [`SolariFrame`] when the motion comes from the GPU rather than a CPU
+/// `Transform`. It needs no [`SolariFrameWorld`] component — the GPU writes the column directly —
+/// though authoring one seeds the frame's initial world. Cost is one subtree re-walk per frame,
+/// the same a continuously-spinning [`SolariFrame`] pays; the GPU-native slot-list optimization
+/// (re-dispatch without re-uploading unchanged locals) is a later step.
+#[derive(Component, Default, Clone, Copy, Debug)]
+pub struct SolariGpuFrame;
 
 /// Opt **out** of per-frame transform extraction: this entity's local `Transform`
 /// is scattered to the GPU table **once** (first sight) and then never re-scanned
@@ -244,14 +235,14 @@ pub fn transform_columns_ready(
     parent: Res<GpuColumn<ParentColumn>>,
     no_readback: Res<GpuColumn<NoReadbackColumn>>,
     entity: Res<GpuColumn<NodeEntityColumn>>,
-    cell: Res<GpuColumn<CellColumn>>,
+    frame_world: Res<GpuColumn<FrameWorldColumn>>,
     cache: Res<PipelineCache>,
 ) -> bool {
     local.scatter_pipeline_ready(&cache)
         && parent.scatter_pipeline_ready(&cache)
         && no_readback.scatter_pipeline_ready(&cache)
         && entity.scatter_pipeline_ready(&cache)
-        && cell.scatter_pipeline_ready(&cache)
+        && frame_world.scatter_pipeline_ready(&cache)
 }
 
 /// Spatial entities whose local transform or parentage changed (or just appeared).
@@ -274,7 +265,7 @@ type TransformChangeFilter = (
         Added<GpuSlot<TransformGraph>>,
         Changed<Transform>,
         Changed<ChildOf>,
-        Changed<SolariGridCell>,
+        Changed<SolariFrameWorld>,
     )>,
 );
 
@@ -287,7 +278,7 @@ pub struct TransformDeltaBuf {
     parent: Vec<u32>,
     no_readback: Vec<u32>,
     entity: Vec<u32>,
-    cell: Vec<u32>,
+    frame_world: Vec<u32>,
 }
 
 impl TransformDeltaBuf {
@@ -308,8 +299,8 @@ impl TransformDeltaBuf {
         push_record(&mut self.entity, slot, entity_bits);
     }
     #[inline]
-    fn push_cell(&mut self, slot: u32, cell: [i32; 4]) {
-        push_record(&mut self.cell, slot, cell);
+    fn push_frame_world(&mut self, slot: u32, frame_world: [f32; 8]) {
+        push_record(&mut self.frame_world, slot, frame_world);
     }
 }
 
@@ -333,7 +324,7 @@ pub fn extract_transform_graph(
                 Entity,
                 Ref<Transform>,
                 Option<Ref<ChildOf>>,
-                Option<Ref<SolariGridCell>>,
+                Option<Ref<SolariFrameWorld>>,
                 Ref<GpuSlot<TransformGraph>>,
                 Has<NoGpuGlobalTransformReadback>,
             ),
@@ -347,10 +338,17 @@ pub fn extract_transform_graph(
             Entity,
             (
                 With<SolariFrame>,
-                Or<(Changed<Transform>, Changed<SolariGridCell>, Changed<ChildOf>)>,
+                Or<(
+                    Changed<Transform>,
+                    Changed<SolariFrameWorld>,
+                    Changed<ChildOf>,
+                )>,
             ),
         >,
     >,
+    // GPU-driven frames: re-walked unconditionally every frame (their world is written on
+    // the GPU with no CPU change, so the change filter never dispatches them or their subtree).
+    gpu_frames: Extract<Query<Entity, With<SolariGpuFrame>>>,
     // Hierarchy + per-descendant (local, slot) for the moved-frame subtree re-walk.
     children_q: Extract<Query<&Children>>,
     frame_descendants: Extract<Query<(&Transform, &GpuSlot<TransformGraph>)>>,
@@ -363,7 +361,7 @@ pub fn extract_transform_graph(
         Query<(
             &Transform,
             Option<&ChildOf>,
-            Option<&SolariGridCell>,
+            Option<&SolariFrameWorld>,
             &GpuSlot<TransformGraph>,
             Has<NoGpuGlobalTransformReadback>,
         )>,
@@ -376,29 +374,29 @@ pub fn extract_transform_graph(
 ) {
     members.par_iter().for_each_init(
         || queues.borrow_local_mut(),
-        |buf, (entity, transform, child_of, grid_cell, slot, no_cpu_global)| {
+        |buf, (entity, transform, child_of, frame_world, slot, no_cpu_global)| {
             // First sight = the frame the slot landed; drives the one-time uploads below. Keyed on
             // the slot (not `transform.is_added()`) so a node whose slot arrives after its
             // Transform-change edge went stale still uploads exactly once.
             let first = slot.is_added();
             let slot = slot.index();
-            // Integer grid cell + presence flag. Pushed at first sight (so every slot is
-            // initialized — absent → all-zero → no offset) and whenever `SolariGridCell`
-            // changes. The propagate pass turns this into `(cell − origin) × cell_edge`.
-            let cell_changed = grid_cell.as_ref().is_some_and(Ref::is_changed);
-            if first || cell_changed {
-                // Truncate the (possibly wide) cell to its low 32 bits — the GPU only
-                // needs `(cell − origin)`, which the i32 wraparound subtract recovers
-                // exactly for any renderable near-camera object (see `CellScalar`).
-                let cell = match &grid_cell {
-                    Some(gc) => [gc.cell[0] as i32, gc.cell[1] as i32, gc.cell[2] as i32, 1],
-                    None => [0, 0, 0, 0],
+            // df64 world translation + presence flag. Pushed at first sight (every slot
+            // initialized — absent → all-zero → no offset) and whenever `SolariFrameWorld`
+            // changes. The propagate pass subtracts the df64 origin from this.
+            let frame_world_changed = frame_world.as_ref().is_some_and(Ref::is_changed);
+            if first || frame_world_changed {
+                let fw = match &frame_world {
+                    Some(f) => f.to_column(),
+                    None => [0.0; 8],
                 };
-                buf.push_cell(slot, cell);
+                buf.push_frame_world(slot, fw);
             }
             // Raw TRS — re-pushed whenever the node moves, and once at first sight (so a node
             // whose Transform-change edge was consumed before its slot existed still uploads).
-            if first || transform.is_changed() {
+            // Also re-pushed when only `frame_world` changed: `load_local` ignores a frame's
+            // local translation (it uses the df64 world), but the node must still land in this
+            // frame's dispatch to recompute its origin-relative world.
+            if first || transform.is_changed() || frame_world_changed {
                 buf.push_local(slot, LocalTRS::from_transform(&transform));
             }
             // Readback opt-out flag + owning-entity bits: first sight only — neither changes
@@ -430,7 +428,7 @@ pub fn extract_transform_graph(
         table.parent.append(&mut buf.parent);
         table.no_readback.append(&mut buf.no_readback);
         table.entity.append(&mut buf.entity);
-        table.cell.append(&mut buf.cell);
+        table.frame_world.append(&mut buf.frame_world);
     }
 
     // Readback opt-out flag changes after first sight. Removals first: an entity
@@ -469,12 +467,21 @@ pub fn extract_transform_graph(
     // are few; a continuously spinning frame pays its subtree every frame (the
     // intrinsic cost of geometry that is genuinely moving in origin space).
     let mut frame_subtree: Vec<u32> = Vec::new();
-    if !moved_frames.is_empty() {
+    if !moved_frames.is_empty() || !gpu_frames.is_empty() {
         let mut stack: Vec<Entity> = Vec::new();
+        // CPU-moved frames: the frame's own `local` was already pushed by the par_iter
+        // (its `Transform` changed), so seed only its children — re-walk descendants.
         for frame in &moved_frames {
             if let Ok(children) = children_q.get(frame) {
                 stack.extend(children.iter());
             }
+        }
+        // GPU-driven frames: the frame's world is written on the GPU (frame_world column) with
+        // no CPU `Transform` change, so the par_iter never dispatched it. Seed the frame ITSELF
+        // so the walk pushes its own `local` (dispatching it to recompute its origin-relative
+        // world from the fresh GPU-written frame_world) AND every descendant, every frame.
+        for frame in &gpu_frames {
+            stack.push(frame);
         }
         while let Some(entity) = stack.pop() {
             if let Ok((transform, slot)) = frame_descendants.get(entity) {
@@ -495,17 +502,17 @@ pub fn extract_transform_graph(
     // statics tagged late (re-scatters identical records). Merged into the single `local` write.
     let mut static_local: Vec<u32> = Vec::new();
     for &entity in &static_queue.entities {
-        let Ok((transform, child_of, grid_cell, slot, no_cpu_global)) = static_data.get(entity)
+        let Ok((transform, child_of, frame_world, slot, no_cpu_global)) = static_data.get(entity)
         else {
             continue; // despawned / lost its slot before we ran
         };
         let slot = slot.index();
         push_record(&mut static_local, slot, LocalTRS::from_transform(transform));
-        let cell = match grid_cell {
-            Some(gc) => [gc.cell[0] as i32, gc.cell[1] as i32, gc.cell[2] as i32, 1],
-            None => [0, 0, 0, 0],
+        let fw = match frame_world {
+            Some(f) => f.to_column(),
+            None => [0.0; 8],
         };
-        push_record(&mut table.cell, slot, cell);
+        push_record(&mut table.frame_world, slot, fw);
         push_record(&mut table.no_readback, slot, no_cpu_global as u32);
         let bits = entity.to_bits();
         push_record(&mut table.entity, slot, [bits as u32, (bits >> 32) as u32]);

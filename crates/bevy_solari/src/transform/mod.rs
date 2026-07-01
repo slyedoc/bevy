@@ -10,15 +10,12 @@
 //! drives the rendered scene (movement is fully GPU-side; the CPU only mirrors
 //! the per-frame local/parent deltas).
 
-use bevy_app::{App, Plugin, PostUpdate, Update};
-use bevy_ecs::{
-    prelude::{Query, ResMut, With},
-    schedule::{common_conditions::resource_exists, IntoScheduleConfigs},
-};
+use bevy_app::{App, Plugin, PostUpdate};
+use bevy_ecs::prelude::With;
+use bevy_ecs::schedule::{common_conditions::resource_exists, IntoScheduleConfigs};
 use bevy_math::{Quat, Vec3};
 use bevy_render::{
-    extract_resource::ExtractResourcePlugin, renderer::RenderGraph, ExtractSchedule, Render,
-    RenderApp, RenderStartup, RenderSystems,
+    renderer::RenderGraph, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_ecs::name::{HashedStr, Name};
 use bevy_transform::components::{GlobalTransform, Transform};
@@ -27,13 +24,15 @@ use bevy_ui::Node;
 
 use crate::ecs_gpu::{GpuColumnPrepareSet, GpuPresenceColumnPlugin};
 use crate::pipelines::SolariPipelines;
-use crate::render::{CameraReset, SolariCamera};
 use crate::{SolariClusterSystems, SolariSetup};
 
+mod df64;
 mod gather;
 mod graph;
 mod propagate;
 mod readback;
+
+pub use df64::{Df64, Df64Vec3};
 
 pub use gather::{
     dispatch_transform_gather, init_transform_gather, prepare_transform_gather,
@@ -41,15 +40,14 @@ pub use gather::{
 };
 pub use graph::{
     clear_static_first_sight, enqueue_node_first_sight, enqueue_static_first_sight,
-    extract_transform_graph,
-    transform_columns_ready, CellColumn, CellScalar, LocalColumn, NodeEntityColumn, ParentColumn,
-    SolariFloatingOrigin, SolariFrame, SolariGridCell, StaticColumn, StaticFirstSightQueue,
-    TransformGraph, TransformStatic, TransformTablePlugin, ROOT_PARENT,
+    extract_transform_graph, transform_columns_ready, FrameWorldColumn, LocalColumn,
+    NodeEntityColumn, ParentColumn, SolariFrame, SolariFrameWorld, SolariGpuFrame, StaticColumn,
+    StaticFirstSightQueue, TransformGraph, TransformStatic, TransformTablePlugin, ROOT_PARENT,
 };
 pub use propagate::{
-    dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,
-    prepare_transform_propagate_bind_groups, transform_propagate_bind_group_layout,
-    TransformPropagate,
+    dispatch_transform_propagate, extract_origin_slot, init_transform_propagate,
+    prepare_transform_propagate, prepare_transform_propagate_bind_groups,
+    transform_propagate_bind_group_layout, SolariOriginSlot, TransformPropagate,
 };
 pub use readback::{
     init_transform_readback, transform_readback_bind_group_layout, NoGpuGlobalTransformReadback,
@@ -59,44 +57,6 @@ use readback::{
     build_readback_main, dispatch_transform_readback, prepare_transform_readback,
     prepare_transform_readback_bind_group,
 };
-
-/// Keep the floating origin glued to the [`SolariCamera`]. When the camera's local
-/// `Transform` drifts past half a cell, shift [`SolariFloatingOrigin::origin_cell`] by
-/// the whole cells crossed and wrap the transform back toward the cell centre — the
-/// camera's world position is unchanged, just re-expressed relative to the new origin
-/// cell, keeping its rendered coordinates small (large coords are what make the 1-spp
-/// path tracer jitter and pixelate).
-///
-/// The origin jump re-worlds every instance for one frame (the propagate's
-/// `needs_full_rebuild` latch fires on the origin change), so we pulse a
-/// [`CameraReset::reframe`] — the previous frame's transforms and view-projection
-/// are in the OLD origin cell, so this is a basis rebase, not just a history smear:
-/// motion-vector reprojection is invalid this frame, not merely stale. No-op when no
-/// floating origin is configured (`cell_edge == 0`), so scenes without a floating
-/// origin pay only an early-returning query.
-pub fn recenter_floating_origin(
-    mut origin: ResMut<SolariFloatingOrigin>,
-    mut camera: Query<(&mut Transform, &mut CameraReset), With<SolariCamera>>,
-) {
-    let edge = origin.cell_edge;
-    if edge <= 0.0 {
-        return;
-    }
-    let Ok((mut transform, mut reset)) = camera.single_mut() else {
-        return;
-    };
-    // Whole cells the camera has drifted from its cell centre (round → nearest cell, so
-    // the local stays within ±½ cell; handles multi-cell jumps from a fast camera too).
-    let drift = (transform.translation / edge).round();
-    if drift == Vec3::ZERO {
-        return;
-    }
-    origin.origin_cell[0] += drift.x as i32;
-    origin.origin_cell[1] += drift.y as i32;
-    origin.origin_cell[2] += drift.z as i32;
-    transform.translation -= drift * edge;
-    *reset = CameraReset::reframe();
-}
 
 /// The transform-table plugin: the macro-generated table (`local`/`parent`
 /// columns + component-indexed slots + extract + clear) plus the GPU
@@ -135,15 +95,6 @@ impl Plugin for SolariTransformPlugin {
         // Reliable first-sight for every node: queue it when its slot is assigned, so the `local`
         // upload never depends on the extract catching a cross-world change edge.
         .add_observer(enqueue_node_first_sight)
-        // Solari's native floating origin (the GPU-table reimplementation of big_space's
-        // grid; credited). Default (origin 0, edge 0) = no offset, so non-floating-origin
-        // scenes are unaffected. Mirrored to the render world for the propagate pass.
-        .init_resource::<SolariFloatingOrigin>()
-        .add_plugins(ExtractResourcePlugin::<SolariFloatingOrigin>::default())
-        // Camera-follow recenter: keeps the origin cell glued to the camera so its
-        // rendered coords stay small. Runs in Update (after camera controllers move it),
-        // before the PostUpdate transform sync + the render extract pick up the change.
-        .add_systems(Update, recenter_floating_origin)
         // TODO: handle few few transforms locally, not sending to gpu, might not need anymore
         .add_systems(
             PostUpdate,
@@ -157,6 +108,11 @@ impl Plugin for SolariTransformPlugin {
             return;
         };
         render_app
+            // The floating origin is the primary camera's own transform-table node; this
+            // resource carries its slot to the propagate (which reads `frame_world[slot]` as
+            // the df64 origin on the GPU — no CPU-set origin resource).
+            .init_resource::<SolariOriginSlot>()
+            .add_systems(ExtractSchedule, extract_origin_slot)
             // Drain the born-static first-sight queue the extract just consumed. Same cold-start
             // gate as the extract (so events accumulate until pipelines compile), ordered after it.
             .add_systems(

@@ -39,9 +39,12 @@ use crate::gpu::allocator::{Allocator, SparseBuffer};
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 
-use super::graph::{
-    CellColumn, CellScalar, LocalColumn, ParentColumn, SolariFloatingOrigin, TransformGraph,
-};
+use super::graph::{FrameWorldColumn, LocalColumn, ParentColumn, SolariFrameWorld, TransformGraph};
+use crate::ecs_gpu::GpuSlot;
+use crate::render::SolariCamera;
+use bevy_ecs::change_detection::DetectChanges;
+use bevy_ecs::prelude::{Query, Ref, With};
+use bevy_render::Extract;
 
 const WORKGROUP_SIZE: u32 = 64;
 /// Bytes per node world entry: `mat3x4<f32>` = 48 B, same packing as `Affine3x4`.
@@ -62,15 +65,15 @@ struct PropagateParams {
     record_stride: u32,
     /// 1 → walk every node (id = slot); 0 → walk only `changed[k*stride]`.
     full_rebuild: u32,
-    /// Metres per floating-origin cell edge; `0` → the cell offset is identically zero
-    /// (a scene with no floating origin propagates exactly as before).
-    cell_edge: f32,
-    /// Floating-origin (camera) cell every celled node is expressed relative to; the
-    /// shader adds `(node_cell − origin) × cell_edge` to a node with `has_cell`.
-    origin_x: i32,
-    origin_y: i32,
-    origin_z: i32,
-    _pad: u32,
+    /// Transform-table slot of the origin node (the primary `SolariCamera`). The shader
+    /// reads `frame_world[origin_slot]` as the df64 origin and subtracts it from each
+    /// frame's world — so the origin is the camera's own GPU world, not a CPU-set value.
+    origin_slot: u32,
+    /// 1 = `origin_slot` is a live, in-range node this frame; 0 → no origin subtract (a
+    /// scene with no floating origin, or the camera slot not yet allocated).
+    origin_valid: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// Render-world resource: the persistent world buffer + the ancestor-walk pipeline.
@@ -99,12 +102,10 @@ pub struct TransformPropagate {
     /// UNDEFINED on first residency); [`dispatch_transform_propagate`] records the
     /// clear before the walk, then takes it.
     pending_clear: Option<Range<u64>>,
-    /// Last frame's floating-origin cell. When it changes (a recenter — the camera
-    /// crossed a cell boundary), every node's camera-relative world shifts, so that
-    /// frame latches `needs_full_rebuild` to re-propagate. Between recenters the
-    /// change-only path holds (static nodes keep last frame's world). Full
-    /// [`CellScalar`] width so a recenter is detected even at i64/i128 scale.
-    last_origin: [CellScalar; 3],
+    /// Whether the origin node was live last frame. A false→true transition (the camera's
+    /// slot just landed) forces a full re-walk so every frame picks up the real origin;
+    /// combined with the extracted "origin moved" flag it drives the re-propagate.
+    last_origin_valid: bool,
     params: UniformBuffer<PropagateParams>,
     bind_group: Option<BindGroup>,
 }
@@ -123,7 +124,7 @@ pub fn transform_propagate_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_sized(false, None),           // 2 world (rw, persistent)
                 storage_buffer_read_only_sized(false, None), // 3 changed (delta records)
                 uniform_buffer::<PropagateParams>(false),    // 4 params
-                storage_buffer_read_only_sized(false, None), // 5 cell (i32×4 per node)
+                storage_buffer_read_only_sized(false, None), // 5 frame_world (f32×8 per node)
             ),
         ),
     )
@@ -141,6 +142,42 @@ impl TransformPropagate {
     #[inline]
     pub fn node_count(&self) -> u32 {
         self.node_count
+    }
+}
+
+/// Render-world designation of the **origin node** — the transform-table slot whose
+/// `frame_world` the propagate subtracts from every other frame (the primary
+/// [`SolariCamera`]). The origin is thus the camera's own GPU df64 world, read from the
+/// `frame_world` column in the shader; there is no CPU-set origin. `changed` mirrors the
+/// camera's `Changed<SolariFrameWorld>` so a moved origin re-walks every frame.
+#[derive(Resource, Default)]
+pub struct SolariOriginSlot {
+    /// Transform-table slot of the origin camera (valid only when `valid`).
+    pub slot: u32,
+    /// A `SolariCamera` with a `SolariFrameWorld` and an allocated slot exists this frame.
+    pub valid: bool,
+    /// The origin camera's `SolariFrameWorld` changed this frame (⇒ full re-walk).
+    pub changed: bool,
+}
+
+/// `ExtractSchedule`: point [`SolariOriginSlot`] at the primary [`SolariCamera`]'s
+/// transform-table slot and note whether its `SolariFrameWorld` moved. A camera with no
+/// `SolariFrameWorld` (a scene with no floating origin) leaves the origin invalid → no
+/// subtract. Mirrors `render/rt_pipeline`'s `extract_rt_camera_slot`, but the origin is a
+/// single global node (the propagate is one pass over the shared world buffer).
+pub fn extract_origin_slot(
+    mut origin: ResMut<SolariOriginSlot>,
+    cameras: Extract<
+        Query<(&GpuSlot<TransformGraph>, Ref<SolariFrameWorld>), With<SolariCamera>>,
+    >,
+) {
+    if let Some((slot, frame_world)) = cameras.iter().next() {
+        origin.slot = slot.index();
+        origin.valid = true;
+        origin.changed = frame_world.is_changed();
+    } else {
+        origin.valid = false;
+        origin.changed = false;
     }
 }
 
@@ -178,7 +215,7 @@ pub fn init_transform_propagate(
         // appeared during warmup, then it stays clear (see the field docs).
         needs_full_rebuild: true,
         pending_clear: None,
-        last_origin: [0; 3],
+        last_origin_valid: false,
         params,
         bind_group: None,
     });
@@ -192,7 +229,7 @@ pub fn prepare_transform_propagate(
     mut propagate: Option<ResMut<TransformPropagate>>,
     graph: Option<Res<TransformGraph>>,
     local: Option<Res<GpuColumn<LocalColumn>>>,
-    origin: Option<Res<SolariFloatingOrigin>>,
+    origin: Option<Res<SolariOriginSlot>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
@@ -201,16 +238,17 @@ pub fn prepare_transform_propagate(
         return;
     };
 
-    // Floating-origin offset. Default (origin `0`, edge `0`) → no offset, so a
-    // non-floating-origin scene is byte-identical. A recenter (origin cell changed)
-    // shifts every node's camera-relative world that frame, so force a full
-    // re-propagate via the cold-start latch; between recenters the change-only path
-    // holds (movers re-walk with the stable origin; static nodes keep their world).
-    let origin = origin.map(|o| *o).unwrap_or_default();
-    if origin.origin_cell != propagate.last_origin {
+    // Floating-origin: the origin is the camera node's own `frame_world` (read on the GPU),
+    // so the CPU only supplies its slot + a "moved" flag. A non-floating-origin scene has no
+    // origin camera (invalid) → no subtract, byte-identical. The origin's frame world moving,
+    // or the camera slot just landing, shifts every frame's origin-relative world → force a
+    // full re-walk that frame; between changes the change-only path holds.
+    let origin = origin.map(|o| (o.slot, o.valid, o.changed)).unwrap_or((0, false, false));
+    let (origin_slot, origin_valid, origin_changed) = origin;
+    if (origin_valid && origin_changed) || (origin_valid && !propagate.last_origin_valid) {
         propagate.needs_full_rebuild = true;
-        propagate.last_origin = origin.origin_cell;
     }
+    propagate.last_origin_valid = origin_valid;
     propagate.node_count = graph.high_water();
     let high_water = propagate.node_count.max(1);
 
@@ -242,12 +280,10 @@ pub fn prepare_transform_propagate(
         count: propagate.dispatch_count,
         record_stride: local.record_stride(),
         full_rebuild: full_rebuild as u32,
-        cell_edge: origin.cell_edge,
-        // Low 32 bits — the GPU subtracts in i32, exact for the renderable delta.
-        origin_x: origin.origin_cell[0] as i32,
-        origin_y: origin.origin_cell[1] as i32,
-        origin_z: origin.origin_cell[2] as i32,
-        _pad: 0,
+        origin_slot,
+        origin_valid: origin_valid as u32,
+        _pad1: 0,
+        _pad2: 0,
     };
     propagate.params.write_buffer(&render_device, &render_queue);
 }
@@ -260,13 +296,17 @@ pub fn prepare_transform_propagate_bind_groups(
     resource_manager: Option<Res<SolariResourceManager>>,
     local: Option<Res<GpuColumn<LocalColumn>>>,
     parent: Option<Res<GpuColumn<ParentColumn>>>,
-    cell: Option<Res<GpuColumn<CellColumn>>>,
+    frame_world: Option<Res<GpuColumn<FrameWorldColumn>>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
-    let (Some(propagate), Some(resource_manager), Some(local), Some(parent), Some(cell)) =
-        (propagate.as_deref_mut(), resource_manager, local, parent, cell)
-    else {
+    let (Some(propagate), Some(resource_manager), Some(local), Some(parent), Some(frame_world)) = (
+        propagate.as_deref_mut(),
+        resource_manager,
+        local,
+        parent,
+        frame_world,
+    ) else {
         return;
     };
     let layout = pipeline_cache.get_bind_group_layout(&resource_manager.transform_propagate);
@@ -287,7 +327,7 @@ pub fn prepare_transform_propagate_bind_groups(
             propagate.world.buffer().as_entire_binding(),
             changed.as_entire_binding(),
             params,
-            cell.buffer().as_entire_binding(),
+            frame_world.buffer().as_entire_binding(),
         )),
     );
     propagate.bind_group = Some(bind_group);

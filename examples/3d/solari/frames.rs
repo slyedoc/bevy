@@ -15,14 +15,16 @@
 //! foundation for co-resident multi-world (each frame → one PTLAS partition): a ship, a
 //! station, or a spinning planet whose surface tiles ride the frame.
 //!
-//! A floating origin is configured too (the station is one cell out), so the frame model
-//! and the cell offset compose: the frame's big offset is integer-exact while its rotation
-//! folds into the children's per-instance matrices on the free walk.
+//! A floating origin is configured too (the station sits 1 AU out), so the frame model and
+//! the df64 offset compose: the frame's big world is carried in double-single precision and
+//! subtracted against the camera origin, while its rotation folds into the children's
+//! per-instance matrices on the free walk.
 
 use bevy::{
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     dev_tools::render_debug::RenderDebugOverlayPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
+    math::DVec3,
     pbr::PbrPlugin,
     prelude::*,
     solari::prelude::*,
@@ -31,8 +33,7 @@ use bevy::{
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy::anti_alias::dlss::DlssProjectId;
 
-/// Metres per grid cell — matches the floating-origin example.
-const CELL_EDGE: f32 = 1000.0;
+const AU_M: f64 = 1.496e11;
 
 /// Marks the spinning station's frame entity so the `spin_station` system can find it.
 #[derive(Component)]
@@ -83,15 +84,13 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut origin: ResMut<SolariFloatingOrigin>,
 ) {
-    // Put the camera's cell at the origin and use km cells. The station sits one cell
-    // (+X) away, so the frame's big offset rides the integer cell path while its spin
-    // rides the per-instance matrices.
-    *origin = SolariFloatingOrigin {
-        origin_cell: [0, 0, 0],
-        cell_edge: CELL_EDGE,
-    };
+    // The station sits 1 AU out along +X; the camera 25 m short of it, looking at it. The
+    // camera *is* the floating origin — its `SolariFrameWorld` (below) is the df64 world the
+    // propagate subtracts from every frame, so the station's ~1 AU offset stays crisp while
+    // its spin rides the per-instance matrices.
+    let station_pos = DVec3::new(AU_M, 0.0, 0.0);
+    let camera_pos = station_pos + DVec3::new(-25.0, 0.0, 0.0);
 
     // Key light.
     commands.spawn((
@@ -124,8 +123,8 @@ fn setup(
         .spawn((
             Station,
             SolariFrame,
-            // The frame's big offset (one cell out) + its initial orientation.
-            SolariGridCell::new(1, 0, 0),
+            // The frame's big df64 world (1 AU out) + its initial orientation.
+            SolariFrameWorld::new(station_pos),
             Transform::IDENTITY,
         ))
         .with_children(|frame| {
@@ -167,14 +166,16 @@ fn setup(
     });
     for i in -2..=2 {
         commands.spawn((
-            SolariGridCell::new(1, 0, 0),
+            SolariFrameWorld::new(station_pos),
             Mesh3d(post_mesh.clone()),
             MeshMaterial3d(post_mat.clone()),
             Transform::from_xyz(0.0, -4.0, i as f32 * 6.0),
         ));
     }
 
-    // Camera in cell 0, looking toward the station one cell away (+X).
+    // Camera: the floating origin itself. Its `SolariFrameWorld` is the df64 world the
+    // propagate reads as the origin, so it renders at 0 (subtracts its own world) and the
+    // station appears 25 m ahead (+X). It flies via its local `Transform` within that origin.
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -183,12 +184,12 @@ fn setup(
         },
         Msaa::Off,
         SolariCamera,
+        SolariFrameWorld::new(camera_pos),
         FreeCamera {
             walk_speed: 100.0,
             run_speed: 2000.0,
             ..Default::default()
         },
-        // 25 m back from the cell boundary toward the camera's own cell, looking at +X.
-        Transform::from_xyz(CELL_EDGE - 25.0, 0.0, 0.0).looking_to(Vec3::X, Vec3::Y),
+        Transform::default().looking_to(Vec3::X, Vec3::Y),
     ));
 }

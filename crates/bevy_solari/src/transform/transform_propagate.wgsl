@@ -32,13 +32,12 @@ struct PropagateParams {
     // 1 → node = thread id (walk every node, e.g. after a growth); 0 → node =
     // `changed[k * record_stride]` (walk only this frame's changed nodes).
     full_rebuild: u32,
-    // Metres per floating-origin cell edge; 0 → the cell offset is identically zero.
-    cell_edge: f32,
-    // Floating-origin (camera) cell every celled node is expressed relative to.
-    origin_x: i32,
-    origin_y: i32,
-    origin_z: i32,
-    _pad: u32,
+    // Transform-table slot of the origin node (the primary camera). `frame_world[origin_slot]`
+    // is the df64 origin subtracted from every frame's world. origin_valid == 0 → no subtract.
+    origin_slot: u32,
+    origin_valid: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 const ROOT_PARENT: u32 = 0xffffffffu;
@@ -50,7 +49,16 @@ const MAX_DEPTH: u32 = 64u;
 @group(0) @binding(2) var<storage, read_write> world: array<vec4<f32>>;  // 3 per node (persistent)
 @group(0) @binding(3) var<storage, read> changed: array<u32>;            // [slot, words…] per record
 @group(0) @binding(4) var<uniform> params: PropagateParams;
-@group(0) @binding(5) var<storage, read> cell: array<i32>;               // 4 per node: [x, y, z, has_cell]
+@group(0) @binding(5) var<storage, read> frame_world: array<f32>;        // 8 per node: [hi.xyz, lo.xyz, has_frame, pad]
+
+// df64 origin-relative render translation — MUST match `Df64Vec3::sub_to_f32` in
+// df64.rs: (hi − hi) + (lo − lo). The hi subtraction is exact when the frame is near
+// the origin (Sterbenz); the lo term restores the sub-ulp part. Inlined here (the
+// transform shaders avoid naga_oil imports); see `transform/df64.wgsl` for the full
+// primitive set used by the frame-compose / orbital passes.
+fn df3_sub_to_f32(self_hi: vec3<f32>, self_lo: vec3<f32>, o_hi: vec3<f32>, o_lo: vec3<f32>) -> vec3<f32> {
+    return (self_hi - o_hi) + (self_lo - o_lo);
+}
 
 // One row of `A ∘ B`: A's row `ar` (.xyz linear, .w translation) times B's linear
 // columns `bc{0,1,2}` and translation `bt`.
@@ -69,21 +77,23 @@ fn load_local(node: u32) -> Mat3x4 {
     let qx = local[b + 3u]; let qy = local[b + 4u]; let qz = local[b + 5u]; let qw = local[b + 6u];
     let s = vec3<f32>(local[b + 7u], local[b + 8u], local[b + 9u]);
 
-    // Floating-origin offset: a celled node (has_cell != 0) is shifted into
-    // camera-cell-relative space by (cell − origin) × cell_edge. The subtraction is
-    // done in INTEGERS first — a body 1 AU out has a huge cell index, but (cell − origin)
-    // is small, so the f32 we scale by cell_edge stays sub-meter precise (computing
-    // cell·edge − origin·edge in f32 would catastrophically cancel). A non-celled node
-    // (no SolariGridCell) adds nothing and inherits its celled ancestor's offset through
-    // the composition in `propagate`. Single grid only (one celled node per chain).
-    let cb = node * 4u;
-    if cell[cb + 3u] != 0 {
-        let d = vec3<f32>(
-            f32(cell[cb] - params.origin_x),
-            f32(cell[cb + 1u] - params.origin_y),
-            f32(cell[cb + 2u] - params.origin_z),
-        );
-        t = t + d * params.cell_edge;
+    // Floating-origin offset: a `has_frame` node's world is its absolute df64 position minus
+    // the df64 origin — which is the origin node's own `frame_world[origin_slot]` (the camera),
+    // read straight from the column, so the origin is the camera's GPU world with no CPU value.
+    // The subtract cancels the huge shared magnitude before it reaches f32 — a metre-scale
+    // offset survives even at AU scale, where a naive f32 subtract would round to zero. The
+    // origin node itself (node == origin_slot) resolves to 0 (it subtracts its own world), so
+    // the camera renders at 0 by construction. Rotation/scale still come from the local TRS;
+    // only the translation is offset. A node with no `SolariFrameWorld` (has_frame == 0) adds
+    // nothing and inherits its frame ancestor's offset through the composition (one per chain).
+    let fb = node * 8u;
+    if frame_world[fb + 6u] != 0.0 && params.origin_valid != 0u {
+        let f_hi = vec3<f32>(frame_world[fb], frame_world[fb + 1u], frame_world[fb + 2u]);
+        let f_lo = vec3<f32>(frame_world[fb + 3u], frame_world[fb + 4u], frame_world[fb + 5u]);
+        let ob = params.origin_slot * 8u;
+        let o_hi = vec3<f32>(frame_world[ob], frame_world[ob + 1u], frame_world[ob + 2u]);
+        let o_lo = vec3<f32>(frame_world[ob + 3u], frame_world[ob + 4u], frame_world[ob + 5u]);
+        t = t + df3_sub_to_f32(f_hi, f_lo, o_hi, o_lo);
     }
 
     let xx = qx * qx; let yy = qy * qy; let zz = qz * qz;

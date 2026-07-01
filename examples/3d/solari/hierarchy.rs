@@ -14,39 +14,35 @@
 //!
 //! **The floating-origin twist:** the whole scene sits ~1 AU (1.5×10⁸ m) from the grid
 //! origin — far past where f32 world coordinates hold sub-metre precision. The big offset
-//! rides an integer [`SolariGridCell`] on the **root frame** (subtracted against the
-//! camera's origin cell *before* the f32 fold), while the frame's spin and the children's
+//! rides a double-single [`SolariFrameWorld`] on the **root frame** (subtracted against the
+//! camera origin in df64 *before* the f32 fold), while the frame's spin and the children's
 //! frame-local offsets stay small and precise. With it working, the cubes render rock-steady
 //! and crisp at 1 AU; the nested motion is identical to the near-origin version. Turn the
-//! cells off (drop `SolariGridCell` / the origin) and the whole scene collapses toward the
-//! f32 origin and shimmers.
+//! frame worlds off (drop `SolariFrameWorld` / the origin) and the whole scene collapses
+//! toward the f32 origin and shimmers.
 //!
 //! How it works: `TransformPlugin` is disabled, so there is no CPU `GlobalTransform` — solari's
 //! change-driven propagate composes worlds on the GPU. That pass re-walks only nodes whose own
 //! local changed, so a moving parent would leave a static-local child stale; tagging the
 //! spinning **root** [`SolariFrame`] opts its whole subtree (arms, hands, *and* the static
-//! fingers) into a re-walk each frame it moves. The floating origin is `big_space`'s algorithm (Aevyrie,
-//! MIT/Apache — credited) reimplemented in the GPU table. It just loops — nothing is despawned.
+//! fingers) into a re-walk each frame it moves. The floating origin is the df64 successor to
+//! `big_space` (Aevyrie, MIT/Apache — credited). It just loops — nothing is despawned.
 
 use bevy::{
     camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     dev_tools::render_debug::RenderDebugOverlayPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
-    math::{DVec3, IVec3},
+    math::DVec3,
     pbr::PbrPlugin,
     prelude::*,
     render::render_resource::TextureUsages,
     solari::prelude::*,
-    solari::transform::{SolariFloatingOrigin, SolariGridCell},
 };
 
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy::anti_alias::dlss::DlssProjectId;
 
-/// Metres per grid cell — matches the floating-origin/frames examples (1 km cells put 1 AU
-/// at cell index ~1.5e8, comfortably inside `i32`).
-const CELL_EDGE: f32 = 1000.0;
 const AU_M: f64 = 1.496e11;
 
 /// The spinning parent at the top of the hierarchy.
@@ -84,8 +80,6 @@ fn main() {
             FreeCameraPlugin,
         ))
         .add_systems(Startup, setup)
-        // The camera-follow recenter is built into `SolariTransformPlugin`; `setup` only
-        // seeds the initial origin cell + `cell_edge`.
         .add_systems(
             Update,
             (
@@ -98,19 +92,6 @@ fn main() {
                 .chain(),
         )
         .run();
-}
-
-/// Split an absolute metre position into `(cell, local)` so `cell × edge + local == pos`,
-/// with `local` kept within half a cell (the floating-origin invariant). Mirrors
-/// `big_space::Grid::translation_to_grid`.
-fn to_grid(pos: DVec3) -> (IVec3, Vec3) {
-    let edge = CELL_EDGE as f64;
-    let cell = (pos / edge).round();
-    let local = pos - cell * edge;
-    (
-        IVec3::new(cell.x as i32, cell.y as i32, cell.z as i32),
-        local.as_vec3(),
-    )
 }
 
 /// Rotate the root. It's a [`SolariFrame`], so its whole subtree — the arms and their
@@ -141,17 +122,14 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut origin: ResMut<SolariFloatingOrigin>,
 ) {
-    // Everything lives ~1 AU out along +X. The camera *is* the floating origin, so its cell
-    // seeds `SolariFloatingOrigin`; the scene sits in that same cell neighbourhood and its
-    // big offset is removed by the integer cell subtraction before the f32 fold.
+    // Everything lives ~1 AU out along +X. The camera *is* the floating origin: its
+    // `SolariFrameWorld` (below) is the df64 world the propagate subtracts, so the camera
+    // renders at 0 and the scene sits just ahead of it, its big df64 world removed before the
+    // f32 fold. `cam_offset` is the camera's world-space offset from the scene root.
     let scene_pos = DVec3::new(AU_M, 0.0, 0.0);
-    let (cell, local) = to_grid(scene_pos);
-    *origin = SolariFloatingOrigin {
-        origin_cell: [cell.x, cell.y, cell.z],
-        cell_edge: CELL_EDGE,
-    };
+    let cam_offset = Vec3::new(0.0, 4.0, 16.0);
+    let camera_pos = scene_pos + cam_offset.as_dvec3();
 
     // Key light (directional — no position, so unaffected by the origin).
     commands.spawn((
@@ -191,19 +169,19 @@ fn setup(
         ..default()
     });
 
-    // ── The hierarchy: root → arm → hand. The ROOT carries the big offset — its integer
-    // `SolariGridCell` (1 AU out) *and* the `SolariFrame` tag that re-walks the whole subtree
-    // each spin. Children stay frame-local with NO cell (one celled node per ChildOf chain —
-    // a second would subtract the origin twice). Local `Transform`s are cell-relative, so add
-    // `local` (the cell-local scene position) to place them within the cell. ──
+    // ── The hierarchy: root → arm → hand. The ROOT carries the big offset — its df64
+    // `SolariFrameWorld` (1 AU out) *and* the `SolariFrame` tag that re-walks the whole
+    // subtree each spin. Children stay frame-local with NO frame world (one frame node per
+    // ChildOf chain — a second would subtract the origin twice); their `Transform`s are the
+    // small frame-local detail. ──
     commands
         .spawn((
             Root,
             SolariFrame,
-            SolariGridCell::new(cell.x, cell.y, cell.z),
+            SolariFrameWorld::new(scene_pos),
             Mesh3d(root_mesh),
             MeshMaterial3d(root_mat),
-            Transform::from_translation(local + Vec3::new(0.0, 1.0, 0.0)),
+            Transform::from_xyz(0.0, 1.0, 0.0),
         ))
         .with_children(|root| {
             // Two arms, on opposite sides of the root. Frame-local offsets, no cell.
@@ -238,7 +216,7 @@ fn setup(
         });
 
     // ── Static reference posts: NOT parented to the root — the fixed-world backdrop the
-    // hierarchy turns against. Each is its own ChildOf chain, so each carries the cell. ──
+    // hierarchy turns against. Each is its own ChildOf chain, so each carries the frame world. ──
     let post_mesh = meshes.add(Cuboid::new(0.6, 3.0, 0.6));
     let post_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(0.5, 0.55, 0.6),
@@ -247,10 +225,10 @@ fn setup(
     });
     for i in -2..=2 {
         commands.spawn((
-            SolariGridCell::new(cell.x, cell.y, cell.z),
+            SolariFrameWorld::new(scene_pos),
             Mesh3d(post_mesh.clone()),
             MeshMaterial3d(post_mat.clone()),
-            Transform::from_translation(local + Vec3::new(i as f32 * 3.0, -1.5, -8.0)),
+            Transform::from_xyz(i as f32 * 3.0, -1.5, -8.0),
         ));
     }
 
@@ -262,16 +240,16 @@ fn setup(
         ..default()
     });
     commands.spawn((
-        SolariGridCell::new(cell.x, cell.y, cell.z),
+        SolariFrameWorld::new(scene_pos),
         Mesh3d(floor_mesh),
         MeshMaterial3d(floor_mat),
-        Transform::from_translation(local + Vec3::new(0.0, -3.0, 0.0)),
+        Transform::from_xyz(0.0, -3.0, 0.0),
     ));
 
-    // Camera: the floating origin itself, so it carries NO `SolariGridCell` (its cell lives
-    // in `SolariFloatingOrigin`) and no transform markers — solari derives the render view
-    // from the GPU transform table, and the recenter reads only its local `Transform`. It
-    // sits in the scene's cell, looking at the root.
+    // Camera: the floating origin itself. Its `SolariFrameWorld` is the df64 world the
+    // propagate reads as the origin, so it renders at 0 (subtracts its own world) — solari
+    // derives the render view from the GPU transform table. It looks at the root, whose
+    // origin-relative position is `−cam_offset` plus the root's frame-local `(0, 1, 0)`.
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -281,12 +259,12 @@ fn setup(
         CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
+        SolariFrameWorld::new(camera_pos),
         FreeCamera {
             walk_speed: 20.0,
             run_speed: 2000.0,
             ..default()
         },
-        Transform::from_translation(local + Vec3::new(0.0, 4.0, 16.0))
-            .looking_at(local + Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
+        Transform::default().looking_at(Vec3::new(0.0, 1.0, 0.0) - cam_offset, Vec3::Y),
     ));
 }
