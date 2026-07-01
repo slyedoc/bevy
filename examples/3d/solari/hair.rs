@@ -15,7 +15,6 @@
 //! logged), and the rest of the scene renders normally.
 
 use bevy::{
-    camera::CameraMainTextureUsages,
     camera::{Exposure, Hdr},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin, FreeCameraState},
     ecs::VariantDefaults,
@@ -29,7 +28,6 @@ use bevy::{
         FeathersPlugins,
     },
     prelude::*,
-    render::render_resource::TextureUsages,
     solari::{
         hair::{hair_absorption_to_color, melanin_absorption},
         prelude::*,
@@ -345,7 +343,6 @@ fn setup_camera_and_light(mut commands: Commands) {
         // the FreeCamera (WASD + mouse) to reframe.
         Transform::from_translation(Vec3::new(0.0, 60.0, 250.0))
             .looking_at(Vec3::new(0.0, 55.0, 0.0), Vec3::Y),
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         Exposure::OVERCAST,
         Hdr,

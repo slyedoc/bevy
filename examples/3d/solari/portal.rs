@@ -12,14 +12,12 @@
 //! transform the rays use, so the view is seamless across the crossing.
 
 use bevy::{
-    camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin, FreeCameraState},
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
     diagnostic::FrameTimeDiagnosticsPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     math::Affine3A,
     prelude::*,
-    render::render_resource::TextureUsages,
     solari::prelude::*,
 };
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -200,7 +198,6 @@ fn setup_scene(
             ..Default::default()
         },
         Transform::from_xyz(0.0, 2.0, 3.0).looking_at(Vec3::new(0.0, 1.2, -5.0), Vec3::Y),
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
         SolariAtmosphere::default(),

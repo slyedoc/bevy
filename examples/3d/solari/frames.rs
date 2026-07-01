@@ -20,13 +20,11 @@
 //! folds into the children's per-instance matrices on the free walk.
 
 use bevy::{
-    camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     dev_tools::render_debug::RenderDebugOverlayPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     pbr::PbrPlugin,
     prelude::*,
-    render::render_resource::TextureUsages,
     solari::prelude::*,
 };
 
@@ -178,13 +176,11 @@ fn setup(
 
     // Camera in cell 0, looking toward the station one cell away (+X).
     commands.spawn((
-        NoGpuGlobalTransformReadback,
         Camera3d::default(),
         Camera {
             clear_color: ClearColorConfig::Custom(Color::BLACK),
             ..default()
         },
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
         FreeCamera {

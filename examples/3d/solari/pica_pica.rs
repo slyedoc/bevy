@@ -9,14 +9,13 @@
 //! - `Shift+Tab` — previous view.
 
 use bevy::{
-    camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
     diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     gltf::GltfMaterialName,
     prelude::*,
-    render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
+    render::diagnostic::RenderDiagnosticsPlugin,
     solari::prelude::*,
     world_serialization::WorldInstanceReady,
 };
@@ -139,7 +138,6 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         Transform::from_translation(Vec3::new(0.219417, 2.5764852, 6.9718704)).with_rotation(
             Quat::from_xyzw(-0.1466768, 0.013738206, 0.002037309, 0.989087),
         ),
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
     ));

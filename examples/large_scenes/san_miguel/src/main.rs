@@ -50,12 +50,7 @@ use mipmap_generator::{
 };
 
 #[cfg(feature = "solari")]
-use bevy::{
-    camera::CameraMainTextureUsages,
-    light::cluster::ClusterConfig,
-    render::render_resource::TextureUsages,
-    solari::prelude::*,
-};
+use bevy::solari::prelude::*;
 
 use crate::light_consts::lux;
 
@@ -577,7 +572,7 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
 
     // Under solari the camera is driven by the ray tracer: no raster transmission /
     // IBL / prepass / postfx. `STORAGE_BINDING` lets the RT compute pass write the
-    // view's main texture; `ClusterConfig::None` skips raster light clustering.
+    // view's main texture. (`SolariCamera` opts out of raster light clustering itself.)
     #[cfg(feature = "solari")]
     cam.insert((
         SolariCamera::default(),
@@ -586,8 +581,6 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
         // defaults are metres-scale (~12 km visibility, 100 m fog layer), which
         // matches this scene.
         SolariAtmosphere::default(),
-        ClusterConfig::None,
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
     ));
 
     #[cfg(not(feature = "solari"))]

@@ -15,14 +15,12 @@
 
 use bevy::{
     asset::RenderAssetUsages,
-    camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
     diagnostic::FrameTimeDiagnosticsPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
-    render::render_resource::TextureUsages,
     solari::prelude::*,
 };
 use std::f32::consts::PI;
@@ -199,7 +197,6 @@ fn setup_scene(
         },
         Transform::from_xyz(0.0, AXIS_Y, eyepiece_z + 0.030)
             .looking_at(Vec3::new(0.0, AXIS_Y, -10.0), Vec3::Y),
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
         SolariAtmosphere::default(),

@@ -19,14 +19,12 @@
 //! and credited).
 
 use bevy::{
-    camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     dev_tools::render_debug::RenderDebugOverlayPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     math::{DVec3, IVec3},
     pbr::PbrPlugin,
     prelude::*,
-    render::render_resource::TextureUsages,
     solari::prelude::*,
     // The floating-origin types live in solari's transform module (not yet in the
     // prelude); import them explicitly.
@@ -190,19 +188,16 @@ fn setup(
 
     // The camera, parked at its cell's local position, looking toward the grid origin.
     // It carries NO `SolariGridCell`: the camera *is* the floating origin, and its cell
-    // lives in `SolariFloatingOrigin`, not on the entity. A (static) cell here would put
-    // the camera in solari's transform table with GPU→CPU readback, which after a recenter
-    // overwrites its `GlobalTransform` with a stale-cell propagated value that fights the
-    // wrapped `Transform` from bevy's `TransformPlugin` → the warp. `NoGpuGlobalTransformReadback`
-    // keeps solari's hands off the camera's transform entirely (bevy + the recenter own it).
+    // lives in `SolariFloatingOrigin`, not on the entity. No transform markers are needed —
+    // solari derives the render view from the GPU transform table (`world[camera_slot]`),
+    // so the camera's CPU `GlobalTransform` never feeds rendering; the recenter reads only
+    // the camera's local `Transform`.
     commands.spawn((
-        NoGpuGlobalTransformReadback,
         Camera3d::default(),
         Camera {
             clear_color: ClearColorConfig::Custom(Color::BLACK),
             ..default()
         },
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
         // Fast enough to fly across cells (1 km each) and watch the world recenter.

@@ -14,7 +14,8 @@ pub mod view;
 pub mod view_cull;
 
 use bevy_app::{App, Plugin, Update};
-use bevy_camera::Hdr;
+use bevy_camera::{CameraMainTextureUsages, Hdr};
+use bevy_light::cluster::ClusterConfig;
 use bevy_core_pipeline::{
     core_3d::{main_opaque_pass_3d, main_transparent_pass_3d},
     schedule::{Core3d, Core3dSystems},
@@ -28,10 +29,14 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
     extract_component::{ExtractComponent, ExtractComponentPlugin},
     extract_resource::ExtractResourcePlugin,
+    render_resource::TextureUsages,
     ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_ecs::component::Component;
+use bevy_ecs::lifecycle::Add;
+use bevy_ecs::observer::On;
 use bevy_ecs::reflect::ReflectComponent;
+use bevy_ecs::system::{Commands, Query};
 use bevy_shader::load_shader_library;
 
 use crate::bindings::RaytracingSceneBindings;
@@ -53,9 +58,38 @@ impl Plugin for SolarRenderPlugin {
             // Solari prepare/render system keys off; it must be extracted or those
             // systems match nothing and nothing renders.
             .add_plugins(ExtractComponentPlugin::<SolariCamera>::default())
+            // Solari does its own light sampling and never reads the clustered-forward
+            // light clusters, so opt every `SolariCamera` out of the per-view cluster
+            // assignment (bevy_light's `assign_objects_to_clusters`) — a free CPU win.
+            // `Camera3d` still requires `Clusters`; `ClusterConfig::None` just makes the
+            // assign pass clear-and-skip it. Overridable: a view that explicitly sets a
+            // `ClusterConfig` (e.g. a hybrid raster view) wins over this default.
+            .register_required_components_with::<SolariCamera, ClusterConfig>(
+                || ClusterConfig::None,
+            )
             .register_type::<SolariViewState>()
             .register_type::<atmosphere::SolariAtmosphere>()
             .register_type::<atmosphere::SolariGlobalFog>();
+
+        // Solari's RT compute pass writes the view's main texture directly, which needs
+        // `STORAGE_BINDING`. `Camera` already requires `CameraMainTextureUsages` (without
+        // it), so a required-component default on `SolariCamera` would be *ignored* (a
+        // required component only fills a slot that isn't already there). Instead, OR the
+        // flag in when a camera becomes a `SolariCamera` — order-independent, and it adds
+        // to (rather than replaces) the camera's other usages.
+        app.add_observer(
+            |add: On<Add, SolariCamera>,
+             mut usages: Query<&mut CameraMainTextureUsages>,
+             mut commands: Commands| {
+                if let Ok(mut u) = usages.get_mut(add.entity) {
+                    u.0 |= TextureUsages::STORAGE_BINDING;
+                } else {
+                    commands.entity(add.entity).insert(
+                        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
+                    );
+                }
+            },
+        );
 
         // DLSS Ray Reconstruction quality mode (global, extracted). The SDK is
         // created in `SolariPlugin::finish` (`dlss::init_dlss`); the per-view context,
@@ -109,6 +143,7 @@ impl Plugin for SolarRenderPlugin {
                     view_cull::extract_solari_view_cull_masks,
                     view_cull::extract_solari_skybox,
                     atmosphere::extract_solari_atmosphere,
+                    rt_pipeline::extract_rt_camera_slot,
                 ),
             )
             .add_systems(

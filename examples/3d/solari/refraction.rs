@@ -18,7 +18,6 @@
 //! image; the realtime ReSTIR path does not refract yet.
 
 use bevy::{
-    camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin, FreeCameraState},
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
     diagnostic::FrameTimeDiagnosticsPlugin,
@@ -31,7 +30,6 @@ use bevy::{
     },
     post_process::dof::{DepthOfField, DepthOfFieldMode},
     prelude::*,
-    render::render_resource::TextureUsages,
     solari::prelude::*,
     ui_widgets::{slider_self_update, SliderPrecision, SliderStep, ValueChange},
     world_serialization::WorldInstanceReady,
@@ -216,7 +214,6 @@ fn setup_scene(
             ..Default::default()
         },
         Transform::from_xyz(0.0, 0.25, 0.55).looking_at(Vec3::new(0.0, 0.15, 0.0), Vec3::Y),
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
         // Depth of field: bevy's standard component. The pathtracer consumes

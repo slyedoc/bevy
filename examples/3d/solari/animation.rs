@@ -9,7 +9,7 @@
 //! selector (the fox's three glTF animations: survey / walk / run).
 
 use bevy::{
-    camera::{CameraMainTextureUsages, Exposure, Hdr},
+    camera::{Exposure, Hdr},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     feathers::{
         controls::*,
@@ -20,7 +20,6 @@ use bevy::{
     input::common_conditions::input_just_pressed,
     post_process::bloom::Bloom,
     prelude::*,
-    render::render_resource::TextureUsages,
     solari::prelude::*,
     ui::Checked,
     ui_widgets::{radio_self_update, slider_self_update, Activate, RadioGroup, SliderStep, SliderValue},
@@ -292,7 +291,6 @@ fn setup_camera_and_light(mut commands: Commands) {
         },
         Transform::from_translation(Vec3::new(80.0, 70.0, 110.0))
             .looking_at(Vec3::new(0.0, 25.0, 0.0), Vec3::Y),
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         Exposure::OVERCAST,
         Bloom::NATURAL,

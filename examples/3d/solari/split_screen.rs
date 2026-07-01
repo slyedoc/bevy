@@ -19,13 +19,13 @@
 //! ```
 
 use bevy::{
-    camera::{visibility::RenderLayers, CameraMainTextureUsages, Viewport},
+    camera::{visibility::RenderLayers, Viewport},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     core_pipeline::prepass::DepthPrepass,
     dev_tools::render_debug::RenderDebugOverlay,
     gltf::GltfMaterialName,
     prelude::*,
-    render::{occlusion_culling::OcclusionCulling, render_resource::TextureUsages},
+    render::occlusion_culling::OcclusionCulling,
     solari::prelude::*,
     window::WindowResized,
     world_serialization::WorldInstanceReady,
@@ -141,7 +141,6 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
                 clear_color: ClearColorConfig::Custom(Color::BLACK),
                 ..default()
             },
-            CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
             Msaa::Off,
             SolariCamera,
             RenderLayers::layer(RT_LAYER),

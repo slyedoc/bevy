@@ -269,11 +269,10 @@ fn setup(
     ));
 
     // Camera: the floating origin itself, so it carries NO `SolariGridCell` (its cell lives
-    // in `SolariFloatingOrigin`) and `NoGpuGlobalTransformReadback` keeps solari's hands off
-    // its transform — bevy + the built-in recenter own it. It sits in the scene's cell,
-    // looking at the root.
+    // in `SolariFloatingOrigin`) and no transform markers — solari derives the render view
+    // from the GPU transform table, and the recenter reads only its local `Transform`. It
+    // sits in the scene's cell, looking at the root.
     commands.spawn((
-        NoGpuGlobalTransformReadback,
         Camera3d::default(),
         Camera {
             clear_color: ClearColorConfig::Custom(Color::BLACK),

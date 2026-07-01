@@ -46,15 +46,6 @@ const BINDING_GBUFFER_SPECULAR: u32 = 7; // storage: specular albedo.xyz + hit d
 #[cfg(feature = "dlss")]
 const BINDING_GBUFFER_MOTION: u32 = 8; // storage: screen-space motion vector.xy (.zw unused)
 
-/// Ring depth for the per-view camera UBO. The CPU rewrites the camera every
-/// frame (host-visible, coherent) but wgpu can't see the raw trace reading it, so
-/// it inserts no wait — overwriting a single buffer races the in-flight trace and
-/// tears `inverse_view_proj` (whole-scene reprojection glitch under camera motion).
-/// Cycling N ≥ frames-in-flight slots via a dynamic uniform offset means the CPU
-/// only ever writes a slot the GPU finished frames ago. 4 covers wgpu's default
-/// 2-frame latency with margin.
-const CAMERA_RING_FRAMES: u64 = 4;
-
 /// Per-frame camera inputs the raygen shader reads — std140-compatible
 /// (mat4 + vec4). `inverse_view_proj` reconstructs a world-space ray per pixel;
 /// `camera_position` is the ray origin.
@@ -197,10 +188,6 @@ pub struct RtPipeline {
     /// compares this via [`Self::classes_changed`].
     material_classes: Vec<u32>,
 
-    /// `minUniformBufferOffsetAlignment` — the camera ring's per-slot stride must
-    /// be a multiple of this (dynamic uniform offsets are validated against it).
-    ubo_alignment: u64,
-
     /// Shader modules retained for the pipeline's lifetime (destroyed on drop).
     modules: Vec<vk::ShaderModule>,
 }
@@ -222,11 +209,6 @@ pub struct RtViewBindings {
     device: ash::Device,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
-    /// Camera UBO, a [`CAMERA_RING_FRAMES`]-slot ring (binding 1 is a *dynamic*
-    /// uniform; `set_camera` writes this frame's slot and `trace` binds its offset).
-    camera: MappedBuffer,
-    /// Aligned byte stride of one camera ring slot.
-    camera_stride: u64,
     /// Bindless geometry addresses (set 1, binding 4); refreshed per frame via the
     /// mapping (`set_geometry_addresses`). Not ringed: the addresses are stable
     /// (stable-address `RawTraceBindable` buffers), so an in-flight overwrite writes
@@ -246,7 +228,7 @@ pub struct RtViewBindings {
     output_buffer: vk::Buffer,
 }
 
-// SAFETY: the host-visible camera mapping is written only from the single
+// SAFETY: the host-visible geometry-address mapping is written only from the single
 // render-schedule dispatch (via `&self` + coherent memory), never shared across
 // threads. All other fields are plain Vulkan handles.
 unsafe impl Send for RtViewBindings {}
@@ -286,13 +268,6 @@ impl RtPipeline {
         let handle_size = rt_props.shader_group_handle_size as u64;
         let handle_align = rt_props.shader_group_handle_alignment as u64;
         let base_align = rt_props.shader_group_base_alignment as u64;
-        // Dynamic-uniform-offset granularity for the camera ring. Separate plain
-        // query to avoid re-borrowing `rt_props` through the `props2` chain.
-        // SAFETY: physical_device valid.
-        let ubo_alignment = unsafe { instance.get_physical_device_properties(physical_device) }
-            .limits
-            .min_uniform_buffer_offset_alignment
-            .max(1);
 
         // --- Shaders: WGSL -> SPIR-V -> VkShaderModule -------------------------
         // Fixed general programs (raygen + the two miss shaders); every closest-hit
@@ -384,8 +359,9 @@ impl RtPipeline {
                 .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_CAMERA)
-                // Dynamic: the camera is a per-frame ring; `trace` binds this frame's
-                // slot via a dynamic offset (avoids tearing the in-flight trace).
+                // The camera is a GPU buffer filled by the `rt_camera` compute pass (or a
+                // CPU fallback `write_buffer`) each frame. Kept `*_DYNAMIC` — bound at a
+                // constant offset 0 — so replacing the old ring needed no layout change.
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(1)
                 // raygen unprojects; miss reads sky brightness/clear color; the
@@ -637,7 +613,6 @@ impl RtPipeline {
             callable_region,
             record_capacity,
             material_classes: material_classes.to_vec(),
-            ubo_alignment,
             modules,
         };
         Some(out)
@@ -670,20 +645,22 @@ impl RtPipeline {
         self.material_classes != current
     }
 
-    /// Build the per-view set-1 resources (descriptor set + camera UBO) for one
-    /// view: a fresh pool, a set allocated from the shared set-1 layout, a camera
-    /// UBO, and the descriptor written ONCE (output buffer @0, camera @1, env cube
-    /// @2, shared sampler @3). The set is never updated again — updating one while
-    /// a prior frame's command buffer still binds it is illegal and device-losts;
-    /// the camera *contents* change per frame via the mapping (`set_camera`), and
-    /// the output buffer is stable (the dispatch rebuilds this whole component if
-    /// the view's output buffer is reallocated). `env_map_image` is `Some` when the
-    /// env cube is the storage atmosphere cube (transitioned around the trace).
+    /// Build the per-view set-1 resources (descriptor set) for one view: a fresh pool,
+    /// a set allocated from the shared set-1 layout, and the descriptor written ONCE
+    /// (output buffer @0, camera @1, env cube @2, shared sampler @3). The set is never
+    /// updated again — updating one while a prior frame's command buffer still binds it
+    /// is illegal and device-losts; the camera *contents* change per frame in the bound
+    /// GPU buffer (the `rt_camera` compute pass writes it), and both the output and
+    /// camera buffers are stable (the dispatch rebuilds this whole component if the
+    /// view's output buffer is reallocated). `env_map_image` is `Some` when the env cube
+    /// is the storage atmosphere cube (transitioned around the trace).
     pub fn create_view_bindings(
         &self,
         allocator: &Allocator,
         output_buffer: vk::Buffer,
         output_size: u64,
+        // The per-view `RtCamera` `VkBuffer` (wgpu-owned) baked into binding 1.
+        camera_buffer: vk::Buffer,
         // DLSS guide G-buffers `(VkBuffer, size)` bound at BINDING_GBUFFER_* (set 1).
         // Empty unless the `dlss` feature is on; its length sizes the storage-buffer
         // pool slot, so it must agree with the layout the pipeline was built with.
@@ -730,13 +707,6 @@ impl RtPipeline {
             }
         };
 
-        // Camera ring: CAMERA_RING_FRAMES slots, each aligned for a dynamic offset.
-        let camera_stride = align_up(size_of::<RtCamera>() as u64, self.ubo_alignment);
-        let camera = alloc_mapped_buffer(
-            allocator,
-            CAMERA_RING_FRAMES * camera_stride,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-        )?;
         let geometry = alloc_mapped_buffer(
             allocator,
             size_of::<RtGeometryAddresses>() as u64,
@@ -761,10 +731,11 @@ impl RtPipeline {
             .buffer(output_buffer)
             .offset(0)
             .range(output_size)];
-        // Dynamic uniform: offset 0 + the bound window (one slot's data); `trace`
-        // supplies the per-frame slot offset.
+        // Dynamic uniform bound at a constant offset 0 (`trace` passes 0) — the
+        // GPU-written `RtCamera` buffer, filled by the `rt_camera` compute pass (or
+        // a CPU `write_buffer`) before the trace reads it.
         let camera_info = [vk::DescriptorBufferInfo::default()
-            .buffer(camera.buffer)
+            .buffer(camera_buffer)
             .offset(0)
             .range(size_of::<RtCamera>() as u64)];
         // `trace()` transitions the atmosphere cube to SHADER_READ_ONLY_OPTIMAL
@@ -844,8 +815,6 @@ impl RtPipeline {
             device: self.device.clone(),
             descriptor_pool,
             descriptor_set,
-            camera,
-            camera_stride,
             geometry,
             env_map_sampler,
             env_map_image,
@@ -869,7 +838,9 @@ impl RtPipeline {
         scene_set: vk::DescriptorSet,
         view: &RtViewBindings,
         columns_set: vk::DescriptorSet,
-        // This frame's camera ring-slot byte offset (from [`RtViewBindings::set_camera`]).
+        // Dynamic offset for the camera buffer (binding 1). Always 0 — the buffer holds
+        // exactly this frame's `RtCamera`; the binding stays dynamic only to reuse the
+        // set-1 layout unchanged.
         camera_dynamic_offset: u32,
         width: u32,
         height: u32,
@@ -1010,26 +981,6 @@ impl RtPipeline {
 }
 
 impl RtViewBindings {
-    /// Upload this frame's camera inputs into the ring slot for `frame_index` and
-    /// return that slot's byte offset — pass it to [`Self::trace`] as the camera's
-    /// dynamic uniform offset. Writing a slot the GPU finished frames ago avoids
-    /// tearing an in-flight trace (host-visible, coherent).
-    pub fn set_camera(&self, camera: &RtCamera, frame_index: u32) -> u32 {
-        let slot = (frame_index as u64) % CAMERA_RING_FRAMES;
-        let offset = slot * self.camera_stride;
-        // SAFETY: `camera.mapped` maps CAMERA_RING_FRAMES * camera_stride bytes;
-        // `offset + size_of::<RtCamera>() <= camera_stride * CAMERA_RING_FRAMES`
-        // since size_of <= camera_stride. RtCamera is Pod.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytemuck::bytes_of(camera).as_ptr(),
-                self.camera.mapped.add(offset as usize),
-                size_of::<RtCamera>(),
-            );
-        }
-        offset as u32
-    }
-
     /// The output `VkBuffer` baked into binding 0. The dispatch compares this to
     /// the view's current output buffer to detect a resize-driven reallocation.
     pub fn output_buffer(&self) -> vk::Buffer {
@@ -1060,8 +1011,7 @@ impl Drop for RtViewBindings {
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device.destroy_sampler(self.env_map_sampler, None);
-            self.device.destroy_buffer(self.camera.buffer, None);
-            self.device.free_memory(self.camera.memory, None);
+            // `camera_buffer` is wgpu-owned (the per-view `RtOutputBuffer`), freed there.
             self.device.destroy_buffer(self.geometry.buffer, None);
             self.device.free_memory(self.geometry.memory, None);
         }

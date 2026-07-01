@@ -28,13 +28,7 @@ use bevy::{
 };
 
 #[cfg(feature = "solari")]
-use bevy::{
-    camera::CameraMainTextureUsages,
-    core_pipeline::Skybox,
-    light::cluster::ClusterConfig,
-    render::render_resource::TextureUsages,
-    solari::prelude::*,
-};
+use bevy::{core_pipeline::Skybox, solari::prelude::*};
 
 use crate::generate_city::{spawn_city};
 use crate::{
@@ -259,12 +253,6 @@ fn camera() -> impl Scene {
         Hdr
         template_value(Transform::from_xyz(15.0, 10.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y))
         FreeCamera
-        // The camera's `GlobalTransform` is CPU-authored by `FreeCamera`; it must
-        // NOT be written back from the GPU transform table, or the lagged value
-        // (and a regen-stale slot→entity reverse-map resolve) clobbers it — the
-        // "camera stuck on an odd pivot after regenerate" symptom.
-        NoGpuGlobalTransformReadback
-
         Exposure::OVERCAST
         //Bloom::NATURAL
         Msaa::Off
@@ -277,10 +265,8 @@ fn camera() -> impl Scene {
         // ground-level camera traces a sun shadow ray per march step). Uncomment
         // for ~660-unit ground visibility + a ~5.5-unit fog layer at y = 0.
         //template_value(SolariGlobalFog { visibility: 1200.0, fog_height: 5.5, fog_base: 0.0, ..default() })
-        template_value(ClusterConfig::None)
-        template_value(CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING))        
-          
-        //template_value(SolariDebugView::Pathtrace)        
+        // `CameraMainTextureUsages` STORAGE_BINDING is added automatically by SolariCamera.
+        //template_value(SolariDebugView::Pathtrace)
     }
 }
 

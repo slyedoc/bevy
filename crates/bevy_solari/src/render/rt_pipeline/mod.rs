@@ -9,28 +9,39 @@
 //! Selected via [`SolariLighting::RtPipeline`](crate::render::view::SolariLighting).
 #![allow(unsafe_code)]
 
+mod rt_camera;
+pub use rt_camera::{rt_camera_bind_group_layout, RtCameraPassParams};
+
 use ash::vk;
 use bevy_asset::{load_embedded_asset, AssetServer};
-use bevy_math::{Mat4, Vec2};
+use bevy_math::{Mat4, UVec4, Vec2, Vec4};
 use bevy_ecs::prelude::*;
 use bevy_render::{
     camera::ExtractedCamera,
     render_asset::RenderAssets,
+    Extract,
     render_resource::{
         binding_types::{storage_buffer_read_only_sized, texture_storage_2d},
         BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, BufferUsages,
         CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
-        ComputePipelineDescriptor, PipelineCache,
-        ShaderStages, StorageTextureAccess, TextureFormat,
+        ComputePipelineDescriptor, PipelineCache, ShaderStages, StorageTextureAccess,
+        TextureFormat, UniformBuffer,
     },
-    renderer::{raw_vulkan_init::AdditionalVulkanFeatures, RenderContext, RenderDevice, ViewQuery},
+    renderer::{
+        raw_vulkan_init::AdditionalVulkanFeatures, RenderContext, RenderDevice, RenderQueue,
+        ViewQuery,
+    },
+    sync_world::RenderEntity,
     texture::{FallbackImage, GpuImage},
     view::{ExtractedView, ViewTarget},
 };
 use wgpu::hal::api::Vulkan as VkApi;
 
 use crate::bindings::RaytracingSceneBindings;
-use crate::ecs_gpu::SceneColumns;
+use crate::ecs_gpu::{GpuSlot, SceneColumns};
+use crate::pipelines::SolariPipelines;
+use crate::resource_manager::SolariResourceManager;
+use crate::transform::{TransformGraph, TransformPropagate};
 use crate::material::{material_sbt_class, MaterialSlots, MaterialTraversalFlags};
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::extension::RayTracingPipelineFeature;
@@ -257,6 +268,18 @@ pub struct RtOutputBuffer {
     pub raw: vk::Buffer,
     pub size: u64,
     pub pixels: u32,
+    /// This view's `RtCamera` GPU buffer — filled by the `rt_camera` compute pass
+    /// (or a CPU `write_buffer`) each frame and bound as set-1 binding 1. Held with
+    /// its raw `VkBuffer` (bridged into the RT descriptor) + the wgpu handle (the
+    /// compute-pass bind group / `write_buffer` target). Reallocated with the output
+    /// so its raw handle is refreshed whenever `create_view_bindings` rebuilds.
+    pub camera_buffer: bevy_render::render_resource::Buffer,
+    pub camera_raw: vk::Buffer,
+    /// Persistent previous camera basis for the `rt_camera` pass's GPU-maintained DLSS
+    /// motion vectors (read-then-write each frame). Zero-cleared on creation so its
+    /// `valid` flag starts 0. Only the compute touches it — never bridged into the RT
+    /// descriptor.
+    pub camera_prev_buffer: bevy_render::render_resource::Buffer,
     /// DLSS ray-reconstruction guide G-buffers — normal+roughness, diffuse+depth,
     /// specular+hit-distance, and motion vectors — each `pixels` × `vec4<f32>`,
     /// allocated and reallocated alongside the color output. Written by the
@@ -294,11 +317,16 @@ pub struct RtGbuffer {
     pub raw: vk::Buffer,
 }
 
+/// Byte size of `rt_camera.wgsl`'s `PrevCamera` (`mat4x4` + `u32`, std430-padded to a
+/// 16-byte multiple).
+const RT_PREV_CAMERA_SIZE: u64 = 80;
+
 /// `Prepare`: (re)allocate the per-view RT output buffer to fit the viewport.
 pub fn prepare_rt_output(
     views: Query<(Entity, &ExtractedCamera, Option<&RtOutputBuffer>), With<SolariCamera>>,
     allocator: Option<Res<Allocator>>,
     render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
     mut commands: Commands,
 ) {
     let Some(allocator) = allocator else {
@@ -346,15 +374,158 @@ pub fn prepare_rt_output(
                 raw,
             }
         });
+        // The GPU camera buffer (constant size — one `RtCamera`). STORAGE (the
+        // `rt_camera` compute writes it) | UNIFORM (the RT trace reads it) | COPY_DST
+        // (the CPU-fill fallback `write_buffer`). Recreated alongside the output so its
+        // raw handle is fresh whenever the view bindings rebuild.
+        let camera_buffer = allocator.create_buffer(
+            &render_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::UNIFORM_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferUsages::STORAGE | BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            size_of::<RtCamera>() as u64,
+            MemoryLocation::GpuOnly,
+            "rt_camera_buffer",
+        );
+        // SAFETY: Vulkan-backed (Allocator only builds VkBuffers).
+        let camera_raw = unsafe { camera_buffer.as_hal::<VkApi>() }
+            .map(|b| b.raw_handle())
+            .expect("rt_camera buffer must be Vulkan-backed");
+        // Persistent previous-basis buffer for GPU motion vectors — `rt_camera.wgsl`'s
+        // `PrevCamera` (mat4 + `valid`, padded to 80 B). Zero-cleared so `valid` starts 0
+        // (frame 1 ⇒ zero motion, not a read of uninitialized memory).
+        let camera_prev_buffer = allocator.create_buffer(
+            &render_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            RT_PREV_CAMERA_SIZE,
+            MemoryLocation::GpuOnly,
+            "rt_camera_prev_buffer",
+        );
+        let camera_prev_buffer: bevy_render::render_resource::Buffer = camera_prev_buffer.into();
+        render_queue.write_buffer(&camera_prev_buffer, 0, &[0u8; RT_PREV_CAMERA_SIZE as usize]);
         commands.entity(entity).insert(RtOutputBuffer {
             buffer: buffer.into(),
             raw,
             size,
             pixels,
+            camera_buffer: camera_buffer.into(),
+            camera_raw,
+            camera_prev_buffer,
             #[cfg(feature = "dlss")]
             gbuffer,
         });
     }
+}
+
+/// The `SolariCamera`'s transform-table slot (`GpuSlot<TransformGraph>`), extracted
+/// onto the render-world view so the `rt_camera` compute pass can read
+/// `world[camera_slot]`. Absent until the camera's slot is allocated (the first frame
+/// or two), where the pass falls back to the CPU-derived camera.
+#[derive(Component, Clone, Copy)]
+pub struct RtCameraSlot(pub u32);
+
+/// `ExtractSchedule`: copy each `SolariCamera`'s transform-table slot index onto its
+/// render-world view entity. The slot lives on the main-world camera (assigned in
+/// `PostUpdate`); the render-world `rt_camera` pass needs it to index `world[…]`.
+pub fn extract_rt_camera_slot(
+    mut commands: Commands,
+    cameras: Extract<Query<(&RenderEntity, &GpuSlot<TransformGraph>), With<SolariCamera>>>,
+) {
+    for (render_entity, slot) in &cameras {
+        commands
+            .entity(render_entity.id())
+            .insert(RtCameraSlot(slot.index()));
+    }
+}
+
+/// CPU-authored inputs to the `rt_camera` compute pass (projection + per-frame
+/// scalars). The transform-derived matrices come from `world[camera_slot]` on the GPU.
+struct RtCameraGpuInputs {
+    clip_from_view: Mat4,
+    /// Floating-origin recenter rebase for the previous basis (identity + `reframe_active`
+    /// false on ordinary frames). The GPU keeps the previous `clip_from_world` itself.
+    reframe_prev_from_current: Mat4,
+    reframe_active: bool,
+    frame: UVec4,
+    sky: Vec4,
+    jitter: Vec4,
+    exposure: f32,
+}
+
+/// Dispatch the `rt_camera` compute pass to fill `output.camera_buffer` from the
+/// camera's transform-table slot. Returns `false` (⇒ caller does the CPU fallback)
+/// when the pass can't run this frame: unsupported device, pipeline/layout not ready,
+/// or the camera's slot isn't allocated / in range yet.
+#[allow(clippy::too_many_arguments)]
+fn try_dispatch_rt_camera(
+    ctx: &mut RenderContext,
+    render_device: &RenderDevice,
+    render_queue: &RenderQueue,
+    pipeline_cache: &PipelineCache,
+    pipelines: Option<&SolariPipelines>,
+    resources: Option<&SolariResourceManager>,
+    propagate: Option<&TransformPropagate>,
+    camera_slot: Option<&RtCameraSlot>,
+    output: &RtOutputBuffer,
+    inputs: RtCameraGpuInputs,
+) -> bool {
+    let (Some(pipelines), Some(resources), Some(propagate), Some(slot)) =
+        (pipelines, resources, propagate, camera_slot)
+    else {
+        return false; // cold start (slot extracted a frame after the camera spawns).
+    };
+    let node_count = propagate.node_count();
+    // Slot not yet propagated → CPU fallback (correct for a root camera; a transient
+    // first-frame-or-two for a childed one, before its slot lands).
+    if slot.0 >= node_count {
+        return false;
+    }
+    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.rt_camera) else {
+        return false; // still compiling (or failed — the cache logs a compile error).
+    };
+
+    let mut params = UniformBuffer::from(RtCameraPassParams {
+        clip_from_view: inputs.clip_from_view,
+        view_from_clip: inputs.clip_from_view.inverse(),
+        reframe_prev_from_current: inputs.reframe_prev_from_current,
+        frame: inputs.frame,
+        sky: inputs.sky,
+        jitter: inputs.jitter,
+        camera_slot: slot.0,
+        node_count,
+        exposure: inputs.exposure,
+        valid: 1,
+        reframe_active: inputs.reframe_active as u32,
+    });
+    params.write_buffer(render_device, render_queue);
+    let Some(params_binding) = params.binding() else {
+        return false;
+    };
+
+    let layout = pipeline_cache.get_bind_group_layout(&resources.rt_camera);
+    let bind_group = render_device.create_bind_group(
+        "rt_camera",
+        &layout,
+        &BindGroupEntries::sequential((
+            propagate.current_world().as_entire_binding(),
+            params_binding,
+            output.camera_buffer.as_entire_binding(),
+            output.camera_prev_buffer.as_entire_binding(),
+        )),
+    );
+
+    // Recorded on the ctx encoder → flushed (and its write made visible by the trace's
+    // pre-barrier) before the trace's own command buffer runs.
+    let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {
+        label: Some("rt_camera"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    pass.dispatch_workgroups(1, 1, 1);
+    true
 }
 
 // Built-in surfaces, registered (in order, by `SolariPlugin`) like any downstream one.
@@ -439,6 +610,7 @@ pub(crate) fn rt_pipeline(
         Option<&RtPrevViewProj>,
         Option<&SolariDlssJitter>,
         Option<&CameraReframe>,
+        Option<&RtCameraSlot>,
     )>,
     rt: Option<Res<RtPipeline>>,
     rt_blit: Res<RtBlit>,
@@ -457,11 +629,22 @@ pub(crate) fn rt_pipeline(
     atmosphere_sky: Option<Res<AtmosphereSky>>,
     env_images: RtEnvImages,
     pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
+    // Tupled to stay under bevy's 16-param system ceiling. `SolariPipelines`/
+    // `SolariResourceManager`/`TransformPropagate` drive the `rt_camera` compute pass
+    // (`Option` — absent on unsupported devices ⇒ CPU-derived camera fallback).
+    render_res: (
+        Res<RenderDevice>,
+        Res<RenderQueue>,
+        Option<Res<SolariPipelines>>,
+        Option<Res<SolariResourceManager>>,
+        Option<Res<TransformPropagate>>,
+    ),
     mut frame_counter: Local<u32>,
     mut commands: Commands,
     mut ctx: RenderContext,
 ) {
+    let (render_device, render_queue, solari_pipelines, solari_resources, transform_propagate) =
+        render_res;
     let (cluster_mesh_manager, tess_classify, hit_group_registry, deform) = geometry_res;
     let view_entity = view.entity();
     let (
@@ -475,6 +658,7 @@ pub(crate) fn rt_pipeline(
         prev_view_proj,
         dlss_jitter,
         reframe,
+        camera_slot,
     ) = view.into_inner();
 
     // Environment cube the miss shader samples (same priority as the megakernel):
@@ -602,6 +786,7 @@ pub(crate) fn rt_pipeline(
                         allocator,
                         output.raw,
                         output.size,
+                        output.camera_raw,
                         &gbuffers,
                         env_view,
                         environment_map_image,
@@ -700,9 +885,44 @@ pub(crate) fn rt_pipeline(
             [j.x, j.y, center, contrast]
         },
     };
-    // Write this frame's camera into its ring slot; the returned offset binds that
-    // slot in the trace (avoids the CPU tearing the in-flight trace's camera read).
-    let camera_dynamic_offset = view_bindings.set_camera(&camera_inputs, *frame_counter);
+    // Fill this view's GPU camera buffer (bound at a constant dynamic offset 0). The
+    // GPU-authoritative path derives the basis from `world[camera_slot]` in the
+    // `rt_camera` compute pass — so the camera is composed on the GPU through any
+    // hierarchy + floating-origin offset, same-frame, with no dependence on the CPU
+    // `GlobalTransform`. Falls back to the CPU-derived `camera_inputs` (a `write_buffer`
+    // TRANSFER write) when the pass isn't ready (device unsupported, pipeline still
+    // compiling, or the camera's slot not yet allocated) — both fills are covered by
+    // the trace's existing pre-barrier (`{TRANSFER,SHADER}_WRITE → SHADER_READ`).
+    let gpu_camera = try_dispatch_rt_camera(
+        &mut ctx,
+        &render_device,
+        &render_queue,
+        &pipeline_cache,
+        solari_pipelines.as_deref(),
+        solari_resources.as_deref(),
+        transform_propagate.as_deref(),
+        camera_slot,
+        output,
+        {
+            // The recenter rebase the GPU applies to its stored previous basis (mirrors
+            // the CPU path's `prev *= reframe.prev_from_current`), or identity/off.
+            let active = reframe.filter(|r| !r.is_identity());
+            RtCameraGpuInputs {
+                clip_from_view: view.clip_from_view,
+                reframe_prev_from_current: active
+                    .map_or(Mat4::IDENTITY, |r| r.prev_from_current),
+                reframe_active: active.is_some(),
+                frame: UVec4::from_array(camera_inputs.frame),
+                sky: Vec4::from_array(camera_inputs.sky),
+                jitter: Vec4::from_array(camera_inputs.jitter),
+                exposure: camera.exposure,
+            }
+        },
+    );
+    if !gpu_camera {
+        render_queue.write_buffer(&output.camera_buffer, 0, bytemuck::bytes_of(&camera_inputs));
+    }
+    let camera_dynamic_offset = 0u32;
     *frame_counter = frame_counter.wrapping_add(1);
     // Cache this frame's unjittered clip-from-world as next frame's "previous".
     commands

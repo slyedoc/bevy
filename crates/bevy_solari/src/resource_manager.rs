@@ -49,6 +49,7 @@ pub struct SolariResourceManager {
     pub transform_propagate: BindGroupLayoutDescriptor,
     pub transform_gather: BindGroupLayoutDescriptor,
     pub transform_readback: BindGroupLayoutDescriptor,
+    pub rt_camera: BindGroupLayoutDescriptor,
     pub light_resolve: BindGroupLayoutDescriptor,
     pub atmosphere: BindGroupLayoutDescriptor,
     // AS passes — each is the `@group(1)` layout; the full pipeline layout pairs it
@@ -80,6 +81,7 @@ pub fn init_solari_resource_manager(mut commands: Commands, allocator: Option<Re
         transform_propagate: transform_propagate_bind_group_layout(),
         transform_gather: transform_gather_bind_group_layout(),
         transform_readback: transform_readback_bind_group_layout(),
+        rt_camera: crate::render::rt_pipeline::rt_camera_bind_group_layout(),
         light_resolve: light_resolve_bind_group_layout(),
         atmosphere: atmosphere_bind_group_layout(),
         selector: selector_bind_group_layout(),

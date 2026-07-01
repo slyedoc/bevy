@@ -39,6 +39,7 @@ pub struct SolariPipelines {
     pub transform_propagate: CachedComputePipelineId,
     pub transform_gather: CachedComputePipelineId,
     pub transform_readback: CachedComputePipelineId,
+    pub rt_camera: CachedComputePipelineId,
     pub light_resolve: CachedComputePipelineId,
     pub atmosphere: CachedComputePipelineId,
 
@@ -77,6 +78,7 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "transform/transform_propagate.wgsl");
     embedded_asset!(app, "transform/transform_gather.wgsl");
     embedded_asset!(app, "transform/transform_readback.wgsl");
+    embedded_asset!(app, "render/rt_pipeline/rt_camera.wgsl");
     embedded_asset!(app, "lights/light_resolve.wgsl");
     embedded_asset!(app, "render/atmosphere_bake.wgsl");
     embedded_asset!(app, "render/rt_pipeline/blit.wgsl");
@@ -119,6 +121,16 @@ pub fn init_solari_pipelines(
     let Some(resource_manager) = resource_manager else {
         return;
     };
+    let rt_camera = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("rt_camera".into()),
+        layout: vec![resource_manager.rt_camera.clone()],
+        shader: load_embedded_asset!(asset_server.as_ref(), "render/rt_pipeline/rt_camera.wgsl"),
+        shader_defs: vec![],
+        entry_point: Some("rt_camera".into()),
+        immediate_size: 0,
+        zero_initialize_workgroup_memory: false,
+        constants: vec![],
+    });
     let transform_propagate = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("transform_propagate".into()),
         layout: vec![resource_manager.transform_propagate.clone()],
@@ -290,6 +302,7 @@ pub fn init_solari_pipelines(
         transform_propagate,
         transform_gather,
         transform_readback,
+        rt_camera,
         light_resolve,
         atmosphere,
         selector_reset,

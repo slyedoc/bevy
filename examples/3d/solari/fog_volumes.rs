@@ -13,13 +13,11 @@
 //! through the mist.
 
 use bevy::{
-    camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
     diagnostic::FrameTimeDiagnosticsPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     prelude::*,
-    render::render_resource::TextureUsages,
     solari::prelude::*,
 };
 
@@ -263,7 +261,6 @@ fn setup_scene(
             ..Default::default()
         },
         Transform::from_xyz(0.0, 3.5, -6.0).looking_at(Vec3::new(0.0, 4.0, -56.0), Vec3::Y),
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
         // The atmosphere drives the sun's color/attenuation and the sky; there's

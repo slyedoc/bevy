@@ -8,7 +8,7 @@
 //! the corner.
 
 use bevy::{
-    camera::CameraMainTextureUsages, camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig}, diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin}, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, image::{ImageAddressMode, ImageLoaderSettings}, mesh::VertexAttributeValues, pbr::PbrPlugin, post_process::bloom::Bloom, prelude::*, render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages}, solari::prelude::*,
+    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig}, diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin}, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, image::{ImageAddressMode, ImageLoaderSettings}, mesh::VertexAttributeValues, pbr::PbrPlugin, post_process::bloom::Bloom, prelude::*, render::diagnostic::RenderDiagnosticsPlugin, solari::prelude::*,
 };
 use chacha20::ChaCha8Rng;
 use rand::{RngExt, SeedableRng};
@@ -83,7 +83,6 @@ fn setup_scene(
         Transform::from_translation(Vec3::new(6.11329, 166.74896, 451.8226)).with_rotation(
             Quat::from_xyzw(-0.183938, 0.009093744, 0.0017017953, 0.9828943),
         ),
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
         Bloom {
