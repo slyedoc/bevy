@@ -1692,6 +1692,24 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
+name = "solari_hierarchy"
+path = "examples/3d/solari/hierarchy.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_hierarchy]
+name = "Solari (transform hierarchy)"
+description = "The classic parent/child/grandchild nesting test in 3D, run on solari's GPU transform table (CPU TransformPlugin disabled) and placed 1 AU from the grid origin so the nested walk composes with the floating-origin cell offset."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
 name = "solari_scope"
 path = "examples/3d/solari/scope.rs"
 doc-scrape-examples = true
