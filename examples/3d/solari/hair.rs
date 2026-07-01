@@ -17,9 +17,9 @@
 use bevy::{
     camera::{Exposure, Hdr},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin, FreeCameraState},
-    ecs::VariantDefaults,
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
     diagnostic::FrameTimeDiagnosticsPlugin,
+    ecs::VariantDefaults,
     feathers::{
         self,
         controls::{ColorSwatchValue, FeathersColorSwatch, FeathersSlider},
@@ -130,7 +130,11 @@ fn main() {
     .add_systems(
         Update,
         (
-            (convert_meshes_to_raytracing, convert_standard_materials_to_solari).chain(),
+            (
+                convert_meshes_to_raytracing,
+                convert_standard_materials_to_solari,
+            )
+                .chain(),
             (read_hair_sliders, sync_hair_appearance).chain(),
         ),
     )
@@ -163,10 +167,13 @@ fn setup_scene(
         // then recenter on the origin with its base on the floor.
         Some(path) => (
             asset_server.load(path),
-            Transform::from_translation(Vec3::new(23.97, 48.41, 0.74))
-                .with_rotation(Quat::from_rotation_x(-FRAC_PI_2)),
+            Transform::from_translation(Vec3::new(23.97, 48.41, 0.74).to_precision())
+                .with_rotation(Quat::from_rotation_x(-FRAC_PI_2).to_precision()),
         ),
-        None => (hair_assets.add(fur_ball(1.0, 16_000)), Transform::from_xyz(0.0, 1.2, 0.0)),
+        None => (
+            hair_assets.add(fur_ball(1.0, 16_000)),
+            Transform::from_xyz(0.0, 1.2, 0.0),
+        ),
     };
     commands.spawn((
         Hair {
@@ -174,7 +181,7 @@ fn setup_scene(
             material: HairAppearance::default().material(),
         },
         transform,
-     ));
+    ));
 }
 
 /// Which hair parameter a slider drives (read from `SliderValue` by
@@ -325,7 +332,7 @@ fn setup_camera_and_light(mut commands: Commands) {
             illuminance: light_consts::lux::RAW_SUNLIGHT,
             ..default()
         },
-        Transform::from_xyz(1.0, 1.6, 1.2).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(1.0, 1.6, 1.2).looking_at(Vec3::ZERO.to_precision(), Vec3::Y),
     ));
 
     commands.spawn((
@@ -341,8 +348,8 @@ fn setup_camera_and_light(mut commands: Commands) {
         },
         // Framed for the upright ~114-unit groom (base on the floor); fly with
         // the FreeCamera (WASD + mouse) to reframe.
-        Transform::from_translation(Vec3::new(0.0, 60.0, 250.0))
-            .looking_at(Vec3::new(0.0, 55.0, 0.0), Vec3::Y),
+        Transform::from_translation(Vec3::new(0.0, 60.0, 250.0).to_precision())
+            .looking_at(Vec3::new(0.0, 55.0, 0.0).to_precision(), Vec3::Y),
         Msaa::Off,
         Exposure::OVERCAST,
         Hdr,

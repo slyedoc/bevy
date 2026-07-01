@@ -33,7 +33,7 @@ use bevy_ecs::{
     resource::Resource,
     system::{Commands, Query, Res, ResMut},
 };
-use bevy_math::{Affine3A, Mat3A, Vec3A};
+use bevy_math::{DAffine3, DMat3, DVec3};
 use bevy_render::{
     diagnostic::RecordDiagnostics as _,
     extract_resource::{ExtractResource, ExtractResourcePlugin},
@@ -54,9 +54,7 @@ use crate::ecs_gpu::GpuColumn;
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 
-use super::graph::{
-    LocalColumn, NodeEntityColumn, NoReadbackColumn, ParentColumn,
-};
+use super::graph::{LocalTranslationColumn, NoReadbackColumn, NodeEntityColumn, ParentColumn};
 use super::propagate::TransformPropagate;
 
 /// Master switch for the whole readback (gather dispatch + the `GlobalTransform`
@@ -68,12 +66,13 @@ const READBACK_ENABLED: bool = true;
 const WORKGROUP_SIZE: u32 = 64;
 /// `u32`s of header at the front of the readback buffer: `[count, _, _, _]`.
 const HEADER_WORDS: u32 = 4;
-/// `u32`s per record: `slot` + a `mat3x4` world transform (12 floats) + the owning
-/// entity's bits (`[lo, hi]` — the identity the writeback resolves by).
-const RECORD_WORDS: u32 = 15;
+/// `u32`s per record: `slot` + the absolute world's 3×3 linear (9 floats) + its
+/// f64 translation (3×2 words) + the owning entity's bits (`[lo, hi]` — the
+/// identity the writeback resolves by).
+const RECORD_WORDS: u32 = 18;
 /// Max records read back per frame. The output buffer is sized to this and bevy's
 /// `Readback` streams the **whole** buffer each frame (it can't size to the live
-/// count), so this is also the per-frame transfer (`capacity × 52 B` ≈ 6.8 MB at
+/// count), so this is also the per-frame transfer (`capacity × 72 B` ≈ 9.4 MB at
 /// 131072). A frame whose changed set exceeds it drops the overflow (warning).
 /// Tune to the scene's moving set; count-scoping the transfer is a follow-up.
 const READBACK_CAPACITY: u32 = 131072;
@@ -140,12 +139,13 @@ pub fn transform_readback_bind_group_layout() -> BindGroupLayoutDescriptor {
             ShaderStages::COMPUTE,
             (
                 storage_buffer_read_only_sized(false, None), // 0 local delta (changed records)
-                storage_buffer_read_only_sized(false, None), // 1 world
-                storage_buffer_sized(false, None),           // 2 out (rw, atomic count + records)
-                uniform_buffer::<ReadbackParams>(false),     // 3 params
-                storage_buffer_read_only_sized(false, None), // 4 no_readback (per-node opt-out flag)
-                storage_buffer_read_only_sized(false, None), // 5 parent (ancestor walk for cascade)
-                storage_buffer_read_only_sized(false, None), // 6 node_generation (ABA stamp)
+                storage_buffer_read_only_sized(false, None), // 1 world_abs_linear
+                storage_buffer_read_only_sized(false, None), // 2 world_abs_t (f64 bit pairs)
+                storage_buffer_sized(false, None),           // 3 out (rw, atomic count + records)
+                uniform_buffer::<ReadbackParams>(false),     // 4 params
+                storage_buffer_read_only_sized(false, None), // 5 no_readback (per-node opt-out flag)
+                storage_buffer_read_only_sized(false, None), // 6 parent (ancestor walk for cascade)
+                storage_buffer_read_only_sized(false, None), // 7 node_entity (owning entity bits)
             ),
         ),
     )
@@ -153,10 +153,7 @@ pub fn transform_readback_bind_group_layout() -> BindGroupLayoutDescriptor {
 
 /// Main world: create the readback output buffer and spawn the [`Readback`] that
 /// streams it back, with the decode-and-write observer attached. Runs once.
-pub fn setup_transform_readback(
-    mut commands: Commands,
-    mut buffers: ResMut<Assets<ShaderBuffer>>,
-) {
+pub fn setup_transform_readback(mut commands: Commands, mut buffers: ResMut<Assets<ShaderBuffer>>) {
     let words = (HEADER_WORDS + READBACK_CAPACITY * RECORD_WORDS) as usize;
     let mut buffer = ShaderBuffer::with_size(words * 4, RenderAssetUsages::RENDER_WORLD);
     // STORAGE: the gather writes it. COPY_SRC: `Readback` streams it.
@@ -192,7 +189,7 @@ pub fn init_transform_readback(mut commands: Commands) {
 /// there). The readback set is the changed nodes — same delta propagation walks.
 pub fn prepare_transform_readback(
     mut readback: ResMut<TransformReadback>,
-    local: Option<Res<GpuColumn<LocalColumn>>>,
+    local: Option<Res<GpuColumn<LocalTranslationColumn>>>,
     propagate: Option<Res<TransformPropagate>>,
     target: Option<Res<TransformReadbackTarget>>,
     gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
@@ -236,7 +233,7 @@ pub fn prepare_transform_readback(
 pub fn prepare_transform_readback_bind_group(
     mut readback: ResMut<TransformReadback>,
     resource_manager: Option<Res<SolariResourceManager>>,
-    local: Option<Res<GpuColumn<LocalColumn>>>,
+    local: Option<Res<GpuColumn<LocalTranslationColumn>>>,
     no_readback: Option<Res<GpuColumn<NoReadbackColumn>>>,
     parent: Option<Res<GpuColumn<ParentColumn>>>,
     entity: Option<Res<GpuColumn<NodeEntityColumn>>>,
@@ -254,7 +251,15 @@ pub fn prepare_transform_readback_bind_group(
         Some(entity),
         Some(propagate),
         Some(target),
-    ) = (resource_manager, local, no_readback, parent, entity, propagate, target)
+    ) = (
+        resource_manager,
+        local,
+        no_readback,
+        parent,
+        entity,
+        propagate,
+        target,
+    )
     else {
         readback.bind_group = None;
         return;
@@ -273,7 +278,8 @@ pub fn prepare_transform_readback_bind_group(
         &layout,
         &BindGroupEntries::sequential((
             changed.as_entire_binding(),
-            propagate.current_world().as_entire_binding(),
+            propagate.world_abs_linear().as_entire_binding(),
+            propagate.world_abs_t().as_entire_binding(),
             out.buffer.as_entire_binding(),
             params,
             no_readback.buffer().as_entire_binding(),
@@ -377,26 +383,34 @@ fn write_readback_global_transforms(
         // and a despawned occupant's `get_mut` fails — either way no stale splat. The
         // record's slot field (`words[base]`) is unused here; the gather only needs it
         // to index `world`.
-        let bits = (words[base + 13] as u64) | ((words[base + 14] as u64) << 32);
+        let bits = (words[base + 16] as u64) | ((words[base + 17] as u64) << 32);
         let Some(entity) = Entity::try_from_bits(bits) else {
             continue; // never-written / torn slot id — skip.
         };
         let Ok(mut global) = transforms.get_mut(entity) else {
             continue; // despawned / recycled since dispatch — skip.
         };
-        // 3 rows of a `mat3x4` (row k = linear row k .xyz, translation k .w).
-        // Rebuild the column-major `Affine3A`: column j = (row0[j], row1[j], row2[j]).
+        // The ABSOLUTE world: 9-float linear rows + f64 translation word pairs.
+        // Rebuild the column-major `DAffine3`: column j = (row0[j], row1[j], row2[j]).
+        // Absolute — the readback GlobalTransform holds true f64 world positions and
+        // never changes when only the camera (origin) moves.
         let f = |w: usize| f32::from_bits(words[base + 1 + w]);
-        let (r0x, r0y, r0z, tx) = (f(0), f(1), f(2), f(3));
-        let (r1x, r1y, r1z, ty) = (f(4), f(5), f(6), f(7));
-        let (r2x, r2y, r2z, tz) = (f(8), f(9), f(10), f(11));
-        *global = GlobalTransform::from(Affine3A {
-            matrix3: Mat3A::from_cols(
-                Vec3A::new(r0x, r1x, r2x),
-                Vec3A::new(r0y, r1y, r2y),
-                Vec3A::new(r0z, r1z, r2z),
+        let (r0x, r0y, r0z) = (f(0), f(1), f(2));
+        let (r1x, r1y, r1z) = (f(3), f(4), f(5));
+        let (r2x, r2y, r2z) = (f(6), f(7), f(8));
+        let d = |w: usize| {
+            f64::from_bits(
+                u64::from(words[base + 10 + w * 2]) | (u64::from(words[base + 11 + w * 2]) << 32),
+            )
+        };
+        let (tx, ty, tz) = (d(0), d(1), d(2));
+        *global = GlobalTransform::from(DAffine3 {
+            matrix3: DMat3::from_cols(
+                DVec3::new(f64::from(r0x), f64::from(r1x), f64::from(r2x)),
+                DVec3::new(f64::from(r0y), f64::from(r1y), f64::from(r2y)),
+                DVec3::new(f64::from(r0z), f64::from(r1z), f64::from(r2z)),
             ),
-            translation: Vec3A::new(tx, ty, tz),
+            translation: DVec3::new(tx, ty, tz),
         });
     }
 }

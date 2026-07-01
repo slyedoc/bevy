@@ -17,6 +17,7 @@ use bevy::{
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
     diagnostic::FrameTimeDiagnosticsPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
+    math::DQuat,
     prelude::*,
     solari::prelude::*,
 };
@@ -55,7 +56,11 @@ fn main() {
             Update,
             (
                 animate_smoke_puffs,
-                (convert_meshes_to_raytracing, convert_standard_materials_to_solari).chain(),
+                (
+                    convert_meshes_to_raytracing,
+                    convert_standard_materials_to_solari,
+                )
+                    .chain(),
             ),
         )
         .run();
@@ -81,13 +86,14 @@ fn animate_smoke_puffs(
     const CYCLE: f32 = 6.0;
     for (puff, mut transform, mut volume) in &mut puffs {
         let h = (time.elapsed_secs() / CYCLE + puff.phase).fract();
-        transform.translation = FIRE_POS
+        transform.translation = (FIRE_POS
             + Vec3::new(
                 h * 1.5 + (h * 9.0).sin() * 0.3, // wind drift + a little wobble
                 1.5 + h * 8.0,
                 (h * 7.0).cos() * 0.3,
-            );
-        transform.scale = Vec3::splat(0.7 + h * 2.0);
+            ))
+        .to_precision();
+        transform.scale = Vec3::splat(0.7 + h * 2.0).to_precision();
         // Fade in quickly at birth, thin out as the puff disperses.
         volume.density = 1.2 * (h * 6.0).min(1.0) * (1.0 - h);
     }
@@ -110,7 +116,7 @@ fn setup_scene(
             softness: 0.2,
             spherical: false,
         },
-        Transform::from_xyz(0.0, 6.0, -28.0).with_scale(Vec3::new(18.0, 6.0, 28.0)),
+        Transform::from_xyz(0.0, 6.0, -28.0).with_scale(Vec3::new(18.0, 6.0, 28.0).to_precision()),
     ));
 
     // A campfire outside the hall, off the left wall: a stone pit and an
@@ -126,7 +132,7 @@ fn setup_scene(
             perceptual_roughness: 1.0,
             ..default()
         })),
-        Transform::from_xyz(FIRE_POS.x, 0.25, FIRE_POS.z),
+        Transform::from_xyz(f64::from(FIRE_POS.x), 0.25, f64::from(FIRE_POS.z)),
     ));
     commands.spawn((
         Mesh3d(meshes.add(Cone {
@@ -138,7 +144,7 @@ fn setup_scene(
             emissive: LinearRgba::rgb(60000.0, 18000.0, 3000.0),
             ..default()
         })),
-        Transform::from_xyz(FIRE_POS.x, 1.4, FIRE_POS.z),
+        Transform::from_xyz(f64::from(FIRE_POS.x), 1.4, f64::from(FIRE_POS.z)),
     ));
     for i in 0..4 {
         commands.spawn((
@@ -152,7 +158,8 @@ fn setup_scene(
                 softness: 0.8,
                 spherical: true,
             },
-            Transform::from_xyz(FIRE_POS.x, 2.0, FIRE_POS.z).with_scale(Vec3::splat(0.7)),
+            Transform::from_xyz(f64::from(FIRE_POS.x), 2.0, f64::from(FIRE_POS.z))
+                .with_scale(Vec3::splat(0.7).to_precision()),
         ));
     }
 
@@ -183,7 +190,7 @@ fn setup_scene(
         commands.spawn((
             Mesh3d(pier.clone()),
             MeshMaterial3d(wall_material.clone()),
-            Transform::from_xyz(k as f32 * 5.2 - 15.6, 5.0, -56.0),
+            Transform::from_xyz(f64::from(k) * 5.2 - 15.6, 5.0, -56.0),
         ));
     }
 
@@ -237,9 +244,9 @@ fn setup_scene(
     // the mist. Through a window at y ≈ 5 the light descends ~0.25 per metre
     // and lands on the floor ~20 m in — right inside the mist pool.
     commands.spawn((
-        Transform::from_rotation(Quat::from_euler(
+        Transform::from_rotation(DQuat::from_euler(
             EulerRot::YXZ,
-            std::f32::consts::PI - 0.15,
+            std::f64::consts::PI - 0.15,
             -0.25,
             0.0,
         )),
@@ -260,7 +267,8 @@ fn setup_scene(
             run_speed: 15.0,
             ..Default::default()
         },
-        Transform::from_xyz(0.0, 3.5, -6.0).looking_at(Vec3::new(0.0, 4.0, -56.0), Vec3::Y),
+        Transform::from_xyz(0.0, 3.5, -6.0)
+            .looking_at(Vec3::new(0.0, 4.0, -56.0).to_precision(), Vec3::Y),
         Msaa::Off,
         SolariCamera,
         // The atmosphere drives the sun's color/attenuation and the sky; there's

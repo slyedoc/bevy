@@ -40,7 +40,7 @@ struct DeformParams {
 // propagated `world[]` buffer — that buffer only re-walks nodes whose own local
 // changed, so a joint whose parent animates but whose own local is static (e.g.
 // a toe bone) would be stale. `local` always holds every node's current local.
-@group(0) @binding(1) var<storage, read> local: array<f32>;
+@group(0) @binding(1) var<storage, read> local_t: array<f64>;
 // Per-joint inverse-bind poses (mat3x4), concatenated across active skeletons.
 @group(0) @binding(2) var<storage, read> inverse_bind: array<mat3x4<f32>>;
 // Per-joint node slot (skinning palette), concatenated across active skeletons.
@@ -62,6 +62,7 @@ struct DeformParams {
 // Rest tangents (vec4: xyz + w bitangent sign) + deformed-tangent output.
 @group(0) @binding(13) var<storage, read> rest_tangents: array<vec4<f32>>;
 @group(0) @binding(14) var<storage, read_write> deform_tangents: array<vec4<f32>>;
+@group(0) @binding(15) var<storage, read> local_rs: array<f32>;
 
 const ROOT_PARENT: u32 = 0xffffffffu;
 const MAX_DEPTH: u32 = 64u;
@@ -125,10 +126,14 @@ fn add_affine(a: mat3x4<f32>, b: mat3x4<f32>) -> mat3x4<f32> {
 // A node's local transform as a `mat3x4` affine (quat→3x3, scaled columns,
 // translation in `.w`). Matches `transform_propagate.wgsl::load_local`.
 fn load_local_affine(node: u32) -> mat3x4<f32> {
-    let b = node * 10u;
-    let t = vec3<f32>(local[b], local[b + 1u], local[b + 2u]);
-    let qx = local[b + 3u]; let qy = local[b + 4u]; let qz = local[b + 5u]; let qw = local[b + 6u];
-    let s = vec3<f32>(local[b + 7u], local[b + 8u], local[b + 9u]);
+    // The f64 local translation narrows to f32 here: the joint chain and the skinned
+    // instance's world are composed in the SAME space, so the shared magnitude cancels
+    // in their relative product (skinning at AU distances would need the f64 walk).
+    let tb = node * 3u;
+    let t = vec3<f32>(f32(local_t[tb]), f32(local_t[tb + 1u]), f32(local_t[tb + 2u]));
+    let b = node * 7u;
+    let qx = local_rs[b]; let qy = local_rs[b + 1u]; let qz = local_rs[b + 2u]; let qw = local_rs[b + 3u];
+    let s = vec3<f32>(local_rs[b + 4u], local_rs[b + 5u], local_rs[b + 6u]);
     let xx = qx * qx; let yy = qy * qy; let zz = qz * qz;
     let xy = qx * qy; let xz = qx * qz; let yz = qy * qz;
     let wx = qw * qx; let wy = qw * qy; let wz = qw * qz;

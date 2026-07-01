@@ -13,7 +13,7 @@ use bevy_ecs::{
 };
 use bevy_image::Image;
 use bevy_math::curve::{FunctionCurve, Interval, SampleAutoCurve};
-use bevy_math::{ops, Curve, FloatPow, Vec3};
+use bevy_math::{ops, Curve, FloatPow, ToPrecision, Vec3};
 use bevy_platform::collections::HashSet;
 use bevy_reflect::TypePath;
 use bevy_transform::components::GlobalTransform;
@@ -63,7 +63,7 @@ fn set_default_transform(mut world: DeferredWorld<'_>, HookContext { entity, .. 
     if let Some(mut transform) = world.get_mut::<GlobalTransform>(entity)
         && *transform == GlobalTransform::default()
     {
-        *transform = GlobalTransform::from_translation(-Vec3::Y * inner_radius);
+        *transform = GlobalTransform::from_translation((-Vec3::Y * inner_radius).to_precision());
     }
 }
 

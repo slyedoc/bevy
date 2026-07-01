@@ -224,7 +224,7 @@ pub fn settings_ui() -> impl Scene {
                             println!("new seed: {seed}");
                             spawn_city(
                                 &mut commands,
-                                &assets,                                
+                                &assets,
                                 seed,
                                 settings.city_size,
                             );

@@ -35,7 +35,7 @@ use bevy_ecs::{
     resource::Resource,
     system::{Commands, Query, Res},
 };
-use bevy_math::{UVec2, Vec2};
+use bevy_math::{Mat4, ToRender, UVec2, Vec2};
 use bevy_render::{
     camera::ExtractedCamera,
     extract_resource::ExtractResource,
@@ -203,7 +203,8 @@ pub fn init_dlss(app: &mut App) -> bool {
 
     match DlssSdk::new(project_id, wgpu_device) {
         Ok(sdk) => {
-            app.sub_app_mut(RenderApp).insert_resource(SolariDlssSdk(sdk));
+            app.sub_app_mut(RenderApp)
+                .insert_resource(SolariDlssSdk(sdk));
             true
         }
         Err(error) => {
@@ -279,8 +280,12 @@ fn create_guide_texture(
 }
 
 fn create_dlss_textures(render_device: &RenderDevice, size: UVec2) -> SolariDlssTextures {
-    let (t_depth, depth) =
-        create_guide_texture(render_device, size, TextureFormat::R32Float, "solari_dlss_depth");
+    let (t_depth, depth) = create_guide_texture(
+        render_device,
+        size,
+        TextureFormat::R32Float,
+        "solari_dlss_depth",
+    );
     let (t_nr, normal_roughness) = create_guide_texture(
         render_device,
         size,
@@ -299,8 +304,12 @@ fn create_dlss_textures(render_device: &RenderDevice, size: UVec2) -> SolariDlss
         TextureFormat::Rgba8Unorm,
         "solari_dlss_specular_albedo",
     );
-    let (t_motion, motion) =
-        create_guide_texture(render_device, size, TextureFormat::Rg16Float, "solari_dlss_motion");
+    let (t_motion, motion) = create_guide_texture(
+        render_device,
+        size,
+        TextureFormat::Rg16Float,
+        "solari_dlss_motion",
+    );
     let (t_shd, specular_hit_distance) = create_guide_texture(
         render_device,
         size,
@@ -513,8 +522,10 @@ pub fn solari_dlss_render(
     let mut context = dlss_context.context.lock().unwrap();
     let render_resolution = UVec2::from(context.render_resolution());
 
-    // Row-major camera matrices for the specular hit-distance guide.
-    let view_from_world = view.world_from_view.to_matrix().inverse();
+    // Row-major camera matrices for the specular hit-distance guide. The guide is
+    // consumed in origin-relative space where the primary camera sits at 0, so the
+    // basis is rotation-only (`world_from_view` is the camera's ABSOLUTE world).
+    let view_from_world = Mat4::from_quat(view.world_from_view.rotation().to_render()).inverse();
     let world_to_view_rows_array = view_from_world.transpose().to_cols_array();
     let view_to_clip_rows_array = view.clip_from_view.transpose().to_cols_array();
 

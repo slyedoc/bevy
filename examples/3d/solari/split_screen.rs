@@ -23,16 +23,20 @@ use bevy::{
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     core_pipeline::prepass::DepthPrepass,
     dev_tools::render_debug::RenderDebugOverlay,
+    feathers::{
+        dark_theme::create_dark_theme,
+        theme::{ThemedText, UiTheme},
+        FeathersPlugins,
+    },
     gltf::GltfMaterialName,
+    math::DQuat,
     prelude::*,
     render::occlusion_culling::OcclusionCulling,
     solari::prelude::*,
+    text::{Justify, TextLayout},
     window::WindowResized,
     world_serialization::WorldInstanceReady,
-    feathers::{dark_theme::create_dark_theme, theme::{ThemedText, UiTheme}, FeathersPlugins},
-    text::{Justify, TextLayout},
 };
-
 
 /// Left half: the Solari ray-traced diorama.
 const RT_LAYER: usize = 0;
@@ -58,11 +62,13 @@ fn main() {
     app.add_plugins(FeathersPlugins)
         .insert_resource(UiTheme(create_dark_theme()))
         .add_systems(Startup, setup_scene)
-        .add_systems(Update, (set_camera_viewports, sync_mirror_camera, draw_demo_gizmos))
+        .add_systems(
+            Update,
+            (set_camera_viewports, sync_mirror_camera, draw_demo_gizmos),
+        )
         // Converts ONLY the entities tagged `ConvertToRaytracing` (the diorama),
         // leaving the raster scene's `Mesh3d` untouched.
         .add_systems(Update, convert_marked_meshes_to_raytracing)
-        
         .run();
 }
 
@@ -102,7 +108,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
     let diorama = asset_server.load(
         GltfAssetLabel::Scene(0).from_asset("https://github.com/bevyengine/bevy_asset_files/raw/2a5950295a8b6d9d051d59c0df69e87abcda58c3/pica_pica/mini_diorama_01.glb"),
     );
-    let diorama_transform = Transform::from_scale(Vec3::splat(10.0));
+    let diorama_transform = Transform::from_scale(Vec3::splat(10.0).to_precision());
     commands
         .spawn((WorldAssetRoot(diorama.clone()), diorama_transform))
         .observe(setup_diorama(RT_LAYER, true));
@@ -120,7 +126,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
             shadow_maps_enabled: true,
             ..default()
         },
-        Transform::from_rotation(Quat::from_xyzw(
+        Transform::from_rotation(DQuat::from_xyzw(
             -0.13334629,
             -0.86597735,
             -0.3586996,
@@ -129,8 +135,11 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         RenderLayers::layer(RT_LAYER).with(RASTER_LAYER),
     ));
 
-    let camera_transform = Transform::from_translation(Vec3::new(0.219417, 2.5764852, 6.9718704))
-        .with_rotation(Quat::from_xyzw(-0.1466768, 0.013738206, 0.002037309, 0.989087));
+    let camera_transform =
+        Transform::from_translation(Vec3::new(0.219417, 2.5764852, 6.9718704).to_precision())
+            .with_rotation(
+                Quat::from_xyzw(-0.1466768, 0.013738206, 0.002037309, 0.989087).to_precision(),
+            );
 
     // Left camera — Solari ray tracing, free-fly controlled.
     let left_camera = commands
@@ -144,7 +153,9 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
             Msaa::Off,
             SolariCamera,
             RenderLayers::layer(RT_LAYER),
-            CameraSlot { pos: UVec2::new(0, 0) },
+            CameraSlot {
+                pos: UVec2::new(0, 0),
+            },
             FreeCamera {
                 walk_speed: 3.0,
                 run_speed: 10.0,
@@ -168,7 +179,9 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
                 ..default()
             },
             RenderLayers::layer(RASTER_LAYER),
-            CameraSlot { pos: UVec2::new(1, 0) },
+            CameraSlot {
+                pos: UVec2::new(1, 0),
+            },
             MirrorCamera,
             camera_transform,
             RenderDebugOverlay::default(),

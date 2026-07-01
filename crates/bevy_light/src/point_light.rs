@@ -6,7 +6,7 @@ use bevy_camera::{
 use bevy_color::Color;
 use bevy_ecs::prelude::*;
 use bevy_image::Image;
-use bevy_math::{primitives::ViewFrustum, Mat4};
+use bevy_math::{primitives::ViewFrustum, Mat4, ToPrecision, ToRender};
 use bevy_reflect::prelude::*;
 use bevy_transform::components::{GlobalTransform, Transform};
 
@@ -226,7 +226,9 @@ pub fn update_point_light_frusta(
 ) {
     let view_rotations = CUBE_MAP_FACES
         .iter()
-        .map(|CubeMapFace { target, up }| Transform::IDENTITY.looking_at(*target, *up))
+        .map(|CubeMapFace { target, up }| {
+            Transform::IDENTITY.looking_at(target.to_precision(), *up)
+        })
         .collect::<Vec<_>>();
 
     for (transform, point_light, mut cubemap_frusta, view_visibility) in &mut views {
@@ -253,11 +255,12 @@ pub fn update_point_light_frusta(
 
         for (view_rotation, frustum) in view_rotations.iter().zip(cubemap_frusta.iter_mut()) {
             let world_from_view = view_translation * *view_rotation;
-            let clip_from_world = clip_from_view * world_from_view.compute_affine().inverse();
+            let clip_from_world =
+                clip_from_view * world_from_view.compute_affine().to_render().inverse();
 
             *frustum = Frustum(ViewFrustum::from_clip_from_world_custom_far(
                 &clip_from_world,
-                &transform.translation(),
+                &transform.translation().to_render(),
                 &view_backward,
                 point_light.range,
             ));

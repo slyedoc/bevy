@@ -363,21 +363,21 @@ impl AnimationClip {
     /// # use bevy_animation::{animated_field, AnimationTargetId};
     /// #
     /// # use bevy_ecs::prelude::Name;
-    /// # use bevy_math::Vec3;
+    /// # use bevy_math::{ToPrecision, Vec3};
     /// # use bevy_transform::components::Transform;
     /// let mut clip = AnimationClip::default();
     /// let animatable_curve = AnimatableCurve::new(
     ///     animated_field!(Transform::translation),
     ///     AnimatableKeyframeCurve::new([
-    ///         (0.0, Vec3::new(0., 0., 1.)),
-    ///         (1.0, Vec3::new(1., 0., 0.)),
+    ///         (0.0, Vec3::new(0., 0., 1.).to_precision()),
+    ///         (1.0, Vec3::new(1., 0., 0.).to_precision()),
     ///     ])
     ///     .expect("Failed to create power level curve"),
     /// );
     /// let target_1 = AnimationTargetId::from_name(&Name::new("Target 1"));
     /// clip.add_curve_to_target(target_1, animatable_curve);
     /// let value = clip.sample_clamped(animated_field!(Transform::translation), target_1, 1.0);
-    /// assert_eq!(value, Some(Vec3::new(1., 0., 0.)));
+    /// assert_eq!(value, Some(Vec3::new(1., 0., 0.).to_precision()));
     /// ```
     pub fn sample_clamped<P: AnimatableProperty>(
         &self,
@@ -1573,7 +1573,7 @@ mod tests {
         self as bevy_animation,
         prelude::{AnimatableCurve, AnimatableKeyframeCurve},
     };
-    use bevy_math::Vec3;
+    use bevy_math::{ToPrecision, Vec3};
     use bevy_reflect::map::{DynamicMap, Map};
     use bevy_transform::components::Transform;
 
@@ -1767,8 +1767,8 @@ mod tests {
         let animatable_curve = AnimatableCurve::new(
             animated_field!(Transform::translation),
             AnimatableKeyframeCurve::new([
-                (0.0, Vec3::new(0., 0., 1.)),
-                (1.0, Vec3::new(1., 0., 0.)),
+                (0.0, Vec3::new(0., 0., 1.).to_precision()),
+                (1.0, Vec3::new(1., 0., 0.).to_precision()),
             ])
             .expect("Failed to create power level curve"),
         );
@@ -1776,7 +1776,7 @@ mod tests {
         let target_2 = AnimationTargetId::from_name(&Name::new("Target 2"));
         clip.add_curve_to_target(target_1, animatable_curve);
         let value = clip.sample_clamped(animated_field!(Transform::translation), target_1, 1.0);
-        assert_eq!(value, Some(Vec3::new(1., 0., 0.)));
+        assert_eq!(value, Some(Vec3::new(1., 0., 0.).to_precision()));
         let value = clip.sample_clamped(animated_field!(Transform::scale), target_1, 1.0);
         assert_eq!(value, None);
         let value = clip.sample_clamped(animated_field!(Transform::translation), target_2, 1.0);

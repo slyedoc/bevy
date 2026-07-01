@@ -26,12 +26,12 @@
 //! [`AnimationCurve`] that will use the given curve to animate the entity's property:
 //!
 //!     # use bevy_math::curve::{Curve, Interval, FunctionCurve};
-//!     # use bevy_math::vec3;
+//!     # use bevy_math::{vec3, ToPrecision};
 //!     # use bevy_transform::components::Transform;
 //!     # use bevy_animation::{animated_field, animation_curves::*};
 //!     # let wobble_curve = FunctionCurve::new(
 //!     #     Interval::UNIT,
-//!     #     |t| vec3(t.cos(), 0.0, 0.0)
+//!     #     |t| vec3(t.cos(), 0.0, 0.0).to_precision()
 //!     # );
 //!     let wobble_animation = AnimatableCurve::new(animated_field!(Transform::translation), wobble_curve);
 //!
@@ -42,10 +42,10 @@
 //!     # use bevy_animation::{AnimationClip, AnimationTargetId, animated_field, animation_curves::*};
 //!     # use bevy_transform::components::Transform;
 //!     # use bevy_ecs::name::Name;
-//!     # use bevy_math::vec3;
+//!     # use bevy_math::{vec3, ToPrecision};
 //!     # let wobble_curve = FunctionCurve::new(
 //!     #     Interval::UNIT,
-//!     #     |t| { vec3(t.cos(), 0.0, 0.0) },
+//!     #     |t| { vec3(t.cos(), 0.0, 0.0).to_precision() },
 //!     # );
 //!     # let wobble_animation = AnimatableCurve::new(animated_field!(Transform::translation), wobble_curve);
 //!     # let animation_target_id = AnimationTargetId::from(&Name::new("Test"));
@@ -804,7 +804,7 @@ macro_rules! animated_field {
 mod tests {
     use super::*;
     use crate::VariableCurve;
-    use bevy_math::Vec3;
+    use bevy_math::{ToPrecision, Vec3};
     use bevy_transform::components::Transform;
 
     #[test]
@@ -825,22 +825,22 @@ mod tests {
         let variable_curve = VariableCurve::new(AnimatableCurve::new(
             animated_field!(Transform::translation),
             AnimatableKeyframeCurve::new([
-                (0.0, Vec3::new(0., 0., 1.)),
-                (1.0, Vec3::new(1., 0., 0.)),
+                (0.0, Vec3::new(0., 0., 1.).to_precision()),
+                (1.0, Vec3::new(1., 0., 0.).to_precision()),
             ])
             .expect("Failed to create power level curve"),
         ));
         let value = variable_curve
             .0
             .sample_clamped(0.)
-            .downcast::<Vec3>()
+            .downcast::<bevy_math::TVec3>()
             .unwrap();
-        assert_eq!(*value, Vec3::new(0., 0., 1.));
+        assert_eq!(*value, Vec3::new(0., 0., 1.).to_precision());
         let value = variable_curve
             .0
             .sample_clamped(1.)
-            .downcast::<Vec3>()
+            .downcast::<bevy_math::TVec3>()
             .unwrap();
-        assert_eq!(*value, Vec3::new(1., 0., 0.));
+        assert_eq!(*value, Vec3::new(1., 0., 0.).to_precision());
     }
 }

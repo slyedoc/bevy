@@ -24,25 +24,21 @@ pub struct CityRoot;
 /// Each city block is 5.5 units x 4.0 units.
 ///
 /// Every asset gets spawned relative to the crossroad position
-pub fn spawn_city(
-    commands: &mut Commands,
-    assets: &CityAssets,
-    seed: u64,
-    size: u32,
-) {
+pub fn spawn_city(commands: &mut Commands, assets: &CityAssets, seed: u64, size: u32) {
     let mut rng = SmallRng::seed_from_u64(seed);
     let noise = OpenSimplex::new(rng.random());
     let noise_scale = 0.025;
 
     commands
         .spawn((
-            CityRoot, 
-            Transform::default(), 
+            CityRoot,
+            Transform::default(),
             Visibility::default(),
             // Note: Since we dont ever use the GlobalTransforms on anythign in city in main world
-            // we can skip reading them back to the CPU for better performance            
-            #[cfg(feature = "solari")] NoGpuGlobalTransformReadback
-    ))
+            // we can skip reading them back to the CPU for better performance
+            #[cfg(feature = "solari")]
+            NoGpuGlobalTransformReadback,
+        ))
         .with_children(|commands| {
             let half_size = size as i32 / 2;
             for x in -half_size..half_size {
@@ -74,9 +70,10 @@ pub fn spawn_city(
                             MeshMaterial3d(assets.ground_tile.1.clone())
                         },
                         Transform::from_translation(
-                            Vec3::new(0.5, -0.5005, 0.5) + ground_tile_scale / 2.0 + offset,
+                            (Vec3::new(0.5, -0.5005, 0.5) + ground_tile_scale / 2.0 + offset)
+                                .to_precision(),
                         )
-                        .with_scale(ground_tile_scale),
+                        .with_scale(ground_tile_scale.to_precision()),
                     ));
 
                     if density < forest {
@@ -104,7 +101,7 @@ fn spawn_roads_and_cars<R: RngExt>(
 
     commands.spawn((
         WorldAssetRoot(assets.crossroad.clone()),
-        Transform::from_xyz(x, 0.0, z),
+        Transform::from_xyz(x.to_precision(), 0.0, z.to_precision()),
     ));
 
     let max_car_density = 0.4;
@@ -118,7 +115,7 @@ fn spawn_roads_and_cars<R: RngExt>(
     let car_count = 9;
     commands
         .spawn((
-            Transform::from_translation(offset),
+            Transform::from_translation(offset.to_precision()),
             Visibility::default(),
             Road {
                 start: Vec3::new(0.75, 0.0, 0.0),
@@ -128,8 +125,8 @@ fn spawn_roads_and_cars<R: RngExt>(
         .with_children(|commands| {
             commands.spawn((
                 WorldAssetRoot(assets.road_straight.clone()),
-                Transform::from_translation(Vec3::new(2.75, 0.0, 0.0))
-                    .with_scale(Vec3::new(4.5, 1.0, 1.0)),
+                Transform::from_translation(Vec3::new(2.75, 0.0, 0.0).to_precision())
+                    .with_scale(Vec3::new(4.5, 1.0, 1.0).to_precision()),
             ));
 
             for i in 0..car_count {
@@ -138,12 +135,14 @@ fn spawn_roads_and_cars<R: RngExt>(
                 if rng.random::<f32>() < max_car_density {
                     commands.spawn((
                         assets.get_random_car(rng),
-                        Transform::from_translation(car_pos + Vec3::new(0.0, 0.0, -0.15))
-                            .with_scale(Vec3::splat(0.15))
-                            .with_rotation(Quat::from_axis_angle(
-                                Vec3::Y,
-                                3.0 * std::f32::consts::FRAC_PI_2,
-                            )),
+                        Transform::from_translation(
+                            (car_pos + Vec3::new(0.0, 0.0, -0.15)).to_precision(),
+                        )
+                        .with_scale(Vec3::splat(0.15).to_precision())
+                        .with_rotation(
+                            Quat::from_axis_angle(Vec3::Y, 3.0 * std::f32::consts::FRAC_PI_2)
+                                .to_precision(),
+                        ),
                         Car {
                             distance_traveled: i as f32 * 0.5,
                             dir: -1.0,
@@ -155,12 +154,14 @@ fn spawn_roads_and_cars<R: RngExt>(
                 if rng.random::<f32>() < max_car_density {
                     commands.spawn((
                         assets.get_random_car(rng),
-                        Transform::from_translation(car_pos + Vec3::new(0.0, 0.0, 0.15))
-                            .with_scale(Vec3::splat(0.15))
-                            .with_rotation(Quat::from_axis_angle(
-                                Vec3::Y,
-                                std::f32::consts::FRAC_PI_2,
-                            )),
+                        Transform::from_translation(
+                            (car_pos + Vec3::new(0.0, 0.0, 0.15)).to_precision(),
+                        )
+                        .with_scale(Vec3::splat(0.15).to_precision())
+                        .with_rotation(
+                            Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2)
+                                .to_precision(),
+                        ),
                         Car {
                             distance_traveled: i as f32 * 0.5,
                             dir: 1.0,
@@ -175,7 +176,7 @@ fn spawn_roads_and_cars<R: RngExt>(
     let car_count = 6;
     commands
         .spawn((
-            Transform::from_translation(offset),
+            Transform::from_translation(offset.to_precision()),
             Visibility::default(),
             Road {
                 start: Vec3::new(0.0, 0.0, 0.75),
@@ -185,9 +186,11 @@ fn spawn_roads_and_cars<R: RngExt>(
         .with_children(|commands| {
             commands.spawn((
                 WorldAssetRoot(assets.road_straight.clone()),
-                Transform::from_translation(Vec3::new(0.0, 0.0, 2.0))
-                    .with_scale(Vec3::new(3.0, 1.0, 1.0))
-                    .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2)),
+                Transform::from_translation(Vec3::new(0.0, 0.0, 2.0).to_precision())
+                    .with_scale(Vec3::new(3.0, 1.0, 1.0).to_precision())
+                    .with_rotation(
+                        Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2).to_precision(),
+                    ),
             ));
 
             for i in 0..car_count {
@@ -196,8 +199,10 @@ fn spawn_roads_and_cars<R: RngExt>(
                 if rng.random::<f32>() < max_car_density {
                     commands.spawn((
                         assets.get_random_car(rng),
-                        Transform::from_translation(car_pos + Vec3::new(0.15, 0.0, 0.0))
-                            .with_scale(Vec3::splat(0.15)),
+                        Transform::from_translation(
+                            (car_pos + Vec3::new(0.15, 0.0, 0.0)).to_precision(),
+                        )
+                        .with_scale(Vec3::splat(0.15).to_precision()),
                         Car {
                             distance_traveled: i as f32 * 0.5,
                             dir: 1.0,
@@ -209,9 +214,13 @@ fn spawn_roads_and_cars<R: RngExt>(
                 if rng.random::<f32>() < max_car_density {
                     commands.spawn((
                         assets.get_random_car(rng),
-                        Transform::from_translation(car_pos + Vec3::new(-0.15, 0.0, 0.0))
-                            .with_scale(Vec3::splat(0.15))
-                            .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::PI)),
+                        Transform::from_translation(
+                            (car_pos + Vec3::new(-0.15, 0.0, 0.0)).to_precision(),
+                        )
+                        .with_scale(Vec3::splat(0.15).to_precision())
+                        .with_rotation(
+                            Quat::from_axis_angle(Vec3::Y, std::f32::consts::PI).to_precision(),
+                        ),
                         Car {
                             distance_traveled: i as f32 * 0.5,
                             dir: -1.0,
@@ -233,29 +242,41 @@ fn spawn_low_density<R: RngExt>(
         let x_factor = 1.8;
         commands.spawn((
             assets.low_density.get_random_building(rng),
-            Transform::from_translation(Vec3::new(x as f32 * x_factor, 0.0, 1.25) + offset),
+            Transform::from_translation(
+                (Vec3::new(x as f32 * x_factor, 0.0, 1.25) + offset).to_precision(),
+            ),
         ));
         commands.spawn((
             assets.low_density.get_random_building(rng),
-            Transform::from_translation(Vec3::new(x as f32 * x_factor, 0.0, 2.75) + offset)
-                .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::PI)),
+            Transform::from_translation(
+                (Vec3::new(x as f32 * x_factor, 0.0, 2.75) + offset).to_precision(),
+            )
+            .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::PI).to_precision()),
         ));
     }
     for i in 0..=6 {
         commands.spawn((
             WorldAssetRoot(assets.fence.clone()),
-            Transform::from_translation(Vec3::new(2.75, 0.0, 0.75 + i as f32 * 0.4) + offset)
-                .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2)),
+            Transform::from_translation(
+                (Vec3::new(2.75, 0.0, 0.75 + i as f32 * 0.4) + offset).to_precision(),
+            )
+            .with_rotation(
+                Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2).to_precision(),
+            ),
         ));
     }
     for z in 0..=8 {
         commands.spawn((
             WorldAssetRoot(assets.tree_small.clone()),
-            Transform::from_translation(Vec3::new(0.75, 0.0, 0.75 + z as f32 * 0.3) + offset),
+            Transform::from_translation(
+                (Vec3::new(0.75, 0.0, 0.75 + z as f32 * 0.3) + offset).to_precision(),
+            ),
         ));
         commands.spawn((
             WorldAssetRoot(assets.tree_small.clone()),
-            Transform::from_translation(Vec3::new(4.75, 0.0, 0.75 + z as f32 * 0.3) + offset),
+            Transform::from_translation(
+                (Vec3::new(4.75, 0.0, 0.75 + z as f32 * 0.3) + offset).to_precision(),
+            ),
         ));
     }
 }
@@ -270,7 +291,9 @@ fn spawn_medium_density<R: RngExt>(
     for x in 1..=5 {
         commands.spawn((
             assets.medium_density.get_random_building(rng),
-            Transform::from_translation(Vec3::new(x as f32 * x_factor, 0.0, 1.0) + offset),
+            Transform::from_translation(
+                (Vec3::new(x as f32 * x_factor, 0.0, 1.0) + offset).to_precision(),
+            ),
         ));
 
         for tree_x in 0..=1 {
@@ -281,38 +304,48 @@ fn spawn_medium_density<R: RngExt>(
             commands.spawn((
                 WorldAssetRoot(assets.tree_large.clone()),
                 Transform::from_translation(
-                    Vec3::new(tree_x + x as f32 * x_factor, 0.0, 1.75) + offset,
+                    (Vec3::new(tree_x + x as f32 * x_factor, 0.0, 1.75) + offset).to_precision(),
                 ),
             ));
             commands.spawn((
                 WorldAssetRoot(assets.tree_large.clone()),
                 Transform::from_translation(
-                    Vec3::new(tree_x + x as f32 * x_factor, 0.0, 2.25) + offset,
+                    (Vec3::new(tree_x + x as f32 * x_factor, 0.0, 2.25) + offset).to_precision(),
                 ),
             ));
         }
 
         commands.spawn((
             assets.medium_density.get_random_building(rng),
-            Transform::from_translation(Vec3::new(x as f32 * x_factor, 0.0, 3.0) + offset)
-                .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::PI)),
+            Transform::from_translation(
+                (Vec3::new(x as f32 * x_factor, 0.0, 3.0) + offset).to_precision(),
+            )
+            .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::PI).to_precision()),
         ));
     }
 
     for x in 0..=10 {
         commands.spawn((
             WorldAssetRoot(assets.path_stones_long.clone()),
-            Transform::from_translation(Vec3::new(0.75 + (x as f32 * 0.4), 0.02, 2.0) + offset)
-                .with_scale(Vec3::new(1.0, 2.0, 1.0))
-                .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2)),
+            Transform::from_translation(
+                (Vec3::new(0.75 + (x as f32 * 0.4), 0.02, 2.0) + offset).to_precision(),
+            )
+            .with_scale(Vec3::new(1.0, 2.0, 1.0).to_precision())
+            .with_rotation(
+                Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2).to_precision(),
+            ),
         ));
         commands.spawn((
             WorldAssetRoot(assets.fence.clone()),
-            Transform::from_translation(Vec3::new(0.75 + (x as f32 * 0.4), 0.02, 1.85) + offset),
+            Transform::from_translation(
+                (Vec3::new(0.75 + (x as f32 * 0.4), 0.02, 1.85) + offset).to_precision(),
+            ),
         ));
         commands.spawn((
             WorldAssetRoot(assets.fence.clone()),
-            Transform::from_translation(Vec3::new(0.75 + (x as f32 * 0.4), 0.02, 2.15) + offset),
+            Transform::from_translation(
+                (Vec3::new(0.75 + (x as f32 * 0.4), 0.02, 2.15) + offset).to_precision(),
+            ),
         ));
     }
 }
@@ -327,12 +360,16 @@ fn spawn_high_density<R: RngExt>(
         let x = x as f32;
         commands.spawn((
             assets.high_density.get_random_building(rng),
-            Transform::from_translation(Vec3::new(1.25 + x * 1.5, 0.0, 1.25) + offset),
+            Transform::from_translation(
+                (Vec3::new(1.25 + x * 1.5, 0.0, 1.25) + offset).to_precision(),
+            ),
         ));
         commands.spawn((
             assets.high_density.get_random_building(rng),
-            Transform::from_translation(Vec3::new(1.25 + x * 1.5, 0.0, 2.75) + offset)
-                .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::PI)),
+            Transform::from_translation(
+                (Vec3::new(1.25 + x * 1.5, 0.0, 2.75) + offset).to_precision(),
+            )
+            .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::PI).to_precision()),
         ));
     }
 }
@@ -346,9 +383,10 @@ fn spawn_forest<R: RngExt>(
     for x in 0..=12 {
         for z in 0..=8 {
             let transform = Transform::from_translation(
-                Vec3::new(x as f32, 0.0, z as f32) * Vec3::new(0.325, 0.0, 0.3)
+                (Vec3::new(x as f32, 0.0, z as f32) * Vec3::new(0.325, 0.0, 0.3)
                     + Vec3::new(0.75, 0.0, 0.85)
-                    + offset,
+                    + offset)
+                    .to_precision(),
             );
 
             match rng.random_range(0..3) {

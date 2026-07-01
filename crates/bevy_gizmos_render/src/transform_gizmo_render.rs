@@ -20,7 +20,7 @@ use bevy_ecs::{
 };
 use bevy_math::{
     primitives::{Cone, Cuboid, Cylinder, Torus},
-    Quat, Vec3,
+    Quat, ToPrecision, ToRender, Vec3,
 };
 use bevy_mesh::{Mesh, Mesh3d, MeshBuilder, Meshable};
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
@@ -244,8 +244,10 @@ fn spawn_gizmo_meshes(
             &mut commands,
             shaft_mesh.clone(),
             mat.clone(),
-            Transform::from_translation(axis_vec(axis) * (AXIS_START_OFFSET + SHAFT_LENGTH / 2.0))
-                .with_rotation(axis_rotation(axis)),
+            Transform::from_translation(
+                (axis_vec(axis) * (AXIS_START_OFFSET + SHAFT_LENGTH / 2.0)).to_precision(),
+            )
+            .with_rotation(axis_rotation(axis).to_precision()),
             axis,
             TransformGizmoMode::Translate,
         );
@@ -254,9 +256,10 @@ fn spawn_gizmo_meshes(
             cone_mesh.clone(),
             mat,
             Transform::from_translation(
-                axis_vec(axis) * (AXIS_START_OFFSET + SHAFT_LENGTH + CONE_HEIGHT / 2.0),
+                (axis_vec(axis) * (AXIS_START_OFFSET + SHAFT_LENGTH + CONE_HEIGHT / 2.0))
+                    .to_precision(),
             )
-            .with_rotation(axis_rotation(axis)),
+            .with_rotation(axis_rotation(axis).to_precision()),
             axis,
             TransformGizmoMode::Translate,
         );
@@ -288,7 +291,7 @@ fn spawn_gizmo_meshes(
             &mut commands,
             rotate_torus_mesh.clone(),
             mat,
-            Transform::from_rotation(torus_rot),
+            Transform::from_rotation(torus_rot.to_precision()),
             axis,
             TransformGizmoMode::Rotate,
         );
@@ -315,8 +318,10 @@ fn spawn_gizmo_meshes(
             &mut commands,
             shaft_mesh.clone(),
             mat.clone(),
-            Transform::from_translation(axis_vec(axis) * (AXIS_START_OFFSET + SHAFT_LENGTH / 2.0))
-                .with_rotation(axis_rotation(axis)),
+            Transform::from_translation(
+                (axis_vec(axis) * (AXIS_START_OFFSET + SHAFT_LENGTH / 2.0)).to_precision(),
+            )
+            .with_rotation(axis_rotation(axis).to_precision()),
             axis,
             TransformGizmoMode::Scale,
         );
@@ -325,7 +330,8 @@ fn spawn_gizmo_meshes(
             scale_cube_mesh.clone(),
             mat,
             Transform::from_translation(
-                axis_vec(axis) * (AXIS_START_OFFSET + SHAFT_LENGTH + CONE_HEIGHT / 2.0),
+                (axis_vec(axis) * (AXIS_START_OFFSET + SHAFT_LENGTH + CONE_HEIGHT / 2.0))
+                    .to_precision(),
             ),
             axis,
             TransformGizmoMode::Scale,
@@ -417,14 +423,14 @@ fn update_gizmo_meshes(
     let rotation = bevy_gizmos::transform_gizmo::gizmo_rotation(*global_tf, space);
 
     let scale = if settings.screen_scale_factor > 0.0 {
-        (cam_tf.translation() - pos).length() * settings.screen_scale_factor
+        (cam_tf.translation() - pos).to_render().length() * settings.screen_scale_factor
     } else {
         1.0
     };
 
     root_tf.translation = pos;
-    root_tf.rotation = rotation;
-    root_tf.scale = Vec3::splat(scale);
+    root_tf.rotation = rotation.to_precision();
+    root_tf.scale = Vec3::splat(scale).to_precision();
 
     let active_axis = if state.active {
         state.axis

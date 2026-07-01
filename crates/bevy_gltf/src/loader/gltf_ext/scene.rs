@@ -1,5 +1,5 @@
 use bevy_ecs::name::Name;
-use bevy_math::{Mat4, Vec3};
+use bevy_math::{Mat4, ToPrecision, Vec3};
 use bevy_transform::components::Transform;
 
 use gltf::scene::Node;
@@ -29,16 +29,16 @@ pub(crate) fn node_name(node: &Node) -> Name {
 pub(crate) fn node_transform(node: &Node) -> Transform {
     match node.transform() {
         gltf::scene::Transform::Matrix { matrix } => {
-            Transform::from_matrix(Mat4::from_cols_array_2d(&matrix))
+            Transform::from_matrix(Mat4::from_cols_array_2d(&matrix).to_precision())
         }
         gltf::scene::Transform::Decomposed {
             translation,
             rotation,
             scale,
         } => Transform {
-            translation: Vec3::from(translation),
-            rotation: bevy_math::Quat::from_array(rotation),
-            scale: Vec3::from(scale),
+            translation: Vec3::from(translation).to_precision(),
+            rotation: bevy_math::Quat::from_array(rotation).to_precision(),
+            scale: Vec3::from(scale).to_precision(),
         },
     }
 }

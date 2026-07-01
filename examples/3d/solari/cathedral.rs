@@ -23,6 +23,7 @@ use bevy::{
     dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
     diagnostic::FrameTimeDiagnosticsPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
+    math::DQuat,
     prelude::*,
     solari::prelude::*,
 };
@@ -61,7 +62,11 @@ fn main() {
         .add_systems(Startup, setup_scene)
         .add_systems(
             Update,
-            (convert_meshes_to_raytracing, convert_standard_materials_to_solari).chain(),
+            (
+                convert_meshes_to_raytracing,
+                convert_standard_materials_to_solari,
+            )
+                .chain(),
         )
         .add_observer(log_click)
         .run();
@@ -109,7 +114,7 @@ fn setup_scene(
             softness: 0.2,
             spherical: false,
         },
-        Transform::from_xyz(0.0, 6.0, -28.0).with_scale(Vec3::new(18.0, 6.0, 28.0)),
+        Transform::from_xyz(0.0, 6.0, -28.0).with_scale(Vec3::new(18.0, 6.0, 28.0).to_precision()),
     ));
 
     // Pale limestone walls and piers — light enough to show the colored pools.
@@ -137,7 +142,7 @@ fn setup_scene(
         commands.spawn((
             Mesh3d(pier.clone()),
             MeshMaterial3d(stone.clone()),
-            Transform::from_xyz(k as f32 * 5.2 - 15.6, 5.0, -56.0),
+            Transform::from_xyz(f64::from(k) * 5.2 - 15.6, 5.0, -56.0),
         ));
     }
 
@@ -160,7 +165,7 @@ fn setup_scene(
                 attenuation_distance: THICKNESS,
                 ..default()
             })),
-            Transform::from_xyz(center_x, 5.0, -56.0),
+            Transform::from_xyz(f64::from(center_x), 5.0, -56.0),
         ));
     }
 
@@ -213,9 +218,9 @@ fn setup_scene(
     // nave. Through a window at y ≈ 5 the light descends ~0.25 per metre and
     // lands on the floor ~20 m in — right inside the mist.
     commands.spawn((
-        Transform::from_rotation(Quat::from_euler(
+        Transform::from_rotation(DQuat::from_euler(
             EulerRot::YXZ,
-            std::f32::consts::PI - 0.15,
+            std::f64::consts::PI - 0.15,
             -0.25,
             0.0,
         )),
@@ -236,7 +241,8 @@ fn setup_scene(
             run_speed: 15.0,
             ..Default::default()
         },
-        Transform::from_xyz(0.0, 3.5, -6.0).looking_at(Vec3::new(0.0, 4.0, -56.0), Vec3::Y),
+        Transform::from_xyz(0.0, 3.5, -6.0)
+            .looking_at(Vec3::new(0.0, 4.0, -56.0).to_precision(), Vec3::Y),
         Msaa::Off,
         SolariCamera,
         // The atmosphere drives the sun's color/attenuation and the sky; there's

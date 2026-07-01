@@ -59,3 +59,6 @@ rustdoc-args = [
   "--generate-macro-expansion",
 ]
 all-features = true
+
+[features]
+transform_f64 = ["bevy_math/transform_f64", "bevy_transform/transform_f64"]

@@ -141,7 +141,7 @@ pub fn main() {
 
     let default_plugins = DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
-            title: "Bistro".into(),            
+            title: "Bistro".into(),
             resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
             present_mode: PresentMode::AutoNoVsync,
             position: WindowPosition::Centered(MonitorSelection::Primary),
@@ -300,7 +300,9 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
                 }
                 spawn_bistro(
                     &mut commands,
-                    Some(Transform::from_xyz(x as f32 * 150.0, 0.0, z as f32 * 150.0)),
+                    Some(Transform::from_translation(
+                        Vec3::new(x as f32 * 150.0, 0.0, z as f32 * 150.0).to_precision(),
+                    )),
                 );
                 count += 1;
             }
@@ -322,7 +324,9 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     #[cfg(not(feature = "solari"))]
     commands
         .spawn((
-            Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0)),
+            Transform::from_rotation(
+                Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0).to_precision(),
+            ),
             DirectionalLight {
                 color: Color::srgb(1.0, 0.87, 0.78),
                 illuminance: lux::FULL_DAYLIGHT,
@@ -348,7 +352,9 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     // the ray tracer traces shadow rays directly.
     #[cfg(feature = "solari")]
     commands.spawn((
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0)),
+        Transform::from_rotation(
+            Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0).to_precision(),
+        ),
         SolariDirectionLight {
             color: Color::srgb(1.0, 0.87, 0.78),
             illuminance: lux::FULL_DAYLIGHT,
@@ -362,7 +368,8 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
         Msaa::Off,
         Camera3d::default(),
         Hdr,
-        Transform::from_xyz(-10.5, 1.7, -1.0).looking_at(Vec3::new(0.0, 3.5, 0.0), Vec3::Y),
+        Transform::from_xyz(-10.5, 1.7, -1.0)
+            .looking_at(Vec3::new(0.0, 3.5, 0.0).to_precision(), Vec3::Y),
         Projection::Perspective(PerspectiveProjection {
             fov: std::f32::consts::PI / 3.0,
             near: 0.1,
@@ -509,42 +516,42 @@ impl Default for CameraPositions {
     fn default() -> Self {
         Self([
             Transform {
-                translation: Vec3::new(-10.5, 1.7, -1.0),
-                rotation: Quat::from_array([-0.05678932, 0.7372272, -0.062454797, -0.670351]),
-                scale: Vec3::ONE,
+                translation: TVec3::new(-10.5, 1.7, -1.0),
+                rotation: TQuat::from_array([-0.05678932, 0.7372272, -0.062454797, -0.670351]),
+                scale: TVec3::ONE,
             },
             Transform {
-                translation: Vec3::new(56.23809, 2.9985719, 28.96291),
-                rotation: Quat::from_array([0.0020175162, 0.35272083, -0.0007605003, 0.93572617]),
-                scale: Vec3::ONE,
+                translation: TVec3::new(56.23809, 2.9985719, 28.96291),
+                rotation: TQuat::from_array([0.0020175162, 0.35272083, -0.0007605003, 0.93572617]),
+                scale: TVec3::ONE,
             },
             Transform {
-                translation: Vec3::new(5.7861176, 3.3475509, -8.821455),
-                rotation: Quat::from_array([-0.0049382094, -0.98193514, -0.025878597, 0.18737496]),
-                scale: Vec3::ONE,
+                translation: TVec3::new(5.7861176, 3.3475509, -8.821455),
+                rotation: TQuat::from_array([-0.0049382094, -0.98193514, -0.025878597, 0.18737496]),
+                scale: TVec3::ONE,
             },
         ])
     }
 }
 
 const ANIM_SPEED: f32 = 0.2;
-const ANIM_HYSTERESIS: f32 = 0.1; // EMA/LPF
+const ANIM_HYSTERESIS: TReal = 0.1; // EMA/LPF
 
 const ANIM_CAM: [Transform; 3] = [
     Transform {
-        translation: Vec3::new(-6.414026, 8.179898, -23.550516),
-        rotation: Quat::from_array([-0.016413536, -0.88136566, -0.030704278, 0.4711502]),
-        scale: Vec3::ONE,
+        translation: TVec3::new(-6.414026, 8.179898, -23.550516),
+        rotation: TQuat::from_array([-0.016413536, -0.88136566, -0.030704278, 0.4711502]),
+        scale: TVec3::ONE,
     },
     Transform {
-        translation: Vec3::new(-14.752817, 6.279289, 5.691277),
-        rotation: Quat::from_array([-0.031593435, -0.516736, -0.019086324, 0.8553488]),
-        scale: Vec3::ONE,
+        translation: TVec3::new(-14.752817, 6.279289, 5.691277),
+        rotation: TQuat::from_array([-0.031593435, -0.516736, -0.019086324, 0.8553488]),
+        scale: TVec3::ONE,
     },
     Transform {
-        translation: Vec3::new(5.1539426, 8.142523, 16.436222),
-        rotation: Quat::from_array([-0.07907656, -0.07581916, -0.006031934, 0.99396276]),
-        scale: Vec3::ONE,
+        translation: TVec3::new(5.1539426, 8.142523, 16.436222),
+        rotation: TQuat::from_array([-0.07907656, -0.07581916, -0.006031934, 0.99396276]),
+        scale: TVec3::ONE,
     },
 ];
 
@@ -570,9 +577,9 @@ fn input(
     }
 }
 
-fn lerp<T>(a: T, b: T, t: f32) -> T
+fn lerp<T>(a: T, b: T, t: TReal) -> T
 where
-    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<f32, Output = T>,
+    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<TReal, Output = T>,
 {
     a + (b - a) * t
 }
@@ -583,6 +590,7 @@ fn follow_path(points: &[Transform], progress: f32) -> Transform {
     let mut segment_progress = progress * total_segments;
     let segment_index = segment_progress.floor() as usize;
     segment_progress -= segment_index as f32;
+    let segment_progress = segment_progress.to_precision();
     let a = points[segment_index];
     let b = points[(segment_index + 1).min(points.len() - 1)];
     Transform {
@@ -624,7 +632,10 @@ fn spin(
     if args.spin {
         let camera_position = things_to_spin.get(*camera).unwrap().translation;
         let spin = |thing_to_spin: &mut Transform| {
-            thing_to_spin.rotate_around(camera_position, Quat::from_rotation_y(time.delta_secs()));
+            thing_to_spin.rotate_around(
+                camera_position,
+                Quat::from_rotation_y(time.delta_secs()).to_precision(),
+            );
         };
         things_to_spin.iter_mut().for_each(|mut s| spin(s.as_mut())); // WHY
         positions.iter_mut().for_each(spin);

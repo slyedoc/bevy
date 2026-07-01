@@ -12,20 +12,20 @@
 //! root → arm → hand → finger, so if it swings correctly the nested propagation is working.
 //! A row of static posts + a floor (not parented) are the fixed-world backdrop.
 //!
-//! **The floating-origin twist:** the whole scene sits ~1 AU (1.5×10⁸ m) from the grid
+//! **The floating-origin twist:** the whole scene sits ~1 AU (1.5×10⁸ m) from the world
 //! origin — far past where f32 world coordinates hold sub-metre precision. The big offset
-//! rides a double-single [`SolariFrameWorld`] on the **root frame** (subtracted against the
-//! camera origin in df64 *before* the f32 fold), while the frame's spin and the children's
-//! frame-local offsets stay small and precise. With it working, the cubes render rock-steady
-//! and crisp at 1 AU; the nested motion is identical to the near-origin version. Turn the
-//! frame worlds off (drop `SolariFrameWorld` / the origin) and the whole scene collapses
-//! toward the f32 origin and shimmers.
+//! is just the root's `Transform` (double-precision with `transform_f64`, which solari
+//! requires); the GPU walk composes it in native f64 and subtracts the camera's own
+//! absolute world *before* the f32 fold, while the frame's spin and the children's
+//! frame-local offsets stay small and precise. With it working, the cubes render
+//! rock-steady and crisp at 1 AU; the nested motion is identical to the near-origin
+//! version — and there is nothing to author beyond ordinary `Transform`s.
 //!
 //! How it works: `TransformPlugin` is disabled, so there is no CPU `GlobalTransform` — solari's
 //! change-driven propagate composes worlds on the GPU. That pass re-walks only nodes whose own
 //! local changed, so a moving parent would leave a static-local child stale; tagging the
 //! spinning **root** [`SolariFrame`] opts its whole subtree (arms, hands, *and* the static
-//! fingers) into a re-walk each frame it moves. The floating origin is the df64 successor to
+//! fingers) into a re-walk each frame it moves. The floating origin is the f64 successor to
 //! `big_space` (Aevyrie, MIT/Apache — credited). It just loops — nothing is despawned.
 
 use bevy::{
@@ -98,14 +98,14 @@ fn main() {
 /// static-local hands — re-walks through the new pose each frame.
 fn spin_root(time: Res<Time>, mut roots: Query<&mut Transform, With<Root>>) {
     for mut transform in &mut roots {
-        transform.rotate_y(0.5 * time.delta_secs());
+        transform.rotate_y(0.5 * f64::from(time.delta_secs()));
     }
 }
 
 /// Rotate each arm about its own axis. Their locals change, so they re-walk normally.
 fn spin_arms(time: Res<Time>, mut arms: Query<&mut Transform, With<Arm>>) {
     for mut transform in &mut arms {
-        transform.rotate_y(1.5 * time.delta_secs());
+        transform.rotate_y(1.5 * f64::from(time.delta_secs()));
     }
 }
 
@@ -114,7 +114,7 @@ fn spin_arms(time: Res<Time>, mut arms: Query<&mut Transform, With<Arm>>) {
 /// subtree re-walk composing root → arm → hand → finger.
 fn spin_hands(time: Res<Time>, mut hands: Query<&mut Transform, With<Hand>>) {
     for mut transform in &mut hands {
-        transform.rotate_y(3.0 * time.delta_secs());
+        transform.rotate_y(3.0 * f64::from(time.delta_secs()));
     }
 }
 
@@ -123,10 +123,10 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Everything lives ~1 AU out along +X. The camera *is* the floating origin: its
-    // `SolariFrameWorld` (below) is the df64 world the propagate subtracts, so the camera
-    // renders at 0 and the scene sits just ahead of it, its big df64 world removed before the
-    // f32 fold. `cam_offset` is the camera's world-space offset from the scene root.
+    // Everything lives ~1 AU out along +X. The camera *is* the floating origin — the
+    // subtract pass reads its own absolute world off the GPU, so the camera renders at 0
+    // and the scene sits just ahead of it, its big world removed before the f32 fold.
+    // `cam_offset` is the camera's world-space offset from the scene root.
     let scene_pos = DVec3::new(AU_M, 0.0, 0.0);
     let cam_offset = Vec3::new(0.0, 4.0, 16.0);
     let camera_pos = scene_pos + cam_offset.as_dvec3();
@@ -169,23 +169,20 @@ fn setup(
         ..default()
     });
 
-    // ── The hierarchy: root → arm → hand. The ROOT carries the big offset — its df64
-    // `SolariFrameWorld` (1 AU out) *and* the `SolariFrame` tag that re-walks the whole
-    // subtree each spin. Children stay frame-local with NO frame world (one frame node per
-    // ChildOf chain — a second would subtract the origin twice); their `Transform`s are the
-    // small frame-local detail. ──
+    // ── The hierarchy: root → arm → hand. The ROOT carries the big offset — its f64
+    // `Transform` (1 AU out) *and* the `SolariFrame` tag that re-walks the whole subtree
+    // each spin. Children stay frame-local; their `Transform`s are the small local detail. ──
     commands
         .spawn((
             Root,
             SolariFrame,
-            SolariFrameWorld::new(scene_pos),
             Mesh3d(root_mesh),
             MeshMaterial3d(root_mat),
-            Transform::from_xyz(0.0, 1.0, 0.0),
+            Transform::from_translation(scene_pos + DVec3::new(0.0, 1.0, 0.0)),
         ))
         .with_children(|root| {
             // Two arms, on opposite sides of the root. Frame-local offsets, no cell.
-            for side in [1.0_f32, -1.0] {
+            for side in [1.0_f64, -1.0] {
                 root.spawn((
                     Arm,
                     Mesh3d(arm_mesh.clone()),
@@ -225,10 +222,9 @@ fn setup(
     });
     for i in -2..=2 {
         commands.spawn((
-            SolariFrameWorld::new(scene_pos),
             Mesh3d(post_mesh.clone()),
             MeshMaterial3d(post_mat.clone()),
-            Transform::from_xyz(i as f32 * 3.0, -1.5, -8.0),
+            Transform::from_translation(scene_pos + DVec3::new(f64::from(i) * 3.0, -1.5, -8.0)),
         ));
     }
 
@@ -240,16 +236,14 @@ fn setup(
         ..default()
     });
     commands.spawn((
-        SolariFrameWorld::new(scene_pos),
         Mesh3d(floor_mesh),
         MeshMaterial3d(floor_mat),
-        Transform::from_xyz(0.0, -3.0, 0.0),
+        Transform::from_translation(scene_pos + DVec3::new(0.0, -3.0, 0.0)),
     ));
 
-    // Camera: the floating origin itself. Its `SolariFrameWorld` is the df64 world the
-    // propagate reads as the origin, so it renders at 0 (subtracts its own world) — solari
-    // derives the render view from the GPU transform table. It looks at the root, whose
-    // origin-relative position is `−cam_offset` plus the root's frame-local `(0, 1, 0)`.
+    // Camera: the floating origin itself — an ordinary f64 `Transform` at 1 AU. It renders
+    // at 0 by construction (the subtract pass reads its own absolute world as the origin) —
+    // solari derives the render view from the GPU transform table.
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -259,12 +253,12 @@ fn setup(
         CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         SolariCamera,
-        SolariFrameWorld::new(camera_pos),
         FreeCamera {
             walk_speed: 20.0,
             run_speed: 2000.0,
             ..default()
         },
-        Transform::default().looking_at(Vec3::new(0.0, 1.0, 0.0) - cam_offset, Vec3::Y),
+        Transform::from_translation(camera_pos)
+            .looking_to((Vec3::new(0.0, 1.0, 0.0) - cam_offset).normalize(), Vec3::Y),
     ));
 }

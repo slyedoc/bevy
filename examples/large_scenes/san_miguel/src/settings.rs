@@ -4,7 +4,7 @@
 //! San Miguel is a daylit courtyard with little authored emissive, so the boost
 //! defaults to 1.0 (no change). It is kept for parity with the other large-scene
 //! examples and to crank any emissive materials should the scene gain them; the
-//! slider scales every `SolariMaterial`'s emissive against its as-loaded value.
+//! slider scales every `StandardSolariMaterial`'s emissive against its as-loaded value.
 
 use std::collections::HashMap;
 
@@ -18,7 +18,7 @@ use bevy::{
     },
     light::light_consts::lux,
     prelude::*,
-    solari::prelude::{CameraReset, SolariCamera, SolariDirectionLight, SolariMaterial},
+    solari::prelude::{CameraReset, SolariCamera, SolariDirectionLight, StandardSolariMaterial},
     ui::Checked,
     ui_widgets::{
         checkbox_self_update, slider_self_update, SliderPrecision, SliderStep, ValueChange,
@@ -89,7 +89,8 @@ fn apply_sun(
             settings.sun_azimuth.to_radians(),
             -settings.sun_elevation.to_radians(),
             0.0,
-        );
+        )
+        .to_precision();
         let illuminance = if settings.sun_enabled {
             lux::FULL_DAYLIGHT
         } else {
@@ -107,8 +108,8 @@ fn apply_sun(
 /// moves (a `get_mut` marks the asset modified, so avoid spurious writes).
 fn apply_emissive(
     settings: Res<LightSettings>,
-    mut materials: ResMut<Assets<SolariMaterial>>,
-    mut as_loaded: Local<HashMap<AssetId<SolariMaterial>, LinearRgba>>,
+    mut materials: ResMut<Assets<StandardSolariMaterial>>,
+    mut as_loaded: Local<HashMap<AssetId<StandardSolariMaterial>, LinearRgba>>,
 ) {
     let changed = settings.is_changed();
     let ids: Vec<_> = materials.ids().collect();

@@ -14,12 +14,11 @@ pub use rt_camera::{rt_camera_bind_group_layout, RtCameraPassParams};
 
 use ash::vk;
 use bevy_asset::{load_embedded_asset, AssetServer};
-use bevy_math::{Mat4, UVec4, Vec2, Vec4};
 use bevy_ecs::prelude::*;
+use bevy_math::{Mat4, ToRender, UVec4, Vec2, Vec3, Vec4};
 use bevy_render::{
     camera::ExtractedCamera,
     render_asset::RenderAssets,
-    Extract,
     render_resource::{
         binding_types::{storage_buffer_read_only_sized, texture_storage_2d},
         BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, BufferUsages,
@@ -34,27 +33,28 @@ use bevy_render::{
     sync_world::RenderEntity,
     texture::{FallbackImage, GpuImage},
     view::{ExtractedView, ViewTarget},
+    Extract,
 };
 use wgpu::hal::api::Vulkan as VkApi;
 
 use crate::bindings::RaytracingSceneBindings;
 use crate::ecs_gpu::{GpuSlot, SceneColumns};
-use crate::pipelines::SolariPipelines;
-use crate::resource_manager::SolariResourceManager;
-use crate::transform::{TransformGraph, TransformPropagate};
-use crate::material::{material_sbt_class, MaterialSlots, MaterialTraversalFlags};
+use crate::geometry::ClusterMeshManager;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::extension::RayTracingPipelineFeature;
-use crate::gpu::RawTraceBindable;
 use crate::gpu::rt_pipeline::{
     RtCamera, RtGeometryAddresses, RtPipeline, RtViewBindings, SolariAnyHitDef, SolariHitGroupDef,
     SolariHitGroupRegistry,
 };
-use crate::geometry::ClusterMeshManager;
+use crate::gpu::RawTraceBindable;
+use crate::material::{material_sbt_class, MaterialSlots, MaterialTraversalFlags};
+use crate::pipelines::SolariPipelines;
 use crate::render::atmosphere::{AtmosphereSky, SolariAtmosphereView};
-use bevy_render::extract_resource::ExtractResource;
 use crate::render::view_cull::SolariEnvironmentMap;
 use crate::render::{CameraReframe, SolariCamera};
+use crate::resource_manager::SolariResourceManager;
+use crate::transform::{TransformGraph, TransformPropagate};
+use bevy_render::extract_resource::ExtractResource;
 
 /// `RenderStartup`: build the RT pipeline (raygen/miss/chit + SBT) if the
 /// `VK_KHR_ray_tracing_pipeline` feature is present and the raw-VK allocator
@@ -81,9 +81,7 @@ fn raw_set(bind_group: &bevy_render::render_resource::BindGroup) -> Option<vk::D
 /// Raw `VkImageView` of a wgpu texture view, or `None` if not Vulkan-backed. Used
 /// to bake the environment-cube view into the RT pipeline's set 1 (the wgpu
 /// texture owns it; we only read the handle).
-fn raw_image_view(
-    view: &bevy_render::render_resource::TextureView,
-) -> Option<vk::ImageView> {
+fn raw_image_view(view: &bevy_render::render_resource::TextureView) -> Option<vk::ImageView> {
     // SAFETY: Vulkan-backed; we read the image-view handle, never destroy it.
     unsafe { view.as_hal::<VkApi>() }.map(|v| unsafe { v.raw_handle() })
 }
@@ -317,9 +315,9 @@ pub struct RtGbuffer {
     pub raw: vk::Buffer,
 }
 
-/// Byte size of `rt_camera.wgsl`'s `PrevCamera` (`mat4x4` + `u32`, std430-padded to a
-/// 16-byte multiple).
-const RT_PREV_CAMERA_SIZE: u64 = 80;
+/// Byte size of `rt_camera.wgsl`'s `PrevCamera` (`mat4x4` + 3×`f64` previous origin +
+/// `u32`, std430-padded).
+const RT_PREV_CAMERA_SIZE: u64 = 96;
 
 /// `Prepare`: (re)allocate the per-view RT output buffer to fit the viewport.
 pub fn prepare_rt_output(
@@ -513,15 +511,18 @@ fn try_dispatch_rt_camera(
             params_binding,
             output.camera_buffer.as_entire_binding(),
             output.camera_prev_buffer.as_entire_binding(),
+            propagate.world_abs_t().as_entire_binding(),
         )),
     );
 
     // Recorded on the ctx encoder → flushed (and its write made visible by the trace's
     // pre-barrier) before the trace's own command buffer runs.
-    let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {
-        label: Some("rt_camera"),
-        timestamp_writes: None,
-    });
+    let mut pass = ctx
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("rt_camera"),
+            timestamp_writes: None,
+        });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     pass.dispatch_workgroups(1, 1, 1);
@@ -815,7 +816,10 @@ pub(crate) fn rt_pipeline(
     // `view.clip_from_world` is usually None; derive world_from_clip from the
     // always-present view transform + projection:
     // world_from_clip = world_from_view * inverse(clip_from_view).
-    let world_from_view = view.world_from_view.to_matrix();
+    // The trace consumes ORIGIN-RELATIVE space and the primary camera IS the
+    // origin, so this CPU fallback basis is rotation-only (translation 0) —
+    // `view.world_from_view` is the camera's ABSOLUTE world.
+    let world_from_view = Mat4::from_quat(view.world_from_view.rotation().to_render());
     let view_from_world = world_from_view.inverse();
     let world_from_clip = world_from_view * view.clip_from_view.inverse();
     // Unjittered clip-from-world for the DLSS motion-vector guide; "previous" comes
@@ -839,7 +843,7 @@ pub(crate) fn rt_pipeline(
         prev_clip_from_world: prev_clip_from_world.to_cols_array(),
         // .xyz = ray origin; .w = camera exposure (raygen scales final radiance by
         // it, like the megakernel's `radiance *= view.exposure`).
-        camera_position: view.world_from_view.translation().extend(camera.exposure).to_array(),
+        camera_position: Vec3::ZERO.extend(camera.exposure).to_array(),
         // .x = frame index (RNG seed); .y = SER material-hint bits =
         // ceil(log2(material_count)), the number of low bits of the SBT-record-index
         // hint reorderThread should sort by (driver clamps to its own max).
@@ -863,7 +867,10 @@ pub(crate) fn rt_pipeline(
             },
             // .w = displacement debug view (1 = on); the opaque chit shows each
             // surface's height map (grayscale) to validate the displacement wiring.
-            debug.show_displacement.as_deref().is_some_and(|d| d.enabled) as u32,
+            debug
+                .show_displacement
+                .as_deref()
+                .is_some_and(|d| d.enabled) as u32,
         ],
         // .x = sky brightness; .yzw = clear color (black for bevy_city).
         sky: [environment_brightness, 0.0, 0.0, 0.0],
@@ -909,8 +916,7 @@ pub(crate) fn rt_pipeline(
             let active = reframe.filter(|r| !r.is_identity());
             RtCameraGpuInputs {
                 clip_from_view: view.clip_from_view,
-                reframe_prev_from_current: active
-                    .map_or(Mat4::IDENTITY, |r| r.prev_from_current),
+                reframe_prev_from_current: active.map_or(Mat4::IDENTITY, |r| r.prev_from_current),
                 reframe_active: active.is_some(),
                 frame: UVec4::from_array(camera_inputs.frame),
                 sky: Vec4::from_array(camera_inputs.sky),

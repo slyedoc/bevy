@@ -34,7 +34,7 @@ use bevy_material::{
 use bevy_math::{
     ops,
     primitives::{HalfSpace, ViewFrustum},
-    Mat4, UVec4, Vec3, Vec3Swizzles, Vec4, Vec4Swizzles,
+    Mat4, ToPrecision, ToRender, UVec4, Vec3, Vec3Swizzles, Vec4, Vec4Swizzles,
 };
 use bevy_mesh::{Mesh3d, MeshVertexBufferLayoutRef};
 use bevy_platform::collections::{HashMap, HashSet};
@@ -1071,7 +1071,9 @@ pub fn prepare_lights(
     // Pre-calculate for PointLights
     let cube_face_rotations = CUBE_MAP_FACES
         .iter()
-        .map(|CubeMapFace { target, up }| Transform::IDENTITY.looking_at(*target, *up))
+        .map(|CubeMapFace { target, up }| {
+            Transform::IDENTITY.looking_at(target.to_precision(), *up)
+        })
         .collect::<Vec<_>>();
 
     global_clusterable_object_meta.entity_to_index.clear();
@@ -1302,7 +1304,11 @@ pub fn prepare_lights(
                     * light.intensity)
                     .xyz()
                     .extend(1.0 / (light.range * light.range)),
-                position_radius: light.transform.translation().extend(light.radius),
+                position_radius: light
+                    .transform
+                    .translation()
+                    .to_render()
+                    .extend(light.radius),
                 flags: flags.bits(),
                 shadow_depth_bias: light.shadow_depth_bias,
                 shadow_normal_bias: light.shadow_normal_bias,
@@ -1966,7 +1972,7 @@ pub fn prepare_lights(
             let up = rect_light.transform.up().into();
             gpu_lights.rect_lights[index] = GpuRectLight {
                 color: Vec4::from_slice(&rect_light.color.to_f32_array()) * rect_light.intensity,
-                position: rect_light.transform.translation(),
+                position: rect_light.transform.translation().to_render(),
                 right,
                 up,
                 width: rect_light.width,
@@ -2957,7 +2963,7 @@ pub fn extract_shadow_lod_origin(
     .and_then(|shadow_lod_origin_entity| global_transform_query.get(shadow_lod_origin_entity).ok())
     {
         Some(global_transform) => {
-            render_shadow_lod_origin.0 = global_transform.translation();
+            render_shadow_lod_origin.0 = global_transform.translation().to_render();
         }
         None => render_shadow_lod_origin.0 = Default::default(),
     }

@@ -15,16 +15,16 @@
 //! foundation for co-resident multi-world (each frame → one PTLAS partition): a ship, a
 //! station, or a spinning planet whose surface tiles ride the frame.
 //!
-//! A floating origin is configured too (the station sits 1 AU out), so the frame model and
-//! the df64 offset compose: the frame's big world is carried in double-single precision and
-//! subtracted against the camera origin, while its rotation folds into the children's
-//! per-instance matrices on the free walk.
+//! A floating origin composes for free (the station sits 1 AU out): `Transform` is
+//! double-precision, the GPU walk carries the frame's big world in native f64, and the
+//! subtract pass relativizes it against the camera origin, while its rotation folds into
+//! the children's per-instance matrices on the free walk.
 
 use bevy::{
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     dev_tools::render_debug::RenderDebugOverlayPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
-    math::DVec3,
+    math::{DQuat, DVec3},
     pbr::PbrPlugin,
     prelude::*,
     solari::prelude::*,
@@ -76,7 +76,7 @@ fn main() {
 /// without carrying any motion of their own.
 fn spin_station(time: Res<Time>, mut frames: Query<&mut Transform, With<Station>>) {
     for mut transform in &mut frames {
-        transform.rotate_y(0.3 * time.delta_secs());
+        transform.rotate_y(0.3 * f64::from(time.delta_secs()));
     }
 }
 
@@ -86,9 +86,9 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     // The station sits 1 AU out along +X; the camera 25 m short of it, looking at it. The
-    // camera *is* the floating origin — its `SolariFrameWorld` (below) is the df64 world the
-    // propagate subtracts from every frame, so the station's ~1 AU offset stays crisp while
-    // its spin rides the per-instance matrices.
+    // camera *is* the floating origin — the subtract pass reads its own absolute world off
+    // the GPU, so the station's ~1 AU offset stays crisp while its spin rides the
+    // per-instance matrices. All of it is plain `Transform`s.
     let station_pos = DVec3::new(AU_M, 0.0, 0.0);
     let camera_pos = station_pos + DVec3::new(-25.0, 0.0, 0.0);
 
@@ -123,9 +123,8 @@ fn setup(
         .spawn((
             Station,
             SolariFrame,
-            // The frame's big df64 world (1 AU out) + its initial orientation.
-            SolariFrameWorld::new(station_pos),
-            Transform::IDENTITY,
+            // The frame's big world (1 AU out) — an ordinary f64 `Transform`.
+            Transform::from_translation(station_pos),
         ))
         .with_children(|frame| {
             // The hub at the frame origin.
@@ -149,8 +148,12 @@ fn setup(
                 frame.spawn((
                     Mesh3d(panel_mesh.clone()),
                     MeshMaterial3d(mat),
-                    Transform::from_xyz(angle.cos() * radius, 0.0, angle.sin() * radius)
-                        .with_rotation(Quat::from_rotation_y(-angle)),
+                    Transform::from_xyz(
+                        f64::from(angle.cos() * radius),
+                        0.0,
+                        f64::from(angle.sin() * radius),
+                    )
+                    .with_rotation(DQuat::from_rotation_y(-f64::from(angle))),
                 ));
             }
         });
@@ -166,16 +169,15 @@ fn setup(
     });
     for i in -2..=2 {
         commands.spawn((
-            SolariFrameWorld::new(station_pos),
             Mesh3d(post_mesh.clone()),
             MeshMaterial3d(post_mat.clone()),
-            Transform::from_xyz(0.0, -4.0, i as f32 * 6.0),
+            Transform::from_translation(station_pos + DVec3::new(0.0, -4.0, f64::from(i) * 6.0)),
         ));
     }
 
-    // Camera: the floating origin itself. Its `SolariFrameWorld` is the df64 world the
-    // propagate reads as the origin, so it renders at 0 (subtracts its own world) and the
-    // station appears 25 m ahead (+X). It flies via its local `Transform` within that origin.
+    // Camera: the floating origin itself — an ordinary `Transform` at 1 AU. It renders at
+    // 0 by construction (the subtract pass reads its own absolute world as the origin), so
+    // the station appears 25 m ahead (+X). The controller flies it directly.
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -184,12 +186,11 @@ fn setup(
         },
         Msaa::Off,
         SolariCamera,
-        SolariFrameWorld::new(camera_pos),
         FreeCamera {
             walk_speed: 100.0,
             run_speed: 2000.0,
             ..Default::default()
         },
-        Transform::default().looking_to(Vec3::X, Vec3::Y),
+        Transform::from_translation(camera_pos).looking_to(Vec3::X, Vec3::Y),
     ));
 }

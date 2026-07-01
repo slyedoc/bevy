@@ -193,7 +193,19 @@ Example | Description
 [Shadow Biases](../examples/3d/shadow_biases.rs) | Demonstrates how shadow biases affect shadows in a 3d scene
 [Shadow Caster and Receiver](../examples/3d/shadow_caster_receiver.rs) | Demonstrates how to prevent meshes from casting/receiving shadows in a 3d scene
 [Skybox](../examples/3d/skybox.rs) | Load a cubemap texture onto a cube like a skybox and cycle through different compressed texture formats.
-[Solari](../examples/3d/solari.rs) | Demonstrates realtime dynamic raytraced lighting using Bevy Solari.
+[Solari (animation)](../examples/3d/solari/animation.rs) | Ray-traced GPU skeletal animation of a skinned glTF (Bevy Solari).
+[Solari (floating origin)](../examples/3d/solari/floating_origin.rs) | Galactic-scale ray tracing with no f32 collapse: solari's native GPU floating origin (big_space-style), camera parked 1 AU from the grid origin.
+[Solari (fog volumes)](../examples/3d/solari/fog_volumes.rs) | Local participating media - a mist pool and a smoke column sliced into god rays by per-step shadow rays.
+[Solari (hair)](../examples/3d/solari/hair.rs) | Ray-traced hair via NV linear swept spheres — a procedural fur ball shaded with a Chiang fiber BSDF (Bevy Solari). Requires an RTX 50-series GPU.
+[Solari (many lights stress test)](../examples/3d/solari/many_lights.rs) | 400 emissive sphere lights over 8000 cubes — Bevy Solari scaling stress test, with the `SolariDebugPlugin` overlay.
+[Solari (pica_pica)](../examples/3d/solari/pica_pica.rs) | Realtime ray-traced lighting on the pica_pica diorama (Bevy Solari), with the `SolariDebugPlugin` overlay.
+[Solari (portals)](../examples/3d/solari/portal.rs) | Ray portals — surfaces that teleport rays to a paired portal, routed to a dedicated SBT hit group (Bevy Solari).
+[Solari (reference frames)](../examples/3d/solari/frames.rs) | A moving SolariFrame whose children ride its pose on the GPU transform table — a spinning station against a fixed world; the foundation for co-resident multi-world (frame → PTLAS partition).
+[Solari (refraction)](../examples/3d/solari/refraction.rs) | Transmissive glass: a Bistro wine bottle and glass path-traced with refraction, TIR, and Beer-Lambert absorption.
+[Solari (scope)](../examples/3d/solari/scope.rs) | A working 4x Galilean telescope built from real lens geometry - magnification emerges from refraction.
+[Solari (split screen)](../examples/3d/solari/split_screen.rs) | The same scene side by side: Solari ray tracing vs the standard Bevy rasterizer, separated by `RenderLayers`.
+[Solari (stained-glass cathedral)](../examples/3d/solari/cathedral.rs) | Colored sunlight through transmissive glass - tinted shadow rays paint window-colored floor pools and fog god-rays.
+[Solari (transform hierarchy)](../examples/3d/solari/hierarchy.rs) | The classic parent/child/grandchild nesting test in 3D, run on solari's GPU transform table (CPU TransformPlugin disabled) and placed 1 AU from the grid origin so the nested walk composes with the floating-origin cell offset.
 [Specular Tint](../examples/3d/specular_tint.rs) | Demonstrates specular tints and maps
 [Spherical Area Lights](../examples/3d/spherical_area_lights.rs) | Demonstrates how point light radius values affect light behavior
 [Split Screen](../examples/3d/split_screen.rs) | Demonstrates how to render two cameras to the same window to accomplish "split screen"
@@ -473,6 +485,7 @@ Example | Description
 Example | Description
 --- | ---
 [BSN example](../examples/scene/bsn.rs) | Demonstrates how to use BSN to compose scenes
+[Dynamic BSN](../examples/scene/dynamic_bsn.rs) | Demonstrates how to load and spawn BSN assets at runtime
 [World Serialization](../examples/scene/world_serialization.rs) | Demonstrates loading from and saving world to files
 
 ### Shaders

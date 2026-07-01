@@ -55,7 +55,11 @@ fn main() {
         .add_systems(
             Update,
             (
-                (convert_meshes_to_raytracing, convert_standard_materials_to_solari).chain(),
+                (
+                    convert_meshes_to_raytracing,
+                    convert_standard_materials_to_solari,
+                )
+                    .chain(),
                 walk_through_portals,
             ),
         )
@@ -81,10 +85,10 @@ fn setup_scene(
     // Each portal's front faces the other across the courtyard; behind each one
     // sits a big wall in the OTHER portal's colour, so looking into the orange
     // portal shows the blue wall (and vice-versa) — the teleport made obvious.
-    let orange_spot = Transform::from_xyz(-4.0, PORTAL_HY, -5.0)
-        .with_rotation(Quat::from_rotation_y(FRAC_PI_2)); // front (+Z) → +X, toward blue
-    let blue_spot = Transform::from_xyz(4.0, PORTAL_HY, -5.0)
-        .with_rotation(Quat::from_rotation_y(-FRAC_PI_2)); // front (+Z) → -X, toward orange
+    let orange_spot = Transform::from_xyz(-4.0, f64::from(PORTAL_HY), -5.0)
+        .with_rotation(Quat::from_rotation_y(FRAC_PI_2).to_precision()); // front (+Z) → +X, toward blue
+    let blue_spot = Transform::from_xyz(4.0, f64::from(PORTAL_HY), -5.0)
+        .with_rotation(Quat::from_rotation_y(-FRAC_PI_2).to_precision()); // front (+Z) → -X, toward orange
 
     let portal_surface = meshes.add(Plane3d::new(Vec3::Z, Vec2::new(PORTAL_HX, PORTAL_HY)));
     // Never shaded — rays redirect on hit. Route to the built-in `chit_portal` via the
@@ -108,12 +112,12 @@ fn setup_scene(
             blue_spot,
         ))
         .id();
-    commands
-        .entity(orange_portal)
-        .insert(SolariPortal { target: blue_portal });
-    commands
-        .entity(blue_portal)
-        .insert(SolariPortal { target: orange_portal });
+    commands.entity(orange_portal).insert(SolariPortal {
+        target: blue_portal,
+    });
+    commands.entity(blue_portal).insert(SolariPortal {
+        target: orange_portal,
+    });
 
     // Frames (so the portals read as objects, not holes in the world).
     for (spot, color) in [
@@ -128,16 +132,28 @@ fn setup_scene(
         });
         let bar_w = 0.08;
         for (offset, size) in [
-            (Vec3::new(-(PORTAL_HX + bar_w / 2.0), 0.0, 0.0), Vec3::new(bar_w, 2.0 * PORTAL_HY + 2.0 * bar_w, bar_w)),
-            (Vec3::new(PORTAL_HX + bar_w / 2.0, 0.0, 0.0), Vec3::new(bar_w, 2.0 * PORTAL_HY + 2.0 * bar_w, bar_w)),
-            (Vec3::new(0.0, PORTAL_HY + bar_w / 2.0, 0.0), Vec3::new(2.0 * PORTAL_HX, bar_w, bar_w)),
-            (Vec3::new(0.0, -(PORTAL_HY + bar_w / 2.0), 0.0), Vec3::new(2.0 * PORTAL_HX, bar_w, bar_w)),
+            (
+                Vec3::new(-(PORTAL_HX + bar_w / 2.0), 0.0, 0.0),
+                Vec3::new(bar_w, 2.0 * PORTAL_HY + 2.0 * bar_w, bar_w),
+            ),
+            (
+                Vec3::new(PORTAL_HX + bar_w / 2.0, 0.0, 0.0),
+                Vec3::new(bar_w, 2.0 * PORTAL_HY + 2.0 * bar_w, bar_w),
+            ),
+            (
+                Vec3::new(0.0, PORTAL_HY + bar_w / 2.0, 0.0),
+                Vec3::new(2.0 * PORTAL_HX, bar_w, bar_w),
+            ),
+            (
+                Vec3::new(0.0, -(PORTAL_HY + bar_w / 2.0), 0.0),
+                Vec3::new(2.0 * PORTAL_HX, bar_w, bar_w),
+            ),
         ] {
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::from_size(size))),
                 MeshMaterial3d(frame_material.clone()),
                 Transform {
-                    translation: spot.transform_point(offset),
+                    translation: spot.transform_point(offset.to_precision()),
                     rotation: spot.rotation,
                     ..default()
                 },
@@ -179,7 +195,7 @@ fn setup_scene(
     ));
 
     commands.spawn((
-        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, -0.7, -1.0, 0.0)),
+        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, -0.7, -1.0, 0.0).to_precision()),
         SolariDirectionLight {
             illuminance: light_consts::lux::FULL_DAYLIGHT,
             ..default()
@@ -197,7 +213,8 @@ fn setup_scene(
             run_speed: 6.0,
             ..Default::default()
         },
-        Transform::from_xyz(0.0, 2.0, 3.0).looking_at(Vec3::new(0.0, 1.2, -5.0), Vec3::Y),
+        Transform::from_xyz(0.0, 2.0, 3.0)
+            .looking_at(Vec3::new(0.0, 1.2, -5.0).to_precision(), Vec3::Y),
         Msaa::Off,
         SolariCamera,
         SolariAtmosphere::default(),
@@ -216,7 +233,7 @@ fn walk_through_portals(
     mut cameras_reset: Query<&mut CameraReset, With<SolariCamera>>,
 ) {
     let (camera_transform, free_camera_state) = &mut *camera;
-    let current = camera_transform.translation;
+    let current = camera_transform.translation.to_render();
     let Some(previous) = previous_position.replace(current) else {
         return;
     };
@@ -226,8 +243,14 @@ fn walk_through_portals(
 
     for (_, portal, portal_transform) in &portals {
         // Segment previous→current vs the portal plane, inside the quad.
-        let local_prev = portal_transform.affine().inverse().transform_point3(previous);
-        let local_cur = portal_transform.affine().inverse().transform_point3(current);
+        let local_prev = portal_transform
+            .affine()
+            .inverse()
+            .transform_point3(previous);
+        let local_cur = portal_transform
+            .affine()
+            .inverse()
+            .transform_point3(current);
         if local_prev.z.signum() == local_cur.z.signum() {
             continue; // didn't cross the plane
         }
@@ -245,12 +268,12 @@ fn walk_through_portals(
         let teleported = map
             * Mat4::from_scale_rotation_translation(
                 Vec3::ONE,
-                camera_transform.rotation,
-                camera_transform.translation,
+                camera_transform.rotation.to_render(),
+                camera_transform.translation.to_render(),
             );
         let (_, rotation, translation) = teleported.to_scale_rotation_translation();
-        camera_transform.translation = translation;
-        camera_transform.rotation = rotation;
+        camera_transform.translation = translation.to_precision();
+        camera_transform.rotation = rotation.to_precision();
 
         // Re-derive the controller's look state from the new rotation.
         let (yaw, pitch, _) = rotation.to_euler(EulerRot::YXZ);

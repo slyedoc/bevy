@@ -8,7 +8,17 @@
 //! the corner.
 
 use bevy::{
-    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig}, diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin}, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, image::{ImageAddressMode, ImageLoaderSettings}, mesh::VertexAttributeValues, pbr::PbrPlugin, post_process::bloom::Bloom, prelude::*, render::diagnostic::RenderDiagnosticsPlugin, solari::prelude::*,
+    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
+    diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin},
+    feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
+    image::{ImageAddressMode, ImageLoaderSettings},
+    mesh::VertexAttributeValues,
+    pbr::PbrPlugin,
+    post_process::bloom::Bloom,
+    prelude::*,
+    render::diagnostic::RenderDiagnosticsPlugin,
+    solari::prelude::*,
 };
 use chacha20::ChaCha8Rng;
 use rand::{RngExt, SeedableRng};
@@ -80,9 +90,10 @@ fn setup_scene(
             run_speed: 250.0,
             ..Default::default()
         },
-        Transform::from_translation(Vec3::new(6.11329, 166.74896, 451.8226)).with_rotation(
-            Quat::from_xyzw(-0.183938, 0.009093744, 0.0017017953, 0.9828943),
-        ),
+        Transform::from_translation(Vec3::new(6.11329, 166.74896, 451.8226).to_precision())
+            .with_rotation(
+                Quat::from_xyzw(-0.183938, 0.009093744, 0.0017017953, 0.9828943).to_precision(),
+            ),
         Msaa::Off,
         SolariCamera,
         Bloom {
@@ -168,16 +179,22 @@ fn setup_scene(
                 ..default()
             })),
             Transform::default()
-                .with_scale(Vec3 {
-                    x: rng.random_range(0.2..=2.0),
-                    y: rng.random_range(0.2..=2.0),
-                    z: rng.random_range(0.2..=2.0),
-                })
-                .with_translation(Vec3::new(
-                    rng.random_range(-180.0..=180.0),
-                    0.2,
-                    rng.random_range(-180.0..=180.0),
-                )),
+                .with_scale(
+                    Vec3 {
+                        x: rng.random_range(0.2..=2.0),
+                        y: rng.random_range(0.2..=2.0),
+                        z: rng.random_range(0.2..=2.0),
+                    }
+                    .to_precision(),
+                )
+                .with_translation(
+                    Vec3::new(
+                        rng.random_range(-180.0..=180.0),
+                        0.2,
+                        rng.random_range(-180.0..=180.0),
+                    )
+                    .to_precision(),
+                ),
         ));
     }
 
@@ -196,11 +213,9 @@ fn setup_scene(
                         ..default()
                     }),
                 ),
-                Transform::default().with_translation(Vec3::new(
-                    (x * 20) as f32,
-                    7.0,
-                    (y * 20) as f32,
-                )),
+                Transform::default().with_translation(
+                    Vec3::new((x * 20) as f32, 7.0, (y * 20) as f32).to_precision(),
+                ),
             ));
         }
     }

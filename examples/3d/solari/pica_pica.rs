@@ -14,6 +14,7 @@ use bevy::{
     diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     gltf::GltfMaterialName,
+    math::DQuat,
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
     solari::prelude::*,
@@ -69,7 +70,11 @@ fn main() {
     // default material and the scene renders untextured / unlit.
     .add_systems(
         Update,
-        (convert_meshes_to_raytracing, convert_standard_materials_to_solari).chain(),
+        (
+            convert_meshes_to_raytracing,
+            convert_standard_materials_to_solari,
+        )
+            .chain(),
     )
     .run();
 }
@@ -83,7 +88,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
                         .from_asset("https://github.com/bevyengine/bevy_asset_files/raw/2a5950295a8b6d9d051d59c0df69e87abcda58c3/pica_pica/mini_diorama_01.glb")
                 ),
             ),
-            Transform::from_scale(Vec3::splat(10.0)),
+            Transform::from_scale(Vec3::splat(10.0).to_precision()),
         ))
         .observe(fix_materials);
 
@@ -92,9 +97,9 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
             WorldAssetRoot(asset_server.load(
                 GltfAssetLabel::Scene(0).from_asset("https://github.com/bevyengine/bevy_asset_files/raw/2a5950295a8b6d9d051d59c0df69e87abcda58c3/pica_pica/robot_01.glb")
             )),
-            Transform::from_scale(Vec3::splat(2.0))
-                .with_translation(Vec3::new(-2.0, 0.05, -2.1))
-                .with_rotation(Quat::from_rotation_y(PI / 2.0)),
+            Transform::from_scale(Vec3::splat(2.0).to_precision())
+                .with_translation(Vec3::new(-2.0, 0.05, -2.1).to_precision())
+                .with_rotation(Quat::from_rotation_y(PI / 2.0).to_precision()),
             PatrolPath {
                 path: vec![
                     (Vec3::new(-2.0, 0.05, -2.1), Quat::from_rotation_y(PI / 2.0)),
@@ -116,7 +121,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
             shadow_maps_enabled: false,
             ..default()
         },
-        Transform::from_rotation(Quat::from_xyzw(
+        Transform::from_rotation(DQuat::from_xyzw(
             -0.13334629,
             -0.86597735,
             -0.3586996,
@@ -135,9 +140,10 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
             run_speed: 10.0,
             ..Default::default()
         },
-        Transform::from_translation(Vec3::new(0.219417, 2.5764852, 6.9718704)).with_rotation(
-            Quat::from_xyzw(-0.1466768, 0.013738206, 0.002037309, 0.989087),
-        ),
+        Transform::from_translation(Vec3::new(0.219417, 2.5764852, 6.9718704).to_precision())
+            .with_rotation(
+                Quat::from_xyzw(-0.1466768, 0.013738206, 0.002037309, 0.989087).to_precision(),
+            ),
         Msaa::Off,
         SolariCamera,
     ));
@@ -152,7 +158,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
             ..default()
         },
     ));
-  
+
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
@@ -176,17 +182,12 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
 fn fix_materials(
     scene_ready: On<WorldInstanceReady>,
     children: Query<&Children>,
-    mesh_query: Query<(
-        &MeshMaterial3d<StandardMaterial>,
-        Option<&GltfMaterialName>,
-    )>,
+    mesh_query: Query<(&MeshMaterial3d<StandardMaterial>, Option<&GltfMaterialName>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut commands: Commands,
 ) {
     for descendant in children.iter_descendants(scene_ready.entity) {
-        if let Ok((MeshMaterial3d(material_handle), material_name)) =
-            mesh_query.get(descendant)
-        {
+        if let Ok((MeshMaterial3d(material_handle), material_name)) = mesh_query.get(descendant) {
             if material_name.map(|s| s.0.as_str()) == Some("material") {
                 let mut material = materials.get_mut(material_handle).unwrap();
                 material.emissive = LinearRgba::BLACK;
@@ -235,7 +236,7 @@ fn toggle_lights(
                     shadow_maps_enabled: false,
                     ..default()
                 },
-                Transform::from_rotation(Quat::from_xyzw(
+                Transform::from_rotation(DQuat::from_xyzw(
                     -0.13334629,
                     -0.86597735,
                     -0.3586996,
@@ -266,22 +267,26 @@ struct PatrolPath {
 fn patrol_path(mut query: Query<(&mut PatrolPath, &mut Transform)>, time: Res<Time<Virtual>>) {
     for (mut path, mut transform) in query.iter_mut() {
         let (mut target_position, mut target_rotation) = path.path[path.i];
+        let mut target_position = target_position.to_precision();
         let mut distance_to_target = transform.translation.distance(target_position);
         if distance_to_target < 0.01 {
             transform.translation = target_position;
-            transform.rotation = target_rotation;
+            transform.rotation = target_rotation.to_precision();
 
             path.i = (path.i + 1) % path.path.len();
-            (target_position, target_rotation) = path.path[path.i];
+            (target_position, target_rotation) = {
+                let (p, r) = path.path[path.i];
+                (p.to_precision(), r)
+            };
             distance_to_target = transform.translation.distance(target_position);
         }
 
         let direction = (target_position - transform.translation).normalize();
-        let movement = direction * time.delta_secs();
+        let movement = direction * f64::from(time.delta_secs());
 
         if movement.length() > distance_to_target {
             transform.translation = target_position;
-            transform.rotation = target_rotation;
+            transform.rotation = target_rotation.to_precision();
         } else {
             transform.translation += movement;
         }

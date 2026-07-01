@@ -2,7 +2,7 @@
 
 use bevy_camera::{Camera, Projection};
 use bevy_ecs::{entity::EntityHashMap, prelude::*};
-use bevy_math::{ops, Mat4, Vec3A, Vec4};
+use bevy_math::{ops, Mat4, ToRender, Vec3A, Vec4};
 use bevy_reflect::prelude::*;
 use bevy_transform::components::GlobalTransform;
 
@@ -225,7 +225,7 @@ pub fn build_directional_light_cascades(
         // users to not change any other aspects of the transform - there's no guarantee
         // `transform.to_matrix()` will give us a matrix with our desired properties.
         // Instead, we directly create a good matrix from just the rotation.
-        let world_from_light = Mat4::from_quat(transform.rotation());
+        let world_from_light = Mat4::from_quat(transform.rotation().to_render());
         // The transpose is the inverse for orthogonal matrices.
         let light_from_world = world_from_light.transpose();
 

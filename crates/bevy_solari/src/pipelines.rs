@@ -18,11 +18,11 @@
 
 use bevy_app::App;
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer};
+use bevy_core_pipeline::FullscreenShader;
 use bevy_ecs::{
     resource::Resource,
     system::{Commands, Res},
 };
-use bevy_core_pipeline::FullscreenShader;
 use bevy_render::render_resource::{
     CachedComputePipelineId, CachedRenderPipelineId, ComputePipelineDescriptor, PipelineCache,
 };
@@ -37,6 +37,7 @@ use crate::resource_manager::SolariResourceManager;
 #[derive(Resource)]
 pub struct SolariPipelines {
     pub transform_propagate: CachedComputePipelineId,
+    pub transform_subtract: CachedComputePipelineId,
     pub transform_gather: CachedComputePipelineId,
     pub transform_readback: CachedComputePipelineId,
     pub rt_camera: CachedComputePipelineId,
@@ -76,6 +77,7 @@ pub struct SolariPipelines {
 /// embedded path matches by construction, no cross-module path drift.
 pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "transform/transform_propagate.wgsl");
+    embedded_asset!(app, "transform/transform_subtract.wgsl");
     embedded_asset!(app, "transform/transform_gather.wgsl");
     embedded_asset!(app, "transform/transform_readback.wgsl");
     embedded_asset!(app, "render/rt_pipeline/rt_camera.wgsl");
@@ -137,6 +139,16 @@ pub fn init_solari_pipelines(
         shader: load_embedded_asset!(asset_server.as_ref(), "transform/transform_propagate.wgsl"),
         shader_defs: vec![],
         entry_point: Some("propagate".into()),
+        immediate_size: 0,
+        zero_initialize_workgroup_memory: false,
+        constants: vec![],
+    });
+    let transform_subtract = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("transform_subtract".into()),
+        layout: vec![resource_manager.transform_subtract.clone()],
+        shader: load_embedded_asset!(asset_server.as_ref(), "transform/transform_subtract.wgsl"),
+        shader_defs: vec![],
+        entry_point: Some("subtract".into()),
         immediate_size: 0,
         zero_initialize_workgroup_memory: false,
         constants: vec![],
@@ -300,6 +312,7 @@ pub fn init_solari_pipelines(
 
     commands.insert_resource(SolariPipelines {
         transform_propagate,
+        transform_subtract,
         transform_gather,
         transform_readback,
         rt_camera,

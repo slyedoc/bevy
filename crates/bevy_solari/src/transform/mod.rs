@@ -11,13 +11,13 @@
 //! the per-frame local/parent deltas).
 
 use bevy_app::{App, Plugin, PostUpdate};
+use bevy_ecs::name::{HashedStr, Name};
 use bevy_ecs::prelude::With;
 use bevy_ecs::schedule::{common_conditions::resource_exists, IntoScheduleConfigs};
 use bevy_math::{Quat, Vec3};
 use bevy_render::{
     renderer::RenderGraph, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
 };
-use bevy_ecs::name::{HashedStr, Name};
 use bevy_transform::components::{GlobalTransform, Transform};
 use bevy_transform::systems::{propagate_transforms_for, sync_simple_transforms};
 use bevy_ui::Node;
@@ -26,13 +26,11 @@ use crate::ecs_gpu::{GpuColumnPrepareSet, GpuPresenceColumnPlugin};
 use crate::pipelines::SolariPipelines;
 use crate::{SolariClusterSystems, SolariSetup};
 
-mod df64;
 mod gather;
 mod graph;
 mod propagate;
 mod readback;
-
-pub use df64::{Df64, Df64Vec3};
+mod subtract;
 
 pub use gather::{
     dispatch_transform_gather, init_transform_gather, prepare_transform_gather,
@@ -40,22 +38,27 @@ pub use gather::{
 };
 pub use graph::{
     clear_static_first_sight, enqueue_node_first_sight, enqueue_static_first_sight,
-    extract_transform_graph, transform_columns_ready, FrameWorldColumn, LocalColumn,
-    NodeEntityColumn, ParentColumn, SolariFrame, SolariFrameWorld, SolariGpuFrame, StaticColumn,
+    extract_transform_graph, transform_columns_ready, LocalRSColumn, LocalTranslationColumn,
+    NodeEntityColumn, ParentColumn, SolariFrame, SolariGpuFrame, StaticColumn,
     StaticFirstSightQueue, TransformGraph, TransformStatic, TransformTablePlugin, ROOT_PARENT,
 };
 pub use propagate::{
-    dispatch_transform_propagate, extract_origin_slot, init_transform_propagate,
-    prepare_transform_propagate, prepare_transform_propagate_bind_groups,
-    transform_propagate_bind_group_layout, SolariOriginSlot, TransformPropagate,
+    dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,
+    prepare_transform_propagate_bind_groups, transform_propagate_bind_group_layout,
+    TransformPropagate,
+};
+use readback::{
+    build_readback_main, dispatch_transform_readback, prepare_transform_readback,
+    prepare_transform_readback_bind_group,
 };
 pub use readback::{
     init_transform_readback, transform_readback_bind_group_layout, NoGpuGlobalTransformReadback,
     TransformReadback,
 };
-use readback::{
-    build_readback_main, dispatch_transform_readback, prepare_transform_readback,
-    prepare_transform_readback_bind_group,
+pub use subtract::{
+    dispatch_transform_subtract, extract_origin_slot, init_transform_subtract,
+    prepare_transform_subtract, prepare_transform_subtract_bind_group,
+    transform_subtract_bind_group_layout, SolariOriginSlot, TransformSubtract,
 };
 
 /// The transform-table plugin: the macro-generated table (`local`/`parent`
@@ -85,21 +88,24 @@ impl Plugin for SolariTransformPlugin {
         // co-located with their `SolariPipelines` builds.
         // Columns, slot index, extract, and Cleanup clear — all generated.
         app.add_plugins(TransformTablePlugin)
-        // The TransformStatic presence flag (node-slot indexed) the PTLAS fill
-        // reads to choose an instance's partition. Observer-fed, zero per-frame cost.
-        .add_plugins(GpuPresenceColumnPlugin::<StaticColumn>::default())
-        // Born-static first-sight queue: makes `TransformStatic` safe to add at spawn
-        // (the observer queues it; the extract does the one-time upload, see `graph`).
-        .init_resource::<StaticFirstSightQueue>()
-        .add_observer(enqueue_static_first_sight)
-        // Reliable first-sight for every node: queue it when its slot is assigned, so the `local`
-        // upload never depends on the extract catching a cross-world change edge.
-        .add_observer(enqueue_node_first_sight)
-        // TODO: handle few few transforms locally, not sending to gpu, might not need anymore
-        .add_systems(
-            PostUpdate,
-            (sync_simple_transforms, propagate_transforms_for::<With<Node>>),
-        );
+            // The TransformStatic presence flag (node-slot indexed) the PTLAS fill
+            // reads to choose an instance's partition. Observer-fed, zero per-frame cost.
+            .add_plugins(GpuPresenceColumnPlugin::<StaticColumn>::default())
+            // Born-static first-sight queue: makes `TransformStatic` safe to add at spawn
+            // (the observer queues it; the extract does the one-time upload, see `graph`).
+            .init_resource::<StaticFirstSightQueue>()
+            .add_observer(enqueue_static_first_sight)
+            // Reliable first-sight for every node: queue it when its slot is assigned, so the `local`
+            // upload never depends on the extract catching a cross-world change edge.
+            .add_observer(enqueue_node_first_sight)
+            // TODO: handle few few transforms locally, not sending to gpu, might not need anymore
+            .add_systems(
+                PostUpdate,
+                (
+                    sync_simple_transforms,
+                    propagate_transforms_for::<With<Node>>,
+                ),
+            );
         // Main-app side of the GlobalTransform readback (the output buffer +
         // the `Readback` entity / decode observer).
         build_readback_main(app);
@@ -108,9 +114,9 @@ impl Plugin for SolariTransformPlugin {
             return;
         };
         render_app
-            // The floating origin is the primary camera's own transform-table node; this
-            // resource carries its slot to the propagate (which reads `frame_world[slot]` as
-            // the df64 origin on the GPU — no CPU-set origin resource).
+            // The floating origin is the primary camera's own transform-table node. The subtract
+            // pass reads `world_abs_t[camera_slot]` as the f64 origin on the GPU — the CPU only
+            // carries the slot index, so a camera childed to a player/ship/patch renders at 0.
             .init_resource::<SolariOriginSlot>()
             .add_systems(ExtractSchedule, extract_origin_slot)
             // Drain the born-static first-sight queue the extract just consumed. Same cold-start
@@ -125,6 +131,7 @@ impl Plugin for SolariTransformPlugin {
                 RenderStartup,
                 (
                     init_transform_propagate,
+                    init_transform_subtract,
                     init_transform_gather,
                     init_transform_readback,
                 )
@@ -135,6 +142,7 @@ impl Plugin for SolariTransformPlugin {
                 (
                     (
                         prepare_transform_propagate,
+                        prepare_transform_subtract,
                         prepare_transform_gather,
                         prepare_transform_readback,
                     )
@@ -143,6 +151,7 @@ impl Plugin for SolariTransformPlugin {
                         .after(GpuColumnPrepareSet),
                     (
                         prepare_transform_propagate_bind_groups,
+                        prepare_transform_subtract_bind_group,
                         prepare_transform_gather_bind_group,
                         prepare_transform_readback_bind_group,
                     )
@@ -151,10 +160,12 @@ impl Plugin for SolariTransformPlugin {
             )
             .add_systems(
                 RenderGraph,
-                // Propagate (ancestor-walk) → gather into the instance
-                // TransformColumn → readback gather for marked entities.
+                // Propagate (ancestor-walk → absolute f64 world) → subtract the camera
+                // origin (→ relative f32 world) → gather into the instance TransformColumn
+                // → readback gather for marked entities.
                 (
                     dispatch_transform_propagate,
+                    dispatch_transform_subtract,
                     dispatch_transform_gather,
                     dispatch_transform_readback,
                 )
@@ -164,5 +175,3 @@ impl Plugin for SolariTransformPlugin {
             );
     }
 }
-
-

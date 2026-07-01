@@ -7,7 +7,7 @@ use core::f32::consts::FRAC_PI_2;
 
 use crate::{gizmos::GizmoBuffer, prelude::GizmoConfigGroup};
 use bevy_color::Color;
-use bevy_math::{Isometry2d, Isometry3d, Quat, Vec2, Vec3};
+use bevy_math::{Isometry2d, Isometry3d, Quat, ToPrecision, Vec2, Vec3};
 use bevy_transform::components::Transform;
 
 /// A builder returned by [`GizmoBuffer::rounded_rect`] and [`GizmoBuffer::rounded_rect_2d`]
@@ -182,9 +182,9 @@ where
 
         // Handle cases where the rounded cuboid collapses into simpler shapes
         if edge_radius == 0.0 {
-            let transform = Transform::from_translation(config.isometry.translation.into())
-                .with_rotation(config.isometry.rotation)
-                .with_scale(self.size);
+            let transform = Transform::from_translation(config.isometry.translation.to_precision())
+                .with_rotation(config.isometry.rotation.to_precision())
+                .with_scale(self.size.to_precision());
             self.gizmos.cube(transform, config.color);
             return;
         }

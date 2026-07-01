@@ -33,7 +33,7 @@ use crate::lights::light_resolve_bind_group_layout;
 use crate::render::atmosphere::atmosphere_bind_group_layout;
 use crate::transform::{
     transform_gather_bind_group_layout, transform_propagate_bind_group_layout,
-    transform_readback_bind_group_layout,
+    transform_readback_bind_group_layout, transform_subtract_bind_group_layout,
 };
 
 /// Every solari pass bind-group layout, built once at `RenderStartup`. Field names
@@ -47,6 +47,7 @@ use crate::transform::{
 #[derive(Resource)]
 pub struct SolariResourceManager {
     pub transform_propagate: BindGroupLayoutDescriptor,
+    pub transform_subtract: BindGroupLayoutDescriptor,
     pub transform_gather: BindGroupLayoutDescriptor,
     pub transform_readback: BindGroupLayoutDescriptor,
     pub rt_camera: BindGroupLayoutDescriptor,
@@ -79,6 +80,7 @@ pub fn init_solari_resource_manager(mut commands: Commands, allocator: Option<Re
     }
     commands.insert_resource(SolariResourceManager {
         transform_propagate: transform_propagate_bind_group_layout(),
+        transform_subtract: transform_subtract_bind_group_layout(),
         transform_gather: transform_gather_bind_group_layout(),
         transform_readback: transform_readback_bind_group_layout(),
         rt_camera: crate::render::rt_pipeline::rt_camera_bind_group_layout(),

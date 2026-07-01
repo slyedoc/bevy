@@ -17,6 +17,7 @@
 //! stale.) No CPU skin-matrix upload — only the static inverse-bind poses are
 //! mirrored to the GPU.
 
+use ash::vk;
 use bevy_asset::Assets;
 use bevy_ecs::{
     resource::Resource,
@@ -29,14 +30,13 @@ use bevy_render::{
     render_resource::{
         binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
         BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
-        BufferUsages, ComputePassDescriptor, PipelineCache, RawBufferVec,
-        ShaderStages, ShaderType, UniformBuffer,
+        BufferUsages, ComputePassDescriptor, PipelineCache, RawBufferVec, ShaderStages, ShaderType,
+        UniformBuffer,
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
     sync_world::RenderEntity,
     Extract,
 };
-use ash::vk;
 use bytemuck::{Pod, Zeroable};
 
 use crate::bindings::RaytracingMesh3d;
@@ -46,7 +46,7 @@ use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::instance::{Affine3x4, InstanceManager, RaytracingGpuEntity, TransformColumn};
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
-use crate::transform::{LocalColumn, ParentColumn, TransformGraph};
+use crate::transform::{LocalRSColumn, LocalTranslationColumn, ParentColumn, TransformGraph};
 
 /// Max concurrent animated instances per frame. Deform / instantiate / BLAS
 /// pools are sized for this; overflow falls back to the static (rest-pose) path.
@@ -144,7 +144,7 @@ pub fn deform_bind_group_layout() -> BindGroupLayoutDescriptor {
             ShaderStages::COMPUTE,
             (
                 storage_buffer_read_only_sized(false, None), // 0 active_slots
-                storage_buffer_read_only_sized(false, None), // 1 transform-table local
+                storage_buffer_read_only_sized(false, None), // 1 transform-table local_t (array<f64>)
                 storage_buffer_read_only_sized(false, None), // 2 inverse_bind
                 storage_buffer_read_only_sized(false, None), // 3 palette
                 storage_buffer_read_only_sized(false, None), // 4 rest_positions
@@ -158,6 +158,7 @@ pub fn deform_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_read_only_sized(false, None), // 12 transform-table parent
                 storage_buffer_read_only_sized(false, None), // 13 rest_tangents
                 storage_buffer_sized(false, None),           // 14 deform_tangents (rw)
+                storage_buffer_read_only_sized(false, None), // 15 transform-table local_rs
             ),
         ),
     )
@@ -214,7 +215,12 @@ fn mat4_to_affine(m: Mat4) -> Affine3x4 {
 
 // Allocator-created (so it carries SHADER_DEVICE_ADDRESS) — the resolve reads these
 // pools bindlessly via `physical_load`, and the instantiate pass reads positions.
-fn pool_buffer(allocator: &Allocator, device: &RenderDevice, label: &'static str, bytes: u64) -> Buffer {
+fn pool_buffer(
+    allocator: &Allocator,
+    device: &RenderDevice,
+    label: &'static str,
+    bytes: u64,
+) -> Buffer {
     allocator
         .create_buffer(
             device,
@@ -410,10 +416,7 @@ pub fn prepare_deform(
     // even when `num == 0` so a stopped/despawned animated instance reverts to
     // the static path. A non-animated scene only ever touches it on growth.
     let stride = size_of::<GpuAnimatedInstance>() as u64;
-    let high_water = instances
-        .map(|i| i.slot_high_water())
-        .unwrap_or(0)
-        .max(1);
+    let high_water = instances.map(|i| i.slot_high_water()).unwrap_or(0).max(1);
     if high_water > deform.animated_table_capacity {
         deform.animated_table_capacity = high_water.next_power_of_two();
         deform.animated_table =
@@ -504,7 +507,8 @@ pub fn prepare_deform_bind_group(
     deform: Option<ResMut<Deform>>,
     resource_manager: Option<Res<SolariResourceManager>>,
     cluster_meshes: Option<Res<ClusterMeshManager>>,
-    local: Option<Res<GpuColumn<LocalColumn>>>,
+    local_t: Option<Res<GpuColumn<LocalTranslationColumn>>>,
+    local_rs: Option<Res<GpuColumn<LocalRSColumn>>>,
     parent: Option<Res<GpuColumn<ParentColumn>>>,
     transforms: Option<Res<GpuColumn<TransformColumn>>>,
     pipeline_cache: Res<PipelineCache>,
@@ -517,8 +521,21 @@ pub fn prepare_deform_bind_group(
         deform.bind_group = None;
         return;
     }
-    let (Some(resource_manager), Some(cluster_meshes), Some(local), Some(parent), Some(transforms)) =
-        (resource_manager, cluster_meshes, local, parent, transforms)
+    let (
+        Some(resource_manager),
+        Some(cluster_meshes),
+        Some(local_t),
+        Some(local_rs),
+        Some(parent),
+        Some(transforms),
+    ) = (
+        resource_manager,
+        cluster_meshes,
+        local_t,
+        local_rs,
+        parent,
+        transforms,
+    )
     else {
         deform.bind_group = None;
         return;
@@ -539,13 +556,19 @@ pub fn prepare_deform_bind_group(
         &layout,
         &BindGroupEntries::sequential((
             slots.as_entire_binding(),
-            local.buffer().as_entire_binding(),
+            local_t.buffer().as_entire_binding(),
             inverse_bind.as_entire_binding(),
             palette.as_entire_binding(),
             cluster_meshes.vertex_positions.buffer().as_entire_binding(),
             cluster_meshes.vertex_normals.buffer().as_entire_binding(),
-            cluster_meshes.vertex_joint_indices.buffer().as_entire_binding(),
-            cluster_meshes.vertex_joint_weights.buffer().as_entire_binding(),
+            cluster_meshes
+                .vertex_joint_indices
+                .buffer()
+                .as_entire_binding(),
+            cluster_meshes
+                .vertex_joint_weights
+                .buffer()
+                .as_entire_binding(),
             transforms.buffer().as_entire_binding(),
             params,
             deform.positions.as_entire_binding(),
@@ -553,6 +576,7 @@ pub fn prepare_deform_bind_group(
             parent.buffer().as_entire_binding(),
             cluster_meshes.vertex_tangents.buffer().as_entire_binding(),
             deform.tangents.as_entire_binding(),
+            local_rs.buffer().as_entire_binding(),
         )),
     );
     deform.bind_group = Some(bind_group);

@@ -13,7 +13,7 @@ use bevy_ecs::{
 use bevy_math::{
     ops::{self, sin_cos},
     primitives::HalfSpace,
-    Mat4, UVec3, Vec2, Vec3, Vec3A, Vec3Swizzles as _, Vec4, Vec4Swizzles as _,
+    Mat4, ToRender, UVec3, Vec2, Vec3, Vec3A, Vec3Swizzles as _, Vec4, Vec4Swizzles as _,
 };
 use bevy_transform::components::GlobalTransform;
 use tracing::{error, warn};
@@ -253,7 +253,7 @@ pub(crate) fn assign_objects_to_clusters(
                         Some(ClusterableObjectAssignmentData {
                             entity,
                             transform: *transform,
-                            range: transform.scale().length(),
+                            range: transform.scale().to_render().length(),
                             object_type: ClusterableObjectType::Decal,
                             render_layers: RenderLayers::default(),
                         })
@@ -312,7 +312,11 @@ pub(crate) fn assign_objects_to_clusters(
         let mut requested_cluster_dimensions = config.dimensions_for_screen_size(screen_size);
 
         let world_from_view = camera_transform.affine();
-        let view_from_world_scale = camera_transform.compute_transform().scale.recip();
+        let view_from_world_scale = camera_transform
+            .compute_transform()
+            .scale
+            .to_render()
+            .recip();
         let view_from_world_scale_max = view_from_world_scale.abs().max_element();
         let view_from_world = Mat4::from(world_from_view.inverse());
         let is_orthographic = camera.clip_from_view().w_axis.w == 1.0;
@@ -525,9 +529,13 @@ pub(crate) fn assign_objects_to_clusters(
                     radius: clusterable_object_sphere.radius * view_from_world_scale_max,
                 };
 
-                let this_object_far_z = -view_from_world_row_2
-                    .dot(clusterable_object.transform.translation().extend(1.0))
-                    + clusterable_object.range * view_from_world_scale.z;
+                let this_object_far_z = -view_from_world_row_2.dot(
+                    clusterable_object
+                        .transform
+                        .translation()
+                        .to_render()
+                        .extend(1.0),
+                ) + clusterable_object.range * view_from_world_scale.z;
                 farthest_z = farthest_z.max(this_object_far_z);
 
                 let spot_light_dir_sin_cos = match clusterable_object.object_type {

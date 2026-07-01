@@ -29,7 +29,7 @@ use bevy_ecs::{
     system::{Local, Query, Res, ResMut, Single},
 };
 use bevy_input::{mouse::MouseButton, ButtonInput};
-use bevy_math::{Quat, Ray3d, Vec2, Vec3};
+use bevy_math::{Quat, Ray3d, TReal, TVec3, ToPrecision, ToRender, Vec2, Vec3};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_transform::components::{GlobalTransform, Transform};
 use bevy_transform::TransformSystems;
@@ -305,12 +305,12 @@ fn transform_gizmo_hover(
         return;
     };
 
-    let gizmo_pos = global_tf.translation();
+    let gizmo_pos = global_tf.translation().to_render();
     let space = effective_space(&settings);
     let rotation = gizmo_rotation(*global_tf, space);
 
     let scale = if settings.screen_scale_factor > 0.0 {
-        (cam_tf.translation() - gizmo_pos).length() * settings.screen_scale_factor
+        (cam_tf.translation().to_render() - gizmo_pos).length() * settings.screen_scale_factor
     } else {
         1.0
     };
@@ -421,7 +421,7 @@ fn transform_gizmo_drag(
             let space = effective_space(&settings);
             let rotation = gizmo_rotation(global_tf, space);
             let axis_dir = axis_direction(axis, rotation, cam_tf);
-            let gizmo_pos = global_tf.translation();
+            let gizmo_pos = global_tf.translation().to_render();
 
             // Compute initial ray-plane intersection
             let Ok(ray) = camera.viewport_to_world(cam_tf, cursor_pos) else {
@@ -515,12 +515,12 @@ fn transform_gizmo_drag(
                         return;
                     };
                     let delta = intersection - state.drag_start_world;
-                    let new_pos = state.start_transform.translation + delta;
+                    let new_pos = state.start_transform.translation + delta.to_precision();
                     transform.translation = match settings.snap_translate {
-                        Some(inc) => Vec3::new(
-                            snap_value(new_pos.x, inc),
-                            snap_value(new_pos.y, inc),
-                            snap_value(new_pos.z, inc),
+                        Some(inc) => TVec3::new(
+                            snap_value_precise(new_pos.x, inc),
+                            snap_value_precise(new_pos.y, inc),
+                            snap_value_precise(new_pos.z, inc),
                         ),
                         None => new_pos,
                     };
@@ -538,9 +538,9 @@ fn transform_gizmo_drag(
                     transform.translation = match settings.snap_translate {
                         Some(inc) => {
                             state.start_transform.translation
-                                + axis_norm * snap_value(delta.dot(axis_norm), inc)
+                                + (axis_norm * snap_value(delta.dot(axis_norm), inc)).to_precision()
                         }
-                        None => state.start_transform.translation + delta,
+                        None => state.start_transform.translation + delta.to_precision(),
                     };
                 }
             }
@@ -564,7 +564,7 @@ fn transform_gizmo_drag(
                     None => raw_angle,
                 };
                 let rotation_delta = Quat::from_axis_angle(rot_axis, angle);
-                transform.rotation = rotation_delta * state.start_transform.rotation;
+                transform.rotation = rotation_delta.to_precision() * state.start_transform.rotation;
             }
             TransformGizmoMode::Scale => {
                 let plane_normal = translation_plane_normal(ray, axis_dir);
@@ -581,7 +581,7 @@ fn transform_gizmo_drag(
                     1.0
                 };
 
-                let mut new_scale = state.start_transform.scale;
+                let mut new_scale = state.start_transform.scale.to_render();
                 match axis {
                     TransformGizmoAxis::X => {
                         new_scale.x = (new_scale.x * scale_factor).max(MIN_SCALE);
@@ -598,9 +598,9 @@ fn transform_gizmo_drag(
                         new_scale = new_scale.max(Vec3::splat(MIN_SCALE));
                     }
                 }
-                transform.scale = match settings.snap_scale {
+                let applied_scale = match settings.snap_scale {
                     Some(inc) => {
-                        let mut snapped = state.start_transform.scale;
+                        let mut snapped = state.start_transform.scale.to_render();
                         match axis {
                             TransformGizmoAxis::X => {
                                 snapped.x = snap_value(new_scale.x, inc).max(inc);
@@ -620,6 +620,7 @@ fn transform_gizmo_drag(
                     }
                     None => new_scale,
                 };
+                transform.scale = applied_scale.to_precision();
             }
         }
         return;
@@ -744,11 +745,18 @@ pub fn gizmo_rotation(global_tf: &GlobalTransform, space: &TransformGizmoSpace) 
         TransformGizmoSpace::World => Quat::IDENTITY,
         TransformGizmoSpace::Local => {
             let (_, rotation, _) = global_tf.to_scale_rotation_translation();
-            rotation
+            rotation.to_render()
         }
     }
 }
 
 fn snap_value(value: f32, increment: f32) -> f32 {
+    (value / increment).round() * increment
+}
+
+/// [`snap_value`] at transform precision — snapping an absolute position must not
+/// round-trip through f32.
+fn snap_value_precise(value: TReal, increment: f32) -> TReal {
+    let increment = increment.to_precision();
     (value / increment).round() * increment
 }

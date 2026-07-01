@@ -146,7 +146,7 @@ pub fn setup(
     commands
         .spawn((
             WorldAssetRoot(hotel_01.clone()),
-            Transform::from_scale(Vec3::splat(0.01)),
+            Transform::from_scale(Vec3::splat(0.01).to_precision()),
             PostProcScene,
             Spin,
         ))
@@ -166,8 +166,10 @@ pub fn setup(
                 }
                 commands.spawn((
                     WorldAssetRoot(hotel_01.clone()),
-                    Transform::from_xyz(x as f32 * 50.0, 0.0, z as f32 * 50.0)
-                        .with_scale(Vec3::splat(0.01)),
+                    Transform::from_translation(
+                        Vec3::new(x as f32 * 50.0, 0.0, z as f32 * 50.0).to_precision(),
+                    )
+                    .with_scale(Vec3::splat(0.01).to_precision()),
                     Spin,
                 ));
                 count += 1;
@@ -178,7 +180,9 @@ pub fn setup(
     // Sun
     commands
         .spawn((
-            Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0)),
+            Transform::from_rotation(
+                Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0).to_precision(),
+            ),
             DirectionalLight {
                 color: Color::srgb(1.0, 0.87, 0.78),
                 illuminance: lux::FULL_DAYLIGHT,
@@ -388,19 +392,19 @@ impl Default for CameraPositions {
     fn default() -> Self {
         Self([
             Transform {
-                translation: Vec3::new(-20.147331, 16.818098, 42.806145),
-                rotation: Quat::from_array([-0.22917402, -0.34915298, -0.08848568, 0.9042908]),
-                scale: Vec3::ONE,
+                translation: TVec3::new(-20.147331, 16.818098, 42.806145),
+                rotation: TQuat::from_array([-0.22917402, -0.34915298, -0.08848568, 0.9042908]),
+                scale: TVec3::ONE,
             },
             Transform {
-                translation: Vec3::new(1.6168646, 1.8304176, -5.846825),
-                rotation: Quat::from_array([-0.0007061247, -0.99179053, 0.12775362, -0.005481863]),
-                scale: Vec3::ONE,
+                translation: TVec3::new(1.6168646, 1.8304176, -5.846825),
+                rotation: TQuat::from_array([-0.0007061247, -0.99179053, 0.12775362, -0.005481863]),
+                scale: TVec3::ONE,
             },
             Transform {
-                translation: Vec3::new(23.97184, 1.8938808, 30.568554),
-                rotation: Quat::from_array([-0.0013945175, 0.4685419, 0.00073959737, 0.8834399]),
-                scale: Vec3::ONE,
+                translation: TVec3::new(23.97184, 1.8938808, 30.568554),
+                rotation: TQuat::from_array([-0.0013945175, 0.4685419, 0.00073959737, 0.8834399]),
+                scale: TVec3::ONE,
             },
         ])
     }
@@ -438,7 +442,10 @@ fn spin(
     if args.spin {
         let camera_position = things_to_spin.get(*camera).unwrap().translation;
         let spin = |thing_to_spin: &mut Transform| {
-            thing_to_spin.rotate_around(camera_position, Quat::from_rotation_y(time.delta_secs()));
+            thing_to_spin.rotate_around(
+                camera_position,
+                Quat::from_rotation_y(time.delta_secs()).to_precision(),
+            );
         };
         things_to_spin.iter_mut().for_each(|mut s| spin(s.as_mut())); // WHY
         positions.iter_mut().for_each(spin);

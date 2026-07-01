@@ -10,6 +10,7 @@
 //! the per-instance BLAS addresses it built and appends one PTLAS record each.
 
 use bevy_asset::AssetId;
+use bevy_asset::{Assets, Handle};
 use bevy_ecs::{
     entity::{Entity, EntityHashMap},
     query::With,
@@ -17,19 +18,19 @@ use bevy_ecs::{
     system::{Commands, Query, Res, ResMut},
 };
 use bevy_image::Image;
-use bevy_transform::components::Transform;
+use bevy_math::ToRender;
+use bevy_math::Vec4;
 use bevy_render::{
     extract_resource::ExtractResource,
     render_resource::{binding_types::*, *},
     renderer::{RenderDevice, RenderQueue},
 };
-use bevy_asset::{Assets, Handle};
-use bevy_math::Vec4;
+use bevy_transform::components::Transform;
 
+use super::asset::ClusterMesh;
 use crate::bindings::RaytracingMesh3d;
 use crate::gpu::allocator::Allocator;
-use crate::material::{StandardSolariMaterial, SolariMaterial3d};
-use super::asset::ClusterMesh;
+use crate::material::{SolariMaterial3d, StandardSolariMaterial};
 
 /// One real displacement-mapped scene instance the tessellation path tessellates
 /// in place: its mesh, its own displacement map, and its world transform.
@@ -95,7 +96,7 @@ pub fn find_tess_showcase_instances(
         // root→children hierarchy with an identity root, so the local `Transform`
         // IS the world transform. Row-major 3×4: world = matrix3 * local +
         // translation; each row is (basis_row_r, translation_r).
-        let a = transform.compute_affine();
+        let a = transform.compute_affine().to_render();
         let (m, t) = (a.matrix3, a.translation);
         let world_from_local = [
             [m.x_axis.x, m.y_axis.x, m.z_axis.x, t.x],
@@ -103,9 +104,16 @@ pub fn find_tess_showcase_instances(
             [m.x_axis.z, m.y_axis.z, m.z_axis.z, t.z],
         ];
         // Object-space AABB (checked loaded above) → drives the explicit world AABB.
-        let aabb = cluster_meshes.get(&mesh3d.0).expect("checked loaded above").aabb();
+        let aabb = cluster_meshes
+            .get(&mesh3d.0)
+            .expect("checked loaded above")
+            .aabb();
         let local_aabb_center = [aabb.center[0], aabb.center[1], aabb.center[2]];
-        let local_aabb_half = [aabb.half_extent[0], aabb.half_extent[1], aabb.half_extent[2]];
+        let local_aabb_half = [
+            aabb.half_extent[0],
+            aabb.half_extent[1],
+            aabb.half_extent[2],
+        ];
         instances.push(TessShowcaseInstanceData {
             mesh: mesh3d.0.id(),
             material: mat3d.0.id(),
@@ -145,7 +153,10 @@ pub fn hide_tessellated_base_instances(
     materials: Res<Assets<StandardSolariMaterial>>,
     query: Query<
         (Entity, &SolariMaterial3d),
-        (With<RaytracingMesh3d>, bevy_ecs::query::Without<TessBaseHidden>),
+        (
+            With<RaytracingMesh3d>,
+            bevy_ecs::query::Without<TessBaseHidden>,
+        ),
     >,
 ) {
     for (entity, mat3d) in &query {
@@ -153,9 +164,10 @@ pub fn hide_tessellated_base_instances(
             continue;
         };
         if mat.depth_map.is_some() {
-            commands
-                .entity(entity)
-                .insert((bevy_camera::visibility::RenderLayers::none(), TessBaseHidden));
+            commands.entity(entity).insert((
+                bevy_camera::visibility::RenderLayers::none(),
+                TessBaseHidden,
+            ));
         }
     }
 }
@@ -219,9 +231,9 @@ fn tess_ptlas_write_layout() -> BindGroupLayoutDescriptor {
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer_sized(false, None),           // 0 write_count (rw atomic)
-                storage_buffer_sized(false, None),           // 1 write_data (rw)
-                uniform_buffer::<TessWriteParams>(false),    // 2 params
+                storage_buffer_sized(false, None), // 0 write_count (rw atomic)
+                storage_buffer_sized(false, None), // 1 write_data (rw)
+                uniform_buffer::<TessWriteParams>(false), // 2 params
                 storage_buffer_read_only_sized(false, None), // 3 instances
                 storage_buffer_read_only_sized(false, None), // 4 blas_addresses
             ),

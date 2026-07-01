@@ -197,6 +197,7 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
 |trace_tracy|Tracing support, exposing a port for Tracy|
 |trace_tracy_memory|Tracing support, with memory profiling, exposing a port for Tracy|
 |track_location|Enables source location tracking for change detection and spawning/despawning, which can assist with debugging|
+|transform_f64|Switches Transform/GlobalTransform to f64 for very large worlds (see bevy_math's transform_f64). Single additive opt-in; absence = f32|
 |type_label_buffers|Pre-populate buffer labels with buffer types for debugging.|
 |ui_picking|Provides an implementation for picking UI|
 |vorbis|OGG/VORBIS audio format support (through `lewton`)|

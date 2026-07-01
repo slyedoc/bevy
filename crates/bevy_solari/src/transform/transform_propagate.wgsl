@@ -1,28 +1,36 @@
-// GPU transform propagation — ancestor-walk over the changed set.
+// GPU transform propagation — ancestor-walk over the changed set, producing each
+// node's ABSOLUTE world with a native-f64 translation (SHADER_F64).
 //
 // `world[node]` is a pure function of the node's own `local`/`parent` ancestor
-// chain — it depends on no other node's world. So one thread per node can
-// compute it independently by walking up the parent chain and composing locals
+// chain — it depends on no other node's world. So one thread per node can compute
+// it independently by walking up the parent chain and composing locals
 // (root∘…∘parent∘local), in a SINGLE pass: no Jacobi iteration, no ping-pong,
-// no read/write hazard (each thread writes only its own `world` slot and reads
-// the read-only `local`/`parent` columns).
+// no read/write hazard (each thread writes only its own world slots and reads
+// the read-only local/`parent` columns).
 //
 // We exploit that to do only the work that changed: the dispatch runs one thread
-// per *changed* node (the `local` column's delta this frame — `changed[k*stride]`
-// is the slot), recomputing just those worlds into the PERSISTENT `world` buffer;
+// per *changed* node (the local columns' delta this frame — `changed[k*stride]`
+// is the slot), recomputing just those worlds into the PERSISTENT world buffers;
 // static nodes keep last frame's value. On a capacity growth (`full_rebuild`) we
-// instead run one thread per node (id = slot) to repopulate the whole buffer.
+// instead run one thread per node (id = slot).
 //
-// Boundary: this updates a changed node's own world. A change that moves a
-// node's DESCENDANTS without changing their own `local` (animating a parent, or
-// a bare re-parent) won't re-walk those descendants — they'd keep a stale world.
-// bevy_city only animates leaves, so this is exact there; a general hierarchy
-// would also dirty descendants (a downward 1-bit propagation) — a later step.
+// The translation is accumulated in f64 so a node's absolute position survives at
+// AU/interstellar magnitude — the huge magnitude is NOT subtracted here. A separate
+// pass (`transform_subtract.wgsl`) subtracts the camera's own f64 world (the origin)
+// to emit the small origin-relative f32 the acceleration structure is built from.
+// De-fusing the subtract from the walk is what keeps this pass changed-only: the
+// origin moving every frame re-runs only the cheap flat subtract, not this walk.
 //
-// Layout: `local` is raw TRS — 10 floats per node (translation.xyz, rotation
-// xyzw quat, scale.xyz), matching `LocalTRS`; `load_local` builds the matrix from
-// it. `world` is mat3x4<f32> as 3 vec4 rows per node — row k is (linear row k
-// .xyz, translation component k .w), matching `Affine3x4`.
+// Boundary: this updates a changed node's own world. A change that moves a node's
+// DESCENDANTS without changing their own `local` (animating a parent, or a bare
+// re-parent) won't re-walk those descendants unless a `SolariFrame`/`SolariGpuFrame`
+// re-pushes their locals (see graph.rs).
+//
+// Layout: `local_t` is a flat array<f64>, 3 per node; `local_rs` is 7 f32 per node
+// (rotation xyzw quat, scale .xyz), matching graph.rs's `LocalTranslation`/`LocalRS`.
+// `world_abs_linear` is 3 vec4 per node (linear row k .xyz, .w unused);
+// `world_abs_t` is a flat array<f64>, 3 per node.
+// NOTE: unsuffixed WGSL float literals are f32 — f64 constants need explicit typing.
 
 struct PropagateParams {
     // Threads to dispatch: `full_rebuild` → node_count; else changed-record count.
@@ -32,84 +40,56 @@ struct PropagateParams {
     // 1 → node = thread id (walk every node, e.g. after a growth); 0 → node =
     // `changed[k * record_stride]` (walk only this frame's changed nodes).
     full_rebuild: u32,
-    // Transform-table slot of the origin node (the primary camera). `frame_world[origin_slot]`
-    // is the df64 origin subtracted from every frame's world. origin_valid == 0 → no subtract.
-    origin_slot: u32,
-    origin_valid: u32,
-    _pad1: u32,
-    _pad2: u32,
+    _pad: u32,
 }
 
 const ROOT_PARENT: u32 = 0xffffffffu;
 // Safety bound on the ancestor walk (guards a malformed/cyclic parent chain).
 const MAX_DEPTH: u32 = 64u;
 
-@group(0) @binding(0) var<storage, read> local: array<f32>;              // 10 per node (TRS)
-@group(0) @binding(1) var<storage, read> parent: array<u32>;             // 1 per node
-@group(0) @binding(2) var<storage, read_write> world: array<vec4<f32>>;  // 3 per node (persistent)
-@group(0) @binding(3) var<storage, read> changed: array<u32>;            // [slot, words…] per record
-@group(0) @binding(4) var<uniform> params: PropagateParams;
-@group(0) @binding(5) var<storage, read> frame_world: array<f32>;        // 8 per node: [hi.xyz, lo.xyz, has_frame, pad]
+@group(0) @binding(0) var<storage, read> local_t: array<f64>;                // 3 per node
+@group(0) @binding(1) var<storage, read> local_rs: array<f32>;               // 7 per node (quat, scale)
+@group(0) @binding(2) var<storage, read> parent: array<u32>;                 // 1 per node
+@group(0) @binding(3) var<storage, read_write> world_abs_linear: array<vec4<f32>>; // 3 per node (persistent)
+@group(0) @binding(4) var<storage, read_write> world_abs_t: array<f64>;      // 3 per node (persistent)
+@group(0) @binding(5) var<storage, read> changed: array<u32>;                // [slot, words…] per record
+@group(0) @binding(6) var<uniform> params: PropagateParams;
 
-// df64 origin-relative render translation — MUST match `Df64Vec3::sub_to_f32` in
-// df64.rs: (hi − hi) + (lo − lo). The hi subtraction is exact when the frame is near
-// the origin (Sterbenz); the lo term restores the sub-ulp part. Inlined here (the
-// transform shaders avoid naga_oil imports); see `transform/df64.wgsl` for the full
-// primitive set used by the frame-compose / orbital passes.
-fn df3_sub_to_f32(self_hi: vec3<f32>, self_lo: vec3<f32>, o_hi: vec3<f32>, o_lo: vec3<f32>) -> vec3<f32> {
-    return (self_hi - o_hi) + (self_lo - o_lo);
+// A node's local transform: linear rows (rotation·scale, f32) + f64 translation.
+struct Local {
+    r0: vec3<f32>,
+    r1: vec3<f32>,
+    r2: vec3<f32>,
+    tx: f64,
+    ty: f64,
+    tz: f64,
 }
 
-// One row of `A ∘ B`: A's row `ar` (.xyz linear, .w translation) times B's linear
-// columns `bc{0,1,2}` and translation `bt`.
-fn mul_row(ar: vec4<f32>, bc0: vec3<f32>, bc1: vec3<f32>, bc2: vec3<f32>, bt: vec3<f32>) -> vec4<f32> {
-    return vec4<f32>(dot(ar.xyz, bc0), dot(ar.xyz, bc1), dot(ar.xyz, bc2), dot(ar.xyz, bt) + ar.w);
-}
-
-// A node's local transform as mat3x4 rows (linear row k .xyz, translation k .w).
-struct Mat3x4 { r0: vec4<f32>, r1: vec4<f32>, r2: vec4<f32> }
-
-// Build the mat3x4 from a node's raw TRS (`local[node*10 .. +10]`): rotation quat
-// → 3×3, columns scaled by `scale`, translation in `.w`.
-fn load_local(node: u32) -> Mat3x4 {
-    let b = node * 10u;
-    var t = vec3<f32>(local[b], local[b + 1u], local[b + 2u]);
-    let qx = local[b + 3u]; let qy = local[b + 4u]; let qz = local[b + 5u]; let qw = local[b + 6u];
-    let s = vec3<f32>(local[b + 7u], local[b + 8u], local[b + 9u]);
-
-    // Floating-origin offset: a `has_frame` node's world is its absolute df64 position minus
-    // the df64 origin — which is the origin node's own `frame_world[origin_slot]` (the camera),
-    // read straight from the column, so the origin is the camera's GPU world with no CPU value.
-    // The subtract cancels the huge shared magnitude before it reaches f32 — a metre-scale
-    // offset survives even at AU scale, where a naive f32 subtract would round to zero. The
-    // origin node itself (node == origin_slot) resolves to 0 (it subtracts its own world), so
-    // the camera renders at 0 by construction. Rotation/scale still come from the local TRS;
-    // only the translation is offset. A node with no `SolariFrameWorld` (has_frame == 0) adds
-    // nothing and inherits its frame ancestor's offset through the composition (one per chain).
-    let fb = node * 8u;
-    if frame_world[fb + 6u] != 0.0 && params.origin_valid != 0u {
-        let f_hi = vec3<f32>(frame_world[fb], frame_world[fb + 1u], frame_world[fb + 2u]);
-        let f_lo = vec3<f32>(frame_world[fb + 3u], frame_world[fb + 4u], frame_world[fb + 5u]);
-        let ob = params.origin_slot * 8u;
-        let o_hi = vec3<f32>(frame_world[ob], frame_world[ob + 1u], frame_world[ob + 2u]);
-        let o_lo = vec3<f32>(frame_world[ob + 3u], frame_world[ob + 4u], frame_world[ob + 5u]);
-        t = t + df3_sub_to_f32(f_hi, f_lo, o_hi, o_lo);
-    }
+// Build from a node's raw records: f64 translation, then rotation quat → 3×3 with
+// columns scaled by `scale`.
+fn load_local(node: u32) -> Local {
+    let tb = node * 3u;
+    let b = node * 7u;
+    let qx = local_rs[b]; let qy = local_rs[b + 1u]; let qz = local_rs[b + 2u]; let qw = local_rs[b + 3u];
+    let s = vec3<f32>(local_rs[b + 4u], local_rs[b + 5u], local_rs[b + 6u]);
 
     let xx = qx * qx; let yy = qy * qy; let zz = qz * qz;
     let xy = qx * qy; let xz = qx * qz; let yz = qy * qz;
     let wx = qw * qx; let wy = qw * qy; let wz = qw * qz;
-    // Row-major rotation rows.
-    let rot0 = vec3<f32>(1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz),       2.0 * (xz + wy));
-    let rot1 = vec3<f32>(2.0 * (xy + wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx));
-    let rot2 = vec3<f32>(2.0 * (xz - wy),       2.0 * (yz + wx),       1.0 - 2.0 * (xx + yy));
+    // Row-major rotation rows, columns scaled by `scale`.
+    var lo: Local;
+    lo.r0 = vec3<f32>(1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz),       2.0 * (xz + wy)) * s;
+    lo.r1 = vec3<f32>(2.0 * (xy + wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)) * s;
+    lo.r2 = vec3<f32>(2.0 * (xz - wy),       2.0 * (yz + wx),       1.0 - 2.0 * (xx + yy)) * s;
+    lo.tx = local_t[tb];
+    lo.ty = local_t[tb + 1u];
+    lo.tz = local_t[tb + 2u];
+    return lo;
+}
 
-    var m: Mat3x4;
-    // Scale columns (component j by s[j]) and pack translation into .w.
-    m.r0 = vec4<f32>(rot0 * s, t.x);
-    m.r1 = vec4<f32>(rot1 * s, t.y);
-    m.r2 = vec4<f32>(rot2 * s, t.z);
-    return m;
+// f32 row · f64 translation, accumulated in f64.
+fn row_dot_t(row: vec3<f32>, tx: f64, ty: f64, tz: f64) -> f64 {
+    return f64(row.x) * tx + f64(row.y) * ty + f64(row.z) * tz;
 }
 
 @compute @workgroup_size(64)
@@ -117,45 +97,55 @@ fn propagate(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(num_workgroups) num_workgroups: vec3<u32>,
 ) {
-    // Flat thread index across a 2D-split dispatch (X capped at the 65535
-    // per-dimension limit, the rest spilled into Y). `* 64u` = the X workgroup size.
     let k = gid.x + gid.y * num_workgroups.x * 64u;
     if k >= params.count {
         return;
     }
+
     var node = k;
     if params.full_rebuild == 0u {
         node = changed[k * params.record_stride];
     }
 
-    // M starts as the node's own local, then left-compose each ancestor's local
-    // walking up to the root: M = local[root] ∘ … ∘ local[parent] ∘ local[node].
+    // M starts as the node's own local; left-compose each ancestor walking up to the
+    // root: M = local[root] ∘ … ∘ local[parent] ∘ local[node]. Linear part in f32,
+    // translation accumulated in f64.
     let m = load_local(node);
-    var m0 = m.r0;
-    var m1 = m.r1;
-    var m2 = m.r2;
+    var r0 = m.r0;
+    var r1 = m.r1;
+    var r2 = m.r2;
+    var tx = m.tx;
+    var ty = m.ty;
+    var tz = m.tz;
     var p = parent[node];
     for (var step = 0u; step < MAX_DEPTH; step = step + 1u) {
         if p == ROOT_PARENT {
             break;
         }
         let a = load_local(p);
-        let a0 = a.r0;
-        let a1 = a.r1;
-        let a2 = a.r2;
-        // M = local[p] ∘ M (parent ∘ child). Columns + translation of M:
-        let bc0 = vec3<f32>(m0.x, m1.x, m2.x);
-        let bc1 = vec3<f32>(m0.y, m1.y, m2.y);
-        let bc2 = vec3<f32>(m0.z, m1.z, m2.z);
-        let bt = vec3<f32>(m0.w, m1.w, m2.w);
-        m0 = mul_row(a0, bc0, bc1, bc2, bt);
-        m1 = mul_row(a1, bc0, bc1, bc2, bt);
-        m2 = mul_row(a2, bc0, bc1, bc2, bt);
+        // M = A ∘ M: linear = A.linear · M.linear; translation = A.linear · M.t + A.t.
+        // Columns of M.linear (for the linear product).
+        let c0 = vec3<f32>(r0.x, r1.x, r2.x);
+        let c1 = vec3<f32>(r0.y, r1.y, r2.y);
+        let c2 = vec3<f32>(r0.z, r1.z, r2.z);
+        r0 = vec3<f32>(dot(a.r0, c0), dot(a.r0, c1), dot(a.r0, c2));
+        r1 = vec3<f32>(dot(a.r1, c0), dot(a.r1, c1), dot(a.r1, c2));
+        r2 = vec3<f32>(dot(a.r2, c0), dot(a.r2, c1), dot(a.r2, c2));
+        // translation: A.linear · t + A.t, per component in f64.
+        let ntx = row_dot_t(a.r0, tx, ty, tz) + a.tx;
+        let nty = row_dot_t(a.r1, tx, ty, tz) + a.ty;
+        let ntz = row_dot_t(a.r2, tx, ty, tz) + a.tz;
+        tx = ntx;
+        ty = nty;
+        tz = ntz;
         p = parent[p];
     }
 
     let wb = node * 3u;
-    world[wb] = m0;
-    world[wb + 1u] = m1;
-    world[wb + 2u] = m2;
+    world_abs_linear[wb]      = vec4<f32>(r0, 0.0);
+    world_abs_linear[wb + 1u] = vec4<f32>(r1, 0.0);
+    world_abs_linear[wb + 2u] = vec4<f32>(r2, 0.0);
+    world_abs_t[wb]      = tx;
+    world_abs_t[wb + 1u] = ty;
+    world_abs_t[wb + 2u] = tz;
 }

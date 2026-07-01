@@ -51,8 +51,18 @@ struct CameraPassParams {
 // motion vectors), then overwrites it with this frame's. `valid` is 0 until the first
 // frame writes it (buffer zero-cleared on creation), so frame 1 reports zero motion
 // instead of reading an uninitialized previous.
+//
+// `origin_*` is the ABSOLUTE floating origin (the camera's own f64 world translation)
+// the stored basis was expressed against. The origin moves every frame the camera
+// does, so the stored previous is in a *shifted* coordinate space: without a rebase,
+// clip_from_world and prev_clip_from_world would differ only by rotation and static
+// geometry would report ~zero motion under camera translation (DLSS smear). The next
+// frame folds `origin_now − origin_prev` back in (below).
 struct PrevCamera {
     clip_from_world: mat4x4<f32>,
+    origin_x: f64,
+    origin_y: f64,
+    origin_z: f64,
     valid: u32,
 }
 
@@ -63,6 +73,10 @@ struct PrevCamera {
 @group(0) @binding(1) var<uniform> params: CameraPassParams;
 @group(0) @binding(2) var<storage, read_write> out_camera: RtCamera;
 @group(0) @binding(3) var<storage, read_write> prev_cam: PrevCamera;
+// The absolute-world translation buffer (flat array<f64>, 3 per node) — the camera's
+// own entry IS the floating origin; its frame-to-frame delta drives the motion-vector
+// rebase above.
+@group(0) @binding(4) var<storage, read> world_abs_t: array<f64>;
 
 // Inverse of an affine transform (last row implicitly `(0,0,0,1)`). Handles a
 // scaled camera basis (general 3×3 inverse via the column cross-products), not
@@ -122,6 +136,17 @@ fn rt_camera() {
         origin = vec3<f32>(0.0);
     }
 
+    // This frame's absolute origin (the camera's own f64 world translation).
+    var origin_x = f64(0.0);
+    var origin_y = f64(0.0);
+    var origin_z = f64(0.0);
+    if params.valid == 1u && params.camera_slot < params.node_count {
+        let ob = params.camera_slot * 3u;
+        origin_x = world_abs_t[ob];
+        origin_y = world_abs_t[ob + 1u];
+        origin_z = world_abs_t[ob + 2u];
+    }
+
     let view_from_world = inverse_affine(world_from_view);
     // Same derivations the CPU path did from `view.world_from_view`, now from the
     // GPU-composed camera world: raygen's `inverse_view_proj` = world_from_clip.
@@ -131,17 +156,34 @@ fn rt_camera() {
     out_camera.clip_from_world = clip_from_world;
 
     // Previous basis for DLSS motion vectors, maintained on the GPU. Frame 1 (no stored
-    // previous) reports zero motion by using this frame's basis; a recenter frame rebases
-    // the stored (old-origin) previous into the new basis. Then store this frame for next.
+    // previous) reports zero motion by using this frame's basis. The stored previous is
+    // in LAST frame's origin basis: a point's previous origin-relative position is its
+    // current one plus (origin_now − origin_prev), so fold that translation in — computed
+    // in f64 (the absolute origins are huge; their difference is small) then narrowed.
+    // Without this, camera translation produces ~zero motion vectors on static geometry.
+    // The CPU-supplied reframe (teleports / explicit frame handoffs) composes after it.
     var prev = clip_from_world;
     if prev_cam.valid == 1u {
         prev = prev_cam.clip_from_world;
+        let dx = f32(origin_x - prev_cam.origin_x);
+        let dy = f32(origin_y - prev_cam.origin_y);
+        let dz = f32(origin_z - prev_cam.origin_z);
+        let origin_shift = mat4x4<f32>(
+            vec4<f32>(1.0, 0.0, 0.0, 0.0),
+            vec4<f32>(0.0, 1.0, 0.0, 0.0),
+            vec4<f32>(0.0, 0.0, 1.0, 0.0),
+            vec4<f32>(dx, dy, dz, 1.0),
+        );
+        prev = prev * origin_shift;
         if params.reframe_active == 1u {
             prev = prev * params.reframe_prev_from_current;
         }
     }
     out_camera.prev_clip_from_world = prev;
     prev_cam.clip_from_world = clip_from_world;
+    prev_cam.origin_x = origin_x;
+    prev_cam.origin_y = origin_y;
+    prev_cam.origin_z = origin_z;
     prev_cam.valid = 1u;
 
     out_camera.camera_position = vec4<f32>(origin, params.exposure);

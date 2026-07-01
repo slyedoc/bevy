@@ -70,7 +70,11 @@ fn main() {
         // convert meshes + materials for the RT scene.
         .add_systems(
             Update,
-            (convert_meshes_to_raytracing, convert_standard_materials_to_solari).chain(),
+            (
+                convert_meshes_to_raytracing,
+                convert_standard_materials_to_solari,
+            )
+                .chain(),
         )
         .run();
 }
@@ -86,9 +90,9 @@ fn setup_scene(
     // second, larger bottle is stripped on spawn — the prism stands in its
     // place.
     commands
-        .spawn(WorldAssetRoot(
-            asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/refraction.glb")),
-        ))
+        .spawn(WorldAssetRoot(asset_server.load(
+            GltfAssetLabel::Scene(0).from_asset("models/refraction.glb"),
+        )))
         .observe(
             |scene_ready: On<WorldInstanceReady>,
              children: Query<&Children>,
@@ -117,8 +121,8 @@ fn setup_scene(
             // The asset's origin is not at the dragon's feet: the Dragon node
             // sits at y = -0.7306 (standing on the stripped backdrop cloth).
             Transform::from_xyz(-0.25, 0.7306 * 0.12, -0.05)
-                .with_scale(Vec3::splat(0.12))
-                .with_rotation(Quat::from_rotation_y(1.0)),
+                .with_scale(Vec3::splat(0.12).to_precision())
+                .with_rotation(Quat::from_rotation_y(1.0).to_precision()),
         ))
         .observe(
             |scene_ready: On<WorldInstanceReady>,
@@ -156,7 +160,8 @@ fn setup_scene(
             dispersion: 0.63,
             ..default()
         })),
-        Transform::from_xyz(0.05, 0.0462, -0.08).with_rotation(Quat::from_rotation_y(0.5)),
+        Transform::from_xyz(0.05, 0.0462, -0.08)
+            .with_rotation(Quat::from_rotation_y(0.5).to_precision()),
     ));
 
     // A small stage: checkered floor so refraction visibly bends straight
@@ -178,7 +183,7 @@ fn setup_scene(
             commands.spawn((
                 Mesh3d(tile.clone()),
                 MeshMaterial3d(material.clone()),
-                Transform::from_xyz(x as f32 * 0.1 + 0.05, 0.0, z as f32 * 0.1 + 0.05),
+                Transform::from_xyz(f64::from(x) * 0.1 + 0.05, 0.0, f64::from(z) * 0.1 + 0.05),
             ));
         }
     }
@@ -188,14 +193,14 @@ fn setup_scene(
             commands.spawn((
                 Mesh3d(tile.clone()),
                 MeshMaterial3d(material.clone()),
-                Transform::from_xyz(x as f32 * 0.1 + 0.05, y as f32 * 0.1 + 0.05, -0.8)
-                    .with_rotation(Quat::from_rotation_x(PI / 2.0)),
+                Transform::from_xyz(f64::from(x) * 0.1 + 0.05, f64::from(y) * 0.1 + 0.05, -0.8)
+                    .with_rotation(Quat::from_rotation_x(PI / 2.0).to_precision()),
             ));
         }
     }
 
     commands.spawn((
-        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, -0.8, -1.0, 0.0)),
+        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, -0.8, -1.0, 0.0).to_precision()),
         SolariDirectionLight {
             illuminance: light_consts::lux::FULL_DAYLIGHT,
             ..default()
@@ -213,7 +218,8 @@ fn setup_scene(
             run_speed: 2.0,
             ..Default::default()
         },
-        Transform::from_xyz(0.0, 0.25, 0.55).looking_at(Vec3::new(0.0, 0.15, 0.0), Vec3::Y),
+        Transform::from_xyz(0.0, 0.25, 0.55)
+            .looking_at(Vec3::new(0.0, 0.15, 0.0).to_precision(), Vec3::Y),
         Msaa::Off,
         SolariCamera,
         // Depth of field: bevy's standard component. The pathtracer consumes

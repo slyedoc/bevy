@@ -22,7 +22,9 @@ use bevy::{
     prelude::*,
     solari::prelude::*,
     ui::Checked,
-    ui_widgets::{radio_self_update, slider_self_update, Activate, RadioGroup, SliderStep, SliderValue},
+    ui_widgets::{
+        radio_self_update, slider_self_update, Activate, RadioGroup, SliderStep, SliderValue,
+    },
     world_serialization::WorldInstanceReady,
 };
 
@@ -54,25 +56,29 @@ fn main() {
         FeathersPlugins,
         FreeCameraPlugin,
     ))
-        .insert_resource(UiTheme(create_dark_theme()))
-        // `PbrPlugin` is disabled, so re-register `Assets<StandardMaterial>` — the
-        // glTF loader + `convert_standard_materials_to_solari` still need it.
-        .init_asset::<StandardMaterial>()
-        .add_systems(Startup, (setup_scene, setup_camera_and_light, ui.spawn()))
-        .add_systems(
-            Update,
+    .insert_resource(UiTheme(create_dark_theme()))
+    // `PbrPlugin` is disabled, so re-register `Assets<StandardMaterial>` — the
+    // glTF loader + `convert_standard_materials_to_solari` still need it.
+    .init_asset::<StandardMaterial>()
+    .add_systems(Startup, (setup_scene, setup_camera_and_light, ui.spawn()))
+    .add_systems(
+        Update,
+        (
+            toggle_animation.run_if(input_just_pressed(KeyCode::Space)),
+            // Drive the fox from the panel widgets' state.
+            sync_speed,
+            sync_clip,
+            // Bake glTF meshes into ClusterMeshes + swap to `RaytracingMesh3d`,
+            // and convert their `StandardMaterial`s — the skinned mesh keeps its
+            // `SkinnedMesh` through the swap, so the deform path picks it up.
             (
-                toggle_animation.run_if(input_just_pressed(KeyCode::Space)),
-                // Drive the fox from the panel widgets' state.
-                sync_speed,
-                sync_clip,
-                // Bake glTF meshes into ClusterMeshes + swap to `RaytracingMesh3d`,
-                // and convert their `StandardMaterial`s — the skinned mesh keeps its
-                // `SkinnedMesh` through the swap, so the deform path picks it up.
-                (convert_meshes_to_raytracing, convert_standard_materials_to_solari).chain(),
-            ),
-        )
-        .run();
+                convert_meshes_to_raytracing,
+                convert_standard_materials_to_solari,
+            )
+                .chain(),
+        ),
+    )
+    .run();
 }
 
 /// Playback state shared between the panel widgets and the `AnimationPlayer`s.
@@ -137,7 +143,7 @@ fn setup_scene(
                 index: clips[DEFAULT_CLIP],
             },
             WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset(GLTF_PATH))),
-            Transform::from_scale(Vec3::splat(0.5)),
+            Transform::from_scale(Vec3::splat(0.5).to_precision()),
         ))
         .observe(play_animation_when_ready);
 }
@@ -275,7 +281,7 @@ fn setup_camera_and_light(mut commands: Commands) {
             illuminance: light_consts::lux::RAW_SUNLIGHT,
             ..default()
         },
-        Transform::from_xyz(1.0, 1.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(1.0, 1.0, 1.0).looking_at(Vec3::ZERO.to_precision(), Vec3::Y),
     ));
 
     commands.spawn((
@@ -289,8 +295,8 @@ fn setup_camera_and_light(mut commands: Commands) {
             run_speed: 200.0,
             ..default()
         },
-        Transform::from_translation(Vec3::new(80.0, 70.0, 110.0))
-            .looking_at(Vec3::new(0.0, 25.0, 0.0), Vec3::Y),
+        Transform::from_translation(Vec3::new(80.0, 70.0, 110.0).to_precision())
+            .looking_at(Vec3::new(0.0, 25.0, 0.0).to_precision(), Vec3::Y),
         Msaa::Off,
         Exposure::OVERCAST,
         Bloom::NATURAL,

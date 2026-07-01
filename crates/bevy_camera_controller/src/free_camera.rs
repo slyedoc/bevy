@@ -27,7 +27,9 @@ use bevy_input::ButtonInput;
 use bevy_log::info;
 use bevy_math::curve::{Interval, SampleAutoCurve};
 use bevy_math::Curve;
-use bevy_math::{ops::exp, Dir3, EulerRot, Quat, StableInterpolate, Vec2, Vec3};
+use bevy_math::{
+    ops::exp, Dir3, EulerRot, Quat, StableInterpolate, ToPrecision, ToRender, Vec2, Vec3,
+};
 use bevy_time::{Real, Time};
 use bevy_transform::prelude::Transform;
 use bevy_window::{CursorGrabMode, CursorOptions, Window};
@@ -282,7 +284,7 @@ pub fn run_freecamera_controller(
     };
 
     if !state.initialized {
-        let (yaw, pitch, _roll) = transform.rotation.to_euler(EulerRot::YXZ);
+        let (yaw, pitch, _roll) = transform.rotation.to_render().to_euler(EulerRot::YXZ);
         state.yaw = yaw;
         state.pitch = pitch;
         state.initialized = true;
@@ -373,9 +375,10 @@ pub fn run_freecamera_controller(
             VerticalMovementAxis::World => Vec3::Y,
             VerticalMovementAxis::Local => *transform.up(),
         };
-        transform.translation += state.velocity.x * dt * right
+        transform.translation += (state.velocity.x * dt * right
             + state.velocity.y * dt * up
-            + state.velocity.z * dt * forward;
+            + state.velocity.z * dt * forward)
+            .to_precision();
     }
 
     // Handle cursor grab
@@ -404,7 +407,8 @@ pub fn run_freecamera_controller(
             - accumulated_mouse_motion.delta.y * RADIANS_PER_DOT * config.sensitivity)
             .clamp(-PI / 2., PI / 2.);
         state.yaw -= accumulated_mouse_motion.delta.x * RADIANS_PER_DOT * config.sensitivity;
-        transform.rotation = Quat::from_euler(EulerRot::ZYX, 0.0, state.yaw, state.pitch);
+        transform.rotation =
+            Quat::from_euler(EulerRot::ZYX, 0.0, state.yaw, state.pitch).to_precision();
     }
 
     // Handle touch input
@@ -413,7 +417,8 @@ pub fn run_freecamera_controller(
             state.pitch = (state.pitch - touch.delta().y * RADIANS_PER_DOT * config.sensitivity)
                 .clamp(-PI / 2., PI / 2.);
             state.yaw -= touch.delta().x * RADIANS_PER_DOT * config.sensitivity;
-            transform.rotation = Quat::from_euler(EulerRot::ZYX, 0.0, state.yaw, state.pitch);
+            transform.rotation =
+                Quat::from_euler(EulerRot::ZYX, 0.0, state.yaw, state.pitch).to_precision();
         }
     }
     // Axis snapping
@@ -441,8 +446,11 @@ pub fn run_freecamera_controller(
         }
     }
     if let Some((dir, up)) = rotate_to {
-        let start = transform.rotation;
-        let target = Transform::default().looking_to(dir, up).rotation; // I don't understand why Quat::look_to_rh produce different result.
+        let start = transform.rotation.to_render();
+        let target = Transform::default()
+            .looking_to(dir, up)
+            .rotation
+            .to_render(); // I don't understand why Quat::look_to_rh produce different result.
         let angle = target.angle_between(start);
         let rotation_time = angle / config.rotation_speed;
 
@@ -474,11 +482,11 @@ pub fn rotate_freecam_to(
         return;
     };
     *progress += time.delta_secs();
-    transform.rotation = curve.sample_clamped(*progress);
+    transform.rotation = curve.sample_clamped(*progress).to_precision();
     if !curve.domain().contains(*progress) {
         state.rotation_curve = None;
     }
-    let (yaw, pitch, _roll) = transform.rotation.to_euler(EulerRot::YXZ);
+    let (yaw, pitch, _roll) = transform.rotation.to_render().to_euler(EulerRot::YXZ);
     state.pitch = pitch;
     state.yaw = yaw;
 }

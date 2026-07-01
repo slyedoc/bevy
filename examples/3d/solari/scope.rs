@@ -59,7 +59,11 @@ fn main() {
         // enabled); convert meshes + materials for the RT scene.
         .add_systems(
             Update,
-            (convert_meshes_to_raytracing, convert_standard_materials_to_solari).chain(),
+            (
+                convert_meshes_to_raytracing,
+                convert_standard_materials_to_solari,
+            )
+                .chain(),
         )
         .run();
 }
@@ -108,14 +112,14 @@ fn setup_scene(
     commands.spawn((
         Mesh3d(objective),
         SolariMaterial3d(glass.clone()),
-        Transform::from_xyz(0.0, AXIS_Y, objective_z),
+        Transform::from_xyz(0.0, f64::from(AXIS_Y), f64::from(objective_z)),
     ));
 
     let eyepiece = meshes.add(lens_mesh(-0.05, -0.05, 0.012, 0.004));
     commands.spawn((
         Mesh3d(eyepiece),
         SolariMaterial3d(glass.clone()),
-        Transform::from_xyz(0.0, AXIS_Y, eyepiece_z),
+        Transform::from_xyz(0.0, f64::from(AXIS_Y), f64::from(eyepiece_z)),
     ));
 
     // Barrel: a wide tube over the objective tapering to a narrow eyepiece
@@ -123,19 +127,19 @@ fn setup_scene(
     commands.spawn((
         Mesh3d(meshes.add(tube_mesh(0.031, 0.034, 0.17))),
         MeshMaterial3d(tube_material.clone()),
-        Transform::from_xyz(0.0, AXIS_Y, -0.04),
+        Transform::from_xyz(0.0, f64::from(AXIS_Y), -0.04),
     ));
     commands.spawn((
         Mesh3d(meshes.add(tube_mesh(0.013, 0.016, 0.06))),
         MeshMaterial3d(tube_material.clone()),
-        Transform::from_xyz(0.0, AXIS_Y, 0.065),
+        Transform::from_xyz(0.0, f64::from(AXIS_Y), 0.065),
     ));
 
     // Stand.
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(0.02, AXIS_Y - 0.034, 0.02))),
         MeshMaterial3d(tube_material.clone()),
-        Transform::from_xyz(0.0, (AXIS_Y - 0.034) / 2.0, -0.04),
+        Transform::from_xyz(0.0, f64::from((AXIS_Y - 0.034) / 2.0), -0.04),
     ));
 
     // ── Downrange ───────────────────────────────────────────────────────────
@@ -158,8 +162,8 @@ fn setup_scene(
                 perceptual_roughness: 0.9,
                 ..default()
             })),
-            Transform::from_xyz(0.0, AXIS_Y, -10.0 + i as f32 * 0.006)
-                .with_rotation(Quat::from_rotation_x(PI / 2.0)),
+            Transform::from_xyz(0.0, f64::from(AXIS_Y), -10.0 + i as f64 * 0.006)
+                .with_rotation(Quat::from_rotation_x(PI / 2.0).to_precision()),
         ));
     }
 
@@ -175,7 +179,7 @@ fn setup_scene(
     ));
 
     commands.spawn((
-        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, -0.6, -0.9, 0.0)),
+        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, -0.6, -0.9, 0.0).to_precision()),
         SolariDirectionLight {
             illuminance: light_consts::lux::FULL_DAYLIGHT,
             ..default()
@@ -195,8 +199,8 @@ fn setup_scene(
             run_speed: 1.5,
             ..Default::default()
         },
-        Transform::from_xyz(0.0, AXIS_Y, eyepiece_z + 0.030)
-            .looking_at(Vec3::new(0.0, AXIS_Y, -10.0), Vec3::Y),
+        Transform::from_xyz(0.0, f64::from(AXIS_Y), f64::from(eyepiece_z + 0.030))
+            .looking_at(Vec3::new(0.0, AXIS_Y, -10.0).to_precision(), Vec3::Y),
         Msaa::Off,
         SolariCamera,
         SolariAtmosphere::default(),
@@ -266,7 +270,10 @@ fn lens_mesh(r_front: f32, r_back: f32, aperture: f32, thickness: f32) -> Mesh {
                 positions.push([x * cos_t, x * sin_t, z(x)]);
                 let n = Vec3::new(-dz * cos_t, -dz * sin_t, 1.0).normalize() * flip;
                 normals.push([n.x, n.y, n.z]);
-                uvs.push([0.5 + 0.5 * (x / aperture) * cos_t, 0.5 + 0.5 * (x / aperture) * sin_t]);
+                uvs.push([
+                    0.5 + 0.5 * (x / aperture) * cos_t,
+                    0.5 + 0.5 * (x / aperture) * sin_t,
+                ]);
             }
         }
         let ring_start = |ring: usize| base + 1 + ((ring - 1) * (SEGMENTS + 1)) as u32;
@@ -309,15 +316,21 @@ fn lens_mesh(r_front: f32, r_back: f32, aperture: f32, thickness: f32) -> Mesh {
     }
     for seg in 0..SEGMENTS as u32 {
         let (a, b) = (band + seg, band + seg + 1);
-        let (c, d) = (band + (SEGMENTS as u32 + 1) + seg, band + (SEGMENTS as u32 + 1) + seg + 1);
+        let (c, d) = (
+            band + (SEGMENTS as u32 + 1) + seg,
+            band + (SEGMENTS as u32 + 1) + seg + 1,
+        );
         indices.extend([a, b, d, a, d, c]);
     }
 
-    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-        .with_inserted_indices(Indices::U32(indices))
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
 }
 
 /// A hollow open-ended tube (annular cross-section revolved around Z):
@@ -334,7 +347,7 @@ fn tube_mesh(inner: f32, outer: f32, length: f32) -> Mesh {
     // Four bands with hard normals: (radius pair, z pair, normal).
     // Each band is a quad strip between two rings of vertices.
     let bands: [([f32; 2], [f32; 2], fn(f32, f32) -> [f32; 3]); 4] = [
-        ([outer, outer], [-h, h], |c, s| [c, s, 0.0]),   // outer wall: +radial
+        ([outer, outer], [-h, h], |c, s| [c, s, 0.0]), // outer wall: +radial
         ([inner, inner], [h, -h], |c, s| [-c, -s, 0.0]), // inner wall: -radial
         ([inner, outer], [h, h], |_, _| [0.0, 0.0, 1.0]), // front ring: +Z
         ([outer, inner], [-h, -h], |_, _| [0.0, 0.0, -1.0]), // back ring: -Z
@@ -361,9 +374,12 @@ fn tube_mesh(inner: f32, outer: f32, length: f32) -> Mesh {
         }
     }
 
-    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-        .with_inserted_indices(Indices::U32(indices))
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
 }

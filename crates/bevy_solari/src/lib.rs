@@ -43,34 +43,34 @@ pub mod gpu;
 pub mod pipelines;
 pub mod resource_manager;
 
-pub mod material;
-pub mod lights;
+pub mod hair;
 pub mod instance;
+pub mod lights;
+pub mod material;
 pub mod ray_query;
 pub mod render;
 pub mod transform;
-pub mod hair;
 
-#[cfg(feature = "cluster_processor")]
-pub mod helper;
 #[cfg(feature = "bevy_solari_debug")]
 pub mod debug;
+#[cfg(feature = "cluster_processor")]
+pub mod helper;
 
 use bevy_app::{App, Plugin};
-use bevy_render::settings::WgpuFeatures;
 use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
-use bevy_render::{renderer::RenderDevice, RenderApp, RenderStartup};
 use bevy_log::warn;
+use bevy_render::settings::WgpuFeatures;
+use bevy_render::{renderer::RenderDevice, RenderApp, RenderStartup};
 
 use crate::accel::AccelPlugin;
 use crate::bindings::BindingsPlugin;
-use crate::hair::HairPlugin;
 use crate::ecs_gpu::{ReconcilePlugin, SceneColumnsPlugin};
 use crate::geometry::GeometryPlugin;
+use crate::hair::HairPlugin;
 use crate::instance::InstancePlugin;
 use crate::lights::SolariLightsPlugin;
-use crate::ray_query::RayQueryPlugin;
 use crate::material::StandardSolariMaterialPlugin;
+use crate::ray_query::RayQueryPlugin;
 use crate::render::SolarRenderPlugin;
 use crate::transform::SolariTransformPlugin;
 
@@ -176,24 +176,25 @@ pub enum SolariClusterSystems {
 /// This includes the most common types in this crate, re-exported for your convenience.
 pub mod prelude {
     pub use crate::{
-        bindings::RaytracingMesh3d, bindings::SolariFogVolume, bindings::SolariPortal,
-        render::CameraReframe, render::CameraReset, render::SolariCamera,
+        bindings::RaytracingMesh3d,
+        bindings::SolariFogVolume,
+        bindings::SolariPortal,
+        geometry::ClusterMesh,
+        hair::{Hair, HairAsset, HairMaterial, HairStrand, SolariBranches},
+        lights::SolariDirectionLight,
+        material::{SolariMaterial3d, StandardSolariMaterial},
+        ray_query::picking::SolariPickingPlugin,
+        render::atmosphere::{SolariAtmosphere, SolariGlobalFog},
         render::rt_pipeline::SolariAnyHitHeatmap,
         render::rt_pipeline::SolariClusterView,
-        render::rt_pipeline::SolariTriangleView,
         render::rt_pipeline::SolariCostHeatmap,
         render::rt_pipeline::SolariShowDisplacement,
-        render::atmosphere::{SolariAtmosphere, SolariGlobalFog},
+        render::rt_pipeline::SolariTriangleView,
+        render::CameraReframe,
+        render::CameraReset,
+        render::SolariCamera,
+        transform::{NoGpuGlobalTransformReadback, SolariFrame, SolariGpuFrame, TransformStatic},
         SolariInitPlugin, SolariPlugin,
-        geometry::ClusterMesh,
-        transform::{
-            NoGpuGlobalTransformReadback, SolariFrame, SolariFrameWorld, SolariGpuFrame,
-            TransformStatic,
-        },
-        material::{StandardSolariMaterial, SolariMaterial3d},
-        lights::SolariDirectionLight,
-        hair::{Hair, HairMaterial, HairAsset, HairStrand, SolariBranches},
-        ray_query::picking::SolariPickingPlugin,
     };
 
     #[cfg(feature = "dlss")]
@@ -208,8 +209,6 @@ pub mod prelude {
         convert_standard_materials_to_solari, ConvertToRaytracing,
     };
 }
-
-
 
 /// Solari-side bootstrap plugin that must be added **before**
 /// [`bevy_render::RenderPlugin`]. Registers Vulkan device-creation
@@ -248,22 +247,18 @@ impl Plugin for SolariPlugin {
         app.add_plugins((
             SceneColumnsPlugin,
             ReconcilePlugin,
-
             BindingsPlugin,
             GeometryPlugin,
             InstancePlugin,
-
             AccelPlugin,
             RayQueryPlugin,
             SolarRenderPlugin,
             #[cfg(feature = "bevy_solari_debug")]
             SolariDebugPlugin,
-
             // ecs gpu tables
             SolariTransformPlugin,
             StandardSolariMaterialPlugin,
             SolariLightsPlugin,
-
             HairPlugin,
         ));
 
@@ -331,5 +326,9 @@ impl SolariPlugin {
             // 64-bit ints for buffer-device-address arithmetic in the RT-pipeline
             // bindless geometry path (`physical_load<T>(addr: u64)`).
             | WgpuFeatures::SHADER_INT64
+            // Native f64 for the transform table: the propagate walk accumulates the
+            // absolute world translation in f64 and the subtract pass relativizes it
+            // against the camera origin (see `transform/`).
+            | WgpuFeatures::SHADER_F64
     }
 }

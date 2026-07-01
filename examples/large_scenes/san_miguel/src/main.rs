@@ -177,9 +177,7 @@ pub fn main() {
         // goes through a custom `fmt_layer` that filters by message text.
         .set(LogPlugin {
             fmt_layer: tess_log_filter::fmt_layer,
-            filter: [
-                "bevy_camera_controller::free_camera",
-            ].join(","),
+            filter: ["bevy_camera_controller::free_camera"].join(","),
             ..default()
         });
     // Under `solari` the full-RT path replaces the raster mesh/material stack, so
@@ -316,7 +314,14 @@ struct LoadingText;
 #[cfg(feature = "solari")]
 fn mark_meshes_for_raytracing(
     mut commands: Commands,
-    query: Query<Entity, (With<Mesh3d>, Without<ConvertToRaytracing>, Without<RaytracingMesh3d>)>,
+    query: Query<
+        Entity,
+        (
+            With<Mesh3d>,
+            Without<ConvertToRaytracing>,
+            Without<RaytracingMesh3d>,
+        ),
+    >,
     args: Res<Args>,
 ) {
     for entity in query.iter().take(args.bake_per_frame as usize) {
@@ -511,7 +516,9 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     #[cfg(not(feature = "solari"))]
     commands
         .spawn((
-            Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0)),
+            Transform::from_rotation(
+                Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0).to_precision(),
+            ),
             DirectionalLight {
                 color: Color::srgb(1.0, 0.87, 0.78),
                 illuminance: lux::FULL_DAYLIGHT,
@@ -537,7 +544,9 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     // the ray tracer traces shadow rays directly.
     #[cfg(feature = "solari")]
     commands.spawn((
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0)),
+        Transform::from_rotation(
+            Quat::from_euler(EulerRot::XYZ, PI * -0.35, PI * -0.13, 0.0).to_precision(),
+        ),
         SolariDirectionLight {
             color: Color::srgb(1.0, 0.87, 0.78),
             illuminance: lux::FULL_DAYLIGHT,
@@ -550,9 +559,11 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     // cluster ~x12-23, y1.8-9.4, z~0 — a wall plane) so the tess-hit counter isn't a false
     // zero from the surfaces being off-screen.
     let cam_transform = if std::env::var_os("CLAUDECODE").is_some() {
-        Transform::from_xyz(17.0, 5.0, 9.0).looking_at(Vec3::new(17.0, 4.5, 0.0), Vec3::Y)
+        Transform::from_xyz(17.0, 5.0, 9.0)
+            .looking_at(Vec3::new(17.0, 4.5, 0.0).to_precision(), Vec3::Y)
     } else {
-        Transform::from_xyz(12.0, 2.0, 12.0).looking_at(Vec3::new(0.0, 2.5, 0.0), Vec3::Y)
+        Transform::from_xyz(12.0, 2.0, 12.0)
+            .looking_at(Vec3::new(0.0, 2.5, 0.0).to_precision(), Vec3::Y)
     };
     let mut cam = commands.spawn((
         Msaa::Off,
@@ -708,34 +719,37 @@ impl Default for CameraPositions {
         // first guesses — fly with the free camera and press `I` to print the
         // current transform, then paste better values here.
         Self([
-            Transform::from_xyz(12.0, 2.0, 12.0).looking_at(Vec3::new(0.0, 2.5, 0.0), Vec3::Y),
-            Transform::from_xyz(0.0, 9.0, 16.0).looking_at(Vec3::new(0.0, 3.0, -2.0), Vec3::Y),
-            Transform::from_xyz(-10.0, 1.7, -8.0).looking_at(Vec3::new(4.0, 2.0, 6.0), Vec3::Y),
+            Transform::from_xyz(12.0, 2.0, 12.0)
+                .looking_at(Vec3::new(0.0, 2.5, 0.0).to_precision(), Vec3::Y),
+            Transform::from_xyz(0.0, 9.0, 16.0)
+                .looking_at(Vec3::new(0.0, 3.0, -2.0).to_precision(), Vec3::Y),
+            Transform::from_xyz(-10.0, 1.7, -8.0)
+                .looking_at(Vec3::new(4.0, 2.0, 6.0).to_precision(), Vec3::Y),
         ])
     }
 }
 
 const ANIM_SPEED: f32 = 0.2;
-const ANIM_HYSTERESIS: f32 = 0.1; // EMA/LPF
+const ANIM_HYSTERESIS: TReal = 0.1; // EMA/LPF
 
 // Placeholder fly-through path (Space toggles it). `const` can't call
 // `looking_at`, so these use identity rotation — record a real path with `I`
 // and paste the printed transforms here.
 const ANIM_CAM: [Transform; 3] = [
     Transform {
-        translation: Vec3::new(12.0, 2.0, 12.0),
-        rotation: Quat::IDENTITY,
-        scale: Vec3::ONE,
+        translation: TVec3::new(12.0, 2.0, 12.0),
+        rotation: TQuat::IDENTITY,
+        scale: TVec3::ONE,
     },
     Transform {
-        translation: Vec3::new(0.0, 9.0, 16.0),
-        rotation: Quat::IDENTITY,
-        scale: Vec3::ONE,
+        translation: TVec3::new(0.0, 9.0, 16.0),
+        rotation: TQuat::IDENTITY,
+        scale: TVec3::ONE,
     },
     Transform {
-        translation: Vec3::new(-10.0, 1.7, -8.0),
-        rotation: Quat::IDENTITY,
-        scale: Vec3::ONE,
+        translation: TVec3::new(-10.0, 1.7, -8.0),
+        rotation: TQuat::IDENTITY,
+        scale: TVec3::ONE,
     },
 ];
 
@@ -761,9 +775,9 @@ fn input(
     }
 }
 
-fn lerp<T>(a: T, b: T, t: f32) -> T
+fn lerp<T>(a: T, b: T, t: TReal) -> T
 where
-    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<f32, Output = T>,
+    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<TReal, Output = T>,
 {
     a + (b - a) * t
 }
@@ -774,6 +788,7 @@ fn follow_path(points: &[Transform], progress: f32) -> Transform {
     let mut segment_progress = progress * total_segments;
     let segment_index = segment_progress.floor() as usize;
     segment_progress -= segment_index as f32;
+    let segment_progress = segment_progress.to_precision();
     let a = points[segment_index];
     let b = points[(segment_index + 1).min(points.len() - 1)];
     Transform {
@@ -815,7 +830,10 @@ fn spin(
     if args.spin {
         let camera_position = things_to_spin.get(*camera).unwrap().translation;
         let spin = |thing_to_spin: &mut Transform| {
-            thing_to_spin.rotate_around(camera_position, Quat::from_rotation_y(time.delta_secs()));
+            thing_to_spin.rotate_around(
+                camera_position,
+                TQuat::from_rotation_y(time.delta_secs().to_precision()),
+            );
         };
         things_to_spin.iter_mut().for_each(|mut s| spin(s.as_mut())); // WHY
         positions.iter_mut().for_each(spin);
@@ -1001,7 +1019,6 @@ mod tess_log_filter {
         // First presented swapchain image is in UNDEFINED layout for one frame
         // before the first render writes it. Cosmetic first-frame warning.
         "VUID-VkPresentInfoKHR-pImageIndices-01430",
-        
     ];
 
     /// Per-layer filter: drop an event if any of its fields' text contains a

@@ -12,25 +12,35 @@
 use argh::FromArgs;
 use assets::{load_assets, CityAssets};
 use bevy::{
-    camera::{Exposure, Hdr, visibility::NoCpuCulling}, camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, color::palettes::css::WHITE, dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig}, diagnostic::FrameTimeDiagnosticsPlugin, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, light::{
+    camera::{visibility::NoCpuCulling, Exposure, Hdr},
+    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    color::palettes::css::WHITE,
+    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
+    diagnostic::FrameTimeDiagnosticsPlugin,
+    feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
+    light::{
+        atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm},
         Atmosphere,
-        atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm}
-    }, pbr::wireframe::{WireframeConfig, WireframePlugin}, post_process::bloom::Bloom, prelude::*, window::{PresentMode, WindowResolution}, winit::WinitSettings, world_serialization::WorldInstanceReady
+    },
+    pbr::wireframe::{WireframeConfig, WireframePlugin},
+    post_process::bloom::Bloom,
+    prelude::*,
+    window::{PresentMode, WindowResolution},
+    winit::WinitSettings,
+    world_serialization::WorldInstanceReady,
 };
 
 // Only used by the rasterized (non-Solari) camera.
 #[cfg(not(feature = "solari"))]
 use bevy::{
-    pbr::{
-        AtmosphereSettings
-    },
-    anti_alias::taa::TemporalAntiAliasing, light::AtmosphereEnvironmentMapLight, pbr::ContactShadows,
+    anti_alias::taa::TemporalAntiAliasing, light::AtmosphereEnvironmentMapLight,
+    pbr::AtmosphereSettings, pbr::ContactShadows,
 };
 
 #[cfg(feature = "solari")]
 use bevy::{core_pipeline::Skybox, solari::prelude::*};
 
-use crate::generate_city::{spawn_city};
+use crate::generate_city::spawn_city;
 use crate::{
     assets::{merge_car_meshes, strip_base_url},
     settings::{settings_ui, Settings, CITY_SIZE_RANGE},
@@ -67,64 +77,64 @@ fn main() {
     let city_size = args.size.clamp(CITY_SIZE_RANGE.0, CITY_SIZE_RANGE.1);
 
     let mut app = App::new();
-        // DLSS needs its project id inserted before RenderPlugin (DlssInitPlugin
-        // reads it during render init). `solari` enables `bevy/dlss`.
-        #[cfg(feature = "dlss")]
-        app.insert_resource(bevy::anti_alias::dlss::DlssProjectId(
-            bevy::asset::uuid::uuid!("a0e6c8d2-1f3b-4c5a-9e7d-2b4f6a8c0e1d"),
-        ));
-        let default_plugins = DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "bevy_city".into(),
-                resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
-                present_mode: PresentMode::AutoNoVsync,
-                position: WindowPosition::Centered(MonitorSelection::Primary),
-                ..default()
-            }),
+    // DLSS needs its project id inserted before RenderPlugin (DlssInitPlugin
+    // reads it during render init). `solari` enables `bevy/dlss`.
+    #[cfg(feature = "dlss")]
+    app.insert_resource(bevy::anti_alias::dlss::DlssProjectId(
+        bevy::asset::uuid::uuid!("a0e6c8d2-1f3b-4c5a-9e7d-2b4f6a8c0e1d"),
+    ));
+    let default_plugins = DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "bevy_city".into(),
+            resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
+            present_mode: PresentMode::AutoNoVsync,
+            position: WindowPosition::Centered(MonitorSelection::Primary),
             ..default()
-        });
-        // Under `solari` the GPU transform table drives the RT scene (transform
-        // columns → Jacobi → gather into the instance transforms), so
-        // bevy_transform's CPU propagation is pure overhead — disable it. CPU
-        // `GlobalTransform` is restored below only for the small set that still
-        // reads it CPU-side (camera/sun/atmosphere + the UI tree).
-        // Under `solari` the full-RT path replaces the raster mesh/material stack,
-        // so disable `PbrPlugin` (bevy_solari owns its material/lights + vendors the
-        // DfgLut + pbr shader helpers) and the render-debug overlay (DefaultPlugins
-        // adds it with the bevy_pbr feature). `TransformPlugin` is GPU-driven.
-        #[cfg(feature = "solari")]
-        let default_plugins = default_plugins
-            .disable::<bevy::transform::TransformPlugin>()
-            .disable::<bevy::pbr::PbrPlugin>()
-            .disable::<bevy::dev_tools::render_debug::RenderDebugOverlayPlugin>();
+        }),
+        ..default()
+    });
+    // Under `solari` the GPU transform table drives the RT scene (transform
+    // columns → Jacobi → gather into the instance transforms), so
+    // bevy_transform's CPU propagation is pure overhead — disable it. CPU
+    // `GlobalTransform` is restored below only for the small set that still
+    // reads it CPU-side (camera/sun/atmosphere + the UI tree).
+    // Under `solari` the full-RT path replaces the raster mesh/material stack,
+    // so disable `PbrPlugin` (bevy_solari owns its material/lights + vendors the
+    // DfgLut + pbr shader helpers) and the render-debug overlay (DefaultPlugins
+    // adds it with the bevy_pbr feature). `TransformPlugin` is GPU-driven.
+    #[cfg(feature = "solari")]
+    let default_plugins = default_plugins
+        .disable::<bevy::transform::TransformPlugin>()
+        .disable::<bevy::pbr::PbrPlugin>()
+        .disable::<bevy::dev_tools::render_debug::RenderDebugOverlayPlugin>();
 
-        app.add_plugins((
-            default_plugins,
-            FreeCameraPlugin,
-            FeathersPlugins,
-            // Wireframe needs the raster mesh pipeline (gone with PbrPlugin).
-            #[cfg(not(feature = "solari"))]
-            WireframePlugin::default(),
-            FrameTimeDiagnosticsPlugin::default(),
-            FpsOverlayPlugin {
-                config: FpsOverlayConfig {
-                    frame_time_graph_config: FrameTimeGraphConfig {
-                        enabled: true,
-                        target_fps: 240.0,
-                        min_fps: 60.0,
-                    },
-                    ..default()
+    app.add_plugins((
+        default_plugins,
+        FreeCameraPlugin,
+        FeathersPlugins,
+        // Wireframe needs the raster mesh pipeline (gone with PbrPlugin).
+        #[cfg(not(feature = "solari"))]
+        WireframePlugin::default(),
+        FrameTimeDiagnosticsPlugin::default(),
+        FpsOverlayPlugin {
+            config: FpsOverlayConfig {
+                frame_time_graph_config: FrameTimeGraphConfig {
+                    enabled: true,
+                    target_fps: 240.0,
+                    min_fps: 60.0,
                 },
-            },    
-            #[cfg(feature = "solari")]  SolariPlugin     
-        ));
-    
+                ..default()
+            },
+        },
+        #[cfg(feature = "solari")]
+        SolariPlugin,
+    ));
 
-        app.insert_resource(args.clone())
+    app.insert_resource(args.clone())
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(WinitSettings::continuous())
         .insert_resource(Settings {
-            city_size: city_size,
+            city_size,
             ..default()
         })
         .insert_resource(UiTheme(create_dark_theme()))
@@ -142,33 +152,29 @@ fn main() {
         // `spawn_atmosphere` needs `Assets<ScatteringMedium>` (registered via
         // PbrPlugin's AtmospherePlugin) — gone under solari, where the RT path
         // doesn't sample the raster atmosphere anyway.
-        .add_systems(Startup, (
-            scene.spawn(),
-            settings_ui.spawn(),
-            #[cfg(not(feature = "solari"))]
-            spawn_atmosphere,
-            load_assets,            
-        ))
+        .add_systems(
+            Startup,
+            (
+                scene.spawn(),
+                settings_ui.spawn(),
+                #[cfg(not(feature = "solari"))]
+                spawn_atmosphere,
+                load_assets,
+            ),
+        )
         .add_systems(
             Update,
             (
                 simulate_cars,
-                
                 settings::update_city_info,
                 update_loading_screen,
                 process_assets.run_if(on_message::<CityAssetsLoaded>),
                 on_city_assets_ready.run_if(on_message::<CityAssetsReady>),
-                (
-                    add_no_cpu_culling,
-                    on_city_spawned,
-                                        
-                ).run_if(on_message::<CitySpawned>),
-                
+                (add_no_cpu_culling, on_city_spawned).run_if(on_message::<CitySpawned>),
                 #[cfg(feature = "solari")]
                 (
                     convert_meshes_to_raytracing,
                     convert_standard_materials_to_solari,
-
                     mark_city_static,
                 ),
             ),
@@ -190,7 +196,14 @@ fn scene() -> impl SceneList {
 #[cfg(feature = "solari")]
 fn mark_city_static(
     mut commands: Commands,
-    query: Query<Entity, (With<RaytracingMesh3d>, Without<Car>, Without<TransformStatic>)>,
+    query: Query<
+        Entity,
+        (
+            With<RaytracingMesh3d>,
+            Without<Car>,
+            Without<TransformStatic>,
+        ),
+    >,
 ) {
     for entity in &query {
         commands.entity(entity).insert(TransformStatic);
@@ -204,7 +217,10 @@ fn mark_city_static(
 /// so it's a calibrated value, not a finicky multiplier — tune to taste. (Only the
 /// `Pathtrace` view samples it today; the realtime ReSTIR path doesn't yet.)
 #[cfg(feature = "solari")]
-#[expect(dead_code, reason = "toggled in for skybox testing vs the baked atmosphere")]
+#[expect(
+    dead_code,
+    reason = "toggled in for skybox testing vs the baked atmosphere"
+)]
 fn add_solari_environment_map(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -220,11 +236,11 @@ fn add_solari_environment_map(
 }
 
 #[cfg(not(feature = "solari"))]
-fn camera() -> impl Scene {        
+fn camera() -> impl Scene {
     bsn! {
         Camera3d
         Hdr
-        template_value(Transform::from_xyz(15.0, 10.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y))
+        template_value(Transform::from_xyz(15.0, 10.0, 20.0).looking_at(Vec3::ZERO.to_precision(), Vec3::Y))
         FreeCamera
         AtmosphereSettings {
             // Reduce the default max distance in the aerial view LUT
@@ -247,11 +263,11 @@ fn camera() -> impl Scene {
 }
 
 #[cfg(feature = "solari")]
-fn camera() -> impl Scene {        
+fn camera() -> impl Scene {
     bsn! {
         Camera3d
         Hdr
-        template_value(Transform::from_xyz(15.0, 10.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y))
+        template_value(Transform::from_xyz(15.0, 10.0, 20.0).looking_at(Vec3::ZERO.to_precision(), Vec3::Y))
         FreeCamera
         Exposure::OVERCAST
         //Bloom::NATURAL
@@ -318,7 +334,7 @@ fn sun() -> impl Scene {
             contact_shadows_enabled: {Settings::default().contact_shadows_enabled},
             illuminance: light_consts::lux::RAW_SUNLIGHT,
         }
-        template_value(Transform::from_xyz(1.0, 0.15, 1.0).looking_at(Vec3::ZERO, Vec3::Y))
+        template_value(Transform::from_xyz(1.0, 0.15, 1.0).looking_at(Vec3::ZERO.to_precision(), Vec3::Y))
     }
 }
 
@@ -330,7 +346,7 @@ fn sun() -> impl Scene {
         SolariDirectionLight {
             illuminance: light_consts::lux::RAW_SUNLIGHT,
         }
-        template_value(Transform::from_xyz(1.0, 0.15, 1.0).looking_at(Vec3::ZERO, Vec3::Y))
+        template_value(Transform::from_xyz(1.0, 0.15, 1.0).looking_at(Vec3::ZERO.to_precision(), Vec3::Y))
         // CPU-authored static sun: keep its GlobalTransform off the async GPU
         // readback so the atmosphere bake always reads the correct sun direction
         // (a clobbered/laggy sun baked a black sky and latched it).
@@ -377,8 +393,8 @@ fn spawn_atmosphere(
     let scale = 1.0 / 20.0;
     commands.spawn((
         earth_atmosphere.clone(),
-        Transform::from_scale(Vec3::splat(scale))
-            .with_translation(-Vec3::Y * earth_atmosphere.inner_radius * scale),
+        Transform::from_scale(Vec3::splat(scale).to_precision())
+            .with_translation((-Vec3::Y * earth_atmosphere.inner_radius * scale).to_precision()),
     ));
 }
 
@@ -457,7 +473,7 @@ fn process_assets(
 
 fn on_city_assets_ready(
     mut commands: Commands,
-    city_assets: Res<CityAssets>,    
+    city_assets: Res<CityAssets>,
     args: Res<Args>,
     mut loading_text: Query<&mut Text, With<LoadingText>>,
 ) {
@@ -465,12 +481,7 @@ fn on_city_assets_ready(
         return;
     };
     text.0 = "Spawning city...".into();
-    spawn_city(
-        &mut commands,
-        &city_assets,    
-        args.seed,
-        args.size,
-    );
+    spawn_city(&mut commands, &city_assets, args.seed, args.size);
     commands.write_message(CitySpawned);
 }
 
@@ -484,7 +495,6 @@ fn on_city_spawned(
     commands.entity(*loading_screen).despawn();
 }
 
-
 #[derive(Component)]
 struct Road {
     start: Vec3,
@@ -497,7 +507,6 @@ struct Car {
     distance_traveled: f32,
     dir: f32,
 }
-
 
 /// Do a very naive traffic simulation. This will only move the car to the end of the road then
 /// spawn it back at the start.
@@ -532,7 +541,7 @@ fn simulate_cars(
             let direction = (road.end - road.start).normalize() * car.dir;
             let progress = car.distance_traveled / road_len;
             car_transform.translation =
-                (road.start + car.offset) + direction * road_len * progress;
+                ((road.start + car.offset) + direction * road_len * progress).to_precision();
         });
 }
 

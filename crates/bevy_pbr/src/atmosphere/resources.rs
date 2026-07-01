@@ -16,7 +16,7 @@ use bevy_ecs::{
 };
 use bevy_image::ToExtents;
 use bevy_light::atmosphere::ScatteringMedium;
-use bevy_math::{Affine3A, Mat4, Vec3, Vec3A};
+use bevy_math::{Affine3A, Mat4, ToRender, Vec3, Vec3A};
 use bevy_render::{
     extract_component::ComponentUniforms,
     render_asset::RenderAssets,
@@ -554,7 +554,7 @@ pub(super) fn prepare_atmosphere_transforms(
 
     for (entity, view, gpu_atmosphere) in &views {
         // Camera position in atmosphere space
-        let cam_world = view.world_from_view.translation();
+        let cam_world = view.world_from_view.translation().to_render();
         let cam_pos = Vec3A::from(
             gpu_atmosphere
                 .world_to_atmosphere

@@ -1,5 +1,7 @@
 use super::GlobalTransform;
-use bevy_math::{Affine3A, Dir3, Isometry3d, Mat3, Mat4, Quat, Vec3};
+use bevy_math::{
+    Dir3, Isometry3d, Mat3, Quat, TAffine3, TMat4, TQuat, TReal, TVec3, ToPrecision, ToRender, Vec3,
+};
 use core::ops::Mul;
 
 #[cfg(feature = "bevy-support")]
@@ -59,6 +61,12 @@ fn assert_is_normalized(message: &str, length_squared: f32) {
 /// update the [`Transform`] of an entity during this set or after, you will notice a 1 frame lag
 /// before the [`GlobalTransform`] is updated.
 ///
+/// ## Precision
+///
+/// The component's fields use the [`TVec3`]/[`TQuat`] transform-precision aliases: plain
+/// `f32` types by default, `f64` with the `transform_f64` cargo feature (for very large
+/// worlds). See [`bevy_math::precision`].
+///
 /// [`TransformSystems::Propagate`]: crate::TransformSystems::Propagate
 ///
 /// # Examples
@@ -84,46 +92,46 @@ fn assert_is_normalized(message: &str, length_squared: f32) {
     reflect(Serialize, Deserialize)
 )]
 pub struct Transform {
-    /// Position of the entity. In 2d, the last value of the `Vec3` is used for z-ordering.
+    /// Position of the entity. In 2d, the last value of the vector is used for z-ordering.
     ///
     /// See the [`translations`] example for usage.
     ///
     /// [`translations`]: https://github.com/bevyengine/bevy/blob/latest/examples/transforms/translation.rs
-    pub translation: Vec3,
+    pub translation: TVec3,
     /// Rotation of the entity.
     ///
     /// See the [`3d_rotation`] example for usage.
     ///
     /// [`3d_rotation`]: https://github.com/bevyengine/bevy/blob/latest/examples/transforms/3d_rotation.rs
-    pub rotation: Quat,
+    pub rotation: TQuat,
     /// Scale of the entity.
     ///
     /// See the [`scale`] example for usage.
     ///
     /// [`scale`]: https://github.com/bevyengine/bevy/blob/latest/examples/transforms/scale.rs
-    pub scale: Vec3,
+    pub scale: TVec3,
 }
 
 impl Transform {
     /// An identity [`Transform`] with no translation, rotation, and a scale of 1 on all axes.
     pub const IDENTITY: Self = Transform {
-        translation: Vec3::ZERO,
-        rotation: Quat::IDENTITY,
-        scale: Vec3::ONE,
+        translation: TVec3::ZERO,
+        rotation: TQuat::IDENTITY,
+        scale: TVec3::ONE,
     };
 
     /// Creates a new [`Transform`] at the position `(x, y, z)`. In 2d, the `z` component
     /// is used for z-ordering elements: higher `z`-value will be in front of lower
     /// `z`-value.
     #[inline]
-    pub const fn from_xyz(x: f32, y: f32, z: f32) -> Self {
-        Self::from_translation(Vec3::new(x, y, z))
+    pub const fn from_xyz(x: TReal, y: TReal, z: TReal) -> Self {
+        Self::from_translation(TVec3::new(x, y, z))
     }
 
     /// Extracts the translation, rotation, and scale from `matrix`. It must be a 3d affine
     /// transformation matrix.
     #[inline]
-    pub fn from_matrix(world_from_local: Mat4) -> Self {
+    pub fn from_matrix(world_from_local: TMat4) -> Self {
         let (scale, rotation, translation) = world_from_local.to_scale_rotation_translation();
 
         Transform {
@@ -136,7 +144,7 @@ impl Transform {
     /// Creates a new [`Transform`], with `translation`. Rotation will be 0 and scale 1 on
     /// all axes.
     #[inline]
-    pub const fn from_translation(translation: Vec3) -> Self {
+    pub const fn from_translation(translation: TVec3) -> Self {
         Transform {
             translation,
             ..Self::IDENTITY
@@ -146,7 +154,7 @@ impl Transform {
     /// Creates a new [`Transform`], with `rotation`. Translation will be 0 and scale 1 on
     /// all axes.
     #[inline]
-    pub const fn from_rotation(rotation: Quat) -> Self {
+    pub const fn from_rotation(rotation: TQuat) -> Self {
         Transform {
             rotation,
             ..Self::IDENTITY
@@ -156,7 +164,7 @@ impl Transform {
     /// Creates a new [`Transform`], with `scale`. Translation will be 0 and rotation 0 on
     /// all axes.
     #[inline]
-    pub const fn from_scale(scale: Vec3) -> Self {
+    pub const fn from_scale(scale: TVec3) -> Self {
         Transform {
             scale,
             ..Self::IDENTITY
@@ -165,12 +173,14 @@ impl Transform {
 
     /// Creates a new [`Transform`] that is equivalent to the given [isometry].
     ///
+    /// [`Isometry3d`] is `f32`; under `transform_f64` the conversion widens (exact).
+    ///
     /// [isometry]: Isometry3d
     #[inline]
     pub fn from_isometry(iso: Isometry3d) -> Self {
         Transform {
-            translation: iso.translation.into(),
-            rotation: iso.rotation,
+            translation: Vec3::from(iso.translation).to_precision(),
+            rotation: iso.rotation.to_precision(),
             ..Self::IDENTITY
         }
     }
@@ -184,7 +194,7 @@ impl Transform {
     /// * if the resulting forward direction is parallel with `up`, an orthogonal vector is used as the "right" direction
     #[inline]
     #[must_use]
-    pub fn looking_at(mut self, target: Vec3, up: impl TryInto<Dir3>) -> Self {
+    pub fn looking_at(mut self, target: TVec3, up: impl TryInto<Dir3>) -> Self {
         self.look_at(target, up);
         self
     }
@@ -239,7 +249,7 @@ impl Transform {
     /// Returns this [`Transform`] with a new translation.
     #[inline]
     #[must_use]
-    pub const fn with_translation(mut self, translation: Vec3) -> Self {
+    pub const fn with_translation(mut self, translation: TVec3) -> Self {
         self.translation = translation;
         self
     }
@@ -247,7 +257,7 @@ impl Transform {
     /// Returns this [`Transform`] with a new rotation.
     #[inline]
     #[must_use]
-    pub const fn with_rotation(mut self, rotation: Quat) -> Self {
+    pub const fn with_rotation(mut self, rotation: TQuat) -> Self {
         self.rotation = rotation;
         self
     }
@@ -255,7 +265,7 @@ impl Transform {
     /// Returns this [`Transform`] with a new scale.
     #[inline]
     #[must_use]
-    pub const fn with_scale(mut self, scale: Vec3) -> Self {
+    pub const fn with_scale(mut self, scale: TVec3) -> Self {
         self.scale = scale;
         self
     }
@@ -263,22 +273,22 @@ impl Transform {
     /// Computes the 3d affine transformation matrix from this transform's translation,
     /// rotation, and scale.
     #[inline]
-    pub fn to_matrix(&self) -> Mat4 {
-        Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
+    pub fn to_matrix(&self) -> TMat4 {
+        TMat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
     }
 
     /// Returns the 3d affine transformation matrix from this transforms translation,
     /// rotation, and scale.
     #[inline]
-    pub fn compute_affine(&self) -> Affine3A {
-        Affine3A::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
+    pub fn compute_affine(&self) -> TAffine3 {
+        TAffine3::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
     }
 
     /// Get the unit vector in the local `X` direction.
     #[inline]
     pub fn local_x(&self) -> Dir3 {
-        // Quat * unit vector is length 1
-        Dir3::new_unchecked(self.rotation * Vec3::X)
+        // Quat * unit vector is length 1; `Dir3` stays f32 in both precision modes.
+        Dir3::new_unchecked((self.rotation * TVec3::X).to_render())
     }
 
     /// Equivalent to [`-local_x()`][Transform::local_x()]
@@ -297,7 +307,7 @@ impl Transform {
     #[inline]
     pub fn local_y(&self) -> Dir3 {
         // Quat * unit vector is length 1
-        Dir3::new_unchecked(self.rotation * Vec3::Y)
+        Dir3::new_unchecked((self.rotation * TVec3::Y).to_render())
     }
 
     /// Equivalent to [`local_y()`][Transform::local_y]
@@ -316,7 +326,7 @@ impl Transform {
     #[inline]
     pub fn local_z(&self) -> Dir3 {
         // Quat * unit vector is length 1
-        Dir3::new_unchecked(self.rotation * Vec3::Z)
+        Dir3::new_unchecked((self.rotation * TVec3::Z).to_render())
     }
 
     /// Equivalent to [`-local_z()`][Transform::local_z]
@@ -341,7 +351,7 @@ impl Transform {
     ///
     /// [`3d_rotation`]: https://github.com/bevyengine/bevy/blob/latest/examples/transforms/3d_rotation.rs
     #[inline]
-    pub fn rotate(&mut self, rotation: Quat) {
+    pub fn rotate(&mut self, rotation: TQuat) {
         self.rotation = rotation * self.rotation;
     }
 
@@ -356,45 +366,48 @@ impl Transform {
     /// result in a denormalized rotation. In this case, it is recommended to normalize the [`Transform::rotation`] after
     /// each call to this method.
     #[inline]
-    pub fn rotate_axis(&mut self, axis: Dir3, angle: f32) {
+    pub fn rotate_axis(&mut self, axis: Dir3, angle: TReal) {
         #[cfg(debug_assertions)]
         assert_is_normalized(
             "The axis given to `Transform::rotate_axis` is not normalized. This may be a result of obtaining \
             the axis from the transform. See the documentation of `Transform::rotate_axis` for more details.",
             axis.length_squared(),
         );
-        self.rotate(Quat::from_axis_angle(axis.into(), angle));
+        self.rotate(TQuat::from_axis_angle(
+            Vec3::from(axis).to_precision(),
+            angle,
+        ));
     }
 
     /// Rotates this [`Transform`] around the `X` axis by `angle` (in radians).
     ///
     /// If this [`Transform`] has a parent, the axis is relative to the rotation of the parent.
     #[inline]
-    pub fn rotate_x(&mut self, angle: f32) {
-        self.rotate(Quat::from_rotation_x(angle));
+    pub fn rotate_x(&mut self, angle: TReal) {
+        self.rotate(TQuat::from_rotation_x(angle));
     }
 
     /// Rotates this [`Transform`] around the `Y` axis by `angle` (in radians).
     ///
     /// If this [`Transform`] has a parent, the axis is relative to the rotation of the parent.
     #[inline]
-    pub fn rotate_y(&mut self, angle: f32) {
-        self.rotate(Quat::from_rotation_y(angle));
+    pub fn rotate_y(&mut self, angle: TReal) {
+        self.rotate(TQuat::from_rotation_y(angle));
     }
 
     /// Rotates this [`Transform`] around the `Z` axis by `angle` (in radians).
     ///
     /// If this [`Transform`] has a parent, the axis is relative to the rotation of the parent.
     #[inline]
-    pub fn rotate_z(&mut self, angle: f32) {
-        self.rotate(Quat::from_rotation_z(angle));
+    pub fn rotate_z(&mut self, angle: TReal) {
+        self.rotate(TQuat::from_rotation_z(angle));
     }
 
     /// Rotates this [`Transform`] by the given `rotation`.
     ///
     /// The `rotation` is relative to this [`Transform`]'s current rotation.
     #[inline]
-    pub fn rotate_local(&mut self, rotation: Quat) {
+    pub fn rotate_local(&mut self, rotation: TQuat) {
         self.rotation *= rotation;
     }
 
@@ -407,39 +420,42 @@ impl Transform {
     /// result in a denormalized rotation. In this case, it is recommended to normalize the [`Transform::rotation`] after
     /// each call to this method.
     #[inline]
-    pub fn rotate_local_axis(&mut self, axis: Dir3, angle: f32) {
+    pub fn rotate_local_axis(&mut self, axis: Dir3, angle: TReal) {
         #[cfg(debug_assertions)]
         assert_is_normalized(
             "The axis given to `Transform::rotate_axis_local` is not normalized. This may be a result of obtaining \
             the axis from the transform. See the documentation of `Transform::rotate_axis_local` for more details.",
             axis.length_squared(),
         );
-        self.rotate_local(Quat::from_axis_angle(axis.into(), angle));
+        self.rotate_local(TQuat::from_axis_angle(
+            Vec3::from(axis).to_precision(),
+            angle,
+        ));
     }
 
     /// Rotates this [`Transform`] around its local `X` axis by `angle` (in radians).
     #[inline]
-    pub fn rotate_local_x(&mut self, angle: f32) {
-        self.rotate_local(Quat::from_rotation_x(angle));
+    pub fn rotate_local_x(&mut self, angle: TReal) {
+        self.rotate_local(TQuat::from_rotation_x(angle));
     }
 
     /// Rotates this [`Transform`] around its local `Y` axis by `angle` (in radians).
     #[inline]
-    pub fn rotate_local_y(&mut self, angle: f32) {
-        self.rotate_local(Quat::from_rotation_y(angle));
+    pub fn rotate_local_y(&mut self, angle: TReal) {
+        self.rotate_local(TQuat::from_rotation_y(angle));
     }
 
     /// Rotates this [`Transform`] around its local `Z` axis by `angle` (in radians).
     #[inline]
-    pub fn rotate_local_z(&mut self, angle: f32) {
-        self.rotate_local(Quat::from_rotation_z(angle));
+    pub fn rotate_local_z(&mut self, angle: TReal) {
+        self.rotate_local(TQuat::from_rotation_z(angle));
     }
 
     /// Translates this [`Transform`] around a `point` in space.
     ///
     /// If this [`Transform`] has a parent, the `point` is relative to the [`Transform`] of the parent.
     #[inline]
-    pub fn translate_around(&mut self, point: Vec3, rotation: Quat) {
+    pub fn translate_around(&mut self, point: TVec3, rotation: TQuat) {
         self.translation = point + rotation * (self.translation - point);
     }
 
@@ -447,7 +463,7 @@ impl Transform {
     ///
     /// If this [`Transform`] has a parent, the `point` is relative to the [`Transform`] of the parent.
     #[inline]
-    pub fn rotate_around(&mut self, point: Vec3, rotation: Quat) {
+    pub fn rotate_around(&mut self, point: TVec3, rotation: TQuat) {
         self.translate_around(point, rotation);
         self.rotate(rotation);
     }
@@ -460,8 +476,10 @@ impl Transform {
     /// * if `up` fails converting to `Dir3` (e.g if it is `Vec3::ZERO`), `Dir3::Y` is used instead
     /// * if the resulting forward direction is parallel with `up`, an orthogonal vector is used as the "right" direction
     #[inline]
-    pub fn look_at(&mut self, target: Vec3, up: impl TryInto<Dir3>) {
-        self.look_to(target - self.translation, up);
+    pub fn look_at(&mut self, target: TVec3, up: impl TryInto<Dir3>) {
+        // The direction is a difference of nearby positions, so truncating to the f32
+        // `Dir3` domain is safe even at large world magnitudes.
+        self.look_to((target - self.translation).to_render(), up);
     }
 
     /// Rotates this [`Transform`] so that [`Transform::forward`] points in the given `direction`
@@ -480,7 +498,7 @@ impl Transform {
             .try_normalize()
             .unwrap_or_else(|| up.any_orthonormal_vector());
         let up = back.cross(right);
-        self.rotation = Quat::from_mat3(&Mat3::from_cols(right, up, back.into()));
+        self.rotation = Quat::from_mat3(&Mat3::from_cols(right, up, back.into())).to_precision();
     }
 
     /// Rotates this [`Transform`] so that the `main_axis` vector, reinterpreted in local coordinates, points
@@ -508,22 +526,22 @@ impl Transform {
     ///
     /// Example
     /// ```
-    /// # use bevy_math::{Dir3, Vec3, Quat};
+    /// # use bevy_math::{Dir3, Vec3, Quat, ToPrecision};
     /// # use bevy_transform::components::Transform;
     /// # let mut t1 = Transform::IDENTITY;
     /// # let mut t2 = Transform::IDENTITY;
     /// t1.align(Dir3::X, Dir3::Y, Vec3::new(1., 1., 0.), Dir3::Z);
-    /// let main_axis_image = t1.rotation * Dir3::X;
-    /// let secondary_axis_image = t1.rotation * Vec3::new(1., 1., 0.);
-    /// assert!(main_axis_image.abs_diff_eq(Vec3::Y, 1e-5));
-    /// assert!(secondary_axis_image.abs_diff_eq(Vec3::new(0., 1., 1.), 1e-5));
+    /// let main_axis_image = t1.rotation * Vec3::from(Dir3::X).to_precision();
+    /// let secondary_axis_image = t1.rotation * Vec3::new(1., 1., 0.).to_precision();
+    /// assert!(main_axis_image.abs_diff_eq(Vec3::Y.to_precision(), 1e-5));
+    /// assert!(secondary_axis_image.abs_diff_eq(Vec3::new(0., 1., 1.).to_precision(), 1e-5));
     ///
     /// t1.align(Vec3::ZERO, Dir3::Z, Vec3::ZERO, Dir3::X);
     /// t2.align(Dir3::X, Dir3::Z, Dir3::Y, Dir3::X);
     /// assert_eq!(t1.rotation, t2.rotation);
     ///
     /// t1.align(Dir3::X, Dir3::Z, Dir3::X, Dir3::Y);
-    /// assert_eq!(t1.rotation, Quat::from_rotation_arc(Vec3::X, Vec3::Z));
+    /// assert_eq!(t1.rotation, Quat::from_rotation_arc(Vec3::X, Vec3::Z).to_precision());
     /// ```
     #[inline]
     pub fn align(
@@ -561,7 +579,8 @@ impl Transform {
                 second_rotation * first_rotation
             }
             _ => first_rotation,
-        };
+        }
+        .to_precision();
     }
 
     /// Multiplies `self` with `transform` component by component, returning the
@@ -591,7 +610,7 @@ impl Transform {
     /// If you always want to transform a point in local space to worldspace, or if you need
     /// the inverse transformations, see [`GlobalTransform::transform_point()`].
     #[inline]
-    pub fn transform_point(&self, mut point: Vec3) -> Vec3 {
+    pub fn transform_point(&self, mut point: TVec3) -> TVec3 {
         point = self.scale * point;
         point = self.rotation * point;
         point += self.translation;
@@ -614,17 +633,17 @@ impl Transform {
     ///
     /// ```
     /// # use bevy_transform::prelude::Transform;
-    /// # use bevy_math::prelude::{Vec3, Quat};
+    /// # use bevy_math::prelude::{Vec3, Quat, ToPrecision};
     /// # use std::f64::consts::PI;
     /// let transform = Transform::from_xyz(1., 2., 3.)
-    ///    .with_scale(Vec3::splat(2.))
-    ///    .with_rotation(Quat::from_axis_angle(Vec3::Y, PI as f32));
-    /// let local_vector = Vec3::new(1., 2., 3.);
+    ///    .with_scale(Vec3::splat(2.).to_precision())
+    ///    .with_rotation(Quat::from_axis_angle(Vec3::Y, PI as f32).to_precision());
+    /// let local_vector = Vec3::new(1., 2., 3.).to_precision();
     /// let global_vector = transform.transform_vector(local_vector);
-    /// assert!(global_vector.abs_diff_eq(Vec3::new(-2., 4., -6.), 1e-5));
+    /// assert!(global_vector.abs_diff_eq(Vec3::new(-2., 4., -6.).to_precision(), 1e-4));
     /// ```
     #[inline]
-    pub fn transform_vector(&self, mut vector: Vec3) -> Vec3 {
+    pub fn transform_vector(&self, mut vector: TVec3) -> TVec3 {
         vector = self.scale * vector;
         vector = self.rotation * vector;
         vector
@@ -641,10 +660,12 @@ impl Transform {
 
     /// Get the [isometry] defined by this transform's rotation and translation, ignoring scale.
     ///
+    /// [`Isometry3d`] is `f32`; under `transform_f64` this conversion truncates.
+    ///
     /// [isometry]: Isometry3d
     #[inline]
     pub fn to_isometry(&self) -> Isometry3d {
-        Isometry3d::new(self.translation, self.rotation)
+        Isometry3d::new(self.translation.to_render(), self.rotation.to_render())
     }
 }
 
@@ -679,10 +700,10 @@ impl Mul<GlobalTransform> for Transform {
     }
 }
 
-impl Mul<Vec3> for Transform {
-    type Output = Vec3;
+impl Mul<TVec3> for Transform {
+    type Output = TVec3;
 
-    fn mul(self, value: Vec3) -> Self::Output {
+    fn mul(self, value: TVec3) -> Self::Output {
         self.transform_point(value)
     }
 }

@@ -26,7 +26,7 @@ use bevy_ecs::{
     system::{Local, Query, ResMut},
     world::Ref,
 };
-use bevy_math::Vec3;
+use bevy_math::{DVec3, ToRender, Vec3};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::Extract;
 use bevy_transform::components::GlobalTransform;
@@ -94,8 +94,18 @@ impl GpuFogVolume {
         params: [0.0; 4],
     };
 
-    fn new(volume: &SolariFogVolume, transform: &GlobalTransform) -> Self {
-        let affine = transform.affine();
+    /// `camera_translation` is the primary camera's absolute world translation — the
+    /// floating origin. The fog uniform must be ORIGIN-RELATIVE (the aerial marches
+    /// intersect origin-relative rays), and `GlobalTransform` is absolute, so the
+    /// subtraction happens here, in f64, before the f32 narrowing.
+    fn new(
+        volume: &SolariFogVolume,
+        transform: &GlobalTransform,
+        camera_translation: DVec3,
+    ) -> Self {
+        let mut affine_full = transform.affine_full();
+        affine_full.translation -= camera_translation;
+        let affine = affine_full.to_render();
         let det = affine.matrix3.determinant();
         // A degenerate (zero-scale) transform has no inverse — inert entry.
         if !det.is_finite() || det.abs() < 1e-12 {
@@ -147,17 +157,35 @@ pub fn extract_solari_fog_volumes(
             &GpuSlot<SolariFogVolumes>,
         )>,
     >,
+    // The floating origin: fog uniforms are origin-relative, so a camera move
+    // re-relativizes every volume (the readback marks the camera Changed).
+    camera: Extract<
+        Query<Ref<GlobalTransform>, bevy_ecs::query::With<crate::render::SolariCamera>>,
+    >,
     mut table: ResMut<SolariFogVolumes>,
     mut written: Local<EntityHashMap<u32>>,
     mut seen: Local<EntityHashSet>,
 ) {
     seen.clear();
+    let (camera_translation, camera_moved) = camera
+        .iter()
+        .next()
+        .map(|c| (c.translation(), c.is_changed()))
+        .unwrap_or((DVec3::ZERO, false));
     for (entity, volume, transform, slot) in &volumes {
         seen.insert(entity);
         let slot = slot.index();
         // `is_changed()` includes the frame the component was added.
-        if volume.is_changed() || transform.is_changed() || !written.contains_key(&entity) {
-            push_record(&mut table.volume, slot, GpuFogVolume::new(&volume, &transform));
+        if volume.is_changed()
+            || transform.is_changed()
+            || camera_moved
+            || !written.contains_key(&entity)
+        {
+            push_record(
+                &mut table.volume,
+                slot,
+                GpuFogVolume::new(&volume, &transform, camera_translation),
+            );
             written.insert(entity, slot);
         }
     }

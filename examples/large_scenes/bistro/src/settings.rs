@@ -4,8 +4,8 @@
 //! The boost exists because the Bistro FBX ships its emissive materials at
 //! factor ~1.0 — invisible next to a daylight sun. NVIDIA's own `.pyscene`
 //! multiplies every `emissiveFactor` by 1000 to get a well-exposed image; the
-//! slider applies the same scaling to every `SolariMaterial`, against the
-//! as-loaded values.
+//! slider applies the same scaling to every `StandardSolariMaterial`, against
+//! the as-loaded values.
 
 use std::collections::HashMap;
 
@@ -19,7 +19,7 @@ use bevy::{
     },
     light::light_consts::lux,
     prelude::*,
-    solari::prelude::{CameraReset, SolariCamera, SolariDirectionLight, SolariMaterial},
+    solari::prelude::{CameraReset, SolariCamera, SolariDirectionLight, StandardSolariMaterial},
     ui::Checked,
     ui_widgets::{
         checkbox_self_update, slider_self_update, SliderPrecision, SliderStep, ValueChange,
@@ -90,7 +90,8 @@ fn apply_sun(
             settings.sun_azimuth.to_radians(),
             -settings.sun_elevation.to_radians(),
             0.0,
-        );
+        )
+        .to_precision();
         let illuminance = if settings.sun_enabled {
             lux::FULL_DAYLIGHT
         } else {
@@ -108,8 +109,8 @@ fn apply_sun(
 /// moves (a `get_mut` marks the asset modified, so avoid spurious writes).
 fn apply_emissive(
     settings: Res<LightSettings>,
-    mut materials: ResMut<Assets<SolariMaterial>>,
-    mut as_loaded: Local<HashMap<AssetId<SolariMaterial>, LinearRgba>>,
+    mut materials: ResMut<Assets<StandardSolariMaterial>>,
+    mut as_loaded: Local<HashMap<AssetId<StandardSolariMaterial>, LinearRgba>>,
 ) {
     let changed = settings.is_changed();
     let ids: Vec<_> = materials.ids().collect();

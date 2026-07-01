@@ -62,9 +62,10 @@ pub fn rt_camera_bind_group_layout() -> BindGroupLayoutDescriptor {
             ShaderStages::COMPUTE,
             (
                 storage_buffer_read_only_sized(false, None), // 0 world (transform table)
-                uniform_buffer::<RtCameraPassParams>(false),  // 1 params
+                uniform_buffer::<RtCameraPassParams>(false), // 1 params
                 storage_buffer_sized(false, None),           // 2 out_camera (rw, RtCamera)
                 storage_buffer_sized(false, None),           // 3 prev_cam (rw, persistent)
+                storage_buffer_read_only_sized(false, None), // 4 world_abs_t (f64 origin source)
             ),
         ),
     )

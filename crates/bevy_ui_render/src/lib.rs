@@ -44,7 +44,7 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_ecs::system::SystemParam;
 use bevy_image::{prelude::*, TRANSPARENT_IMAGE_HANDLE};
-use bevy_math::{Affine2, FloatOrd, Mat4, Rect, UVec4, Vec2};
+use bevy_math::{Affine2, FloatOrd, Mat4, Rect, ToPrecision, UVec4, Vec2};
 use bevy_render::{
     render_asset::RenderAssets,
     render_phase::{
@@ -840,7 +840,7 @@ pub fn extract_ui_camera_view(
                         world_from_view: GlobalTransform::from_xyz(
                             0.0,
                             0.0,
-                            UI_CAMERA_FAR + UI_CAMERA_TRANSFORM_OFFSET,
+                            (UI_CAMERA_FAR + UI_CAMERA_TRANSFORM_OFFSET).to_precision(),
                         ),
                         clip_from_world: None,
                         target_format,

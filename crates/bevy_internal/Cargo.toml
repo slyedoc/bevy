@@ -10,6 +10,13 @@ keywords = ["game", "engine", "gamedev", "graphics", "bevy"]
 categories = ["game-engines", "graphics", "gui", "rendering"]
 
 [features]
+# Switches Transform/GlobalTransform (and the bevy_math transform-precision
+# aliases) to f64 for very large worlds. Single additive opt-in; absence = f32.
+transform_f64 = [
+  "bevy_math/transform_f64",
+  "bevy_transform/transform_f64",
+  "bevy_animation?/transform_f64",
+]
 trace = [
   "bevy_app/trace",
   "bevy_asset?/trace",
@@ -282,7 +289,7 @@ bevy_sprite_render = [
 bevy_ui_render = ["dep:bevy_ui_render", "bevy_sprite_render", "bevy_ui"]
 # Feathers ships its built-in icons as PNGs, so enable the PNG feature
 bevy_feathers = ["dep:bevy_feathers", "png"]
-bevy_solari = ["dep:bevy_solari", "bevy_pbr"]
+bevy_solari = ["dep:bevy_solari", "bevy_pbr", "transform_f64"]
 bevy_gizmos = ["dep:bevy_gizmos", "bevy_camera", "bevy_light?/bevy_gizmos"]
 bevy_gizmos_render = ["dep:bevy_gizmos_render", "bevy_gizmos"]
 bevy_gltf = ["dep:bevy_gltf", "bevy_world_serialization", "bevy_pbr?/bevy_gltf", "bevy_solari?/gltf"]

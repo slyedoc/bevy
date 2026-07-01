@@ -1,22 +1,32 @@
-//! GPU transform propagation — single-pass ancestor-walk over the changed set.
+//! GPU transform propagation — single-pass ancestor-walk over the changed set,
+//! producing each node's ABSOLUTE world (native-`f64` translation via `SHADER_F64`).
 //!
 //! `world[node]` is a pure function of the node's own `local`/`parent` ancestor
 //! chain (`world = local[root] ∘ … ∘ local[parent] ∘ local[node]`), independent
 //! of every other node's world. So one thread walks a node's chain and writes
 //! its world in a SINGLE pass — no Jacobi iteration, no ping-pong, no hazard.
 //!
-//! The buffer is **persistent**: each frame we recompute only the nodes whose
+//! The buffers are **persistent**: each frame we recompute only the nodes whose
 //! `local` changed (the column's delta — `changed[k*stride]` is the slot), and
 //! static nodes keep last frame's value. This is the symmetric twin of the PTLAS
 //! move detection — use the change delta we already build instead of brute-forcing
 //! all nodes every frame. A capacity growth repopulates the whole buffer once
 //! (`full_rebuild`: one thread per node).
 //!
+//! The translation is accumulated in `f64`, so a node's absolute position survives
+//! at AU/interstellar magnitude — the huge magnitude is NOT subtracted here. The
+//! separate subtract pass ([`super::subtract`]) subtracts the camera's own absolute
+//! world (the origin) to emit the small origin-relative f32 `world_rel` every RT
+//! consumer reads. De-fusing the subtract from the walk keeps this pass
+//! changed-only: the origin moving every frame re-runs only the cheap flat
+//! subtract, not this walk.
+//!
 //! Boundary (see the shader): updates a *changed* node's own world. Animating a
 //! parent (descendants move without their own `local` changing) or a bare
-//! re-parent won't re-walk the descendants. bevy_city animates only leaves, so
-//! it's exact there; a general hierarchy needs descendant dirtying too — later.
+//! re-parent won't re-walk the descendants unless a `SolariFrame`/`SolariGpuFrame`
+//! re-pushes their locals (see `graph.rs`).
 
+use ash::vk;
 use bevy_ecs::{
     resource::Resource,
     system::{Commands, Res, ResMut},
@@ -26,11 +36,11 @@ use bevy_render::{
     render_resource::{
         binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
         BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
-        BufferUsages, ComputePassDescriptor, PipelineCache, ShaderStages, ShaderType, UniformBuffer,
+        BufferUsages, ComputePassDescriptor, PipelineCache, ShaderStages, ShaderType,
+        UniformBuffer,
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
 };
-use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use core::ops::Range;
 
@@ -39,19 +49,21 @@ use crate::gpu::allocator::{Allocator, SparseBuffer};
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 
-use super::graph::{FrameWorldColumn, LocalColumn, ParentColumn, SolariFrameWorld, TransformGraph};
-use crate::ecs_gpu::GpuSlot;
-use crate::render::SolariCamera;
-use bevy_ecs::change_detection::DetectChanges;
-use bevy_ecs::prelude::{Query, Ref, With};
-use bevy_render::Extract;
+use super::graph::{LocalRSColumn, LocalTranslationColumn, ParentColumn, TransformGraph};
 
 const WORKGROUP_SIZE: u32 = 64;
-/// Bytes per node world entry: `mat3x4<f32>` = 48 B, same packing as `Affine3x4`.
-const WORLD_STRIDE: u64 = 48;
-/// Virtual address space reserved for the sparse `world` buffer (pages committed
-/// on growth). Fixed handle/address across growth → consumer bind groups stay
-/// valid; 1 GiB covers ~22M nodes at the 48-byte stride. Cf. the AS-side
+/// Bytes per node in the absolute world's LINEAR buffer: 3 `vec4<f32>` = 48 B —
+/// row k is (linear row k .xyz, unused .w), same packing as the relative world.
+const WORLD_ABS_LINEAR_STRIDE: u64 = 48;
+/// Bytes per node in the absolute world's TRANSLATION buffer: 3×`f64` = 24 B,
+/// bound as a flat `array<f64>` (a `vec3<f64>` would force 32-byte alignment).
+const WORLD_ABS_T_STRIDE: u64 = 24;
+/// Bytes per node in the RELATIVE world buffer: `mat3x4<f32>` = 48 B, same packing as
+/// `Affine3x4` — what every RT consumer reads (`current_world()`).
+const WORLD_REL_STRIDE: u64 = 48;
+/// Virtual address space reserved for each sparse world buffer (pages committed on
+/// growth). Fixed handle/address across growth → consumer bind groups stay valid;
+/// 1 GiB covers ~22M nodes at the 48-byte strides. Cf. the AS-side
 /// `*_VIRTUAL_BYTES` and `ecs_gpu::column`'s `COLUMN_VIRTUAL_BYTES`.
 const WORLD_VIRTUAL_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -65,47 +77,44 @@ struct PropagateParams {
     record_stride: u32,
     /// 1 → walk every node (id = slot); 0 → walk only `changed[k*stride]`.
     full_rebuild: u32,
-    /// Transform-table slot of the origin node (the primary `SolariCamera`). The shader
-    /// reads `frame_world[origin_slot]` as the df64 origin and subtracts it from each
-    /// frame's world — so the origin is the camera's own GPU world, not a CPU-set value.
-    origin_slot: u32,
-    /// 1 = `origin_slot` is a live, in-range node this frame; 0 → no origin subtract (a
-    /// scene with no floating origin, or the camera slot not yet allocated).
-    origin_valid: u32,
-    _pad1: u32,
-    _pad2: u32,
+    _pad: u32,
 }
 
-/// Render-world resource: the persistent world buffer + the ancestor-walk pipeline.
+/// Render-world resource: the persistent world buffers + the ancestor-walk pipeline.
 #[derive(Resource)]
 pub struct TransformPropagate {
-    /// Persistent **sparse** world buffer (`mat3x4` per node): a fixed virtual
-    /// range reserved once, pages committed on growth. Only changed nodes are
-    /// rewritten each frame; static nodes retain their value across growth (the
-    /// pages persist — no realloc). The gather pass reads this.
-    world: SparseBuffer,
+    /// Persistent **sparse** absolute-world LINEAR buffer (3 `vec4<f32>` per node): the
+    /// walk's f32 rotation·scale output. Only changed nodes are rewritten each frame;
+    /// static nodes retain their value across growth (pages persist — no realloc).
+    world_abs_linear: SparseBuffer,
+    /// Persistent **sparse** absolute-world TRANSLATION buffer (flat `array<f64>`, 3 per
+    /// node): the walk's f64 translation output. The subtract pass reads this — and the
+    /// origin (`world_abs_t[camera_slot]`) from it.
+    world_abs_t: SparseBuffer,
+    /// Persistent **sparse** RELATIVE world buffer (`mat3x4` per node): the subtract pass's
+    /// output — the camera-origin-relative f32 world every RT consumer reads (`current_world`).
+    world_rel: SparseBuffer,
     /// Slots whose pages are committed (and zeroed). Grows by `next_power_of_two`.
     capacity_slots: u32,
     node_count: u32,
     /// Threads to dispatch this frame (`full_rebuild` ? node_count : changed count).
     dispatch_count: u32,
+    /// Whether the walk wrote any world this frame (or a growth needs the subtract's
+    /// first fill) — gates the subtract pass, which re-runs iff a node (or the origin) moved.
+    world_dirty: bool,
     /// The one-time cold-start guard: set at init, cleared only after
     /// [`dispatch_transform_propagate`] *actually* runs the full repopulate. While
     /// the propagate pipeline is still compiling the dispatch bails and the latch
     /// stays set, so the first successful frame walks every node created during
     /// warmup (the old all-black-on-load race). After that it stays clear: new
-    /// nodes are caught by the per-frame changed-path, and `world` persists across
+    /// nodes are caught by the per-frame changed-path, and the worlds persist across
     /// growth (sparse — no realloc), so growth needs no re-rebuild. Same retain-
     /// until-consumed rule `dispatch_column` uses for its `pending`.
     needs_full_rebuild: bool,
-    /// Byte range of newly-committed sparse pages a growth needs zeroed (pages are
-    /// UNDEFINED on first residency); [`dispatch_transform_propagate`] records the
-    /// clear before the walk, then takes it.
-    pending_clear: Option<Range<u64>>,
-    /// Whether the origin node was live last frame. A false→true transition (the camera's
-    /// slot just landed) forces a full re-walk so every frame picks up the real origin;
-    /// combined with the extracted "origin moved" flag it drives the re-propagate.
-    last_origin_valid: bool,
+    /// Range of newly-committed sparse pages (in *slots*) a growth needs zeroed (pages
+    /// are UNDEFINED on first residency); [`dispatch_transform_propagate`] records the clear
+    /// (scaled per-buffer by stride) before the walk, then takes it.
+    pending_clear: Option<Range<u32>>,
     params: UniformBuffer<PropagateParams>,
     bind_group: Option<BindGroup>,
 }
@@ -119,76 +128,61 @@ pub fn transform_propagate_bind_group_layout() -> BindGroupLayoutDescriptor {
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer_read_only_sized(false, None), // 0 local
-                storage_buffer_read_only_sized(false, None), // 1 parent
-                storage_buffer_sized(false, None),           // 2 world (rw, persistent)
-                storage_buffer_read_only_sized(false, None), // 3 changed (delta records)
-                uniform_buffer::<PropagateParams>(false),    // 4 params
-                storage_buffer_read_only_sized(false, None), // 5 frame_world (f32×8 per node)
+                storage_buffer_read_only_sized(false, None), // 0 local_t (array<f64>)
+                storage_buffer_read_only_sized(false, None), // 1 local_rs (array<f32>)
+                storage_buffer_read_only_sized(false, None), // 2 parent
+                storage_buffer_sized(false, None),           // 3 world_abs_linear (rw, persistent)
+                storage_buffer_sized(false, None),           // 4 world_abs_t (rw, persistent)
+                storage_buffer_read_only_sized(false, None), // 5 changed (delta records)
+                uniform_buffer::<PropagateParams>(false),    // 6 params
             ),
         ),
     )
 }
 
 impl TransformPropagate {
-    /// The world buffer holding the propagated transforms. The gather pass reads
-    /// `world[node_slot[i]]` from this persistent buffer.
+    /// The RELATIVE world buffer holding the origin-relative transforms. Every RT consumer
+    /// (gather, rt_camera, readback) reads `world_rel[node_slot[i]]` from this persistent buffer.
     #[inline]
     pub fn current_world(&self) -> &Buffer {
-        self.world.buffer()
+        self.world_rel.buffer()
     }
 
-    /// Node count the world buffer covers this frame (for out-of-range guards).
+    /// The absolute world's f32 LINEAR buffer (3 `vec4` per node) — the subtract pass
+    /// copies rows from this.
+    #[inline]
+    pub fn world_abs_linear(&self) -> &Buffer {
+        self.world_abs_linear.buffer()
+    }
+
+    /// The absolute world's f64 TRANSLATION buffer (flat `array<f64>`, 3 per node) — the
+    /// subtract pass reads this and the origin (`world_abs_t[camera_slot]`) from it.
+    #[inline]
+    pub fn world_abs_t(&self) -> &Buffer {
+        self.world_abs_t.buffer()
+    }
+
+    /// Node count the world buffers cover this frame (for out-of-range guards).
     #[inline]
     pub fn node_count(&self) -> u32 {
         self.node_count
     }
-}
 
-/// Render-world designation of the **origin node** — the transform-table slot whose
-/// `frame_world` the propagate subtracts from every other frame (the primary
-/// [`SolariCamera`]). The origin is thus the camera's own GPU df64 world, read from the
-/// `frame_world` column in the shader; there is no CPU-set origin. `changed` mirrors the
-/// camera's `Changed<SolariFrameWorld>` so a moved origin re-walks every frame.
-#[derive(Resource, Default)]
-pub struct SolariOriginSlot {
-    /// Transform-table slot of the origin camera (valid only when `valid`).
-    pub slot: u32,
-    /// A `SolariCamera` with a `SolariFrameWorld` and an allocated slot exists this frame.
-    pub valid: bool,
-    /// The origin camera's `SolariFrameWorld` changed this frame (⇒ full re-walk).
-    pub changed: bool,
-}
-
-/// `ExtractSchedule`: point [`SolariOriginSlot`] at the primary [`SolariCamera`]'s
-/// transform-table slot and note whether its `SolariFrameWorld` moved. A camera with no
-/// `SolariFrameWorld` (a scene with no floating origin) leaves the origin invalid → no
-/// subtract. Mirrors `render/rt_pipeline`'s `extract_rt_camera_slot`, but the origin is a
-/// single global node (the propagate is one pass over the shared world buffer).
-pub fn extract_origin_slot(
-    mut origin: ResMut<SolariOriginSlot>,
-    cameras: Extract<
-        Query<(&GpuSlot<TransformGraph>, Ref<SolariFrameWorld>), With<SolariCamera>>,
-    >,
-) {
-    if let Some((slot, frame_world)) = cameras.iter().next() {
-        origin.slot = slot.index();
-        origin.valid = true;
-        origin.changed = frame_world.is_changed();
-    } else {
-        origin.valid = false;
-        origin.changed = false;
+    /// Whether the walk touched the absolute world this frame → the subtract pass must re-run.
+    #[inline]
+    pub fn world_dirty(&self) -> bool {
+        self.world_dirty
     }
 }
 
 /// `RenderStartup`: build the ancestor-walk bind-group layout + compute pipeline
-/// and the (initially empty) sparse world buffer.
+/// and the (initially empty) sparse world buffers.
 pub fn init_transform_propagate(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     allocator: Option<Res<Allocator>>,
 ) {
-    // The sparse `world` buffer needs the cluster allocator (created in
+    // The sparse world buffers need the cluster allocator (created in
     // `SolariSetup`, which this runs after). Absent → device lacks the support
     // solari needs; skip (every consumer reads `Option<Res<TransformPropagate>>`).
     let Some(allocator) = allocator else {
@@ -199,113 +193,126 @@ pub fn init_transform_propagate(
     let mut params = UniformBuffer::<PropagateParams>::default();
     params.set_label(Some("transform_propagate"));
 
-    let world = allocator.create_sparse_buffer(
+    let world_abs_linear = allocator.create_sparse_buffer(
         &render_device,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
         BufferUsages::STORAGE | BufferUsages::COPY_DST,
         WORLD_VIRTUAL_BYTES,
-        "transform.world",
+        "transform.world_abs_linear",
+    );
+    let world_abs_t = allocator.create_sparse_buffer(
+        &render_device,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        WORLD_VIRTUAL_BYTES,
+        "transform.world_abs_t",
+    );
+    let world_rel = allocator.create_sparse_buffer(
+        &render_device,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        WORLD_VIRTUAL_BYTES,
+        "transform.world_rel",
     );
     commands.insert_resource(TransformPropagate {
-        world,
+        world_abs_linear,
+        world_abs_t,
+        world_rel,
         capacity_slots: 0,
         node_count: 0,
         dispatch_count: 0,
+        world_dirty: false,
         // Armed once; the first frame the pipeline is ready walks every node that
         // appeared during warmup, then it stays clear (see the field docs).
         needs_full_rebuild: true,
         pending_clear: None,
-        last_origin_valid: false,
         params,
         bind_group: None,
     });
 }
 
 /// `Render::Prepare` (after the column prepares): grow the persistent world
-/// buffer (commit sparse pages) to the table's node high-water and pick this
+/// buffers (commit sparse pages) to the table's node high-water and pick this
 /// frame's work. A growth latches `full_rebuild` (cold-start guard); otherwise we
-/// walk only the `local` column's changed records this frame.
+/// walk only the local columns' changed records this frame.
 pub fn prepare_transform_propagate(
     mut propagate: Option<ResMut<TransformPropagate>>,
     graph: Option<Res<TransformGraph>>,
-    local: Option<Res<GpuColumn<LocalColumn>>>,
-    origin: Option<Res<SolariOriginSlot>>,
+    local_t: Option<Res<GpuColumn<LocalTranslationColumn>>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
-    let (Some(propagate), Some(graph), Some(local)) = (propagate.as_deref_mut(), graph, local)
+    let (Some(propagate), Some(graph), Some(local_t)) = (propagate.as_deref_mut(), graph, local_t)
     else {
         return;
     };
 
-    // Floating-origin: the origin is the camera node's own `frame_world` (read on the GPU),
-    // so the CPU only supplies its slot + a "moved" flag. A non-floating-origin scene has no
-    // origin camera (invalid) → no subtract, byte-identical. The origin's frame world moving,
-    // or the camera slot just landing, shifts every frame's origin-relative world → force a
-    // full re-walk that frame; between changes the change-only path holds.
-    let origin = origin.map(|o| (o.slot, o.valid, o.changed)).unwrap_or((0, false, false));
-    let (origin_slot, origin_valid, origin_changed) = origin;
-    if (origin_valid && origin_changed) || (origin_valid && !propagate.last_origin_valid) {
-        propagate.needs_full_rebuild = true;
-    }
-    propagate.last_origin_valid = origin_valid;
     propagate.node_count = graph.high_water();
     let high_water = propagate.node_count.max(1);
 
-    // Growth commits more sparse pages to the same buffer — existing nodes' worlds
+    // Growth commits more sparse pages to the same buffers — existing nodes' worlds
     // persist (no realloc), so growth needs NO full rebuild: new nodes are walked
     // by the per-frame changed-path on the frame their `local` is set, and static
     // nodes keep their value. (`needs_full_rebuild` is the one-time cold-start
     // guard, armed at init — deliberately not re-armed here; re-arming would
     // re-walk every node on each streaming growth, an O(n) hitch at 1M nodes.) The
     // newly-committed region is undefined, so it's queued for a zero-clear before
-    // any read (see the dispatch).
+    // any read (see the dispatch). The clear range is in *slots*; the dispatch
+    // scales it per-buffer by each stride.
     let grew = high_water > propagate.capacity_slots;
     if grew {
         let old_slots = propagate.capacity_slots;
         propagate.capacity_slots = high_water.next_power_of_two();
-        let committed = propagate.capacity_slots as u64 * WORLD_STRIDE;
-        propagate.world.commit(0..committed);
-        propagate.pending_clear = Some(old_slots as u64 * WORLD_STRIDE..committed);
+        let cap = propagate.capacity_slots;
+        propagate
+            .world_abs_linear
+            .commit(0..cap as u64 * WORLD_ABS_LINEAR_STRIDE);
+        propagate
+            .world_abs_t
+            .commit(0..cap as u64 * WORLD_ABS_T_STRIDE);
+        propagate.world_rel.commit(0..cap as u64 * WORLD_REL_STRIDE);
+        propagate.pending_clear = Some(old_slots..cap);
     }
 
     let full_rebuild = propagate.needs_full_rebuild;
-    let changed_count = local.pending();
+    // The two local columns are pushed in lockstep (see `graph.rs`), so the
+    // translation column's delta is THE changed-nodes list.
+    let changed_count = local_t.pending();
     propagate.dispatch_count = if full_rebuild {
         propagate.node_count
     } else {
         changed_count
     };
+    // The subtract pass re-runs iff the walk wrote anything (a node — possibly the camera
+    // origin — moved) or a growth needs its first fill; an idle frame leaves `world_rel` as is.
+    propagate.world_dirty = propagate.dispatch_count > 0 || grew;
     *propagate.params.get_mut() = PropagateParams {
         count: propagate.dispatch_count,
-        record_stride: local.record_stride(),
+        record_stride: local_t.record_stride(),
         full_rebuild: full_rebuild as u32,
-        origin_slot,
-        origin_valid: origin_valid as u32,
-        _pad1: 0,
-        _pad2: 0,
+        _pad: 0,
     };
     propagate.params.write_buffer(&render_device, &render_queue);
 }
 
 /// `Render::PrepareBindGroups`: (re)build the bind group. Rebuilt every frame —
-/// cheap, and transparently picks up a `local`/`parent`/delta buffer that
+/// cheap, and transparently picks up a local/`parent`/delta buffer that
 /// reallocated in its own prepare.
 pub fn prepare_transform_propagate_bind_groups(
     mut propagate: Option<ResMut<TransformPropagate>>,
     resource_manager: Option<Res<SolariResourceManager>>,
-    local: Option<Res<GpuColumn<LocalColumn>>>,
+    local_t: Option<Res<GpuColumn<LocalTranslationColumn>>>,
+    local_rs: Option<Res<GpuColumn<LocalRSColumn>>>,
     parent: Option<Res<GpuColumn<ParentColumn>>>,
-    frame_world: Option<Res<GpuColumn<FrameWorldColumn>>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
-    let (Some(propagate), Some(resource_manager), Some(local), Some(parent), Some(frame_world)) = (
+    let (Some(propagate), Some(resource_manager), Some(local_t), Some(local_rs), Some(parent)) = (
         propagate.as_deref_mut(),
         resource_manager,
-        local,
+        local_t,
+        local_rs,
         parent,
-        frame_world,
     ) else {
         return;
     };
@@ -315,19 +322,20 @@ pub fn prepare_transform_propagate_bind_groups(
     };
     // The changed-slot list. When empty (`pending == 0`) the dispatch is skipped
     // or the shader returns before reading it, so a fallback buffer is harmless —
-    // bind the always-present `local` buffer so the bind group is still valid.
-    let changed = local.delta_buffer().unwrap_or_else(|| local.buffer());
+    // bind the always-present `parent` buffer so the bind group is still valid.
+    let changed = local_t.delta_buffer().unwrap_or_else(|| parent.buffer());
 
     let bind_group = render_device.create_bind_group(
         "transform_propagate",
         &layout,
         &BindGroupEntries::sequential((
-            local.buffer().as_entire_binding(),
+            local_t.buffer().as_entire_binding(),
+            local_rs.buffer().as_entire_binding(),
             parent.buffer().as_entire_binding(),
-            propagate.world.buffer().as_entire_binding(),
+            propagate.world_abs_linear.buffer().as_entire_binding(),
+            propagate.world_abs_t.buffer().as_entire_binding(),
             changed.as_entire_binding(),
             params,
-            frame_world.buffer().as_entire_binding(),
         )),
     );
     propagate.bind_group = Some(bind_group);
@@ -336,8 +344,8 @@ pub fn prepare_transform_propagate_bind_groups(
 /// `RenderGraph` (`Propagate`): one ancestor-walk pass. Each thread walks a
 /// node's parent chain and writes its world — `full_rebuild` covers every node
 /// (id = slot), otherwise just this frame's changed nodes. No ping-pong: a
-/// thread reads only the read-only `local`/`parent` columns and writes its own
-/// `world` slot, so a single pass is exact.
+/// thread reads only the read-only local/`parent` columns and writes its own
+/// world slots, so a single pass is exact.
 pub fn dispatch_transform_propagate(
     propagate: Option<ResMut<TransformPropagate>>,
     pipelines: Res<SolariPipelines>,
@@ -353,7 +361,7 @@ pub fn dispatch_transform_propagate(
         return;
     }
     // `None` until the pipeline compiles → the walk is skipped this frame (but the
-    // clear above still runs, so a consumer never reads undefined `world`).
+    // clear above still runs, so a consumer never reads undefined world data).
     let pipeline = pipeline_cache.get_compute_pipeline(pipelines.transform_propagate);
     let groups = propagate.dispatch_count.div_ceil(WORKGROUP_SIZE);
     let mut walked = false;
@@ -361,13 +369,23 @@ pub fn dispatch_transform_propagate(
         let diagnostics = ctx.diagnostic_recorder();
         let diagnostics = diagnostics.as_deref();
         let encoder = ctx.command_encoder();
-        // Zero the freshly-committed sparse region (undefined on first residency)
-        // before the walk — no pipeline needed, so even a cold-pipeline frame
-        // leaves a consumer reading `world` at 0 (origin), never garbage/NaN.
-        if let Some(range) = &clear {
-            let len = range.end - range.start;
+        // Zero the freshly-committed sparse region of ALL world buffers (undefined on
+        // first residency) before the walk — no pipeline needed, so even a cold-pipeline
+        // frame leaves a consumer reading `world_rel` at 0 (origin), never garbage/NaN.
+        if let Some(slots) = &clear {
+            let len = (slots.end - slots.start) as u64;
             if len > 0 {
-                encoder.clear_buffer(&propagate.world.wgpu_buffer, range.start, Some(len));
+                for (buffer, stride) in [
+                    (&propagate.world_abs_linear, WORLD_ABS_LINEAR_STRIDE),
+                    (&propagate.world_abs_t, WORLD_ABS_T_STRIDE),
+                    (&propagate.world_rel, WORLD_REL_STRIDE),
+                ] {
+                    encoder.clear_buffer(
+                        &buffer.wgpu_buffer,
+                        slots.start as u64 * stride,
+                        Some(len * stride),
+                    );
+                }
             }
         }
         if propagate.dispatch_count > 0 {
