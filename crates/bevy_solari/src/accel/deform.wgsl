@@ -17,7 +17,7 @@
 
 // Per active animated instance. Mirrors `deform.rs::AnimatedSlotGpu` (32 B).
 struct AnimatedSlot {
-    instance_slot: u32,      // GpuEntity slot — indexes instance_transforms
+    instance_slot: u32,      // GpuEntity slot of the skinned instance
     mesh_vertex_base: u32,   // global vertex-pool slot of vertex 0 (rest pos/normal)
     mesh_vertex_count: u32,  // vertices to deform
     deform_pool_base: u32,   // per-slot base (in vertices) into the deform pool
@@ -25,6 +25,12 @@ struct AnimatedSlot {
     palette_base: u32,       // base into `palette` (node slot per joint)
     inverse_bind_base: u32,  // base into `inverse_bind` (mat3x4 per joint)
     joint_base: u32,         // global slot of vertex 0 in the joint streams
+    // The instance's own transform-table node — its ABSOLUTE world is recomputed
+    // here with the same local/parent walk the joints use, so the skin and the
+    // inverse-instance transform live in the same (absolute) space. The gathered
+    // per-instance transforms are ORIGIN-RELATIVE and would displace the deformed
+    // geometry by the camera's world position.
+    node_slot: u32,
 }
 
 struct DeformParams {
@@ -51,18 +57,16 @@ struct DeformParams {
 // Per-vertex joint influences: 4 indices packed as [u16;4] -> vec2<u32>, + weights.
 @group(0) @binding(6) var<storage, read> joint_indices: array<vec2<u32>>;
 @group(0) @binding(7) var<storage, read> joint_weights: array<vec4<f32>>;
-// Per-instance world transforms (the gather output the resolve path also reads).
-@group(0) @binding(8) var<storage, read> instance_transforms: array<mat3x4<f32>>;
-@group(0) @binding(9) var<uniform> params: DeformParams;
+@group(0) @binding(8) var<uniform> params: DeformParams;
 // Outputs: per-slot deformed positions (stride 3 f32) + octahedral normals.
-@group(0) @binding(10) var<storage, read_write> deform_positions: array<f32>;
-@group(0) @binding(11) var<storage, read_write> deform_normals: array<u32>;
+@group(0) @binding(9) var<storage, read_write> deform_positions: array<f32>;
+@group(0) @binding(10) var<storage, read_write> deform_normals: array<u32>;
 // Transform-table `parent` column (node-slot per node) — for the ancestor walk.
-@group(0) @binding(12) var<storage, read> parent: array<u32>;
+@group(0) @binding(11) var<storage, read> parent: array<u32>;
 // Rest tangents (vec4: xyz + w bitangent sign) + deformed-tangent output.
-@group(0) @binding(13) var<storage, read> rest_tangents: array<vec4<f32>>;
-@group(0) @binding(14) var<storage, read_write> deform_tangents: array<vec4<f32>>;
-@group(0) @binding(15) var<storage, read> local_rs: array<f32>;
+@group(0) @binding(12) var<storage, read> rest_tangents: array<vec4<f32>>;
+@group(0) @binding(13) var<storage, read_write> deform_tangents: array<vec4<f32>>;
+@group(0) @binding(14) var<storage, read> local_rs: array<f32>;
 
 const ROOT_PARENT: u32 = 0xffffffffu;
 const MAX_DEPTH: u32 = 64u;
@@ -215,12 +219,14 @@ fn deform(@builtin(global_invocation_id) gid: vec3<u32>) {
         m = add_affine(m, scale_affine(weight, skin));
     }
 
-    // Skin to world, then pre-multiply inverse(instance world) -> mesh-local.
+    // Skin to (absolute) world, then pre-multiply inverse(instance world) -> mesh-local.
+    // The instance world is walked from the SAME local columns as the joints, so the
+    // two are in the same absolute space and the huge shared translation cancels.
     let pos_world = affine_point(m, rest_pos);
     let nrm_world = affine_dir(m, rest_nrm);
     let rest_tan = rest_tangents[pos_slot];
     let tan_world = affine_dir(m, rest_tan.xyz);
-    let inv_instance = affine_inverse(instance_transforms[s.instance_slot]);
+    let inv_instance = affine_inverse(joint_world(s.node_slot));
     let pos_local = affine_point(inv_instance, pos_world);
     let nrm_local = normalize(affine_dir(inv_instance, nrm_world));
     let tan_local = normalize(affine_dir(inv_instance, tan_world));

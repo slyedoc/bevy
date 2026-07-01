@@ -43,7 +43,7 @@ use crate::bindings::RaytracingMesh3d;
 use crate::ecs_gpu::{GpuColumn, GpuSlot};
 use crate::geometry::ClusterMeshManager;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
-use crate::instance::{Affine3x4, InstanceManager, RaytracingGpuEntity, TransformColumn};
+use crate::instance::{Affine3x4, InstanceManager, RaytracingGpuEntity};
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 use crate::transform::{LocalRSColumn, LocalTranslationColumn, ParentColumn, TransformGraph};
@@ -56,7 +56,7 @@ pub const MAX_VERTS_PER_ANIMATED_MESH: u32 = 65536;
 
 const WORKGROUP_SIZE: u32 = 64;
 
-/// Per active animated instance. Mirrors `deform.wgsl::AnimatedSlot` (32 B).
+/// Per active animated instance. Mirrors `deform.wgsl::AnimatedSlot` (36 B).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct AnimatedSlotGpu {
@@ -68,6 +68,10 @@ pub struct AnimatedSlotGpu {
     pub palette_base: u32,
     pub inverse_bind_base: u32,
     pub joint_base: u32,
+    /// The instance's transform-table node — the shader walks it for the instance's
+    /// absolute world (same space as the joint walk; the gathered per-instance
+    /// transforms are origin-relative and would displace the skin).
+    pub node_slot: u32,
 }
 
 /// Uniform shared with `deform.wgsl::DeformParams`.
@@ -151,14 +155,13 @@ pub fn deform_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_read_only_sized(false, None), // 5 rest_normals
                 storage_buffer_read_only_sized(false, None), // 6 joint_indices
                 storage_buffer_read_only_sized(false, None), // 7 joint_weights
-                storage_buffer_read_only_sized(false, None), // 8 instance_transforms
-                uniform_buffer::<DeformParams>(false),       // 9 params
-                storage_buffer_sized(false, None),           // 10 deform_positions (rw)
-                storage_buffer_sized(false, None),           // 11 deform_normals (rw)
-                storage_buffer_read_only_sized(false, None), // 12 transform-table parent
-                storage_buffer_read_only_sized(false, None), // 13 rest_tangents
-                storage_buffer_sized(false, None),           // 14 deform_tangents (rw)
-                storage_buffer_read_only_sized(false, None), // 15 transform-table local_rs
+                uniform_buffer::<DeformParams>(false),       // 8 params
+                storage_buffer_sized(false, None),           // 9 deform_positions (rw)
+                storage_buffer_sized(false, None),           // 10 deform_normals (rw)
+                storage_buffer_read_only_sized(false, None), // 11 transform-table parent
+                storage_buffer_read_only_sized(false, None), // 12 rest_tangents
+                storage_buffer_sized(false, None),           // 13 deform_tangents (rw)
+                storage_buffer_read_only_sized(false, None), // 14 transform-table local_rs
             ),
         ),
     )
@@ -298,7 +301,7 @@ fn make_animated_table(allocator: &Allocator, device: &RenderDevice, slots: u32)
 /// skinning palette (joint → transform-table node slot) + inverse-bind poses,
 /// mesh pool bases, and deform-pool slot assignment.
 pub fn extract_animated_skins(
-    rt_skins: Extract<Query<(RenderEntity, &RaytracingMesh3d, &SkinnedMesh)>>,
+    rt_skins: Extract<Query<(bevy_ecs::entity::Entity, RenderEntity, &RaytracingMesh3d, &SkinnedMesh)>>,
     joint_slots: Extract<Query<&GpuSlot<TransformGraph>>>,
     bindposes: Extract<Res<Assets<SkinnedMeshInverseBindposes>>>,
     gpu_entities: Query<&RaytracingGpuEntity>,
@@ -316,7 +319,12 @@ pub fn extract_animated_skins(
     // Instances dropped because the per-frame cap is full — they fall back to the
     // static (rest-pose) path. Counted to warn once if the scene needs a bigger cap.
     let mut dropped_over_cap = 0u32;
-    for (render_entity, mesh3d, skin) in &rt_skins {
+    for (entity, render_entity, mesh3d, skin) in &rt_skins {
+        // The instance's own transform-table node: the deform shader walks it for the
+        // instance's absolute world. Not yet slotted (first frame) -> rest pose.
+        let Ok(node_slot) = joint_slots.get(entity).map(GpuSlot::index) else {
+            continue;
+        };
         // Instance must be bound (has a GPU slot) and its mesh resident + animated.
         let Ok(gpu) = gpu_entities.get(render_entity) else {
             continue;
@@ -373,6 +381,7 @@ pub fn extract_animated_skins(
             palette_base,
             inverse_bind_base,
             joint_base: ptrs.joint_base,
+            node_slot,
         });
         deform.max_vertex_count = deform.max_vertex_count.max(ptrs.vertex_count);
         deform.active_count += 1;
@@ -510,7 +519,6 @@ pub fn prepare_deform_bind_group(
     local_t: Option<Res<GpuColumn<LocalTranslationColumn>>>,
     local_rs: Option<Res<GpuColumn<LocalRSColumn>>>,
     parent: Option<Res<GpuColumn<ParentColumn>>>,
-    transforms: Option<Res<GpuColumn<TransformColumn>>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
@@ -527,15 +535,7 @@ pub fn prepare_deform_bind_group(
         Some(local_t),
         Some(local_rs),
         Some(parent),
-        Some(transforms),
-    ) = (
-        resource_manager,
-        cluster_meshes,
-        local_t,
-        local_rs,
-        parent,
-        transforms,
-    )
+    ) = (resource_manager, cluster_meshes, local_t, local_rs, parent)
     else {
         deform.bind_group = None;
         return;
@@ -569,7 +569,6 @@ pub fn prepare_deform_bind_group(
                 .vertex_joint_weights
                 .buffer()
                 .as_entire_binding(),
-            transforms.buffer().as_entire_binding(),
             params,
             deform.positions.as_entire_binding(),
             deform.normals.as_entire_binding(),
