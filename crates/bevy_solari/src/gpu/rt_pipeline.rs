@@ -1092,6 +1092,9 @@ fn rt_capabilities() -> naga::valid::Capabilities {
         // 64-bit ints for buffer-device-address arithmetic in the bindless
         // geometry path (`physical_load<T>(addr: u64)`).
         | naga::valid::Capabilities::SHADER_INT64
+        // f64 for planet-scale domain math in user composable modules
+        // (SHADER_F64 is a required solari device feature post-transform_f64).
+        | naga::valid::Capabilities::FLOAT64
 }
 
 /// Build a naga_oil composer pre-loaded with the built-in importable modules the RT
