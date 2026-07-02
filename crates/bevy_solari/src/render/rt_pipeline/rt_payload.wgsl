@@ -63,4 +63,6 @@ struct RtCamera {
     sky: vec4<f32>,            // .x = environment brightness (cd/m²); .yzw = clear color
     jitter: vec4<f32>,         // .xy = sub-pixel camera jitter (pixels); .zw = debug-heatmap colormap params
     misc: vec4<f32>,           // .x = time (s, wrapped); .y = pixel ray-cone tan (footprint LOD); .zw reserved
+    sky_frame: vec4<f32>,      // world→bake sky quaternion (xyzw); identity for flat scenes/skyboxes
+    atmo: vec4<f32>,           // .xy = volume-buffer device address (lo/hi bits); .z = volume count
 }

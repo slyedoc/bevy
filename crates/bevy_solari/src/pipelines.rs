@@ -43,6 +43,7 @@ pub struct SolariPipelines {
     pub rt_camera: CachedComputePipelineId,
     pub light_resolve: CachedComputePipelineId,
     pub atmosphere: CachedComputePipelineId,
+    pub atmosphere_lut: CachedComputePipelineId,
 
     pub selector_reset: CachedComputePipelineId,
     pub selector_main: CachedComputePipelineId,
@@ -83,6 +84,7 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "render/rt_pipeline/rt_camera.wgsl");
     embedded_asset!(app, "lights/light_resolve.wgsl");
     embedded_asset!(app, "render/atmosphere_bake.wgsl");
+    embedded_asset!(app, "render/atmosphere_lut_bake.wgsl");
     embedded_asset!(app, "render/rt_pipeline/blit.wgsl");
     #[cfg(feature = "dlss")]
     embedded_asset!(app, "render/dlss_resolve.wgsl");
@@ -179,6 +181,16 @@ pub fn init_solari_pipelines(
         shader: load_embedded_asset!(asset_server.as_ref(), "lights/light_resolve.wgsl"),
         shader_defs: vec![],
         entry_point: Some("resolve".into()),
+        immediate_size: 0,
+        zero_initialize_workgroup_memory: false,
+        constants: vec![],
+    });
+    let atmosphere_lut = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("solari_atmosphere_lut_bake".into()),
+        layout: vec![resource_manager.atmosphere_lut.clone()],
+        shader: load_embedded_asset!(asset_server.as_ref(), "render/atmosphere_lut_bake.wgsl"),
+        shader_defs: vec![],
+        entry_point: Some("bake".into()),
         immediate_size: 0,
         zero_initialize_workgroup_memory: false,
         constants: vec![],
@@ -318,6 +330,7 @@ pub fn init_solari_pipelines(
         rt_camera,
         light_resolve,
         atmosphere,
+        atmosphere_lut,
         selector_reset,
         selector_main,
         blas_sharing_geom_reset,

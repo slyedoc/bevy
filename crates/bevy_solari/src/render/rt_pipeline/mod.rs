@@ -49,7 +49,9 @@ use crate::gpu::rt_pipeline::{
 use crate::gpu::RawTraceBindable;
 use crate::material::{material_sbt_class, MaterialSlots, MaterialTraversalFlags};
 use crate::pipelines::SolariPipelines;
-use crate::render::atmosphere::{AtmosphereSky, SolariAtmosphereView};
+use crate::render::atmosphere::{
+    AtmosphereSky, SolariAtmosphereGpu, SolariAtmosphereView, SolariAtmosphereVolumesGpu,
+};
 use crate::render::view_cull::SolariEnvironmentMap;
 use crate::render::{CameraReframe, SolariCamera};
 use crate::resource_manager::SolariResourceManager;
@@ -451,6 +453,10 @@ struct RtCameraGpuInputs {
     jitter: Vec4,
     /// `.x` = time (s, wrapped), `.y` = pixel ray-cone tan; see `RtCamera::misc`.
     misc: Vec4,
+    /// World→bake sky quaternion (xyzw); see `RtCamera::sky_frame`.
+    sky_frame: Vec4,
+    /// Atmosphere-volume buffer address bits + count; see `RtCamera::atmo`.
+    atmo: Vec4,
     exposure: f32,
 }
 
@@ -494,6 +500,8 @@ fn try_dispatch_rt_camera(
         sky: inputs.sky,
         jitter: inputs.jitter,
         misc: inputs.misc,
+        sky_frame: inputs.sky_frame,
+        atmo: inputs.atmo,
         camera_slot: slot.0,
         node_count,
         exposure: inputs.exposure,
@@ -634,7 +642,13 @@ pub(crate) fn rt_pipeline(
         Option<Res<crate::accel::deform::Deform>>,
     ),
     materials: RtMaterials,
-    atmosphere_sky: Option<Res<AtmosphereSky>>,
+    // Tupled: baked sky cube + atmosphere GPU state (sky_frame quat) +
+    // world-space atmosphere volumes (address for raygen's march).
+    atmosphere_res: (
+        Option<Res<AtmosphereSky>>,
+        Option<Res<SolariAtmosphereGpu>>,
+        Option<Res<SolariAtmosphereVolumesGpu>>,
+    ),
     env_images: RtEnvImages,
     pipeline_cache: Res<PipelineCache>,
     // Tupled to stay under bevy's 16-param system ceiling. `SolariPipelines`/
@@ -655,6 +669,7 @@ pub(crate) fn rt_pipeline(
     let (render_device, render_queue, solari_pipelines, solari_resources, transform_propagate, time) =
         render_res;
     let (cluster_mesh_manager, tess_classify, hit_group_registry, deform) = geometry_res;
+    let (atmosphere_sky, atmosphere_gpu, atmosphere_volumes) = atmosphere_res;
     let view_entity = view.entity();
     let (
         view,
@@ -909,6 +924,21 @@ pub(crate) fn rt_pipeline(
             0.0,
             0.0,
         ],
+        // World→bake sky rotation (identity unless a spherical-planet
+        // atmosphere set one) — the miss shader rotates cube sample dirs.
+        sky_frame: atmosphere_gpu
+            .as_deref()
+            .map_or([0.0, 0.0, 0.0, 1.0], |a| a.sky_frame.to_array()),
+        // Atmosphere volumes: device address (bit-preserved through f32) +
+        // live count. Zero count ⇒ raygen skips the march entirely.
+        atmo: atmosphere_volumes.as_deref().map_or([0.0; 4], |v| {
+            [
+                f32::from_bits(v.address as u32),
+                f32::from_bits((v.address >> 32) as u32),
+                f32::from_bits(v.count),
+                0.0,
+            ]
+        }),
     };
     // Fill this view's GPU camera buffer (bound at a constant dynamic offset 0). The
     // GPU-authoritative path derives the basis from `world[camera_slot]` in the
@@ -940,6 +970,8 @@ pub(crate) fn rt_pipeline(
                 sky: Vec4::from_array(camera_inputs.sky),
                 jitter: Vec4::from_array(camera_inputs.jitter),
                 misc: Vec4::from_array(camera_inputs.misc),
+                sky_frame: Vec4::from_array(camera_inputs.sky_frame),
+                atmo: Vec4::from_array(camera_inputs.atmo),
                 exposure: camera.exposure,
             }
         },

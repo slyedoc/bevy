@@ -39,6 +39,10 @@ pub struct RtCameraPassParams {
     pub jitter: Vec4,
     /// Passthrough → `RtCamera.misc` (`.x` time seconds, `.y` pixel ray-cone tan).
     pub misc: Vec4,
+    /// Passthrough → `RtCamera.sky_frame` (world→bake sky quaternion, xyzw).
+    pub sky_frame: Vec4,
+    /// Passthrough → `RtCamera.atmo` (volume buffer address bits + count).
+    pub atmo: Vec4,
     /// The `SolariCamera`'s transform-table slot (`GpuSlot<TransformGraph>`).
     pub camera_slot: u32,
     /// World-buffer node high-water — bounds guard for `camera_slot`.

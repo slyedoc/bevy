@@ -24,6 +24,8 @@ struct RtCamera {
     sky: vec4<f32>,
     jitter: vec4<f32>,
     misc: vec4<f32>,
+    sky_frame: vec4<f32>,
+    atmo: vec4<f32>,
 }
 
 struct CameraPassParams {
@@ -38,6 +40,8 @@ struct CameraPassParams {
     sky: vec4<f32>,                          // passthrough → RtCamera.sky
     jitter: vec4<f32>,                       // passthrough → RtCamera.jitter
     misc: vec4<f32>,                         // passthrough → RtCamera.misc (time, cone tan)
+    sky_frame: vec4<f32>,                    // passthrough → RtCamera.sky_frame (world→bake quat)
+    atmo: vec4<f32>,                         // passthrough → RtCamera.atmo (volume addr bits + count)
     camera_slot: u32,                        // the SolariCamera's transform-table slot
     node_count: u32,                         // world-buffer node high-water (bounds guard)
     exposure: f32,                           // → camera_position.w
@@ -193,4 +197,6 @@ fn rt_camera() {
     out_camera.sky = params.sky;
     out_camera.jitter = params.jitter;
     out_camera.misc = params.misc;
+    out_camera.sky_frame = params.sky_frame;
+    out_camera.atmo = params.atmo;
 }

@@ -12,6 +12,7 @@ enable wgpu_ray_tracing_pipeline;
 #import bevy_solari::scene_bindings::{tlas, RAY_T_MIN, RAY_T_MAX}
 #import bevy_solari::rt_payload::{RtPayload, RtCamera}
 #import bevy_solari::pbr::rand_f
+#import bevy_solari::atmosphere::{atmosphere_ray_sphere_near, atmosphere_ray_sphere_far, atmosphere_rayleigh_phase, atmosphere_mie_phase}
 
 // Rec. 709 luminance, for Russian-roulette survival probability.
 fn luminance(c: vec3<f32>) -> f32 {
@@ -83,6 +84,130 @@ fn cost_heatmap(t: f32) -> vec3<f32> {
 }
 #endif
 
+// ── World-space atmosphere volumes (spherical planets) ─────────────────────
+// Loaded by device address from `RtCamera.atmo` (mirrors
+// `atmosphere.rs::GpuAtmosphereVolume(s)` — std430). Marched over the PRIMARY
+// segment only: aerial perspective on surfaces, the limb from orbit, the sky
+// through the shell on a miss.
+
+struct AtmoVolume {
+    center: vec3<f32>,        // shell center relative to the primary camera (world METERS)
+    bottom_radius: f32,       // km
+    rayleigh_scattering: vec3<f32>,
+    rayleigh_scale_height: f32,
+    top_radius: f32,          // km
+    mie_scattering: f32,
+    mie_extinction: f32,
+    mie_scale_height: f32,
+    mie_phase_g: f32,
+    pad_a: f32,
+    pad_b: f32,
+    pad_c: f32,
+}
+
+struct AtmoHeader {
+    sun_direction: vec3<f32>,
+    sun_illuminance: f32,
+    count: u32,
+    pad_a: u32,
+    pad_b: u32,
+    pad_c: u32,
+}
+
+const ATMO_VOLUME_STEPS: u32 = 16u;
+// Transmittance LUT (mirrors `atmosphere.rs` / `atmosphere_lut_bake.wgsl`):
+// per volume, T(radius, sun-zenith cos) baked to a 256×64 vec4 grid living in
+// the same buffer at byte 512. One bilinear lookup replaces the 8-step sun
+// integral per march step (the 550→120 fps cost).
+const ATMO_LUT_W: u32 = 256u;
+const ATMO_LUT_H: u32 = 64u;
+const ATMO_LUT_OFFSET: u32 = 512u;
+const ATMO_LUT_LAYER_BYTES: u32 = ATMO_LUT_W * ATMO_LUT_H * 16u;
+
+// Bilinear sun-transmittance lookup for volume `layer` at radius r (km) and
+// sun-zenith cosine mu.
+fn atmo_lut_sun_t(base: u64, layer: u32, r: f32, mu: f32, bottom: f32, top: f32) -> vec3<f32> {
+    let fx = clamp(mu * 0.5 + 0.5, 0.0, 1.0) * f32(ATMO_LUT_W - 1u);
+    let fy = clamp((r - bottom) / max(top - bottom, 1e-4), 0.0, 1.0) * f32(ATMO_LUT_H - 1u);
+    let x0 = u32(fx);
+    let y0 = u32(fy);
+    let x1 = min(x0 + 1u, ATMO_LUT_W - 1u);
+    let y1 = min(y0 + 1u, ATMO_LUT_H - 1u);
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let row0 = base + u64(ATMO_LUT_OFFSET + layer * ATMO_LUT_LAYER_BYTES + y0 * ATMO_LUT_W * 16u);
+    let row1 = base + u64(ATMO_LUT_OFFSET + layer * ATMO_LUT_LAYER_BYTES + y1 * ATMO_LUT_W * 16u);
+    let t00 = physical_load<vec4<f32>>(row0 + u64(x0 * 16u)).xyz;
+    let t10 = physical_load<vec4<f32>>(row0 + u64(x1 * 16u)).xyz;
+    let t01 = physical_load<vec4<f32>>(row1 + u64(x0 * 16u)).xyz;
+    let t11 = physical_load<vec4<f32>>(row1 + u64(x1 * 16u)).xyz;
+    return mix(mix(t00, t10, tx), mix(t01, t11, tx), ty);
+}
+
+// March every volume the primary ray crosses; composite over `radiance`.
+// `t_hit_m` = primary hit distance in world meters (huge sentinel on a miss).
+fn atmosphere_volumes_apply(
+    radiance: vec3<f32>, cam_origin: vec3<f32>, dir: vec3<f32>, t_hit_m: f32,
+) -> vec3<f32> {
+    let count = bitcast<u32>(camera.atmo.z);
+    if count == 0u {
+        return radiance;
+    }
+    let base = (u64(bitcast<u32>(camera.atmo.y)) << 32u) | u64(bitcast<u32>(camera.atmo.x));
+    let header = physical_load<AtmoHeader>(base);
+    var out = radiance;
+    for (var v = 0u; v < min(count, 4u); v += 1u) {
+        let vol = physical_load<AtmoVolume>(base + u64(32u) + u64(v) * u64(64u));
+        // Shell-centered km space (the atmosphere functions' native frame).
+        // The volume's center is camera-relative; re-anchor to this ray.
+        let o_km = (cam_origin - (camera.camera_position.xyz + vol.center)) * 1e-3;
+        let t_far = atmosphere_ray_sphere_far(o_km, dir, vol.top_radius);
+        if t_far <= 0.0 {
+            continue;
+        }
+        let t_enter = max(atmosphere_ray_sphere_near(o_km, dir, vol.top_radius), 0.0);
+        let t_exit = min(t_far, t_hit_m * 1e-3);
+        if t_exit <= t_enter {
+            continue;
+        }
+
+        // Single-scatter march, sun transmittance from the baked LUT.
+        let cos_theta = dot(dir, header.sun_direction);
+        let phase_r = atmosphere_rayleigh_phase(cos_theta);
+        let phase_m = atmosphere_mie_phase(vol.mie_phase_g, cos_theta);
+        let march_origin = o_km + dir * t_enter;
+        let ds = (t_exit - t_enter) / f32(ATMO_VOLUME_STEPS);
+        var od_r = 0.0;
+        var od_m = 0.0;
+        var inscatter = vec3<f32>(0.0);
+        for (var i = 0u; i < ATMO_VOLUME_STEPS; i += 1u) {
+            let p = march_origin + dir * ((f32(i) + 0.5) * ds);
+            let r = length(p);
+            let h = r - vol.bottom_radius;
+            let d = vec2<f32>(
+                exp(-h / vol.rayleigh_scale_height),
+                exp(-h / vol.mie_scale_height),
+            );
+            od_r += d.x * ds;
+            od_m += d.y * ds;
+            let t_view = exp(-(vol.rayleigh_scattering * od_r
+                + vec3<f32>(vol.mie_extinction) * od_m));
+            let mu_sun = dot(p / r, header.sun_direction);
+            let t_sun = atmo_lut_sun_t(base, v, r, mu_sun, vol.bottom_radius, vol.top_radius);
+            let scatter = vol.rayleigh_scattering * (d.x * phase_r)
+                + vec3<f32>(vol.mie_scattering) * (d.y * phase_m);
+            inscatter += t_view * t_sun * scatter * ds;
+        }
+        let transmittance = exp(-(vol.rayleigh_scattering * od_r
+            + vec3<f32>(vol.mie_extinction) * od_m));
+
+        // The whole gathered path enters the camera through this segment:
+        // attenuate it, add the segment's (pre-illuminance) in-scatter.
+        out = out * transmittance + inscatter * header.sun_illuminance;
+    }
+    return out;
+}
+
 // Hash an id (cluster or cluster⊕triangle) to a distinct, well-spread flat color for
 // the geometry-debug views. PCG-style integer hash → hue via three decorrelated bytes,
 // lifted off black so adjacent ids stay visually distinct.
@@ -110,6 +235,10 @@ fn raygen(
     let far = camera.inverse_view_proj * vec4<f32>(ndc.x, -ndc.y, 1.0, 1.0);
     var origin = camera.camera_position.xyz;
     var direction = normalize(far.xyz / far.w - origin);
+    // Primary ray (pre-bounce) for the atmosphere-volume march.
+    let cam_origin = origin;
+    let cam_direction = direction;
+    var primary_t = 1e30;
 
     var radiance = vec3<f32>(0.0);
     var throughput = vec3<f32>(1.0);
@@ -230,6 +359,7 @@ fn raygen(
             if dot(hit_pos - origin, hit_pos - origin) > 1e-10 {
                 let clip = camera.clip_from_world * vec4<f32>(hit_pos, 1.0);
                 primary_depth = clip.z / clip.w;
+                primary_t = length(hit_pos - origin);
             }
         }
 
@@ -280,6 +410,10 @@ fn raygen(
         }
         throughput /= p;
     }
+
+    // Atmosphere volumes: attenuate + in-scatter over the primary segment
+    // (aerial perspective / limb / sky-through-shell). Before exposure.
+    radiance = atmosphere_volumes_apply(radiance, cam_origin, cam_direction, primary_t);
 
     // Camera exposure (matches the megakernel's `radiance *= view.exposure`); the
     // physical sky/light radiance is otherwise far too bright. `.w` of the camera

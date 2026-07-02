@@ -74,6 +74,15 @@ pub struct RtCamera {
     /// gas-giant bands); `.y` = per-pixel ray-cone tangent (`2·tan(fov/2)/height`)
     /// for footprint-based shading LOD; `.zw` reserved.
     pub misc: [f32; 4],
+    /// World→bake quaternion (xyzw) for the environment/atmosphere cube: the
+    /// miss shader rotates sample directions by it so the baked sky (up = +Y
+    /// convention) follows a spherical planet's local frame. Identity
+    /// `(0,0,0,1)` for flat scenes / plain skyboxes.
+    pub sky_frame: [f32; 4],
+    /// Atmosphere volumes: `.xy` = device address (lo/hi bits) of the
+    /// `GpuAtmosphereVolumes` buffer, `.z` = live volume count (0 ⇒ raygen
+    /// skips the march and the miss shader keeps the cube on primary rays).
+    pub atmo: [f32; 4],
 }
 
 /// Bindless geometry buffer-device-addresses the closest-hit reads via

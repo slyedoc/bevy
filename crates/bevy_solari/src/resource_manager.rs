@@ -30,7 +30,7 @@ use crate::accel::{
 };
 use crate::gpu::allocator::Allocator;
 use crate::lights::light_resolve_bind_group_layout;
-use crate::render::atmosphere::atmosphere_bind_group_layout;
+use crate::render::atmosphere::{atmosphere_bind_group_layout, atmosphere_lut_bind_group_layout};
 use crate::transform::{
     transform_gather_bind_group_layout, transform_propagate_bind_group_layout,
     transform_readback_bind_group_layout, transform_subtract_bind_group_layout,
@@ -53,6 +53,7 @@ pub struct SolariResourceManager {
     pub rt_camera: BindGroupLayoutDescriptor,
     pub light_resolve: BindGroupLayoutDescriptor,
     pub atmosphere: BindGroupLayoutDescriptor,
+    pub atmosphere_lut: BindGroupLayoutDescriptor,
     // AS passes — each is the `@group(1)` layout; the full pipeline layout pairs it
     // with the cluster-scene group (composited in `init_solari_pipelines`).
     pub selector: BindGroupLayoutDescriptor,
@@ -86,6 +87,7 @@ pub fn init_solari_resource_manager(mut commands: Commands, allocator: Option<Re
         rt_camera: crate::render::rt_pipeline::rt_camera_bind_group_layout(),
         light_resolve: light_resolve_bind_group_layout(),
         atmosphere: atmosphere_bind_group_layout(),
+        atmosphere_lut: atmosphere_lut_bind_group_layout(),
         selector: selector_bind_group_layout(),
         blas_sharing: blas_sharing_bind_group_layout(),
         ptlas: ptlas_bind_group_layout(),

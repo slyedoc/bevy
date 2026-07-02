@@ -128,6 +128,7 @@ impl Plugin for SolarRenderPlugin {
             .init_resource::<crate::gpu::rt_pipeline::SolariHitGroupRegistry>()
             .init_resource::<view_cull::SolariViewUniforms>()
             .init_resource::<atmosphere::SolariAtmosphereGpu>()
+            .init_resource::<atmosphere::SolariAtmosphereVolumesGpu>()
             .add_systems(RenderStartup, atmosphere::init_atmosphere_pipeline)
             .add_systems(RenderStartup, rt_pipeline::init_rt_blit)
             .add_systems(
@@ -143,6 +144,7 @@ impl Plugin for SolarRenderPlugin {
                     view_cull::extract_solari_view_cull_masks,
                     view_cull::extract_solari_skybox,
                     atmosphere::extract_solari_atmosphere,
+                    atmosphere::extract_atmosphere_volumes,
                     rt_pipeline::extract_rt_camera_slot,
                 ),
             )
@@ -152,6 +154,7 @@ impl Plugin for SolarRenderPlugin {
                     rt_pipeline::prepare_rt_output,
                     view_cull::prepare_solari_view_uniforms,
                     atmosphere::prepare_atmosphere_sky,
+                    atmosphere::prepare_atmosphere_volumes,
                 )
                     .in_set(RenderSystems::PrepareResources),
             )
@@ -179,6 +182,8 @@ impl Plugin for SolarRenderPlugin {
                 Core3d,
                 (
                     atmosphere::dispatch_atmosphere_bake
+                        .run_if(resource_exists::<SolariPipelines>),
+                    atmosphere::dispatch_atmosphere_lut_bake
                         .run_if(resource_exists::<SolariPipelines>),
                     rt_pipeline::rt_pipeline
                         // No `resource_exists::<RtPipeline>` gate — the system
