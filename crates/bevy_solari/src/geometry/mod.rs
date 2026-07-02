@@ -18,6 +18,7 @@ pub mod clas_template;
 pub mod from_mesh;
 pub mod indices;
 pub mod mesh_manager;
+pub mod procedural;
 pub mod tess_classify;
 pub mod tess_displace;
 pub mod tess_table;
@@ -39,6 +40,11 @@ pub use self::mesh_manager::{
     init_cluster_mesh_manager, perform_pending_cluster_mesh_writes, ClusterMeshManager,
     ClusterMeshUpload, PendingClasUpload,
 };
+pub use self::procedural::{
+    ProceduralClusters, ProceduralFillQueue, ProceduralInstantiateQueue, ProceduralMeshInfo,
+    ProceduralMeshRanges, ProceduralRanges, ProceduralReadyChannel, ProceduralTopology,
+    SolariProceduralSystems,
+};
 pub use crate::gpu::persistent_buffer::{PersistentGpuBuffer, PersistentGpuBufferable};
 
 #[cfg(feature = "cluster_processor")]
@@ -50,9 +56,12 @@ pub use self::from_mesh::{
 use bevy_app::{App, Plugin};
 use bevy_asset::AssetApp;
 use bevy_ecs::schedule::IntoScheduleConfigs;
-use bevy_render::{Render, RenderApp, RenderStartup, RenderSystems};
+use bevy_render::{
+    renderer::{RenderGraph, RenderGraphSystems},
+    Render, RenderApp, RenderStartup, RenderSystems,
+};
 
-use crate::SolariSetup;
+use crate::{SolariClusterSystems, SolariSetup};
 
 /// Geometry domain plugin: registers the [`ClusterMesh`] asset + loader
 /// and the render-world systems that upload asset data into the shared
@@ -67,16 +76,49 @@ impl Plugin for GeometryPlugin {
             // that needs the `ReflectHandle` + `String -> HandleTemplate<ClusterMesh>` machinery.
             .register_asset_reflect::<ClusterMesh>();
 
+        // Cross-world readiness handshake for procedural meshes: ONE shared
+        // vec, cloned into both worlds (main-world consumers drain it).
+        let ready_channel = ProceduralReadyChannel::default();
+        app.insert_resource(ready_channel.clone());
+
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
         render_app
+            .insert_resource(ready_channel)
+            .init_resource::<ProceduralMeshRanges>()
+            .init_resource::<ProceduralFillQueue>()
+            .init_resource::<ProceduralInstantiateQueue>()
+            // Procedural flow: publish reservations → user fill dispatches →
+            // CLAS instantiate, all before the cluster-AS chain consumes the
+            // CLAS address table.
+            .configure_sets(
+                RenderGraph,
+                (
+                    SolariProceduralSystems::Reserve,
+                    SolariProceduralSystems::Fill,
+                    SolariProceduralSystems::Instantiate,
+                )
+                    .chain()
+                    .in_set(RenderGraphSystems::Render)
+                    .before(SolariClusterSystems::Scatter),
+            )
+            .add_systems(
+                RenderGraph,
+                (
+                    procedural::drain_pending_procedural
+                        .in_set(SolariProceduralSystems::Reserve),
+                    procedural::instantiate_procedural
+                        .in_set(SolariProceduralSystems::Instantiate),
+                ),
+            )
             .add_systems(
                 RenderStartup,
                 (
                     init_cluster_mesh_manager.after(SolariSetup),
                     init_clas_arena.after(SolariSetup),
                     init_clas_template_arena.after(SolariSetup),
+                    procedural::init_procedural_clusters.after(SolariSetup),
                     tess_table::init_tessellation_table.after(SolariSetup),
                     tess_classify::init_tess_classify.after(SolariSetup),
                     tess_displace::init_tess_ptlas_write.after(SolariSetup),

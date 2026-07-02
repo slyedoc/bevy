@@ -151,6 +151,13 @@ pub struct ClusterMesh {
     pub omm_usage: Arc<[OmmUsage]>,
     /// Usage histogram for the BLAS/CLAS OMM attach.
     pub omm_index_usage: Arc<[OmmUsage]>,
+    /// RUNTIME-ONLY: marks this mesh's vertex payload GPU-authored (pools
+    /// reserved, filled by a downstream compute pass, CLAS instantiated from a
+    /// shared topology template — see `geometry::procedural`). The vertex
+    /// streams above stay EMPTY; topology (`indices`/`clusters`/`groups`) is
+    /// CPU-authored as usual. Never serialized (`.cluster_mesh` files are
+    /// always fully CPU-baked; the saver rejects it).
+    pub gpu_authored: Option<crate::geometry::procedural::ProceduralMeshInfo>,
 }
 
 impl ClusterMesh {
@@ -494,6 +501,12 @@ impl AssetSaver for ClusterMeshSaver {
         _settings: &(),
         _asset_path: AssetPath<'_>,
     ) -> Result<(), ClusterMeshSaveOrLoadError> {
+        // GPU-authored meshes have no CPU vertex payload — persisting one would
+        // write an empty husk that renders nothing on load.
+        assert!(
+            asset.gpu_authored.is_none(),
+            "ClusterMeshSaver: refusing to save a gpu_authored (procedural) ClusterMesh",
+        );
         writer
             .write_all(&CLUSTER_MESH_ASSET_MAGIC.to_le_bytes())
             .await?;
@@ -624,6 +637,7 @@ impl AssetLoader for ClusterMeshLoader {
             omm_index,
             omm_usage,
             omm_index_usage,
+            gpu_authored: None,
         })
     }
 

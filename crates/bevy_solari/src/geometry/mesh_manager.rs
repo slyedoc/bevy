@@ -188,6 +188,9 @@ pub struct ClusterMeshManager {
     /// the geometry-pool high-water BLAS sharing sizes against.
     next_geometry_id: u32,
     pub pending_clas_uploads: Vec<PendingClasUpload>,
+    /// GPU-authored meshes reserved this frame, awaiting range publication +
+    /// fill + template instantiate (`geometry::procedural` drains this).
+    pub pending_procedural: Vec<crate::geometry::procedural::ProceduralPendingUpload>,
 }
 
 pub fn init_cluster_mesh_manager(
@@ -220,6 +223,7 @@ pub fn init_cluster_mesh_manager(
         cluster_mesh_slices: HashMap::default(),
         next_geometry_id: 0,
         pending_clas_uploads: Vec::new(),
+        pending_procedural: Vec::new(),
     };
 
     // Queue a placeholder write to `child_table` + `nodes` so the
@@ -254,6 +258,13 @@ impl ClusterMeshManager {
         let mesh = assets.remove_untracked(asset_id).expect(
             "ClusterMesh asset was already unloaded but is not registered with ClusterMeshManager",
         );
+
+        // GPU-authored meshes reserve their vertex pools (a compute pass fills
+        // them) and take the template-instantiate CLAS path instead of the
+        // direct build — see `geometry::procedural`.
+        if let Some(info) = mesh.gpu_authored {
+            return self.queue_procedural_upload(asset_id, mesh, info);
+        }
 
         // 1. Queue independent streams first; their `.start` becomes
         //    the base for downstream streams' rebase metadata.
@@ -467,6 +478,132 @@ impl ClusterMeshManager {
             bloat_aabbs: Arc::clone(&mesh.cluster_bloat_aabbs),
         };
         self.pending_clas_uploads.push(pending);
+        upload
+    }
+
+    /// Reserve pool ranges for a GPU-authored mesh: vertex streams get
+    /// payload-less reservations (a downstream compute pass fills them — see
+    /// [`crate::geometry::procedural`]), topology uploads as usual, and the
+    /// mesh is queued for template-instantiate instead of the direct CLAS
+    /// build. Same pool-ordering discipline as the static path, so the
+    /// packed/custom bases stay equal to `vertex_base`.
+    fn queue_procedural_upload(
+        &mut self,
+        asset_id: AssetId<ClusterMesh>,
+        mesh: ClusterMesh,
+        info: crate::geometry::procedural::ProceduralMeshInfo,
+    ) -> ClusterMeshUpload {
+        use crate::geometry::procedural::{ProceduralPendingUpload, ProceduralRanges};
+
+        debug_assert!(
+            mesh.vertex_positions.is_empty(),
+            "gpu_authored ClusterMesh must not carry CPU vertex payloads",
+        );
+        debug_assert!(
+            mesh.vertex_joint_indices.is_empty() && mesh.nodes.is_empty(),
+            "gpu_authored ClusterMesh: skinning / interior node trees unsupported",
+        );
+        let vertex_count: u32 = mesh.clusters.iter().map(|c| c.vertex_count).sum();
+        debug_assert!(vertex_count > 0, "gpu_authored ClusterMesh has no vertices");
+        let n = vertex_count as u64;
+
+        // Reservations in the SAME pool order as the static path's writes.
+        let vertex_positions = self.vertex_positions.queue_reserve(n * size_of::<Vec3>() as u64);
+        let vertex_normals = self.vertex_normals.queue_reserve(n * size_of::<u32>() as u64);
+        let vertex_tangents = self.vertex_tangents.queue_reserve(n * size_of::<Vec4>() as u64);
+        let vertex_uvs = self.vertex_uvs.queue_reserve(n * size_of::<Vec2>() as u64);
+        let vertex_custom = self.vertex_custom.queue_reserve(n * size_of::<u32>() as u64);
+        let vertex_packed = self
+            .vertex_packed
+            .queue_reserve(n * size_of::<PackedVertex>() as u64);
+        let indices = self.indices.queue_write(Arc::clone(&mesh.indices), ());
+
+        let vertex_base = (vertex_positions.start / size_of::<Vec3>() as u64) as u32;
+        debug_assert_eq!(
+            vertex_base,
+            (vertex_packed.start / size_of::<PackedVertex>() as u64) as u32,
+            "vertex_packed pool diverged from vertex_positions indexing",
+        );
+        debug_assert_eq!(
+            vertex_base,
+            (vertex_custom.start / size_of::<u32>() as u64) as u32,
+            "vertex_custom pool diverged from vertex_positions indexing",
+        );
+        let index_base = (indices.start / size_of::<u32>() as u64) as u32;
+
+        let clusters = self
+            .clusters
+            .queue_write(Arc::clone(&mesh.clusters), (vertex_base, index_base));
+        let cluster_base = ClusterIndex((clusters.start / size_of::<Cluster>() as u64) as u32);
+        let groups = self
+            .groups
+            .queue_write(Arc::clone(&mesh.groups), (cluster_base, 0));
+        let group_base = GroupIndex((groups.start / size_of::<ClusterLodGroup>() as u64) as u32);
+        let cluster_to_group_rebased: Arc<[u32]> = mesh
+            .cluster_to_group
+            .iter()
+            .map(|g| g + group_base.0)
+            .collect();
+        let cluster_to_group = self.cluster_to_group.queue_write(cluster_to_group_rebased, ());
+
+        let root_group = GroupIndex(mesh.root_group_id + group_base.0);
+        let cluster_count = mesh.clusters.len() as u32;
+        let total_triangle_count: u32 = mesh.clusters.iter().map(|c| c.triangle_count).sum();
+        let geometry_id = self.next_geometry_id;
+        self.next_geometry_id += 1;
+
+        let slices = ClusterMeshSlices {
+            vertex_positions,
+            vertex_packed,
+            vertex_normals,
+            vertex_tangents,
+            vertex_uvs,
+            vertex_custom,
+            vertex_joint_indices: 0..0,
+            vertex_joint_weights: 0..0,
+            cluster_bloat_aabbs: 0..0,
+            indices,
+            child_table: 0..0,
+            clusters,
+            groups,
+            nodes: 0..0,
+            cluster_to_group,
+            aabb: mesh.aabb,
+            root_group,
+            root_node: NodeIndex::NONE,
+            lod_levels: mesh.lod_levels,
+            mesh_max_error: mesh.mesh_max_error,
+            cluster_count,
+            total_triangle_count,
+            tess_clusters: mesh
+                .clusters
+                .iter()
+                .map(|c| TessCluster {
+                    vertex_offset: vertex_base + c.vertex_offset,
+                    index_offset: index_base + c.index_offset,
+                    triangle_count: c.triangle_count,
+                    center: [c.bounds_sphere[0], c.bounds_sphere[1], c.bounds_sphere[2]],
+                })
+                .collect(),
+            geometry_id,
+        };
+        let upload = upload_from_slices(&slices);
+        self.cluster_mesh_slices.insert(asset_id, slices);
+
+        self.pending_procedural.push(ProceduralPendingUpload {
+            asset_id,
+            ranges: ProceduralRanges {
+                topology_key: info.topology_key,
+                band: info.band,
+                vertex_base,
+                vertex_count,
+                index_base,
+                cluster_base,
+                cluster_count,
+            },
+            band_aabb_min: info.band_aabb_min,
+            band_aabb_max: info.band_aabb_max,
+        });
         upload
     }
 

@@ -608,6 +608,7 @@ impl TryFrom<&Mesh> for ClusterMesh {
             omm_index: Arc::from(&[][..]),
             omm_usage: Arc::from(&[][..]),
             omm_index_usage: Arc::from(&[][..]),
+            gpu_authored: None,
         })
 
     }

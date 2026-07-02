@@ -47,8 +47,14 @@ impl<T: PersistentGpuBufferable> PersistentGpuBuffer<T> {
                 render_device,
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
+                    // TRANSFER_SRC: debug/validation readbacks of GPU-generated
+                    // pool contents (procedural meshes, height queries).
+                    | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-                BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::BLAS_INPUT,
+                BufferUsages::STORAGE
+                    | BufferUsages::COPY_DST
+                    | BufferUsages::COPY_SRC
+                    | BufferUsages::BLAS_INPUT,
                 virtual_bytes,
                 label,
             ),
@@ -77,6 +83,24 @@ impl<T: PersistentGpuBufferable> PersistentGpuBuffer<T> {
         self.write_queue
             .push((data, metadata, buffer_slice.clone()));
         buffer_slice
+    }
+
+    /// Allocate a range with NO CPU payload — for regions a GPU compute pass will
+    /// write (procedural/GPU-authored meshes). Pages for the range are committed at
+    /// the next [`perform_writes`](Self::perform_writes) (which runs every frame in
+    /// `PrepareAssets`, before any procedural fill dispatch reads or writes the
+    /// range). Contents are undefined until the fill pass writes them; consumers
+    /// must not read the range before then.
+    pub fn queue_reserve(&mut self, size_bytes: u64) -> Range<BufferAddress> {
+        debug_assert!(size_bytes.is_multiple_of(COPY_BUFFER_ALIGNMENT));
+        if let Ok(buffer_slice) = self.allocation_planner.allocate_range(size_bytes) {
+            return buffer_slice;
+        }
+        let buffer_size = self.allocation_planner.initial_range();
+        let double_buffer_size = (buffer_size.end - buffer_size.start) * 2;
+        let new_size = double_buffer_size.max(size_bytes);
+        self.allocation_planner.grow_to(buffer_size.end + new_size);
+        self.allocation_planner.allocate_range(size_bytes).unwrap()
     }
 
     /// Upload all pending data to the GPU buffer, committing more sparse pages

@@ -625,6 +625,10 @@ pub fn flush_cluster_instances(
     mut manager: ResMut<InstanceManager>,
     mut cluster_meshes: ResMut<ClusterMeshManager>,
     mut clas_arena: ResMut<ClasArena>,
+    // Procedural (GPU-authored) mesh bookkeeping, freed alongside the pools on
+    // asset eviction. `Option`: absent on non-cluster devices.
+    mut procedural: Option<ResMut<crate::geometry::procedural::ProceduralClusters>>,
+    mut procedural_ranges: Option<ResMut<crate::geometry::procedural::ProceduralMeshRanges>>,
     mut slot_map: ResMut<RtSlotMap>,
     mut main_world: ResMut<MainWorld>,
     // GPU instance-change journal — an absolute-state UPSERT is appended per bind
@@ -665,6 +669,11 @@ pub fn flush_cluster_instances(
         if let AssetEvent::Unused { id } | AssetEvent::Modified { id } = ev {
             cluster_meshes.remove(&id);
             clas_arena.remove(&id);
+            if let (Some(procedural), Some(ranges)) =
+                (procedural.as_deref_mut(), procedural_ranges.as_deref_mut())
+            {
+                crate::geometry::procedural::remove_procedural_mesh(&id, procedural, ranges);
+            }
         }
     }
 

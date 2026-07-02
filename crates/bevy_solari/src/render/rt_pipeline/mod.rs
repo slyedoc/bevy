@@ -449,6 +449,8 @@ struct RtCameraGpuInputs {
     frame: UVec4,
     sky: Vec4,
     jitter: Vec4,
+    /// `.x` = time (s, wrapped), `.y` = pixel ray-cone tan; see `RtCamera::misc`.
+    misc: Vec4,
     exposure: f32,
 }
 
@@ -491,6 +493,7 @@ fn try_dispatch_rt_camera(
         frame: inputs.frame,
         sky: inputs.sky,
         jitter: inputs.jitter,
+        misc: inputs.misc,
         camera_slot: slot.0,
         node_count,
         exposure: inputs.exposure,
@@ -546,6 +549,7 @@ impl crate::SolariMaterial for OpaqueSurface {
                 file: "ahit_alpha.wgsl",
                 entry: "ahit_alpha",
             }),
+            composable_modules: &[],
         }
     }
 }
@@ -561,6 +565,7 @@ impl crate::SolariMaterial for GlassSurface {
             closest_hit_file: "chit_glass.wgsl",
             closest_hit_entry: "chit_glass",
             any_hit: None,
+            composable_modules: &[],
         }
     }
 }
@@ -576,6 +581,7 @@ impl crate::SolariMaterial for HairSurface {
             closest_hit_file: "chit_hair.wgsl",
             closest_hit_entry: "chit_hair",
             any_hit: None,
+            composable_modules: &[],
         }
     }
 }
@@ -591,6 +597,7 @@ impl crate::SolariMaterial for PortalSurface {
             closest_hit_file: "chit_portal.wgsl",
             closest_hit_entry: "chit_portal",
             any_hit: None,
+            composable_modules: &[],
         }
     }
 }
@@ -639,12 +646,13 @@ pub(crate) fn rt_pipeline(
         Option<Res<SolariPipelines>>,
         Option<Res<SolariResourceManager>>,
         Option<Res<TransformPropagate>>,
+        Res<bevy_time::Time>,
     ),
     mut frame_counter: Local<u32>,
     mut commands: Commands,
     mut ctx: RenderContext,
 ) {
-    let (render_device, render_queue, solari_pipelines, solari_resources, transform_propagate) =
+    let (render_device, render_queue, solari_pipelines, solari_resources, transform_propagate, time) =
         render_res;
     let (cluster_mesh_manager, tess_classify, hit_group_registry, deform) = geometry_res;
     let view_entity = view.entity();
@@ -891,6 +899,16 @@ pub(crate) fn rt_pipeline(
             };
             [j.x, j.y, center, contrast]
         },
+        // .x = time for animated surfaces; .y = per-pixel ray-cone tangent for
+        // footprint-based shading LOD: full vertical FOV spans `viewport.y` pixels,
+        // so one pixel subtends 2·tan(fov/2)/height. `clip_from_view[1][1]` is
+        // 1/tan(fov_y/2) for a perspective projection (garbage-but-harmless for ortho).
+        misc: [
+            time.elapsed_secs_wrapped(),
+            2.0 / (view.clip_from_view.y_axis.y * viewport.y as f32),
+            0.0,
+            0.0,
+        ],
     };
     // Fill this view's GPU camera buffer (bound at a constant dynamic offset 0). The
     // GPU-authoritative path derives the basis from `world[camera_slot]` in the
@@ -921,6 +939,7 @@ pub(crate) fn rt_pipeline(
                 frame: UVec4::from_array(camera_inputs.frame),
                 sky: Vec4::from_array(camera_inputs.sky),
                 jitter: Vec4::from_array(camera_inputs.jitter),
+                misc: Vec4::from_array(camera_inputs.misc),
                 exposure: camera.exposure,
             }
         },

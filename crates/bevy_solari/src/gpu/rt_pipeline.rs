@@ -67,8 +67,13 @@ pub struct RtCamera {
     /// at the clear color in `.yzw`).
     pub sky: [f32; 4],
     /// `.xy` = sub-pixel camera jitter in pixels (added to the primary ray);
-    /// `.zw` reserved. Zero until DLSS drives it from `suggested_jitter`.
+    /// `.zw` = debug-heatmap colormap params (center/contrast — one debug view
+    /// active at a time). Jitter zero until DLSS drives it from `suggested_jitter`.
     pub jitter: [f32; 4],
+    /// `.x` = wall-clock time in seconds (wrapped) for animated surfaces (waves,
+    /// gas-giant bands); `.y` = per-pixel ray-cone tangent (`2·tan(fov/2)/height`)
+    /// for footprint-based shading LOD; `.zw` reserved.
+    pub misc: [f32; 4],
 }
 
 /// Bindless geometry buffer-device-addresses the closest-hit reads via
@@ -117,6 +122,13 @@ pub struct SolariHitGroupDef {
     pub closest_hit_file: &'static str,
     pub closest_hit_entry: &'static str,
     pub any_hit: Option<SolariAnyHitDef>,
+    /// Extra `(file_path, source)` naga_oil modules composed into this group's
+    /// chit/any-hit alongside the built-in `bevy_solari::*` set — lets a downstream
+    /// crate `#import` its own shared WGSL (e.g. a terrain function used by both a
+    /// compute pass and a closest-hit) without forking. Registered in slice order
+    /// AFTER the built-ins, so they may import `bevy_solari::*` and each other
+    /// (dependencies first). Scoped to this group: other groups never see them.
+    pub composable_modules: &'static [(&'static str, &'static str)],
 }
 
 /// An any-hit program attached to a [`SolariHitGroupDef`] (alpha cutout, etc.).
@@ -135,7 +147,21 @@ pub struct SolariHitGroupRegistry {
 
 impl SolariHitGroupRegistry {
     /// Append a hit group; returns its SBT class (its index).
+    ///
+    /// The group's `composable_modules` are validated eagerly (composed against the
+    /// built-in module set) so a broken user module is reported at registration —
+    /// at pipeline-build time a compose failure in ANY group aborts the whole RT
+    /// pipeline, which is far harder to attribute.
     pub fn register(&mut self, group: SolariHitGroupDef) -> u32 {
+        if !group.composable_modules.is_empty() {
+            if let Err(e) = validate_composable_modules(group.composable_modules) {
+                bevy_log::error!(
+                    "rt_pipeline: hit group '{}': composable module failed to compose: {e}. \
+                     The RT pipeline will fail to build until this is fixed.",
+                    group.label
+                );
+            }
+        }
         let class = self.groups.len() as u32;
         self.groups.push(group);
         class
@@ -276,15 +302,15 @@ impl RtPipeline {
         // portal register the same way as any downstream material (see SolariPlugin).
         let raygen_mod = create_shader_module(
             &device,
-            &compile_rt_wgsl(include_str!("../render/rt_pipeline/raygen.wgsl"), "raygen.wgsl")?,
+            &compile_rt_wgsl(include_str!("../render/rt_pipeline/raygen.wgsl"), "raygen.wgsl", &[])?,
         )?;
         let miss_mod = create_shader_module(
             &device,
-            &compile_rt_wgsl(include_str!("../render/rt_pipeline/miss.wgsl"), "miss.wgsl")?,
+            &compile_rt_wgsl(include_str!("../render/rt_pipeline/miss.wgsl"), "miss.wgsl", &[])?,
         )?;
         let miss_shadow_mod = create_shader_module(
             &device,
-            &compile_rt_wgsl(include_str!("../render/rt_pipeline/miss_shadow.wgsl"), "miss_shadow.wgsl")?,
+            &compile_rt_wgsl(include_str!("../render/rt_pipeline/miss_shadow.wgsl"), "miss_shadow.wgsl", &[])?,
         )?;
 
         // Stage table: (flags, module, entry). Fixed stages first (raygen 0, primary
@@ -299,13 +325,18 @@ impl RtPipeline {
         // Per hit group: compile chit (+ any-hit), recording their stage indices.
         let mut hit_group_stages: Vec<(u32, Option<u32>)> = Vec::with_capacity(hit_groups.len());
         for hg in hit_groups {
-            let chit_mod =
-                create_shader_module(&device, &compile_rt_wgsl(hg.closest_hit_wgsl, hg.closest_hit_file)?)?;
+            let chit_mod = create_shader_module(
+                &device,
+                &compile_rt_wgsl(hg.closest_hit_wgsl, hg.closest_hit_file, hg.composable_modules)?,
+            )?;
             let chit_stage = stage_specs.len() as u32;
             modules.push(chit_mod);
             stage_specs.push((vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, hg.closest_hit_entry));
             let any_hit_stage = if let Some(ah) = &hg.any_hit {
-                let ah_mod = create_shader_module(&device, &compile_rt_wgsl(ah.wgsl, ah.file)?)?;
+                let ah_mod = create_shader_module(
+                    &device,
+                    &compile_rt_wgsl(ah.wgsl, ah.file, hg.composable_modules)?,
+                )?;
                 let s = stage_specs.len() as u32;
                 modules.push(ah_mod);
                 stage_specs.push((vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, ah.entry));
@@ -1054,12 +1085,14 @@ fn rt_capabilities() -> naga::valid::Capabilities {
         | naga::valid::Capabilities::SHADER_INT64
 }
 
-/// Compile a WGSL ray-tracing-stage shader to SPIR-V (1.4, RT capabilities) via
-/// the re-exported naga. Returns `None` on parse/validate/emit failure (logged).
-fn compile_rt_wgsl(source: &str, file_path: &str) -> Option<Vec<u32>> {
-    use naga_oil::compose::{
-        ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderDefValue,
-    };
+/// Build a naga_oil composer pre-loaded with the built-in importable modules the RT
+/// shaders may `#import`, then any `extra_modules` (`(file_path, source)`, registered
+/// in slice order so later entries may import earlier ones and the built-ins).
+/// `None` when a module fails to compose (logged).
+fn rt_composer(
+    extra_modules: &[(&'static str, &'static str)],
+) -> Option<naga_oil::compose::Composer> {
+    use naga_oil::compose::{ComposableModuleDescriptor, Composer};
 
     // Compose via naga_oil so the RT shaders can `#import` solari's scene-binding
     // / BRDF / sampling modules (raw `naga::parse_str` can't resolve `#import`).
@@ -1071,15 +1104,18 @@ fn compile_rt_wgsl(source: &str, file_path: &str) -> Option<Vec<u32>> {
     // / ray-query / SER). `with_capabilities` purges modules, so set it first.
     let mut composer = Composer::default().with_capabilities(rt_capabilities());
     macro_rules! register {
-        ($path:literal) => {
+        ($path:expr, $source:expr) => {
             if let Err(e) = composer.add_composable_module(ComposableModuleDescriptor {
-                source: include_str!($path),
+                source: $source,
                 file_path: $path,
                 ..Default::default()
             }) {
                 bevy_log::error!("rt_pipeline: compose register {}: {e:?}", $path);
                 return None;
             }
+        };
+        ($path:literal) => {
+            register!($path, include_str!($path))
         };
     }
     // Registered leaf-first: naga_oil resolves each module's `#import`s at
@@ -1095,6 +1131,38 @@ fn compile_rt_wgsl(source: &str, file_path: &str) -> Option<Vec<u32>> {
     register!("../bindings/sampling.wgsl"); // -> pbr, scene_bindings, maths
     register!("../bindings/brdf.wgsl"); // -> pbr, sampling, scene_bindings, maths
     register!("../hair/hair.wgsl"); // bevy_solari::hair (Chiang fiber BSDF) -> pbr
+    // Downstream modules (a hit group's `composable_modules`), after the built-ins
+    // so they can import them.
+    for (path, source) in extra_modules {
+        register!(*path, *source);
+    }
+    Some(composer)
+}
+
+/// Registration-time check that a hit group's extra modules compose against the
+/// built-in set — surfaces "module X won't parse / imports something unregistered"
+/// at `register_solari_chit` time instead of as an opaque whole-pipeline build
+/// failure. Composition errors inside are logged by `rt_composer` itself.
+fn validate_composable_modules(
+    modules: &[(&'static str, &'static str)],
+) -> Result<(), &'static str> {
+    match rt_composer(modules) {
+        Some(_) => Ok(()),
+        None => Err("see preceding rt_pipeline compose error"),
+    }
+}
+
+/// Compile a WGSL ray-tracing-stage shader to SPIR-V (1.4, RT capabilities) via
+/// the re-exported naga, with the group's extra composable modules (if any)
+/// available for `#import`. Returns `None` on parse/validate/emit failure (logged).
+fn compile_rt_wgsl(
+    source: &str,
+    file_path: &str,
+    extra_modules: &[(&'static str, &'static str)],
+) -> Option<Vec<u32>> {
+    use naga_oil::compose::{NagaModuleDescriptor, ShaderDefValue};
+
+    let mut composer = rt_composer(extra_modules)?;
 
     // Shader-def axes for the RT shaders. This is the "pipeline key": each def is a
     // compile-out feature axis the raygen/chits can `#ifdef` on. Keep the axes few

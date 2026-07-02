@@ -61,5 +61,6 @@ struct RtCamera {
     camera_position: vec4<f32>,
     frame: vec4<u32>,          // .x = frame index (RNG seed); .y = SER material-hint bits; .z = debug view
     sky: vec4<f32>,            // .x = environment brightness (cd/m²); .yzw = clear color
-    jitter: vec4<f32>,         // .xy = sub-pixel camera jitter (pixels); .zw reserved
+    jitter: vec4<f32>,         // .xy = sub-pixel camera jitter (pixels); .zw = debug-heatmap colormap params
+    misc: vec4<f32>,           // .x = time (s, wrapped); .y = pixel ray-cone tan (footprint LOD); .zw reserved
 }

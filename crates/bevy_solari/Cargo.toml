@@ -84,6 +84,9 @@ bevy_image = { path = "../bevy_image", version = "0.20.0-dev", features = [
   "zstd_rust"
 ] }
 bevy_tasks = { path = "../bevy_tasks", version = "0.20.0-dev" }
+# Render-world `Time` (extracted by bevy_render's globals) — feeds RtCamera.misc.x
+# so hit shaders can animate (ocean waves, gas-giant bands).
+bevy_time = { path = "../bevy_time", version = "0.20.0-dev" }
 bevy_utils = { path = "../bevy_utils", version = "0.20.0-dev" }
 bevy_transform = { path = "../bevy_transform", version = "0.20.0-dev", features = [
   "transform_f64",
