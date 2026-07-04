@@ -720,6 +720,14 @@ impl ClasArena {
         );
         let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses_buf).get();
 
+        // Declared access (SOLARI_VALIDATE): the implicit-dst window of the
+        // arena this mesh's CLASes land in.
+        crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
+            op: "clas_arena.upload_mesh",
+            reads: &[],
+            writes: &[(&self.storage, storage_range.clone())],
+        });
+
         // 5. Encode + submit the cluster_AS build + address-table copy.
         let mut encoder =
             render_device.create_command_encoder(&CommandEncoderDescriptor {

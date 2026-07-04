@@ -183,6 +183,12 @@ impl<T: PersistentGpuBufferable> PersistentGpuBuffer<T> {
     pub fn device_address(&self) -> StableAddr {
         StableAddr::new(self.buffer.address)
     }
+
+    /// The sparse backing — for `RawAccess` declarations.
+    #[inline]
+    pub fn sparse_buffer(&self) -> &SparseBuffer {
+        &self.buffer
+    }
 }
 
 /// A trait representing data that can be written to a [`PersistentGpuBuffer`].

@@ -938,6 +938,31 @@ pub fn instantiate_procedural(
         }
     }
 
+    // Declared access (SOLARI_VALIDATE): slab dst windows + per-mesh vertex
+    // reads — the reserve-without-commit class gets named here, not as an
+    // anonymous fault VA.
+    if crate::gpu::extension::solari_validate_enabled() {
+        let vp = cluster_meshes.vertex_positions.sparse_buffer();
+        let reads: Vec<_> = ops
+            .iter()
+            .filter_map(|op| ranges.0.get(&op.asset_id))
+            .map(|r| {
+                let base = r.vertex_base as u64 * 12;
+                (vp, base..base + r.vertex_count as u64 * 12)
+            })
+            .collect();
+        let writes: Vec<_> = ops
+            .iter()
+            .filter_map(|op| procedural.slabs.get(&op.asset_id))
+            .map(|slab| (&procedural.slab_storage, slab.clone()))
+            .collect();
+        crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
+            op: "procedural.instantiate",
+            reads: &reads,
+            writes: &writes,
+        });
+    }
+
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("procedural.instantiate"),
     });

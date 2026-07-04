@@ -1,3 +1,4 @@
+pub mod epoch_table;
 pub mod allocator;
 pub mod extension;
 pub mod raw_trace;

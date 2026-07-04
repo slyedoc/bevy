@@ -127,6 +127,12 @@ impl<V: ShaderType + WriteInto> StableStorageBuffer<V> {
         StableAddr::new(self.sparse.address)
     }
 
+    /// The sparse backing — for `RawAccess` declarations.
+    #[inline]
+    pub fn sparse_buffer(&self) -> &SparseBuffer {
+        &self.sparse
+    }
+
     /// A descriptor binding sized to **exactly this frame's data**, so shader
     /// `arrayLength()` is the real element count. `None` until the first non-empty
     /// [`write_buffer`](Self::write_buffer) (a consumer skips its bind group then,

@@ -340,6 +340,14 @@ impl ClusterTemplateArena {
         );
         let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses_buf).get();
 
+        // Declared access (SOLARI_VALIDATE): the implicit-dst window of the
+        // template pool this mesh's templates land in.
+        crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
+            op: "clas_template.upload",
+            reads: &[],
+            writes: &[(&self.storage, storage_range.clone())],
+        });
+
         // 5. Encode + submit the template build.
         let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("clas_template.upload"),

@@ -94,6 +94,7 @@ use crate::material::MaterialTraversalFlags;
 use crate::transform::StaticColumn;
 
 use crate::gpu::allocator::{Allocator, SparseBuffer};
+use crate::gpu::epoch_table::EpochTable;
 use super::blas_sharing::BlasSharing;
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
@@ -288,13 +289,9 @@ pub struct Ptlas {
     /// Slot capacity of [`Self::instance_written_partition`].
     pub written_partition_capacity: u32,
 
-    /// Slot-indexed epoch stamp `fill_seed` writes / `fill_incremental` skips —
-    /// dedupes CPU-seeded vs GPU-appended WRITEs within one build. Grown with
-    /// the slot space (fresh zeroed; growth forces a full rebuild).
-    pub seed_epoch: Buffer,
-    pub seed_epoch_capacity: u32,
-    /// Monotonic (wrapping, never 0) build counter feeding `fill_params.epoch`.
-    pub epoch: u32,
+    /// Slot-indexed epoch stamps `fill_seed` writes / `fill_incremental` skips —
+    /// dedupes CPU-seeded vs GPU-appended WRITEs within one build.
+    pub seed_epoch: EpochTable,
     /// Bytes committed on [`Self::scratch`] this frame (sizing query + align pad).
     pub scratch_commit: u64,
 
@@ -427,12 +424,7 @@ pub fn init_ptlas(
         mapped_at_creation: false,
     });
 
-    let seed_epoch = render_device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ptlas.seed_epoch"),
-        size: 4,
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
+    let seed_epoch = EpochTable::new(&render_device, "ptlas.seed_epoch");
 
     let validate_report = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("ptlas.validate_report"),
@@ -474,8 +466,6 @@ pub fn init_ptlas(
         instance_written_partition,
         written_partition_capacity: 1,
         seed_epoch,
-        seed_epoch_capacity: 1,
-        epoch: 0,
         scratch_commit: 0,
         validate_report,
         validate_staging,
@@ -575,16 +565,6 @@ pub fn prepare_ptlas_params(
         resources.written_partition_capacity = high_water;
         debug_assert!(full_rebuild);
     }
-    if high_water > resources.seed_epoch_capacity {
-        resources.seed_epoch = render_device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ptlas.seed_epoch"),
-            size: high_water as u64 * 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        resources.seed_epoch_capacity = high_water;
-        debug_assert!(full_rebuild);
-    }
 
     // We can't skip the build on a no-CPU-delta frame: a geometry's
     // shared BLAS can be rebuilt in place at a new LOD level (detected
@@ -670,12 +650,13 @@ pub fn prepare_ptlas_params(
         .write_data
         .commit(0..(max_records.max(1)) * WRITE_INSTANCE_DATA_SIZE);
 
-    resources.epoch = resources.epoch.wrapping_add(1).max(1);
+    let (epoch, seed_grew) = resources.seed_epoch.begin(&render_device, high_water);
+    debug_assert!(!seed_grew || full_rebuild);
     *resources.fill_params.get_mut() = PtlasFillParamsGpu {
         active_count,
         cpu_count,
         force_all: full_rebuild as u32,
-        epoch: resources.epoch,
+        epoch,
         // DEBUG: default ON whenever OMM is available so the micromap drives
         // traversal (drops FORCE_NO_OPAQUE). SOLARI_OMM_CONSULT=0 forces it off.
         // (Holes on non-OMM cutouts render solid under it — the per-geometry has_omm
@@ -918,7 +899,7 @@ pub fn prepare_ptlas_fill_bind_group(
             static_flags.buffer().as_entire_binding(),
             ptlas.instance_written_partition.as_entire_binding(),
             ptlas.validate_report.as_entire_binding(),
-            ptlas.seed_epoch.as_entire_binding(),
+            ptlas.seed_epoch.buffer().as_entire_binding(),
         )),
     );
     ptlas.bind_group = Some(group);
