@@ -534,6 +534,12 @@ pub fn prepare_ptlas_params(
     // the very first build (no `src` to carry from). A change in hair count
     // also grows/shrinks the space and is folded into `high_water`.
     let grew = high_water > resources.as_capacity;
+    // TODO: bounded-latency build batching — batch churn frames into a full
+    // rebuild every N frames (adds/removes wait ≤N; geometry is pinned so a
+    // lingering instance stays valid). At 1.76M instances the per-churn-frame
+    // full rebuild costs ~25 ms while streaming; batching amortizes it ~N×.
+    // Also re-test incremental multi-partition writes on each driver release —
+    // if fixed, drop `|| churn` below and this whole tax disappears.
     // ANY CPU-known churn (add/remove/rewrite) takes the full-rebuild path:
     // incremental updates that WRITE instances across many regular partitions
     // fault the driver (580.159) — full rebuilds with 1024 partitions are clean
