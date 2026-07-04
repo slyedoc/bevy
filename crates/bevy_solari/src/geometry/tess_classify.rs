@@ -29,6 +29,7 @@ use bytemuck::{Pod, Zeroable};
 
 use ash::vk::{self, TaggedStructure};
 
+use crate::gpu::retire::GpuRetire;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::extension::ClusterExtensionFns;
 use super::clas_arena::CLAS_SCRATCH_ALIGN;
@@ -568,6 +569,7 @@ fn tess_instantiate_input<'a>(
 pub fn run_tess_classify(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    mut retire: ResMut<GpuRetire>,
     pipeline_cache: Res<PipelineCache>,
     mut classify: Option<ResMut<TessClassify>>,
     showcase: Option<Res<TessShowcaseInstances>>,
@@ -780,9 +782,15 @@ pub fn run_tess_classify(
                 classify.tess_clas_scratch_addr =
                     align_up(alloc.wgpu_buffer_device_address(&scratch).get(), CLAS_SCRATCH_ALIGN);
                 classify.tess_clas_addresses_addr = alloc.wgpu_buffer_device_address(&addresses).get();
-                classify.tess_clas_storage = Some(storage.into());
-                classify.tess_clas_scratch = Some(scratch.into());
-                classify.tess_clas_addresses = Some(addresses.into());
+                if let Some(old) = classify.tess_clas_storage.replace(storage.into()) {
+                    retire.retire(&render_queue, "tess_classify.tess_clas_storage", old);
+                }
+                if let Some(old) = classify.tess_clas_scratch.replace(scratch.into()) {
+                    retire.retire(&render_queue, "tess_classify.tess_clas_scratch", old);
+                }
+                if let Some(old) = classify.tess_clas_addresses.replace(addresses.into()) {
+                    retire.retire(&render_queue, "tess_classify.tess_clas_addresses", old);
+                }
                 classify.tess_clas_sized_for = count;
                 tracing::debug!(
                     "tess_classify: sized CLAS pool for {} parts — storage {} MiB, scratch {} bytes",
@@ -805,7 +813,9 @@ pub fn run_tess_classify(
                     "tess_classify.references",
                 );
                 classify.references_addr = alloc.wgpu_buffer_device_address(&references).get();
-                classify.references = Some(references.into());
+                if let Some(old) = classify.references.replace(references.into()) {
+                    retire.retire(&render_queue, "tess_classify.references", old);
+                }
                 let blas_addresses = alloc.create_buffer(
                     &render_device,
                     vk::BufferUsageFlags::STORAGE_BUFFER
@@ -817,7 +827,9 @@ pub fn run_tess_classify(
                     "tess_classify.blas_addresses",
                 );
                 classify.blas_addresses_addr = alloc.wgpu_buffer_device_address(&blas_addresses).get();
-                classify.blas_addresses = Some(blas_addresses.into());
+                if let Some(old) = classify.blas_addresses.replace(blas_addresses.into()) {
+                    retire.retire(&render_queue, "tess_classify.blas_addresses", old);
+                }
                 classify.blas_sized_for = num_instances;
 
                 // Shading attrs: denormalized per-micro-triangle {normal, uv} (36 B),
@@ -835,7 +847,9 @@ pub fn run_tess_classify(
                     "tess_classify.gen_attrs",
                 );
                 classify.gen_attrs_addr = alloc.wgpu_buffer_device_address(&gen_attrs).get();
-                classify.gen_attrs = Some(gen_attrs.into());
+                if let Some(old) = classify.gen_attrs.replace(gen_attrs.into()) {
+                    retire.retire(&render_queue, "tess_classify.gen_attrs", old);
+                }
                 let gen_attrs_meta = alloc.create_buffer(
                     &render_device,
                     vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
@@ -845,7 +859,9 @@ pub fn run_tess_classify(
                     "tess_classify.gen_attrs_meta",
                 );
                 classify.gen_attrs_meta_addr = alloc.wgpu_buffer_device_address(&gen_attrs_meta).get();
-                classify.gen_attrs_meta = Some(gen_attrs_meta.into());
+                if let Some(old) = classify.gen_attrs_meta.replace(gen_attrs_meta.into()) {
+                    retire.retire(&render_queue, "tess_classify.gen_attrs_meta", old);
+                }
                 tracing::debug!(
                     "tess_classify: sized shading attrs for {} parts (stride {} tris) — {} MiB",
                     count,
@@ -1257,11 +1273,12 @@ pub fn run_tess_classify(
             built.push(blas);
         }
         render_queue.submit([blas_encoder.finish()]);
-        // 2-deep keepalive: this frame's + last frame's BLAS storage outlive their builds
-        // (and any future trace once the PTLAS inject lands).
+        // Old BLAS sets outlive their last consuming submit via the reaper
+        // (frame-count keepalives get outrun; completion flags don't).
         classify.blas_keepalive.push(built);
         if classify.blas_keepalive.len() > 2 {
-            classify.blas_keepalive.remove(0);
+            let old = classify.blas_keepalive.remove(0);
+            retire.retire(&render_queue, "tess_classify.blas_set", old);
         }
         // The BLAS addresses are now valid in `blas_addresses` — the PTLAS inject may run.
         classify.blas_ready = true;

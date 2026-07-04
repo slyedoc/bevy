@@ -295,6 +295,8 @@ pub struct Ptlas {
     pub seed_epoch_capacity: u32,
     /// Monotonic (wrapping, never 0) build counter feeding `fill_params.epoch`.
     pub epoch: u32,
+    /// Bytes committed on [`Self::scratch`] this frame (sizing query + align pad).
+    pub scratch_commit: u64,
 
     /// Debug (SOLARI_PTLAS_VALIDATE): GPU report of corrupt BLAS addresses
     /// caught in the WRITE stream ([0..4)=valid span, [4]=count, [5..)=entries),
@@ -312,7 +314,10 @@ const VALIDATE_REPORT_WORDS: u64 = 7 + 15 * 5;
 /// logging offenders (slot + address) instead of device-losting in the build.
 fn ptlas_validate_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SOLARI_PTLAS_VALIDATE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| {
+        std::env::var("SOLARI_PTLAS_VALIDATE").as_deref() == Ok("1")
+            || crate::gpu::extension::solari_validate_enabled()
+    })
 }
 
 /// SOLARI_PTLAS_FULL_REBUILD=1 → build from scratch every frame (no `src`
@@ -471,6 +476,7 @@ pub fn init_ptlas(
         seed_epoch,
         seed_epoch_capacity: 1,
         epoch: 0,
+        scratch_commit: 0,
         validate_report,
         validate_staging,
         validate_in_flight: false,
@@ -740,9 +746,8 @@ pub fn prepare_ptlas_params(
             s.commit(0..sizes_info.acceleration_structure_size.max(1));
         }
         let scratch_pad = PTLAS_SCRATCH_ALIGN - 1;
-        resources
-            .scratch
-            .commit(0..(sizes_info.build_scratch_size.max(1) + scratch_pad));
+        resources.scratch_commit = sizes_info.build_scratch_size.max(1) + scratch_pad;
+        resources.scratch.commit(0..resources.scratch_commit);
     }
 
     // (Re)create BOTH AS handles if the build size changed (one per
@@ -1164,6 +1169,28 @@ pub fn dispatch_ptlas(
         d.end(encoder);
     }
     resources.validate_in_flight = validate_recorded;
+
+    // Declared access for the raw build — SOLARI_VALIDATE checks every range
+    // is committed BEFORE the GPU faults on an anonymous VA.
+    let max_record_bytes = (resources.cpu_count + active_count + hair_count + tess_count).max(1)
+        as u64
+        * WRITE_INSTANCE_DATA_SIZE;
+    let src_read = if resources.full_rebuild {
+        0..0
+    } else {
+        0..resources.as_handle_size
+    };
+    crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
+        op: "ptlas.build",
+        reads: &[
+            (&resources.write_data, 0..max_record_bytes),
+            (&resources.storage[resources.build_src_idx], src_read),
+        ],
+        writes: &[
+            (&resources.storage[resources.current], 0..resources.as_handle_size),
+            (&resources.scratch, scratch_offset..resources.scratch_commit),
+        ],
+    });
 
     let mut build_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("ptlas.build"),

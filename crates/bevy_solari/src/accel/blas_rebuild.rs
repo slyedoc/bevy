@@ -260,6 +260,20 @@ pub fn dispatch_blas_rebuild(
         _marker: core::marker::PhantomData,
     };
 
+    // Declared access (SOLARI_VALIDATE): CPU-knowable ranges only — the BLAS
+    // pool dst addresses are GPU-computed and can't be declared here.
+    crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
+        op: "blas_rebuild.build",
+        reads: &[
+            (&selector.args_buf, 0..(bucket_capacity as u64) * 16),
+            (&sharing.geometry_dst_addresses, 0..(bucket_capacity as u64) * 8),
+        ],
+        writes: &[(
+            &resources.scratch,
+            scratch_offset..(sizes_info.build_scratch_size.max(1) + BLAS_SCRATCH_ALIGN - 1),
+        )],
+    });
+
     // Raw-VK cluster-BLAS build in its OWN encoder (the solari-pt wgpu fork
     // panics if one encoder mixes wgpu passes with raw `as_hal_mut`), handed
     // to the shared render context: `add_command_buffer` flushes this frame's

@@ -588,6 +588,23 @@ pub fn dispatch_animated_blas(
         _marker: core::marker::PhantomData,
     };
 
+    // Declared access (SOLARI_VALIDATE): the CPU-knowable ranges of the two
+    // raw builds — instantiate writes the CLAS storage + scratch, the BLAS
+    // build writes the pool + scratch (per-cluster dst addrs are GPU-computed).
+    let total_clusters = MAX_TOTAL_ANIMATED_CLUSTERS as u64;
+    crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
+        op: "animated_blas.builds",
+        reads: &[],
+        writes: &[
+            (
+                &resources.instantiated_clas_storage,
+                0..total_clusters * WORST_INSTANTIATE_BYTES_PER_CLUSTER,
+            ),
+            (&resources.instantiate_scratch, 0..64 * 1024 * 1024),
+            (&resources.blas_scratch, 0..64 * 1024 * 1024),
+        ],
+    });
+
     let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("animated_blas.builds"),
     });

@@ -549,6 +549,42 @@ pub const CKPT_CLUSTER_OP_BASE: usize = 0x1000;
 pub const CKPT_PTLAS: usize = 0x2000;
 pub const CKPT_MICROMAP: usize = 0x3000;
 
+/// Declared buffer access for a raw-VK op — invisible to wgpu's tracker, so
+/// [`validate_raw_access`] checks it instead under `SOLARI_VALIDATE=1`:
+/// every declared range must be fully committed before the op records.
+pub struct RawAccess<'a> {
+    pub op: &'static str,
+    pub reads: &'a [(&'a crate::gpu::allocator::SparseBuffer, core::ops::Range<u64>)],
+    pub writes: &'a [(&'a crate::gpu::allocator::SparseBuffer, core::ops::Range<u64>)],
+}
+
+/// SOLARI_VALIDATE=1 — umbrella debug gate: raw-op access checks here + the
+/// PTLAS record validation pass.
+pub fn solari_validate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SOLARI_VALIDATE").as_deref() == Ok("1"))
+}
+
+/// An uncommitted range consumed by a raw op is a future device-lost — log it
+/// with the op + buffer named, BEFORE the GPU faults on an anonymous VA.
+pub fn validate_raw_access(a: &RawAccess) {
+    if !solari_validate_enabled() {
+        return;
+    }
+    for (kind, set) in [("READ", a.reads), ("WRITE", a.writes)] {
+        for (buf, range) in set.iter() {
+            if !buf.is_committed(range.clone()) {
+                tracing::error!(
+                    "raw op {}: {kind} {:?} of sparse {} not fully committed",
+                    a.op,
+                    range,
+                    buf.label(),
+                );
+            }
+        }
+    }
+}
+
 pub unsafe fn cmd_build_cluster_acceleration_structures_indirect(
     encoder: &mut wgpu::CommandEncoder,
     fns: &ClusterExtensionFns,

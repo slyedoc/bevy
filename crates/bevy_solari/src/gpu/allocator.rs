@@ -111,6 +111,27 @@ impl SubmitAddr {
     }
 }
 
+/// A buffer whose device address escaped to GPU consumers and which is
+/// therefore PINNED: created once, never replaced. Owns the only handle —
+/// swapping the buffer means dropping the wrapper, a deliberate, greppable
+/// act (and a bug unless every capturing consumer is provably done).
+pub struct PinnedBuffer {
+    buffer: Buffer,
+    addr: StableAddr,
+}
+
+impl PinnedBuffer {
+    #[inline]
+    pub fn buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+
+    #[inline]
+    pub fn stable_addr(&self) -> StableAddr {
+        self.addr
+    }
+}
+
 /// Render-world resource holding raw Vulkan handles for the cluster-AS
 /// pipeline's buffer allocation path. Cloning is cheap (internal Arc)
 /// so downstream sub-managers can each hold their own handle.
@@ -188,6 +209,14 @@ impl Allocator {
     /// BLAS/CLAS device address lives inside this span.
     pub fn sparse_va_span(&self) -> (u64, u64) {
         *self.inner.sparse_va_span.lock().unwrap()
+    }
+
+    /// Pin `buffer`: take ownership and capture its address as [`StableAddr`].
+    /// The wrapper must outlive every GPU consumer of the address — in
+    /// practice, live in an init-created resource for the app's lifetime.
+    pub fn pin_buffer(&self, buffer: Buffer) -> PinnedBuffer {
+        let addr = StableAddr(self.wgpu_buffer_device_address(&buffer).get());
+        PinnedBuffer { buffer, addr }
     }
 
     /// Raw `ash::Device` for callers issuing raw Vulkan commands
@@ -588,6 +617,23 @@ impl SparseBuffer {
     #[inline]
     pub fn stable_addr(&self) -> StableAddr {
         StableAddr(self.address)
+    }
+
+    #[inline]
+    pub fn label(&self) -> &'static str {
+        self.label
+    }
+
+    /// Whether every page covering `byte_range` is currently committed —
+    /// a raw op consuming an uncommitted range is a future device-lost.
+    pub fn is_committed(&self, byte_range: Range<u64>) -> bool {
+        if byte_range.is_empty() {
+            return true;
+        }
+        let committed = self.committed_pages.lock().unwrap();
+        let start_page = byte_range.start / self.page_size;
+        let end_page = byte_range.end.div_ceil(self.page_size);
+        (start_page..end_page).all(|p| bit_get(&committed, p as usize))
     }
 
     /// Ensure every page covering `byte_range` is backed by memory.
