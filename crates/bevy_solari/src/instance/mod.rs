@@ -32,9 +32,10 @@ pub mod journal;
 pub use gpu_instances::{
     cluster_columns_ready, Affine3x4, GeometryIdColumn, GroupBaseColumn, GpuInstancesPlugin,
     InstanceColumns, InstanceMaskColumn, LodInputColumn, MaterialColumn, NodeSlotColumn,
+    PartitionColumn,
     TransformColumn,
 };
-pub use instance_manager::{
+pub use instance_manager::{SolariPartition, 
     clear_instance_deltas, flush_cluster_instances, free_cluster_slot, init_instance_manager,
     mark_instance_added, mark_instance_layers_changed, mark_instance_material_changed,
     resolve_instance_material_ids, InstanceManager, RaytracingGpuEntity, RtInstanceChanges,

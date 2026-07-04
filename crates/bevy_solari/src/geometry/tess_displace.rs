@@ -143,6 +143,12 @@ pub fn find_tess_showcase_instances(
 #[derive(bevy_ecs::component::Component)]
 pub struct TessBaseHidden;
 
+/// Marker: material inspected once — keeps the scan query archetype-empty in
+/// steady state (a runtime depth_map ADDITION won't re-hide; live-edit nicety
+/// traded away, this was O(every RT entity) per frame at 1.7M instances).
+#[derive(bevy_ecs::component::Component)]
+pub struct TessBaseChecked;
+
 /// `Update` (main world): hide the original flat cluster instance of every
 /// displacement-mapped entity by setting its RT cull mask to 0 (`RenderLayers::none()`),
 /// so only the tessellated, displaced version renders. Without this the flat base mesh
@@ -155,11 +161,12 @@ pub fn hide_tessellated_base_instances(
         (Entity, &SolariMaterial3d),
         (
             With<RaytracingMesh3d>,
-            bevy_ecs::query::Without<TessBaseHidden>,
+            bevy_ecs::query::Without<TessBaseChecked>,
         ),
     >,
 ) {
     for (entity, mat3d) in &query {
+        // Not loaded yet — stays unmarked, retried next frame.
         let Some(mat) = materials.get(&mat3d.0) else {
             continue;
         };
@@ -167,7 +174,10 @@ pub fn hide_tessellated_base_instances(
             commands.entity(entity).insert((
                 bevy_camera::visibility::RenderLayers::none(),
                 TessBaseHidden,
+                TessBaseChecked,
             ));
+        } else {
+            commands.entity(entity).insert(TessBaseChecked);
         }
     }
 }

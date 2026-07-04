@@ -157,11 +157,12 @@ pub struct PtlasWritePair {
     null_flag: u32,
 }
 
-/// Regular (static) partition count. Statics share one regular partition;
-/// movers live in the global partition (built per-instance), so a moved mover
-/// never dirties the static partition. A spatial grid of many regular
-/// partitions was tried and reverted — see the `Partitioning` module note.
-pub const PTLAS_PARTITION_COUNT: u32 = 1;
+/// Regular-partition count. Partition 0 = the legacy shared static partition
+/// (un-hinted statics); 1.. are CPU-assigned per streamed spatial cell via
+/// `SolariPartition` — tight AABBs by construction (the earlier HASHED grid
+/// gave scene-spanning partitions and was reverted; explicit cell ids don't).
+/// Movers stay in the global partition.
+pub const PTLAS_PARTITION_COUNT: u32 = 16384;
 
 /// Uniform layout shared with `ptlas_fill.wgsl::PtlasFillParams`.
 #[repr(C)]
@@ -294,6 +295,10 @@ pub struct Ptlas {
     pub seed_epoch: EpochTable,
     /// Bytes committed on [`Self::scratch`] this frame (sizing query + align pad).
     pub scratch_commit: u64,
+    /// Slots freed AND re-bound in the same frame: their null lands this build,
+    /// the re-write next build — an instance index must never move partitions
+    /// (or fight a null) inside one incremental build.
+    pub deferred_adds: Vec<u32>,
 
     /// Debug (SOLARI_PTLAS_VALIDATE): GPU report of corrupt BLAS addresses
     /// caught in the WRITE stream ([0..4)=valid span, [4]=count, [5..)=entries),
@@ -467,6 +472,7 @@ pub fn init_ptlas(
         written_partition_capacity: 1,
         seed_epoch,
         scratch_commit: 0,
+        deferred_adds: Vec::new(),
         validate_report,
         validate_staging,
         validate_in_flight: false,
@@ -528,17 +534,29 @@ pub fn prepare_ptlas_params(
     // the very first build (no `src` to carry from). A change in hair count
     // also grows/shrinks the space and is folded into `high_water`.
     let grew = high_water > resources.as_capacity;
-    // A regenerate churns a large fraction of the slot space in a burst — a mass
-    // despawn of the old scene AND a respawn that streams in many new slots over
-    // several frames. The incremental in-place PTLAS update can't absorb a mass
-    // *add* any more than a mass despawn (the build faults → device lost), so any
-    // frame with a large add or disable takes the proven full-rebuild path; normal
-    // mover frames (a handful of either) stay incremental.
-    const MASS_CHURN_FULL_REBUILD: usize = 4096;
-    let mass_churn = instances.disabled_slots().len() > MASS_CHURN_FULL_REBUILD
-        || instances.added_slots().len() > MASS_CHURN_FULL_REBUILD;
+    // ANY CPU-known churn (add/remove/rewrite) takes the full-rebuild path:
+    // incremental updates that WRITE instances across many regular partitions
+    // fault the driver (580.159) — full rebuilds with 1024 partitions are clean
+    // and measured fast. Pure mover / no-op frames stay incremental (or skip).
+    let churn = !instances.added_slots().is_empty()
+        || !instances.disabled_slots().is_empty()
+        || !instances.rewrite_slots().is_empty()
+        || !resources.deferred_adds.is_empty();
     let full_rebuild =
-        !resources.has_built || grew || mass_churn || ptlas_force_full_rebuild();
+        !resources.has_built || grew || churn || ptlas_force_full_rebuild();
+    if churn {
+        tracing::debug!(
+            "ptlas churn: +{} -{} ~{} deferred {}",
+            instances.added_slots().len(),
+            instances.disabled_slots().len(),
+            instances.rewrite_slots().len(),
+            resources.deferred_adds.len(),
+        );
+    }
+    if full_rebuild {
+        // force_all restamps every active slot — parked re-adds are covered.
+        resources.deferred_adds.clear();
+    }
 
     // Grow the per-slot written-flags mirror with the slot space. Fresh
     // buffer = all zeros, consistent because growth forces a full rebuild
@@ -586,30 +604,63 @@ pub fn prepare_ptlas_params(
     // by `fill_incremental`.
     resources.write_slots_cpu.clear();
     if !full_rebuild {
+        // ONE record per instance per build (duplicates are spec-UB and corrupt
+        // the partitioned build), and an instance index freed + re-bound in one
+        // frame is written over TWO builds: null now, re-write next build — a
+        // same-build null/write pair (or a cross-partition move without an
+        // intervening remove) corrupts the incremental partitioned build.
+        let disabled: std::collections::HashSet<u32> =
+            instances.disabled_slots().iter().map(|s| s.0).collect();
+        let mut seeded: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for slot in core::mem::take(&mut resources.deferred_adds) {
+            // Freed again while parked → the instance is gone; drop the re-add.
+            if disabled.contains(&slot) {
+                continue;
+            }
+            if seeded.insert(slot) {
+                resources.write_slots_cpu.push(PtlasWritePair {
+                    slot,
+                    null_flag: PAIR_NORMAL,
+                });
+            }
+        }
         for slot in instances
             .added_slots()
             .iter()
             .chain(instances.rewrite_slots())
         {
-            resources.write_slots_cpu.push(PtlasWritePair {
-                slot: slot.0,
-                null_flag: PAIR_NORMAL,
-            });
-        }
-        for slot in instances.disabled_slots() {
-            resources.write_slots_cpu.push(PtlasWritePair {
-                slot: slot.0,
-                null_flag: PAIR_NULL,
-            });
+            if disabled.contains(&slot.0) {
+                resources.deferred_adds.push(slot.0);
+                continue;
+            }
+            if seeded.insert(slot.0) {
+                resources.write_slots_cpu.push(PtlasWritePair {
+                    slot: slot.0,
+                    null_flag: PAIR_NORMAL,
+                });
+            }
         }
         // Animated instances rebuild their per-instance BLAS in place every frame
         // (stable address, new content), which `fill_incremental` can't detect — a
         // still fox wouldn't "move". Force-rewrite them so the partition re-reads.
         if let Some(deform) = deform.as_ref() {
             for s in deform.active_slots() {
+                if disabled.contains(&s.instance_slot) {
+                    continue;
+                }
+                if seeded.insert(s.instance_slot) {
+                    resources.write_slots_cpu.push(PtlasWritePair {
+                        slot: s.instance_slot,
+                        null_flag: PAIR_NORMAL,
+                    });
+                }
+            }
+        }
+        for slot in instances.disabled_slots() {
+            if seeded.insert(slot.0) {
                 resources.write_slots_cpu.push(PtlasWritePair {
-                    slot: s.instance_slot,
-                    null_flag: PAIR_NORMAL,
+                    slot: slot.0,
+                    null_flag: PAIR_NULL,
                 });
             }
         }
@@ -738,6 +789,20 @@ pub fn prepare_ptlas_params(
         || resources.as_handle_size != sizes_info.acceleration_structure_size
     {
         let _span = tracing::info_span!("ptlas.create_as_handle").entered();
+        tracing::info!(
+            "ptlas: AS size {} MiB, scratch {} MiB (capacity {}, {} partitions)",
+            sizes_info.acceleration_structure_size >> 20,
+            sizes_info.build_scratch_size >> 20,
+            capacity,
+            PTLAS_PARTITION_COUNT,
+        );
+        tracing::info!(
+            "ptlas: AS size {} MiB, scratch {} MiB (capacity {}, {} partitions)",
+            sizes_info.acceleration_structure_size >> 20,
+            sizes_info.build_scratch_size >> 20,
+            capacity,
+            PTLAS_PARTITION_COUNT,
+        );
         for i in 0..2 {
             resources.tlas[i] = None; // Drop old handle first (frees the VkAS).
             // SAFETY: as_hal yields the raw VkBuffer while the SparseBuffer
@@ -822,6 +887,7 @@ pub fn prepare_ptlas_fill_bind_group(
     transforms: Option<Res<GpuColumn<TransformColumn>>>,
     node_slots: Option<Res<GpuColumn<NodeSlotColumn>>>,
     static_flags: Option<Res<GpuColumn<Presence<StaticColumn>>>>,
+    partition_hints: Option<Res<GpuColumn<crate::instance::PartitionColumn>>>,
     render_device: Res<RenderDevice>,
 ) {
     let Some(ptlas) = ptlas.as_deref_mut() else {
@@ -836,6 +902,7 @@ pub fn prepare_ptlas_fill_bind_group(
         Some(transforms),
         Some(node_slots),
         Some(static_flags),
+        Some(partition_hints),
     ) = (
         resource_manager,
         sharing,
@@ -845,6 +912,7 @@ pub fn prepare_ptlas_fill_bind_group(
         transforms,
         node_slots,
         static_flags,
+        partition_hints,
     )
     else {
         ptlas.bind_group = None;
@@ -900,6 +968,7 @@ pub fn prepare_ptlas_fill_bind_group(
             ptlas.instance_written_partition.as_entire_binding(),
             ptlas.validate_report.as_entire_binding(),
             ptlas.seed_epoch.buffer().as_entire_binding(),
+            partition_hints.buffer().as_entire_binding(),
         )),
     );
     ptlas.bind_group = Some(group);

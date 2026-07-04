@@ -30,7 +30,7 @@ use bevy_render::{
 };
 use bytemuck::{Pod, Zeroable};
 
-use crate::instance::{
+use crate::instance::{PartitionColumn, 
     GeometryIdColumn, GroupBaseColumn, LodInputColumn, NodeSlotColumn, RtJournal,
 };
 use crate::ecs_gpu::GpuColumn;
@@ -70,6 +70,7 @@ fn reconcile_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_sized(false, None),           // 3 geometry_ids (rw)
                 storage_buffer_sized(false, None),           // 4 group_bases (rw)
                 storage_buffer_sized(false, None),           // 5 lod_inputs (rw)
+                storage_buffer_sized(false, None),           // 6 partition_hints (rw)
             ),
         ),
     )
@@ -133,6 +134,7 @@ pub fn prepare_rt_reconcile_bind_group(
     geometry_ids: Option<Res<GpuColumn<GeometryIdColumn>>>,
     group_bases: Option<Res<GpuColumn<GroupBaseColumn>>>,
     lod_inputs: Option<Res<GpuColumn<LodInputColumn>>>,
+    partition_hints: Option<Res<GpuColumn<PartitionColumn>>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
@@ -143,7 +145,8 @@ pub fn prepare_rt_reconcile_bind_group(
         Some(geometry_ids),
         Some(group_bases),
         Some(lod_inputs),
-    ) = (reconcile, journal, node_slots, geometry_ids, group_bases, lod_inputs)
+        Some(partition_hints),
+    ) = (reconcile, journal, node_slots, geometry_ids, group_bases, lod_inputs, partition_hints)
     else {
         return;
     };
@@ -170,6 +173,7 @@ pub fn prepare_rt_reconcile_bind_group(
             geometry_ids.buffer().as_entire_binding(),
             group_bases.buffer().as_entire_binding(),
             lod_inputs.buffer().as_entire_binding(),
+            partition_hints.buffer().as_entire_binding(),
         )),
     ));
 }

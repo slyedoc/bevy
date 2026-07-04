@@ -19,6 +19,7 @@ impl Plugin for SolariDebugPlugin {
                 // "view" dropdown (normal / time heatmap) + the cost-heatmap sliders.
                 ui::spawn_view_panels,
                 ui::update_view_label,
+                ui::update_stats_label,
                 ui::toggle_heatmap_controls,
             ),
         );

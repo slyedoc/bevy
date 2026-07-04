@@ -127,6 +127,12 @@ impl<T: GpuSlotTable> GpuSlotAllocator<T> {
     pub fn high_water(&self) -> u32 {
         self.slots.next
     }
+
+    /// Currently-live slots (high-water minus the free list).
+    #[inline]
+    pub fn live(&self) -> u32 {
+        self.slots.next - self.slots.free.len() as u32
+    }
 }
 
 /// Main world: assign a slot to every new member of table `T` (matches

@@ -184,6 +184,8 @@ pub mod prelude {
         lights::SolariDirectionLight,
         material::{SolariMaterial3d, StandardSolariMaterial},
         ray_query::picking::SolariPickingPlugin,
+        accel::ClusterSelectorSettings,
+        instance::SolariPartition,
         render::atmosphere::{SolariAtmosphere, SolariAtmosphereVolume, SolariGlobalFog},
         render::rt_pipeline::SolariAnyHitHeatmap,
         render::rt_pipeline::SolariClusterView,

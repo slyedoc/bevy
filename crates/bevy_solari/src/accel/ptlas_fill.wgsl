@@ -133,6 +133,12 @@ const PTLAS_GLOBAL_PARTITION: u32 = 0xffffffffu;
 /// / node-less instance) goes to the global partition, which NV builds
 /// per-instance — so a moved mover never dirties the static partition.
 fn resolve_partition(slot: u32) -> u32 {
+    // Explicit spatial hint wins: one tight partition per streamed cell gives
+    // the driver a per-cell BVH + per-cell incremental rebuilds.
+    let hint = partition_hints[slot];
+    if hint != PTLAS_GLOBAL_PARTITION {
+        return hint;
+    }
     let node = node_slots[slot];
     // No transform node (defensive) or not static → global.
     if node == PTLAS_GLOBAL_PARTITION || static_flags[node] == 0u {
@@ -310,6 +316,10 @@ fn fill_incremental(
 fn finalize() {
     src_infos[1] = atomicLoad(&write_count[0]);
 }
+
+// slot-indexed: PTLAS regular-partition hint (0xffffffff = derive from the
+// static flag). CPU-assigned per streamed cell — tight per-cell partitions.
+@group(1) @binding(19) var<storage, read> partition_hints: array<u32>;
 
 // slot-indexed: the epoch `fill_seed` last wrote this slot's record in.
 // `fill_incremental` skips epoch-stamped slots — an instance must be WRITTEN

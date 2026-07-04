@@ -8,7 +8,7 @@
 // Must match `instance::journal::InstanceJournalRecord` (48 B, 12 × u32).
 struct JournalRecord {
     slot: u32,
-    pad0: u32,
+    partition_hint: u32,
     op: u32,
     geometry_id: u32,
     material_id: u32,
@@ -42,6 +42,8 @@ struct ReconcileParams {
 @group(0) @binding(4) var<storage, read_write> group_bases: array<u32>;
 // `InstanceLodInputGpu` = (cluster_base, cluster_count, group_base, root_group).
 @group(0) @binding(5) var<storage, read_write> lod_inputs: array<vec4<u32>>;
+// PTLAS regular-partition hint (0xffffffff = derive from the static flag).
+@group(0) @binding(6) var<storage, read_write> partition_hints: array<u32>;
 
 @compute @workgroup_size(64)
 fn reconcile_apply(
@@ -69,4 +71,5 @@ fn reconcile_apply(
     // reconcile and the CPU writer produce byte-identical columns (the authority flip
     // relies on this).
     lod_inputs[slot] = vec4<u32>(rec.cluster_base, rec.cluster_count, rec.group_base, rec.root_group);
+    partition_hints[slot] = rec.partition_hint;
 }

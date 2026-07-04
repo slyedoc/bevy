@@ -146,7 +146,7 @@ pub fn update_render_debug_label(
 // (`SolariShowDisplacement.enabled`). In heatmap view the two sliders (center,
 // contrast) appear and the DLSS dropdown hides; otherwise it's the reverse.
 
-pub use view_panel::{spawn_view_panels, toggle_heatmap_controls, update_view_label};
+pub use view_panel::{spawn_view_panels, toggle_heatmap_controls, update_stats_label, update_view_label};
 
 mod view_panel {
     use super::*;
@@ -159,6 +159,10 @@ mod view_panel {
     use bevy_feathers::controls::FeathersSlider;
     use bevy_feathers::theme::ThemeBackgroundColor;
     use bevy_feathers::tokens::WINDOW_BG;
+    use bevy_feathers::constants::{fonts, size};
+    use bevy_feathers::theme::ThemeTextColor;
+    use bevy_feathers::tokens;
+    use bevy_text::{FontSourceTemplate, FontWeight, LineBreak, TextFont, TextLayout};
     use bevy_ui::{Display, FlexDirection, UiRect};
     use bevy_ui_widgets::{slider_self_update, SliderPrecision, ValueChange};
 
@@ -169,6 +173,19 @@ mod view_panel {
     /// Marker on the view button caption.
     #[derive(Component, Default, Clone)]
     pub struct ViewLabel;
+
+    /// Marker on the view panel card root (the shared debug card — stats,
+    /// view dropdown, heatmap sliders, and the DLSS dropdown all live in it).
+    #[derive(Component, Default, Clone)]
+    pub struct ViewPanelRoot;
+
+    /// Marker on the live transform-count line.
+    #[derive(Component, Default, Clone)]
+    pub struct StatsTransformsLabel;
+
+    /// Marker on the live RT-instance-count line.
+    #[derive(Component, Default, Clone)]
+    pub struct StatsRtLabel;
 
     /// Marker on the container holding the heatmap sliders (shown only in heatmap view).
     #[derive(Component, Default, Clone)]
@@ -226,8 +243,31 @@ mod view_panel {
                     ThemeBackgroundColor(WINDOW_BG),
                     TabGroup::default(),
                     UiTargetCamera(camera),
+                    ViewPanelRoot,
                 ))
                 .queue_spawn_related_scenes::<Children>(bsn_list! {
+                    (
+                        Text("")
+                        TextFont {
+                            font: FontSourceTemplate::Handle(fonts::REGULAR),
+                            font_size: size::EXTRA_SMALL_FONT,
+                            weight: FontWeight::NORMAL,
+                        }
+                        TextLayout { linebreak: LineBreak::NoWrap }
+                        ThemeTextColor(tokens::TEXT_DIM)
+                        StatsTransformsLabel
+                    ),
+                    (
+                        Text("")
+                        TextFont {
+                            font: FontSourceTemplate::Handle(fonts::REGULAR),
+                            font_size: size::EXTRA_SMALL_FONT,
+                            weight: FontWeight::NORMAL,
+                        }
+                        TextLayout { linebreak: LineBreak::NoWrap }
+                        ThemeTextColor(tokens::TEXT_DIM)
+                        StatsRtLabel
+                    ),
                     (
                         @FeathersMenu
                         Children [
@@ -311,6 +351,35 @@ mod view_panel {
         }
     }
 
+    /// Live scene stats above the view dropdown: transform-table nodes and
+    /// main-world RT mesh entities (thousands-grouped), one line each.
+    pub fn update_stats_label(
+        transforms: Res<crate::ecs_gpu::GpuSlotAllocator<crate::transform::TransformGraph>>,
+        rt: Query<(), With<crate::bindings::RaytracingMesh3d>>,
+        mut tf_labels: Query<&mut Text, (With<StatsTransformsLabel>, Without<StatsRtLabel>)>,
+        mut rt_labels: Query<&mut Text, With<StatsRtLabel>>,
+    ) {
+        fn k(n: u32) -> String {
+            match n {
+                0..=9_999 => n.to_string(),
+                10_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
+                _ => format!("{:.2}M", n as f64 / 1_000_000.0),
+            }
+        }
+        let tf = format!("transforms {}", k(transforms.live()));
+        let rt_count = format!("rt {}", k(rt.iter().len() as u32));
+        for mut text in &mut tf_labels {
+            if text.0 != tf {
+                text.0 = tf.clone();
+            }
+        }
+        for mut text in &mut rt_labels {
+            if text.0 != rt_count {
+                text.0 = rt_count.clone();
+            }
+        }
+    }
+
     /// Show the heatmap sliders only in heatmap view.
     pub fn toggle_heatmap_controls(
         heatmap: Res<SolariCostHeatmap>,
@@ -349,8 +418,8 @@ mod dlss_dropdown {
     #[derive(Component)]
     pub struct DlssPanelSpawned;
 
-    /// Marker on the DLSS dropdown root node, so it can be hidden in heatmap view.
-    #[derive(Component)]
+    /// Marker on the DLSS dropdown row (inside the view card), hidden in heatmap view.
+    #[derive(Component, Default, Clone)]
     pub struct DlssPanelRoot;
 
     /// Marker on the DLSS button caption.
@@ -369,50 +438,50 @@ mod dlss_dropdown {
         }
     }
 
-    /// Spawn one bottom-left DLSS dropdown per [`SolariCamera`] (the render-debug
-    /// dropdown sits bottom-right and targets raster cameras, so they don't collide).
+    /// Add the DLSS dropdown INTO each camera's view-panel card (below the view
+    /// dropdown / sliders), so the debug widgets read as one panel.
     pub fn spawn_dlss_panels(
-        cameras: Query<Entity, (With<SolariCamera>, Without<DlssPanelSpawned>)>,
+        cameras: Query<(), (With<SolariCamera>, Without<DlssPanelSpawned>)>,
+        panels: Query<(Entity, &UiTargetCamera), With<view_panel::ViewPanelRoot>>,
         mut commands: Commands,
     ) {
-        for camera in &cameras {
+        for (panel, target) in &panels {
+            if cameras.get(target.0).is_err() {
+                continue; // camera already has its dropdown (or isn't solari)
+            }
             commands
-                .spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        bottom: px(8),
-                        left: px(8),
-                        ..Default::default()
-                    },
-                    TabGroup::default(),
-                    UiTargetCamera(camera),
-                    DlssPanelRoot,
-                ))
+                .entity(panel)
                 .queue_spawn_related_scenes::<Children>(bsn_list! {
                     (
-                        @FeathersMenu
+                        Node {}
+                        DlssPanelRoot
                         Children [
                             (
-                                @FeathersMenuButton {
-                                    @caption: bsn! { Text("dlss: off") ThemedText DlssLabel }
-                                }
-                            ),
-                            (
-                                @FeathersMenuPopup
+                                @FeathersMenu
                                 Children [
-                                    dlss_item(SolariDlssMode::Off),
-                                    dlss_item(SolariDlssMode::Auto),
-                                    dlss_item(SolariDlssMode::Dlaa),
-                                    dlss_item(SolariDlssMode::Quality),
-                                    dlss_item(SolariDlssMode::Balanced),
-                                    dlss_item(SolariDlssMode::Performance),
-                                    dlss_item(SolariDlssMode::UltraPerformance),
+                                    (
+                                        @FeathersMenuButton {
+                                            @caption: bsn! { Text("dlss: off") ThemedText DlssLabel }
+                                        }
+                                    ),
+                                    (
+                                        @FeathersMenuPopup
+                                        Children [
+                                            dlss_item(SolariDlssMode::Off),
+                                            dlss_item(SolariDlssMode::Auto),
+                                            dlss_item(SolariDlssMode::Dlaa),
+                                            dlss_item(SolariDlssMode::Quality),
+                                            dlss_item(SolariDlssMode::Balanced),
+                                            dlss_item(SolariDlssMode::Performance),
+                                            dlss_item(SolariDlssMode::UltraPerformance),
+                                        ]
+                                    )
                                 ]
                             )
                         ]
                     )
                 });
-            commands.entity(camera).insert(DlssPanelSpawned);
+            commands.entity(target.0).insert(DlssPanelSpawned);
         }
     }
 

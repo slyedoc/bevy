@@ -153,6 +153,19 @@ impl GpuColumnDesc for InstanceMaskColumn {
     }
 }
 
+/// Per-instance PTLAS regular-partition hint (`PARTITION_HINT_NONE` = derive
+/// from the static flag). Bind-only, **reconcile-written** — the CPU assigns
+/// spatially-tight ids (one per streamed cell) via [`super::SolariPartition`].
+pub struct PartitionColumn;
+impl GpuColumnDesc for PartitionColumn {
+    type Value = u32;
+    type Table = InstanceManager;
+    const LABEL: &'static str = "gpu_instances.partition_hints";
+    fn delta_records(_: &InstanceManager) -> &[u32] {
+        &[]
+    }
+}
+
 /// Per-instance transform-table node slot — the foreign key bridging an RT
 /// instance to its node in the [`TransformGraph`](crate::transform::TransformGraph).
 /// Bind-only (an entity's `GpuSlot` is stable). The transform-gather pass reads it
@@ -208,6 +221,7 @@ pub fn cluster_columns_ready(
     // a static instance is never re-written). `Option` (None = column not up yet
     // → not ready) keeps this safe on a non-solari device.
     static_flags: Option<Res<GpuColumn<Presence<StaticColumn>>>>,
+    partition_hints: Option<Res<GpuColumn<PartitionColumn>>>,
     cache: Res<PipelineCache>,
 ) -> bool {
     columns.transforms.scatter_pipeline_ready(&cache)
@@ -217,6 +231,7 @@ pub fn cluster_columns_ready(
         && columns.geometry_ids.scatter_pipeline_ready(&cache)
         && columns.instance_masks.scatter_pipeline_ready(&cache)
         && columns.node_slots.scatter_pipeline_ready(&cache)
+        && partition_hints.is_some_and(|c| c.scatter_pipeline_ready(&cache))
         && static_flags.is_some_and(|c| c.scatter_pipeline_ready(&cache))
 }
 
@@ -234,6 +249,7 @@ impl Plugin for GpuInstancesPlugin {
             GpuColumnPlugin::<GeometryIdColumn>::default(),
             GpuColumnPlugin::<InstanceMaskColumn>::default(),
             GpuColumnPlugin::<NodeSlotColumn>::default(),
+            GpuColumnPlugin::<PartitionColumn>::default(),
         ));
     }
 }

@@ -37,6 +37,9 @@ pub const JOURNAL_OP_REMOVE: u32 = 1;
 /// CPU re-pack and the record stays narrow. `node_key` is the **stable**
 /// transform-table slot (`GpuSlot<TransformGraph>`), resolved to a world matrix
 /// GPU-side — never a frozen transform.
+/// No explicit partition: the fill derives static→regular-0 / mover→global.
+pub const PARTITION_HINT_NONE: u32 = 0xffff_ffff;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct InstanceJournalRecord {
@@ -45,8 +48,10 @@ pub struct InstanceJournalRecord {
     /// atomically from one record, so a reused slot is fully re-initialized in a
     /// single pass — no partial/stale column survives (the aliasing fix).
     pub slot: u32,
-    /// Reserved (keeps the 16-byte std430 alignment of the following fields).
-    pub _pad0: u32,
+    /// PTLAS regular-partition hint ([`PARTITION_HINT_NONE`] = derive from the
+    /// static flag as before). Spatially-tight ids (e.g. one per vegetation
+    /// cell) give the driver per-cell BVHs + per-cell incremental rebuilds.
+    pub partition_hint: u32,
     /// [`JOURNAL_OP_UPSERT`] or [`JOURNAL_OP_REMOVE`].
     pub op: u32,
     /// Dense `ClusterMesh` geometry id (stable, asset-resident).
@@ -79,7 +84,7 @@ const _: () = {
     use core::mem::offset_of;
     assert!(size_of::<InstanceJournalRecord>() == 48);
     assert!(offset_of!(InstanceJournalRecord, slot) == 0);
-    assert!(offset_of!(InstanceJournalRecord, _pad0) == 4);
+    assert!(offset_of!(InstanceJournalRecord, partition_hint) == 4);
     assert!(offset_of!(InstanceJournalRecord, op) == 8);
     assert!(offset_of!(InstanceJournalRecord, geometry_id) == 12);
     assert!(offset_of!(InstanceJournalRecord, material_id) == 16);
@@ -100,6 +105,7 @@ impl InstanceJournalRecord {
         Self {
             slot,
             op: JOURNAL_OP_REMOVE,
+            partition_hint: PARTITION_HINT_NONE,
             ..Default::default()
         }
     }
@@ -118,10 +124,11 @@ impl InstanceJournalRecord {
         cluster_base: u32,
         cluster_count: u32,
         root_group: u32,
+        partition_hint: u32,
     ) -> Self {
         Self {
             slot,
-            _pad0: 0,
+            partition_hint,
             op: JOURNAL_OP_UPSERT,
             geometry_id,
             material_id,

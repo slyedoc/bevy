@@ -28,7 +28,8 @@ use crate::geometry::{ClusterIndex, GroupIndex, GpuEntity};
 use crate::bindings::RaytracingMesh3d;
 use crate::geometry::ClusterMesh;
 use crate::material::MaterialSlots;
-use super::journal::{InstanceJournalRecord, RtJournal};
+use super::journal::{InstanceJournalRecord, RtJournal, PARTITION_HINT_NONE};
+use bevy_ecs::hierarchy::ChildOf;
 use bevy_asset::{AssetEvent, AssetId, AssetServer, Assets};
 use bytemuck::{Pod, Zeroable};
 use bevy_ecs::{
@@ -579,6 +580,30 @@ pub fn mark_instance_layers_changed(
 
 /// Unfiltered fetch of one entity's data, keyed by main entity. `RenderEntity`
 /// yields the synced render entity (where the slot/`RaytracingGpuEntity` lives).
+/// PTLAS regular-partition hint for an instance and its descendants (looked up
+/// through the hierarchy at bind time). Assign one id per streamed spatial cell
+/// so the partitioned build gets tight per-cell BVHs + per-cell rebuilds. Must
+/// be present BEFORE the meshes bind (spawn it on the cell/wrapper root).
+#[derive(bevy_ecs::component::Component, Clone, Copy, Debug)]
+pub struct SolariPartition(pub u32);
+
+/// Nearest `SolariPartition` on `entity` or its ancestors.
+fn resolve_partition_hint(
+    entity: Entity,
+    partitions: &Query<&SolariPartition>,
+    parents: &Query<&ChildOf>,
+) -> u32 {
+    let mut e = entity;
+    for _ in 0..64 {
+        if let Ok(p) = partitions.get(e) {
+            return p.0;
+        }
+        let Ok(c) = parents.get(e) else { break };
+        e = c.parent();
+    }
+    PARTITION_HINT_NONE
+}
+
 type ExtractGetData = (
     RenderEntity,
     &'static RaytracingMesh3d,
@@ -650,6 +675,8 @@ pub fn flush_cluster_instances(
                 ResMut<'static, Assets<ClusterMesh>>,
                 MessageReader<'static, 'static, AssetEvent<ClusterMesh>>,
                 ResMut<'static, RtInstanceChanges>,
+                Query<'static, 'static, &'static SolariPartition>,
+                Query<'static, 'static, &'static ChildOf>,
             )>,
         >,
     >,
@@ -658,7 +685,7 @@ pub fn flush_cluster_instances(
         *system_state = Some(SystemState::new(&mut main_world));
     }
     let state = system_state.as_mut().unwrap();
-    let Ok((get_one, asset_server, mut assets, mut asset_events, mut changes)) =
+    let Ok((get_one, asset_server, mut assets, mut asset_events, mut changes, partitions, parents)) =
         state.get_mut(&mut main_world)
     else {
         return;
@@ -711,6 +738,7 @@ pub fn flush_cluster_instances(
                 material_id,
                 node_slot,
                 cull_mask,
+                resolve_partition_hint(main_entity, &partitions, &parents),
             );
             // Bound here this frame — drop any stale `pending` entry so the
             // retry below doesn't bind it a second time.
@@ -758,6 +786,7 @@ pub fn flush_cluster_instances(
                     material_id,
                     node_slot,
                     cull_mask,
+                    resolve_partition_hint(main_entity, &partitions, &parents),
                 );
             } else {
                 pending.insert(main_entity);
@@ -778,6 +807,7 @@ fn push_instance_upsert(
     material: AssetId<StandardSolariMaterial>,
     node_slot: u32,
     cull_mask: u32,
+    partition_hint: u32,
 ) {
     let Some(journal) = journal else {
         return;
@@ -794,6 +824,7 @@ fn push_instance_upsert(
         pointers.cluster_base.0,
         pointers.cluster_count,
         pointers.root_group.0,
+        partition_hint,
     ));
 }
 
