@@ -318,8 +318,8 @@ pub fn prepare_animated_blas(
     );
 
     // Params: deform pool + instantiated-CLAS-addr device addresses.
-    let deform_addr = allocator.wgpu_buffer_device_address(&deform.positions);
-    let clas_addrs = allocator.wgpu_buffer_device_address(&resources.instantiated_clas_addrs);
+    let deform_addr = deform.positions.stable_addr().get();
+    let clas_addrs = allocator.wgpu_buffer_device_address(&resources.instantiated_clas_addrs).get();
     // Set params here; the uniform is uploaded by `prepare_animated_blas_params`
     // (which has the `RenderDevice`).
     *resources.params.get_mut() = InstantiateParams {
@@ -530,13 +530,13 @@ pub fn dispatch_animated_blas(
 
     let inst_scratch = align_addr(resources.instantiate_scratch.address, SCRATCH_ALIGN);
     let blas_scratch = align_addr(resources.blas_scratch.address, SCRATCH_ALIGN);
-    let inst_args_addr = allocator.wgpu_buffer_device_address(&resources.instantiate_args);
-    let inst_count_addr = allocator.wgpu_buffer_device_address(&resources.count);
-    let inst_addrs_addr = allocator.wgpu_buffer_device_address(&resources.instantiated_clas_addrs);
-    let inst_sizes_addr = allocator.wgpu_buffer_device_address(&resources.instantiated_clas_sizes);
-    let blas_args_addr = allocator.wgpu_buffer_device_address(&resources.blas_args);
-    let blas_dst_addr = allocator.wgpu_buffer_device_address(&resources.blas_dst_addresses);
-    let blas_count_addr = allocator.wgpu_buffer_device_address(&resources.blas_count);
+    let inst_args_addr = allocator.wgpu_buffer_device_address(&resources.instantiate_args).get();
+    let inst_count_addr = allocator.wgpu_buffer_device_address(&resources.count).get();
+    let inst_addrs_addr = allocator.wgpu_buffer_device_address(&resources.instantiated_clas_addrs).get();
+    let inst_sizes_addr = allocator.wgpu_buffer_device_address(&resources.instantiated_clas_sizes).get();
+    let blas_args_addr = allocator.wgpu_buffer_device_address(&resources.blas_args).get();
+    let blas_dst_addr = allocator.wgpu_buffer_device_address(&resources.blas_dst_addresses).get();
+    let blas_count_addr = allocator.wgpu_buffer_device_address(&resources.blas_count).get();
 
     let inst_cmd = vk::ClusterAccelerationStructureCommandsInfoNV {
         s_type: vk::ClusterAccelerationStructureCommandsInfoNV::STRUCTURE_TYPE,

@@ -230,7 +230,7 @@ pub fn dispatch_blas_rebuild(
     // `dst_addresses_array` as INPUT (the GPU-written per-bucket
     // addresses); `dst_implicit_data` is unused in this mode but the
     // validation layer requires a valid address.
-    let args_addr = allocator.wgpu_buffer_device_address(&selector.args_buf.wgpu_buffer);
+    let args_addr = allocator.wgpu_buffer_device_address(&selector.args_buf.wgpu_buffer).get();
     let cmd_info = vk::ClusterAccelerationStructureCommandsInfoNV {
         s_type: vk::ClusterAccelerationStructureCommandsInfoNV::STRUCTURE_TYPE,
         p_next: core::ptr::null_mut(),
@@ -254,7 +254,7 @@ pub fn dispatch_blas_rebuild(
         // `build_count` (= min(dirty_build_count, capacity)). The driver
         // builds exactly the live buckets, not the instance count, and
         // never more than `max_acceleration_structure_count`.
-        src_infos_count: allocator.wgpu_buffer_device_address(&sharing.build_count),
+        src_infos_count: allocator.wgpu_buffer_device_address(&sharing.build_count).get(),
         address_resolution_flags:
             vk::ClusterAccelerationStructureAddressResolutionFlagsNV::default(),
         _marker: core::marker::PhantomData,

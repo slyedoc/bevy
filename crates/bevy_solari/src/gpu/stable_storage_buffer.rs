@@ -26,7 +26,7 @@ use bevy_render::{
 };
 use core::num::NonZeroU64;
 
-use super::allocator::{Allocator, SparseBuffer};
+use super::allocator::{Allocator, SparseBuffer, StableAddr};
 
 /// A persistent storage buffer at a stable device address. `V` is the whole stored
 /// value (e.g. `Vec<GpuMaterial>`), matching `render_resource::StorageBuffer<V>`;
@@ -123,8 +123,8 @@ impl<V: ShaderType + WriteInto> StableStorageBuffer<V> {
     /// Base device address — stable for the buffer's lifetime. For the bindless
     /// read path (`physical_load<T>(addr + i * stride)`).
     #[inline]
-    pub fn device_address(&self) -> vk::DeviceAddress {
-        self.sparse.address
+    pub fn device_address(&self) -> StableAddr {
+        StableAddr::new(self.sparse.address)
     }
 
     /// A descriptor binding sized to **exactly this frame's data**, so shader

@@ -268,7 +268,7 @@ impl ClasArena {
                 padded.resize(padded_len, 0);
                 render_queue.write_buffer(&buf, 0, &padded);
             }
-            let addr = allocator.wgpu_buffer_device_address(&buf);
+            let addr = allocator.wgpu_buffer_device_address(&buf).get();
             (buf, addr)
         };
         let (array_input, array_input_addr) = make_input(&omm.array_data[..], "omm.array_input");
@@ -316,7 +316,7 @@ impl ClasArena {
             MemoryLocation::GpuOnly,
             "omm.backing",
         );
-        let backing_addr = allocator.wgpu_buffer_device_address(&backing);
+        let backing_addr = allocator.wgpu_buffer_device_address(&backing).get();
         let create_info = vk::MicromapCreateInfoEXT::default()
             .buffer(backing_raw)
             .offset(0)
@@ -351,7 +351,7 @@ impl ClasArena {
             MemoryLocation::GpuOnly,
             "omm.scratch",
         );
-        let scratch_base = allocator.wgpu_buffer_device_address(&scratch);
+        let scratch_base = allocator.wgpu_buffer_device_address(&scratch).get();
         let scratch_addr = scratch_base.next_multiple_of(OMM_SCRATCH_ALIGN);
 
         // tracing::info!(
@@ -588,7 +588,7 @@ impl ClasArena {
             mapped_at_creation: false,
         });
         render_queue.write_buffer(&src_infos_buf, 0, desc_bytes);
-        let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos_buf);
+        let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos_buf).get();
 
         let count_buf = render_device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("clas_arena.src_infos_count"),
@@ -694,7 +694,7 @@ impl ClasArena {
             MemoryLocation::GpuOnly,
             "clas_arena.scratch",
         );
-        let scratch_addr_base = allocator.wgpu_buffer_device_address(&scratch_buf);
+        let scratch_addr_base = allocator.wgpu_buffer_device_address(&scratch_buf).get();
         let scratch_misalign = scratch_addr_base & (CLAS_SCRATCH_ALIGN - 1);
         let scratch_offset = if scratch_misalign == 0 {
             0
@@ -718,7 +718,7 @@ impl ClasArena {
             MemoryLocation::GpuOnly,
             "clas_arena.dst_addresses",
         );
-        let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses_buf);
+        let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses_buf).get();
 
         // 5. Encode + submit the cluster_AS build + address-table copy.
         let mut encoder =
@@ -744,7 +744,7 @@ impl ClasArena {
                 stride: desc_stride,
                 size: desc_bytes_len,
             },
-            src_infos_count: allocator.wgpu_buffer_device_address(&count_buf),
+            src_infos_count: allocator.wgpu_buffer_device_address(&count_buf).get(),
             address_resolution_flags:
                 vk::ClusterAccelerationStructureAddressResolutionFlagsNV::default(),
             _marker: core::marker::PhantomData,
@@ -880,9 +880,9 @@ pub fn upload_pending_clas(
     }
 
     let vertex_addr =
-        allocator.wgpu_buffer_device_address(cluster_meshes.vertex_positions.buffer());
+        allocator.wgpu_buffer_device_address(cluster_meshes.vertex_positions.buffer()).get();
     let index_addr =
-        allocator.wgpu_buffer_device_address(cluster_meshes.indices.buffer());
+        allocator.wgpu_buffer_device_address(cluster_meshes.indices.buffer()).get();
 
     let pending = std::mem::take(&mut cluster_meshes.pending_clas_uploads);
     for entry in pending {

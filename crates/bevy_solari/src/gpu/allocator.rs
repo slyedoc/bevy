@@ -77,6 +77,40 @@ pub enum MemoryLocation {
     GpuToCpu,
 }
 
+/// Device address stable for its buffer's WHOLE lifetime — only the
+/// never-moving wrappers ([`SparseBuffer`], `StableStorageBuffer`,
+/// `PersistentGpuBuffer`) mint one. Safe to store across frames (CPU structs,
+/// GPU tables, cached params).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StableAddr(u64);
+
+impl StableAddr {
+    #[inline]
+    pub(crate) fn new(addr: vk::DeviceAddress) -> Self {
+        Self(addr)
+    }
+
+    #[inline]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Device address valid only for work recorded before this frame's submit —
+/// consume it inline; do NOT store it. An address that must outlive the frame
+/// belongs to a stable wrapper ([`StableAddr`]) or behind a
+/// [`GpuRetire`](super::retire::GpuRetire) guard.
+#[derive(Clone, Copy, Debug)]
+#[must_use]
+pub struct SubmitAddr(u64);
+
+impl SubmitAddr {
+    #[inline]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Render-world resource holding raw Vulkan handles for the cluster-AS
 /// pipeline's buffer allocation path. Cloning is cheap (internal Arc)
 /// so downstream sub-managers can each hold their own handle.
@@ -439,14 +473,12 @@ impl Allocator {
         }
     }
 
-    /// Resolve a `wgpu::Buffer`'s `VkDeviceAddress`. Used when an
-    /// AS-build path needs the device address of a buffer wgpu (or
-    /// we through wgpu) owns. Requires `SHADER_DEVICE_ADDRESS_BIT` on
-    /// the underlying `VkBuffer` — set automatically for buffers from
-    /// [`create_buffer`](Self::create_buffer), and set by wgpu itself
-    /// when the `bufferDeviceAddress` feature is enabled (ray-tracing
-    /// requires it).
-    pub fn wgpu_buffer_device_address(&self, buf: &wgpu::Buffer) -> vk::DeviceAddress {
+    /// Resolve a `wgpu::Buffer`'s `VkDeviceAddress` — as a [`SubmitAddr`]:
+    /// valid for THIS frame's recording only, never stored. Requires
+    /// `SHADER_DEVICE_ADDRESS_BIT` on the underlying `VkBuffer` — set
+    /// automatically for buffers from [`create_buffer`](Self::create_buffer),
+    /// and set by wgpu itself when `bufferDeviceAddress` is enabled.
+    pub fn wgpu_buffer_device_address(&self, buf: &wgpu::Buffer) -> SubmitAddr {
         // SAFETY: as_hal yields the raw VkBuffer while `buf` is alive;
         // we only read the handle.
         let raw = unsafe {
@@ -465,7 +497,7 @@ impl Allocator {
         // passes through here — an Aftermath fault VA inside [addr, addr+size)
         // names it. Debug-gated (persistent consumers re-query per frame).
         tracing::debug!("addr taken: 0x{addr:x}+{} ({:?})", buf.size(), buf);
-        addr
+        SubmitAddr(addr)
     }
 
     fn find_memory_type(
@@ -549,6 +581,13 @@ impl SparseBuffer {
     #[inline]
     pub fn buffer(&self) -> &Buffer {
         &self.bevy_buffer
+    }
+
+    /// The buffer's [`StableAddr`] — sparse reservations never move or free
+    /// while the wrapper lives, so this is safe to store across frames.
+    #[inline]
+    pub fn stable_addr(&self) -> StableAddr {
+        StableAddr(self.address)
     }
 
     /// Ensure every page covering `byte_range` is backed by memory.

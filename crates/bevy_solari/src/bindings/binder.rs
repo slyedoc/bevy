@@ -39,7 +39,7 @@ pub struct RaytracingSceneBindings {
     /// [`StableStorageBuffer`](crate::gpu::stable_storage_buffer::StableStorageBuffer)
     /// via [`RawTraceBindable`](crate::gpu::RawTraceBindable), so it stays valid for
     /// any in-flight trace. `0` until the first bind-group build.
-    pub materials_device_address: ash::vk::DeviceAddress,
+    pub materials_device_address: crate::gpu::allocator::StableAddr,
 }
 
 /// The scene's per-frame-rebuilt tables, now on persistent **stable-address**
@@ -347,7 +347,7 @@ impl RaytracingSceneBindings {
     pub fn new() -> Self {
         Self {
             bind_group: None,
-            materials_device_address: 0,
+            materials_device_address: Default::default(),
             bind_group_layout: BindGroupLayoutDescriptor::new(
                 "raytracing_scene_bind_group_layout",
                 // `transforms` / `previous_frame_transforms` / `material_ids` /

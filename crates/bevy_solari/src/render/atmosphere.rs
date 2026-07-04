@@ -360,7 +360,7 @@ pub fn prepare_atmosphere_volumes(
                     | bevy_render::render_resource::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-        gpu.address = allocator.wgpu_buffer_device_address(&buffer);
+        gpu.address = allocator.wgpu_buffer_device_address(&buffer).get();
         gpu.lut_bind_group = None;
         gpu.buffer = Some(buffer);
     }

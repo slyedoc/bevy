@@ -7,7 +7,7 @@ use core::{num::NonZero, ops::Range};
 use range_alloc::RangeAllocator;
 use wgpu_types::WriteOnly;
 
-use super::allocator::{Allocator, SparseBuffer};
+use super::allocator::{Allocator, SparseBuffer, StableAddr};
 
 /// Wrapper for a GPU buffer holding a large amount of data that persists across
 /// frames. Backed by a [`SparseBuffer`]: growth commits more physical pages to the
@@ -180,8 +180,8 @@ impl<T: PersistentGpuBufferable> PersistentGpuBuffer<T> {
     /// is never freed). Safe to capture for the raw RT trace; see
     /// [`RawTraceBindable`](super::raw_trace::RawTraceBindable).
     #[inline]
-    pub fn device_address(&self) -> vk::DeviceAddress {
-        self.buffer.address
+    pub fn device_address(&self) -> StableAddr {
+        StableAddr::new(self.buffer.address)
     }
 }
 

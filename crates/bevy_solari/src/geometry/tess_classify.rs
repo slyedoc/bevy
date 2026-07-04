@@ -718,7 +718,7 @@ pub fn run_tess_classify(
     // each instantiate descriptor's vertex start address).
     if classify.gen_vertices_addr == 0 {
         if let Some(alloc) = allocator.as_ref() {
-            classify.gen_vertices_addr = alloc.wgpu_buffer_device_address(&classify.gen_vertices);
+            classify.gen_vertices_addr = alloc.wgpu_buffer_device_address(&classify.gen_vertices).get();
         }
     }
 
@@ -776,10 +776,10 @@ pub fn run_tess_classify(
                     MemoryLocation::GpuOnly,
                     "tess_classify.clas_addresses",
                 );
-                classify.tess_clas_storage_addr = alloc.wgpu_buffer_device_address(&storage);
+                classify.tess_clas_storage_addr = alloc.wgpu_buffer_device_address(&storage).get();
                 classify.tess_clas_scratch_addr =
-                    align_up(alloc.wgpu_buffer_device_address(&scratch), CLAS_SCRATCH_ALIGN);
-                classify.tess_clas_addresses_addr = alloc.wgpu_buffer_device_address(&addresses);
+                    align_up(alloc.wgpu_buffer_device_address(&scratch).get(), CLAS_SCRATCH_ALIGN);
+                classify.tess_clas_addresses_addr = alloc.wgpu_buffer_device_address(&addresses).get();
                 classify.tess_clas_storage = Some(storage.into());
                 classify.tess_clas_scratch = Some(scratch.into());
                 classify.tess_clas_addresses = Some(addresses.into());
@@ -804,7 +804,7 @@ pub fn run_tess_classify(
                     MemoryLocation::GpuOnly,
                     "tess_classify.references",
                 );
-                classify.references_addr = alloc.wgpu_buffer_device_address(&references);
+                classify.references_addr = alloc.wgpu_buffer_device_address(&references).get();
                 classify.references = Some(references.into());
                 let blas_addresses = alloc.create_buffer(
                     &render_device,
@@ -816,7 +816,7 @@ pub fn run_tess_classify(
                     MemoryLocation::GpuOnly,
                     "tess_classify.blas_addresses",
                 );
-                classify.blas_addresses_addr = alloc.wgpu_buffer_device_address(&blas_addresses);
+                classify.blas_addresses_addr = alloc.wgpu_buffer_device_address(&blas_addresses).get();
                 classify.blas_addresses = Some(blas_addresses.into());
                 classify.blas_sized_for = num_instances;
 
@@ -834,7 +834,7 @@ pub fn run_tess_classify(
                     MemoryLocation::GpuOnly,
                     "tess_classify.gen_attrs",
                 );
-                classify.gen_attrs_addr = alloc.wgpu_buffer_device_address(&gen_attrs);
+                classify.gen_attrs_addr = alloc.wgpu_buffer_device_address(&gen_attrs).get();
                 classify.gen_attrs = Some(gen_attrs.into());
                 let gen_attrs_meta = alloc.create_buffer(
                     &render_device,
@@ -844,7 +844,7 @@ pub fn run_tess_classify(
                     MemoryLocation::GpuOnly,
                     "tess_classify.gen_attrs_meta",
                 );
-                classify.gen_attrs_meta_addr = alloc.wgpu_buffer_device_address(&gen_attrs_meta);
+                classify.gen_attrs_meta_addr = alloc.wgpu_buffer_device_address(&gen_attrs_meta).get();
                 classify.gen_attrs_meta = Some(gen_attrs_meta.into());
                 tracing::debug!(
                     "tess_classify: sized shading attrs for {} parts (stride {} tris) — {} MiB",
@@ -1139,8 +1139,8 @@ pub fn run_tess_classify(
         let alloc = allocator.as_ref().unwrap();
         let fns_res = fns.as_ref().unwrap();
         let count = classify.total_base_tris;
-        let counts_addr = alloc.wgpu_buffer_device_address(&classify.counts);
-        let src_addr = alloc.wgpu_buffer_device_address(&classify.instantiate_infos);
+        let counts_addr = alloc.wgpu_buffer_device_address(&classify.counts).get();
+        let src_addr = alloc.wgpu_buffer_device_address(&classify.instantiate_infos).get();
         let mut tri_input = vk::ClusterAccelerationStructureTriangleClusterInputNV::default();
         let input = tess_instantiate_input(
             &mut tri_input,

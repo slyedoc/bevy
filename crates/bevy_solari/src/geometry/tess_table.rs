@@ -164,7 +164,7 @@ impl TessellationTable {
             mapped_at_creation: false,
         });
         render_queue.write_buffer(&verts_buf, 0, verts_bytes);
-        let verts_addr = allocator.wgpu_buffer_device_address(&verts_buf);
+        let verts_addr = allocator.wgpu_buffer_device_address(&verts_buf).get();
 
         let idx_bytes: &[u8] = bytemuck::cast_slice(&indices32);
         let idx_buf = render_device.create_buffer(&wgpu::BufferDescriptor {
@@ -176,7 +176,7 @@ impl TessellationTable {
             mapped_at_creation: false,
         });
         render_queue.write_buffer(&idx_buf, 0, idx_bytes);
-        let idx_addr = allocator.wgpu_buffer_device_address(&idx_buf);
+        let idx_addr = allocator.wgpu_buffer_device_address(&idx_buf).get();
 
         // ── Template descriptors (normal then flipped) ──────────────────────
         let mut max_tris = 0u32;
@@ -368,10 +368,10 @@ impl TessellationTable {
             core::slice::from_raw_parts(descriptors.as_ptr().cast::<u8>(), desc_bytes_len as usize)
         };
         let src_infos = blas_input_buffer(render_device, render_queue, "tess_table.tpl.src", desc_bytes);
-        let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos);
+        let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos).get();
         let count_buf =
             blas_input_buffer(render_device, render_queue, "tess_table.tpl.count", &count.to_le_bytes());
-        let count_addr = allocator.wgpu_buffer_device_address(&count_buf);
+        let count_addr = allocator.wgpu_buffer_device_address(&count_buf).get();
 
         let mut triangle_input = vk::ClusterAccelerationStructureTriangleClusterInputNV::default()
             .vertex_format(vk::Format::R32G32B32_SFLOAT)
@@ -409,7 +409,7 @@ impl TessellationTable {
             MemoryLocation::GpuOnly,
             "tess_table.template_storage",
         );
-        let storage_addr = allocator.wgpu_buffer_device_address(&storage);
+        let storage_addr = allocator.wgpu_buffer_device_address(&storage).get();
         let scratch = allocator.create_buffer(
             render_device,
             vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -418,7 +418,7 @@ impl TessellationTable {
             MemoryLocation::GpuOnly,
             "tess_table.template_scratch",
         );
-        let scratch_addr = align256(allocator.wgpu_buffer_device_address(&scratch));
+        let scratch_addr = align256(allocator.wgpu_buffer_device_address(&scratch).get());
 
         let addr_array_size = (count as u64) * 8;
         let dst_addresses = allocator.create_buffer(
@@ -431,7 +431,7 @@ impl TessellationTable {
             MemoryLocation::GpuOnly,
             "tess_table.template_dst_addresses",
         );
-        let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses);
+        let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses).get();
 
         let cmd = vk::ClusterAccelerationStructureCommandsInfoNV {
             s_type: vk::ClusterAccelerationStructureCommandsInfoNV::STRUCTURE_TYPE,
@@ -505,10 +505,10 @@ impl TessellationTable {
             core::slice::from_raw_parts(descs.as_ptr().cast::<u8>(), desc_bytes_len as usize)
         };
         let src_infos = blas_input_buffer(render_device, render_queue, "tess_table.inst.src", desc_bytes);
-        let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos);
+        let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos).get();
         let count_buf =
             blas_input_buffer(render_device, render_queue, "tess_table.inst.count", &count.to_le_bytes());
-        let count_addr = allocator.wgpu_buffer_device_address(&count_buf);
+        let count_addr = allocator.wgpu_buffer_device_address(&count_buf).get();
 
         let mut triangle_input = vk::ClusterAccelerationStructureTriangleClusterInputNV::default()
             .vertex_format(vk::Format::R32G32B32_SFLOAT)
@@ -544,7 +544,7 @@ impl TessellationTable {
             MemoryLocation::GpuOnly,
             "tess_table.inst_scratch",
         );
-        let scratch_addr = align256(allocator.wgpu_buffer_device_address(&scratch));
+        let scratch_addr = align256(allocator.wgpu_buffer_device_address(&scratch).get());
 
         let sizes_array_size = (count as u64) * 4;
         let dst_sizes = allocator.create_buffer(
@@ -555,7 +555,7 @@ impl TessellationTable {
             MemoryLocation::GpuOnly,
             "tess_table.inst_dst_sizes",
         );
-        let dst_sizes_addr = allocator.wgpu_buffer_device_address(&dst_sizes);
+        let dst_sizes_addr = allocator.wgpu_buffer_device_address(&dst_sizes).get();
 
         let cmd = vk::ClusterAccelerationStructureCommandsInfoNV {
             s_type: vk::ClusterAccelerationStructureCommandsInfoNV::STRUCTURE_TYPE,

@@ -1027,8 +1027,8 @@ pub fn dispatch_ptlas(
         src_acceleration_structure_data,
         dst_acceleration_structure_data: storage_addr,
         scratch_data: scratch_addr,
-        src_infos: allocator.wgpu_buffer_device_address(&resources.src_infos),
-        src_infos_count: allocator.wgpu_buffer_device_address(&resources.src_infos_count),
+        src_infos: allocator.wgpu_buffer_device_address(&resources.src_infos).get(),
+        src_infos_count: allocator.wgpu_buffer_device_address(&resources.src_infos_count).get(),
         _marker: core::marker::PhantomData,
     };
 

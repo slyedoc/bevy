@@ -17,10 +17,9 @@
 //! [`Allocator::wgpu_buffer_device_address`](super::allocator::Allocator::wgpu_buffer_device_address)
 //! directly — it is not a cross-frame trace read and is not constrained here.
 
-use ash::vk;
 use bevy_render::render_resource::encase::{internal::WriteInto, ShaderType};
 
-use super::allocator::SparseBuffer;
+use super::allocator::{SparseBuffer, StableAddr};
 use super::persistent_buffer::{PersistentGpuBuffer, PersistentGpuBufferable};
 use super::stable_storage_buffer::StableStorageBuffer;
 
@@ -33,21 +32,21 @@ mod sealed {
 pub trait RawTraceBindable: sealed::Sealed {
     /// The buffer's base device address. Stable for the buffer's lifetime, so a
     /// captured copy stays valid for any in-flight trace that recorded it.
-    fn trace_device_address(&self) -> vk::DeviceAddress;
+    fn trace_device_address(&self) -> StableAddr;
 }
 
 impl sealed::Sealed for SparseBuffer {}
 impl RawTraceBindable for SparseBuffer {
     #[inline]
-    fn trace_device_address(&self) -> vk::DeviceAddress {
-        self.address
+    fn trace_device_address(&self) -> StableAddr {
+        self.stable_addr()
     }
 }
 
 impl<V: ShaderType + WriteInto> sealed::Sealed for StableStorageBuffer<V> {}
 impl<V: ShaderType + WriteInto> RawTraceBindable for StableStorageBuffer<V> {
     #[inline]
-    fn trace_device_address(&self) -> vk::DeviceAddress {
+    fn trace_device_address(&self) -> StableAddr {
         self.device_address()
     }
 }
@@ -55,7 +54,7 @@ impl<V: ShaderType + WriteInto> RawTraceBindable for StableStorageBuffer<V> {
 impl<T: PersistentGpuBufferable> sealed::Sealed for PersistentGpuBuffer<T> {}
 impl<T: PersistentGpuBufferable> RawTraceBindable for PersistentGpuBuffer<T> {
     #[inline]
-    fn trace_device_address(&self) -> vk::DeviceAddress {
+    fn trace_device_address(&self) -> StableAddr {
         self.device_address()
     }
 }

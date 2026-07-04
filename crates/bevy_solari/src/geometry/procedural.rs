@@ -392,7 +392,7 @@ impl ProceduralClusters {
             mapped_at_creation: false,
         });
         render_queue.write_buffer(&index_buf, 0, bytemuck::cast_slice(&indices));
-        let index_addr = allocator.wgpu_buffer_device_address(&index_buf);
+        let index_addr = allocator.wgpu_buffer_device_address(&index_buf).get();
 
         // Positions are tightly packed vec3 (stride 12), same as the pool.
         // Scaled from the canonical unit domain to the band's real extent —
@@ -420,7 +420,7 @@ impl ProceduralClusters {
             mapped_at_creation: false,
         });
         render_queue.write_buffer(&ref_verts_buf, 0, &ref_bytes);
-        let ref_verts_addr = allocator.wgpu_buffer_device_address(&ref_verts_buf);
+        let ref_verts_addr = allocator.wgpu_buffer_device_address(&ref_verts_buf).get();
 
         let count_buf = render_device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("procedural.template.count"),
@@ -431,7 +431,7 @@ impl ProceduralClusters {
             mapped_at_creation: false,
         });
         render_queue.write_buffer(&count_buf, 0, &(cluster_count as u32).to_le_bytes());
-        let count_addr = allocator.wgpu_buffer_device_address(&count_buf);
+        let count_addr = allocator.wgpu_buffer_device_address(&count_buf).get();
 
         // Per-cluster template build descriptors. Ids bake to 0 — every
         // instantiate restores the per-mesh global ids via its offsets.
@@ -499,7 +499,7 @@ impl ProceduralClusters {
             mapped_at_creation: false,
         });
         render_queue.write_buffer(&src_infos_buf, 0, tmpl_bytes);
-        let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos_buf);
+        let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos_buf).get();
 
         // Geometry-shape input shared by the template + instantiate size
         // queries and ops. `max_geometry_index_value` must cover the OFFSET
@@ -544,7 +544,7 @@ impl ProceduralClusters {
             MemoryLocation::GpuOnly,
             "procedural.template.storage",
         );
-        let template_storage_addr = allocator.wgpu_buffer_device_address(&template_storage);
+        let template_storage_addr = allocator.wgpu_buffer_device_address(&template_storage).get();
 
         let scratch = allocator.create_buffer(
             render_device,
@@ -555,7 +555,7 @@ impl ProceduralClusters {
             "procedural.template.scratch",
         );
         let scratch_addr = align_up(
-            allocator.wgpu_buffer_device_address(&scratch),
+            allocator.wgpu_buffer_device_address(&scratch).get(),
             CLAS_SCRATCH_ALIGN,
         );
 
@@ -570,7 +570,7 @@ impl ProceduralClusters {
             MemoryLocation::GpuOnly,
             "procedural.template.dst_addresses",
         );
-        let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses);
+        let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses).get();
 
         let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("procedural.template.build"),
@@ -795,7 +795,7 @@ pub fn instantiate_procedural(
         return;
     }
     let batch: Vec<AssetId<ClusterMesh>> = queue.0.drain(..).collect();
-    let vertex_pool_addr = cluster_meshes.vertex_positions.device_address();
+    let vertex_pool_addr = cluster_meshes.vertex_positions.device_address().get();
 
     // Gather per-mesh descriptor slices into one upload, sizing scratch as we go.
     struct Op {
@@ -922,12 +922,12 @@ pub fn instantiate_procedural(
     );
     let (src_infos_buf, scratch_buf, dst_addresses_buf) = procedural.batch_bufs.bufs();
     render_queue.write_buffer(src_infos_buf, 0, desc_bytes);
-    let src_infos_addr = allocator.wgpu_buffer_device_address(src_infos_buf);
+    let src_infos_addr = allocator.wgpu_buffer_device_address(src_infos_buf).get();
     let scratch_base = align_up(
-        allocator.wgpu_buffer_device_address(scratch_buf),
+        allocator.wgpu_buffer_device_address(scratch_buf).get(),
         CLAS_SCRATCH_ALIGN,
     );
-    let dst_addresses_addr = allocator.wgpu_buffer_device_address(dst_addresses_buf);
+    let dst_addresses_addr = allocator.wgpu_buffer_device_address(dst_addresses_buf).get();
     // Per-op byte offset into the dst buffer, in `ops` order.
     let mut dst_offsets: Vec<u64> = Vec::with_capacity(ops.len());
     {

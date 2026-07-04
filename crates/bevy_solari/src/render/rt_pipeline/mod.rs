@@ -996,16 +996,16 @@ pub(crate) fn rt_pipeline(
         // metadata (real UVs + smooth normals) reached via `geometry_addresses.tess_clusters`.
         let tess_clusters = tess_classify.as_ref().map_or(0, |c| c.gen_attrs_meta_addr);
         view_bindings.set_geometry_addresses(&RtGeometryAddresses {
-            vertex_packed: cluster_mesh_manager.vertex_packed.trace_device_address(),
-            vertex_positions: cluster_mesh_manager.vertex_positions.trace_device_address(),
-            materials: scene_bindings.materials_device_address,
+            vertex_packed: cluster_mesh_manager.vertex_packed.trace_device_address().get(),
+            vertex_positions: cluster_mesh_manager.vertex_positions.trace_device_address().get(),
+            materials: scene_bindings.materials_device_address.get(),
             material_stride: crate::bindings::GPU_MATERIAL_SIZE,
             _pad: 0,
             tess_clusters,
-            vertex_custom: cluster_mesh_manager.vertex_custom.trace_device_address(),
-            deform_normals: deform.as_ref().map_or(0, |d| d.normals_addr),
-            deform_tangents: deform.as_ref().map_or(0, |d| d.tangents_addr),
-            animated_table: deform.as_ref().map_or(0, |d| d.animated_table_addr),
+            vertex_custom: cluster_mesh_manager.vertex_custom.trace_device_address().get(),
+            deform_normals: deform.as_ref().map_or(0, |d| d.normals_addr.get()),
+            deform_tangents: deform.as_ref().map_or(0, |d| d.tangents_addr.get()),
+            animated_table: deform.as_ref().map_or(0, |d| d.animated_table_addr.get()),
         });
     }
 

@@ -42,8 +42,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::bindings::RaytracingMesh3d;
 use crate::ecs_gpu::{GpuColumn, GpuSlot};
 use crate::geometry::ClusterMeshManager;
-use crate::gpu::allocator::{Allocator, MemoryLocation};
-use crate::gpu::retire::GpuRetire;
+use crate::gpu::allocator::{Allocator, SparseBuffer, StableAddr};
 use crate::instance::{Affine3x4, InstanceManager, RaytracingGpuEntity};
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
@@ -101,18 +100,18 @@ pub struct GpuAnimatedInstance {
 #[derive(Resource)]
 pub struct Deform {
     /// Per-slot deformed positions (stride 3 f32) — `MAX_ANIMATED_INSTANCES`
-    /// regions of `MAX_VERTS_PER_ANIMATED_MESH` vertices.
-    pub positions: Buffer,
+    /// regions of `MAX_VERTS_PER_ANIMATED_MESH` vertices. Sparse → stable address.
+    pub positions: SparseBuffer,
     /// Per-slot deformed octahedral normals (u32).
-    pub normals: Buffer,
+    pub normals: SparseBuffer,
     /// Per-slot deformed tangents (vec4: xyz + w bitangent sign).
-    pub tangents: Buffer,
+    pub tangents: SparseBuffer,
 
-    /// Device addresses for the bindless resolve (`RtGeometryAddresses`); the table
-    /// address changes on growth, so they're refreshed in `prepare_deform`.
-    pub normals_addr: u64,
-    pub tangents_addr: u64,
-    pub animated_table_addr: u64,
+    /// Stable addresses for the bindless resolve (`RtGeometryAddresses`) and the
+    /// instantiate pass — set once at init; sparse buffers never move.
+    pub normals_addr: StableAddr,
+    pub tangents_addr: StableAddr,
+    pub animated_table_addr: StableAddr,
 
     // Per-frame skinning inputs (rebuilt by the extract, uploaded in prepare).
     slots_cpu: Vec<AnimatedSlotGpu>,
@@ -128,11 +127,11 @@ pub struct Deform {
     /// Max vertex count across active slots (dispatch x-bound).
     max_vertex_count: u32,
 
-    /// Slot-indexed [`GpuAnimatedInstance`] table the resolve shader reads
-    /// (bound into the scene group by `bindings::binder`). Persistent; grows with
-    /// the instance high-water, maintained incrementally (this frame's animated
-    /// entries written, last frame's cleared) so non-animated scenes pay nothing.
-    animated_table: Buffer,
+    /// Slot-indexed [`GpuAnimatedInstance`] table the resolve shader reads.
+    /// Sparse: grows by page COMMIT (stable address — the resolve reads it via
+    /// `physical_load` across frames), maintained incrementally (this frame's
+    /// animated entries written, last frame's cleared).
+    animated_table: SparseBuffer,
     animated_table_capacity: u32,
     /// Slots written animated last frame — cleared this frame if no longer animated.
     prev_animated: Vec<u32>,
@@ -193,7 +192,7 @@ impl Deform {
     /// Slot-indexed [`GpuAnimatedInstance`] table the resolve shader reads.
     #[inline]
     pub fn animated_table(&self) -> &Buffer {
-        &self.animated_table
+        self.animated_table.buffer()
     }
 
     fn begin_frame(&mut self) {
@@ -217,24 +216,23 @@ fn mat4_to_affine(m: Mat4) -> Affine3x4 {
     }
 }
 
-// Allocator-created (so it carries SHADER_DEVICE_ADDRESS) — the resolve reads these
-// pools bindlessly via `physical_load`, and the instantiate pass reads positions.
+// Sparse (stable-address) — the resolve reads these pools bindlessly via
+// `physical_load` and the instantiate pass reads positions, both cross-frame.
 fn pool_buffer(
     allocator: &Allocator,
     device: &RenderDevice,
     label: &'static str,
     bytes: u64,
-) -> Buffer {
-    allocator
-        .create_buffer(
-            device,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
-            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            bytes,
-            MemoryLocation::GpuOnly,
-            label,
-        )
-        .into()
+) -> SparseBuffer {
+    let buf = allocator.create_sparse_buffer(
+        device,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+        BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        bytes,
+        label,
+    );
+    buf.commit(0..bytes);
+    buf
 }
 
 /// `RenderStartup`: build the deform pool buffers. No-op without the raw-VK
@@ -262,13 +260,16 @@ pub fn init_deform(
     let mut params = UniformBuffer::<DeformParams>::default();
     params.set_label(Some("deform.params"));
 
+    let normals_addr = normals.stable_addr();
+    let tangents_addr = tangents.stable_addr();
+    let animated_table_addr = animated_table.stable_addr();
     commands.insert_resource(Deform {
         positions,
         normals,
         tangents,
-        normals_addr: 0,
-        tangents_addr: 0,
-        animated_table_addr: 0,
+        normals_addr,
+        tangents_addr,
+        animated_table_addr,
         slots_cpu: Vec::new(),
         palette_cpu: Vec::new(),
         inverse_bind_cpu: Vec::new(),
@@ -285,17 +286,19 @@ pub fn init_deform(
     });
 }
 
-fn make_animated_table(allocator: &Allocator, device: &RenderDevice, slots: u32) -> Buffer {
-    allocator
-        .create_buffer(
-            device,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            slots.max(1) as u64 * size_of::<GpuAnimatedInstance>() as u64,
-            MemoryLocation::GpuOnly,
-            "deform.animated_table",
-        )
-        .into()
+/// 256 MB virtual ≈ 16M slots; pages committed as the slot space grows.
+const ANIMATED_TABLE_VIRTUAL_BYTES: u64 = 256 * 1024 * 1024;
+
+fn make_animated_table(allocator: &Allocator, device: &RenderDevice, slots: u32) -> SparseBuffer {
+    let buf = allocator.create_sparse_buffer(
+        device,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        ANIMATED_TABLE_VIRTUAL_BYTES,
+        "deform.animated_table",
+    );
+    buf.commit(0..slots.max(1) as u64 * size_of::<GpuAnimatedInstance>() as u64);
+    buf
 }
 
 /// `ExtractSchedule`: gather this frame's active animated instances — their
@@ -405,12 +408,10 @@ pub fn extract_animated_skins(
 pub fn prepare_deform(
     deform: Option<ResMut<Deform>>,
     instances: Option<Res<InstanceManager>>,
-    allocator: Option<Res<Allocator>>,
-    mut retire: ResMut<GpuRetire>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
-    let (Some(mut deform), Some(allocator)) = (deform, allocator) else {
+    let Some(mut deform) = deform else {
         return;
     };
     let num = deform.active_count;
@@ -429,35 +430,24 @@ pub fn prepare_deform(
     let stride = size_of::<GpuAnimatedInstance>() as u64;
     let high_water = instances.map(|i| i.slot_high_water()).unwrap_or(0).max(1);
     if high_water > deform.animated_table_capacity {
+        let old = deform.animated_table_capacity as u64 * stride;
         deform.animated_table_capacity = high_water.next_power_of_two();
-        let new_table =
-            make_animated_table(&allocator, &render_device, deform.animated_table_capacity);
-        // In-flight traces still read the OLD table via its captured raw
-        // address (`animated_table_addr` → `physical_load`, untracked by
-        // wgpu) — park it on the reaper; dropping it here frees the memory
-        // under them → MMU fault → device lost.
-        let old = core::mem::replace(&mut deform.animated_table, new_table);
-        retire.retire(&render_queue, "deform.animated_table", old);
-        let zeros = vec![0u8; (deform.animated_table_capacity as u64 * stride) as usize];
-        render_queue.write_buffer(&deform.animated_table, 0, &zeros);
-        deform.prev_animated.clear();
-    }
-    // Refresh bindless addresses (table buffer may have just been recreated).
-    {
-        let alloc = &allocator;
-        let na = alloc.wgpu_buffer_device_address(&deform.normals);
-        let ta = alloc.wgpu_buffer_device_address(&deform.tangents);
-        let aa = alloc.wgpu_buffer_device_address(&deform.animated_table);
-        deform.normals_addr = na;
-        deform.tangents_addr = ta;
-        deform.animated_table_addr = aa;
+        let new = deform.animated_table_capacity as u64 * stride;
+        // Grow by page COMMIT — the buffer (and its trace-captured address)
+        // never moves. Fresh sparse pages are UNDEFINED: zero the new region.
+        deform.animated_table.commit(0..new);
+        render_queue.write_buffer(
+            deform.animated_table.buffer(),
+            old,
+            &vec![0u8; (new - old) as usize],
+        );
     }
 
     let prev = core::mem::take(&mut deform.prev_animated);
     let zero = GpuAnimatedInstance::default();
     for slot in &prev {
         render_queue.write_buffer(
-            &deform.animated_table,
+            deform.animated_table.buffer(),
             *slot as u64 * stride,
             bytemuck::bytes_of(&zero),
         );
@@ -479,7 +469,7 @@ pub fn prepare_deform(
         .collect();
     for (slot, entry) in &entries {
         render_queue.write_buffer(
-            &deform.animated_table,
+            deform.animated_table.buffer(),
             *slot as u64 * stride,
             bytemuck::bytes_of(entry),
         );
@@ -578,11 +568,11 @@ pub fn prepare_deform_bind_group(
                 .buffer()
                 .as_entire_binding(),
             params,
-            deform.positions.as_entire_binding(),
-            deform.normals.as_entire_binding(),
+            deform.positions.buffer().as_entire_binding(),
+            deform.normals.buffer().as_entire_binding(),
             parent.buffer().as_entire_binding(),
             cluster_meshes.vertex_tangents.buffer().as_entire_binding(),
-            deform.tangents.as_entire_binding(),
+            deform.tangents.buffer().as_entire_binding(),
             local_rs.buffer().as_entire_binding(),
         )),
     );

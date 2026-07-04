@@ -87,7 +87,7 @@ pub fn record_build_per_instance_blas(
         mapped_at_creation: false,
     });
     render_queue.write_buffer(&src_infos, 0, info_bytes);
-    let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos);
+    let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos).get();
 
     let count_buf = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tess_template.blas.count"),
@@ -98,7 +98,7 @@ pub fn record_build_per_instance_blas(
         mapped_at_creation: false,
     });
     render_queue.write_buffer(&count_buf, 0, &1u32.to_le_bytes());
-    let count_addr = allocator.wgpu_buffer_device_address(&count_buf);
+    let count_addr = allocator.wgpu_buffer_device_address(&count_buf).get();
 
     let mut clusters_input =
         vk::ClusterAccelerationStructureClustersBottomLevelInputNV::default()
@@ -128,7 +128,7 @@ pub fn record_build_per_instance_blas(
         MemoryLocation::GpuOnly,
         "tess_template.blas.storage",
     );
-    let storage_addr = allocator.wgpu_buffer_device_address(&storage);
+    let storage_addr = allocator.wgpu_buffer_device_address(&storage).get();
 
     let scratch = allocator.create_buffer(
         render_device,
@@ -139,7 +139,7 @@ pub fn record_build_per_instance_blas(
         "tess_template.blas.scratch",
     );
     let scratch_addr = {
-        let base = allocator.wgpu_buffer_device_address(&scratch);
+        let base = allocator.wgpu_buffer_device_address(&scratch).get();
         let m = base & 255;
         if m == 0 { base } else { base + (256 - m) }
     };
