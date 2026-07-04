@@ -60,7 +60,7 @@ use bevy_app::{App, Plugin};
 use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use bevy_log::warn;
 use bevy_render::settings::WgpuFeatures;
-use bevy_render::{renderer::RenderDevice, RenderApp, RenderStartup};
+use bevy_render::{renderer::RenderDevice, Render, RenderApp, RenderStartup, RenderSystems};
 
 use crate::accel::AccelPlugin;
 use crate::bindings::BindingsPlugin;
@@ -274,6 +274,8 @@ impl Plugin for SolariPlugin {
             return;
         };
         render_app
+            .init_resource::<gpu::retire::GpuRetire>()
+            .add_systems(Render, gpu::retire::reap_retired.in_set(RenderSystems::Cleanup))
             .add_systems(
                 RenderStartup,
                 (

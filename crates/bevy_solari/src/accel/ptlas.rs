@@ -177,6 +177,9 @@ pub struct PtlasFillParamsGpu {
     /// the any-hit. Trades a sub-micro-triangle-precise cutout edge for zero any-hit.
     /// Set from `SOLARI_OMM_2STATE` when the extension is available.
     pub omm_force_2_state: u32,
+    /// This build's seed-epoch stamp (≥1) — `fill_seed` marks its slots,
+    /// `fill_incremental` skips them (one WRITE per instance per build).
+    pub epoch: u32,
 }
 
 /// Render-world resource for the incremental partitioned-TLAS pass.
@@ -284,6 +287,40 @@ pub struct Ptlas {
     pub instance_written_partition: Buffer,
     /// Slot capacity of [`Self::instance_written_partition`].
     pub written_partition_capacity: u32,
+
+    /// Slot-indexed epoch stamp `fill_seed` writes / `fill_incremental` skips —
+    /// dedupes CPU-seeded vs GPU-appended WRITEs within one build. Grown with
+    /// the slot space (fresh zeroed; growth forces a full rebuild).
+    pub seed_epoch: Buffer,
+    pub seed_epoch_capacity: u32,
+    /// Monotonic (wrapping, never 0) build counter feeding `fill_params.epoch`.
+    pub epoch: u32,
+
+    /// Debug (SOLARI_PTLAS_VALIDATE): GPU report of corrupt BLAS addresses
+    /// caught in the WRITE stream ([0..4)=valid span, [4]=count, [5..)=entries),
+    /// its CPU-readback staging twin, and the in-flight flag.
+    pub validate_report: Buffer,
+    pub validate_staging: Buffer,
+    pub validate_in_flight: bool,
+}
+
+/// u32 words in the validation report: 4 span + capacity + partition count +
+/// bad count + 15 × 5-word entries.
+const VALIDATE_REPORT_WORDS: u64 = 7 + 15 * 5;
+
+/// SOLARI_PTLAS_VALIDATE=1 → scan + null corrupt BLAS addresses each build,
+/// logging offenders (slot + address) instead of device-losting in the build.
+fn ptlas_validate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SOLARI_PTLAS_VALIDATE").as_deref() == Ok("1"))
+}
+
+/// SOLARI_PTLAS_FULL_REBUILD=1 → build from scratch every frame (no `src`
+/// carry). Bisect lever: if device-losts stop, the corruption lives in the
+/// incremental/carry path.
+fn ptlas_force_full_rebuild() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SOLARI_PTLAS_FULL_REBUILD").as_deref() == Ok("1"))
 }
 
 impl Ptlas {
@@ -385,6 +422,28 @@ pub fn init_ptlas(
         mapped_at_creation: false,
     });
 
+    let seed_epoch = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ptlas.seed_epoch"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let validate_report = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ptlas.validate_report"),
+        size: VALIDATE_REPORT_WORDS * 4,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let validate_staging = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ptlas.validate_staging"),
+        size: VALIDATE_REPORT_WORDS * 4,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     commands.insert_resource(Ptlas {
         storage,
         scratch,
@@ -409,6 +468,12 @@ pub fn init_ptlas(
         written_flags_capacity: 1,
         instance_written_partition,
         written_partition_capacity: 1,
+        seed_epoch,
+        seed_epoch_capacity: 1,
+        epoch: 0,
+        validate_report,
+        validate_staging,
+        validate_in_flight: false,
     });
 }
 
@@ -476,7 +541,8 @@ pub fn prepare_ptlas_params(
     const MASS_CHURN_FULL_REBUILD: usize = 4096;
     let mass_churn = instances.disabled_slots().len() > MASS_CHURN_FULL_REBUILD
         || instances.added_slots().len() > MASS_CHURN_FULL_REBUILD;
-    let full_rebuild = !resources.has_built || grew || mass_churn;
+    let full_rebuild =
+        !resources.has_built || grew || mass_churn || ptlas_force_full_rebuild();
 
     // Grow the per-slot written-flags mirror with the slot space. Fresh
     // buffer = all zeros, consistent because growth forces a full rebuild
@@ -501,6 +567,16 @@ pub fn prepare_ptlas_params(
                 mapped_at_creation: false,
             });
         resources.written_partition_capacity = high_water;
+        debug_assert!(full_rebuild);
+    }
+    if high_water > resources.seed_epoch_capacity {
+        resources.seed_epoch = render_device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ptlas.seed_epoch"),
+            size: high_water as u64 * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        resources.seed_epoch_capacity = high_water;
         debug_assert!(full_rebuild);
     }
 
@@ -588,10 +664,12 @@ pub fn prepare_ptlas_params(
         .write_data
         .commit(0..(max_records.max(1)) * WRITE_INSTANCE_DATA_SIZE);
 
+    resources.epoch = resources.epoch.wrapping_add(1).max(1);
     *resources.fill_params.get_mut() = PtlasFillParamsGpu {
         active_count,
         cpu_count,
         force_all: full_rebuild as u32,
+        epoch: resources.epoch,
         // DEBUG: default ON whenever OMM is available so the micromap drives
         // traversal (drops FORCE_NO_OPAQUE). SOLARI_OMM_CONSULT=0 forces it off.
         // (Holes on non-OMM cutouts render solid under it — the per-geometry has_omm
@@ -834,6 +912,8 @@ pub fn prepare_ptlas_fill_bind_group(
             node_slots.buffer().as_entire_binding(),
             static_flags.buffer().as_entire_binding(),
             ptlas.instance_written_partition.as_entire_binding(),
+            ptlas.validate_report.as_entire_binding(),
+            ptlas.seed_epoch.as_entire_binding(),
         )),
     );
     ptlas.bind_group = Some(group);
@@ -859,6 +939,7 @@ pub fn dispatch_ptlas(
     hair_write: Option<Res<crate::hair::ptlas_hair::HairPtlasWrite>>,
     tess_write: Option<Res<crate::geometry::tess_displace::TessPtlasWrite>>,
     additional: Res<AdditionalVulkanFeatures>,
+    render_queue: Res<RenderQueue>,
     mut ctx: RenderContext,
 ) {
     // The shading path is the RT pipeline (`vkCmdTraceRays`), so the post-build
@@ -876,6 +957,8 @@ pub fn dispatch_ptlas(
     if fns.partitioned.is_none() {
         return;
     }
+    // Log what LAST build's validation pass caught (its copy has long retired).
+    drain_ptlas_validation(resources, &render_device);
     // `op_count == 0` means `prepare_ptlas_params` decided there was
     // nothing to build this frame (no delta) — `storage` already holds
     // the current PTLAS, so leave it alone.
@@ -948,6 +1031,24 @@ pub fn dispatch_ptlas(
         src_infos_count: allocator.wgpu_buffer_device_address(&resources.src_infos_count),
         _marker: core::marker::PhantomData,
     };
+
+    // Reset the validation report head: valid span, this build's instance
+    // capacity + partition count, zeroed bad-record count.
+    let validate = ptlas_validate_enabled();
+    if validate {
+        let (lo, hi) = allocator.sparse_va_span();
+        let head = [
+            lo as u32,
+            (lo >> 32) as u32,
+            hi as u32,
+            (hi >> 32) as u32,
+            capacity,
+            PTLAS_PARTITION_COUNT,
+            0u32,
+        ];
+        render_queue.write_buffer(&resources.validate_report, 0, bytemuck::cast_slice(&head));
+    }
+    let mut validate_recorded = false;
 
     // wgpu fill records into the shared render-context encoder; the raw-VK
     // build gets its OWN encoder (the fork panics if one encoder mixes wgpu
@@ -1031,8 +1132,38 @@ pub fn dispatch_ptlas(
             pass.set_pipeline(finalize_pipe);
             pass.dispatch_workgroups(1, 1, 1);
         }
+        // Debug: scan the final WRITE stream, null + report corrupt BLAS
+        // addresses before the raw build dereferences them.
+        if validate {
+            if let Some(validate_pipe) =
+                pipeline_cache.get_compute_pipeline(pipelines.ptlas_validate)
+            {
+                let max_records = resources.cpu_count + active_count + hair_count + tess_count;
+                {
+                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                        label: Some("ptlas.validate"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_bind_group(0, scene_bg, &[]);
+                    pass.set_bind_group(1, fill_bg, &[]);
+                    pass.set_pipeline(validate_pipe);
+                    let (gx, gy, gz) =
+                        crate::ecs_gpu::linear_dispatch(max_records.max(1).div_ceil(64));
+                    pass.dispatch_workgroups(gx, gy, gz);
+                }
+                encoder.copy_buffer_to_buffer(
+                    &resources.validate_report,
+                    0,
+                    &resources.validate_staging,
+                    0,
+                    VALIDATE_REPORT_WORDS * 4,
+                );
+                validate_recorded = true;
+            }
+        }
         d.end(encoder);
     }
+    resources.validate_in_flight = validate_recorded;
 
     let mut build_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("ptlas.build"),
@@ -1059,4 +1190,63 @@ pub fn dispatch_ptlas(
     // A PTLAS now exists, so subsequent frames can build incrementally
     // (`src` = the buffer just built, `dst` = the other) instead of from scratch.
     resources.has_built = true;
+}
+
+/// Map last build's validation staging copy and log the corrupt records it
+/// caught (the GPU already nulled them, so the build survived to report).
+fn drain_ptlas_validation(resources: &mut Ptlas, render_device: &RenderDevice) {
+    if !resources.validate_in_flight {
+        return;
+    }
+    resources.validate_in_flight = false;
+    let slice = resources.validate_staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    let _ = render_device.wgpu_device().poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    if !matches!(rx.try_recv(), Ok(Ok(()))) {
+        return;
+    }
+    {
+        let data = slice.get_mapped_range();
+        let words: &[u32] = bytemuck::cast_slice(&data);
+        static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ARMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                "ptlas.validate armed: span 0x{:x}..0x{:x} capacity {}",
+                words[0] as u64 | ((words[1] as u64) << 32),
+                words[2] as u64 | ((words[3] as u64) << 32),
+                words[4],
+            );
+        }
+        let bad = words[6];
+        if bad > 0 {
+            tracing::error!(
+                "ptlas.validate: {bad} corrupt WRITE record(s) defused, span 0x{:x}..0x{:x} capacity {}",
+                words[0] as u64 | ((words[1] as u64) << 32),
+                words[2] as u64 | ((words[3] as u64) << 32),
+                words[4],
+            );
+            for e in 0..bad.min(15) as usize {
+                let w = &words[7 + e * 5..7 + e * 5 + 5];
+                let kind = match w[0] {
+                    1 => "addr-out-of-span",
+                    2 => "instance_index-oob",
+                    3 => "partition-oob",
+                    _ => "?",
+                };
+                tracing::error!(
+                    "ptlas.validate: {kind} record {} slot {} value 0x{:x}",
+                    w[1],
+                    w[2],
+                    w[3] as u64 | ((w[4] as u64) << 32),
+                );
+            }
+        }
+    }
+    resources.validate_staging.unmap();
 }

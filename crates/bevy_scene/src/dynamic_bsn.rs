@@ -1090,7 +1090,18 @@ where
 /// Instead, dynamic fields are *replaced wholesale*; the handle fields are then resolved to concrete
 /// `Handle<T>` values in [`build_handle_template_fields`] before `insert_reflect` materializes the
 /// component via `FromReflect`.
-struct DefaultDynamicErasedTemplate(Box<dyn PartialReflect>);
+struct DefaultDynamicErasedTemplate {
+    value: Box<dyn PartialReflect>,
+    /// Handle-resolved output, computed once at FIRST apply and reused for
+    /// every later instance of this template. Inline asset values (e.g. a
+    /// `.bsn` material) therefore become ONE shared asset per template — the
+    /// old per-apply resolution minted a fresh asset per instance, which
+    /// outgrew the RT pipeline's SBT headroom and forced ~2 s pipeline
+    /// rebuilds on every streaming batch. Safe because resolve-time patching
+    /// (`self.fun`) finishes before any apply, and `clone_template` starts
+    /// with an empty cache.
+    resolved: bevy_platform::sync::Mutex<Option<Box<dyn PartialReflect>>>,
+}
 
 impl<F> Scene for ErasedTemplatePatch<F>
 where
@@ -1126,7 +1137,10 @@ where
                     // represented type so it can be materialized via `FromReflect` later.
                     reflect_default.default().to_dynamic()
                 };
-                Box::new(DefaultDynamicErasedTemplate(reflect))
+                Box::new(DefaultDynamicErasedTemplate {
+                    value: reflect,
+                    resolved: Default::default(),
+                })
             });
         // The template was created (or cloned) by us as a `DefaultDynamicErasedTemplate`, so we can
         // recover mutable access to the underlying reflected value via `Any` downcasting.
@@ -1134,7 +1148,7 @@ where
         else {
             return Err(ResolveSceneError::TypeNotReflectable);
         };
-        (self.fun)(&mut template.0, context);
+        (self.fun)(&mut template.value, context);
 
         Ok(())
     }
@@ -1149,17 +1163,28 @@ impl ErasedComponentTemplate for DefaultDynamicErasedTemplate {
         // The stored value is a *dynamic* representation of the output component (built from
         // `ReflectDefault` and patched in `resolve`). Any field that was assigned a string-literal
         // asset path holds a `HandleTemplate<T>` value, and any inline asset value holds a raw
-        // asset; resolve both to concrete `Handle<T>` values, then materialize the component via
+        // asset; resolve both to concrete `Handle<T>` values ONCE (cached — every instance of
+        // this template shares the same handles), then materialize the component via
         // `FromReflect` (`insert_reflect`).
-        let mut output = self.0.to_dynamic();
-        build_handle_template_fields(&mut output, context);
+        let output = {
+            let mut cache = self.resolved.lock().unwrap();
+            if cache.is_none() {
+                let mut out = self.value.to_dynamic();
+                build_handle_template_fields(&mut out, context);
+                *cache = Some(out);
+            }
+            cache.as_ref().unwrap().to_dynamic()
+        };
 
         context.entity.insert_reflect(output);
         Ok(())
     }
 
     fn clone_template(&self) -> Box<dyn ErasedComponentTemplate> {
-        Box::new(DefaultDynamicErasedTemplate(self.0.to_dynamic()))
+        Box::new(DefaultDynamicErasedTemplate {
+            value: self.value.to_dynamic(),
+            resolved: Default::default(),
+        })
     }
 }
 

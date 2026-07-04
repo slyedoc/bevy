@@ -9,8 +9,8 @@
 // land in the standard `ClasArena::cluster_clas_addresses` table (the instantiate
 // offsets restore global cluster/geometry ids), so the downstream
 // selector → blas_rebuild → PTLAS path and the bindless chit resolve are
-// completely unchanged — `upload_mesh_via_template` (clas_arena.rs) is the
-// proven 1:1 equivalence this leans on.
+// completely unchanged — the template→instantiate 1:1 equivalence with the
+// direct build was proven during the Phase 2a A/B bring-up (since removed).
 //
 // Per-frame flow (all in the `RenderGraph` schedule, before
 // `SolariClusterSystems::Scatter`):
@@ -54,6 +54,7 @@ use super::clas_arena::{
 };
 use super::{Cluster, ClusterIndex, ClusterMesh, ClusterMeshManager};
 use crate::gpu::allocator::{Allocator, MemoryLocation, SparseBuffer};
+use crate::gpu::retire::GpuRetire;
 use crate::gpu::extension::{
     cmd_build_cluster_acceleration_structures_indirect, cmd_global_as_barrier,
     ClusterExtensionFns,
@@ -190,6 +191,87 @@ struct TemplateSet {
     _count_buf: Buffer,
 }
 
+/// Reused per-batch instantiate inputs, grown on demand (old buffers retired
+/// through [`GpuRetire`]) — per-batch dedicated allocations churned the heap.
+/// Cross-batch reuse is ordered by the global AS barriers around every op.
+#[derive(Default)]
+struct BatchBufs {
+    src_infos: Option<(Buffer, u64)>,
+    /// Capacity is usable bytes AFTER `CLAS_SCRATCH_ALIGN` base alignment.
+    scratch: Option<(wgpu::Buffer, u64)>,
+    dst_addresses: Option<(wgpu::Buffer, u64)>,
+}
+
+impl BatchBufs {
+    /// Grow any buffer whose capacity is below this batch's need.
+    fn ensure(
+        &mut self,
+        render_device: &RenderDevice,
+        allocator: &Allocator,
+        retire: &mut GpuRetire,
+        queue: &RenderQueue,
+        src_len: u64,
+        scratch_len: u64,
+        dst_len: u64,
+    ) {
+        if self.src_infos.as_ref().is_none_or(|(_, cap)| *cap < src_len) {
+            let cap = src_len.next_power_of_two().max(64 << 10);
+            if let Some((old, _)) = self.src_infos.take() {
+                retire.retire(queue, "procedural.instantiate.src_infos", old);
+            }
+            let buf = render_device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("procedural.instantiate.src_infos"),
+                size: cap,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::BLAS_INPUT
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.src_infos = Some((buf, cap));
+        }
+        if self.scratch.as_ref().is_none_or(|(_, cap)| *cap < scratch_len) {
+            let cap = scratch_len.next_power_of_two().max(1 << 20);
+            if let Some((old, _)) = self.scratch.take() {
+                retire.retire(queue, "procedural.instantiate.scratch", old);
+            }
+            let buf = allocator.create_buffer(
+                render_device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                wgpu::BufferUsages::STORAGE,
+                cap + CLAS_SCRATCH_ALIGN - 1,
+                MemoryLocation::GpuOnly,
+                "procedural.instantiate.scratch",
+            );
+            self.scratch = Some((buf, cap));
+        }
+        if self.dst_addresses.as_ref().is_none_or(|(_, cap)| *cap < dst_len) {
+            let cap = dst_len.next_power_of_two().max(64 << 10);
+            if let Some((old, _)) = self.dst_addresses.take() {
+                retire.retire(queue, "procedural.instantiate.dst_addresses", old);
+            }
+            let buf = allocator.create_buffer(
+                render_device,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                    | vk::BufferUsageFlags::TRANSFER_SRC,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                cap,
+                MemoryLocation::GpuOnly,
+                "procedural.instantiate.dst_addresses",
+            );
+            self.dst_addresses = Some((buf, cap));
+        }
+    }
+
+    fn bufs(&self) -> (&Buffer, &wgpu::Buffer, &wgpu::Buffer) {
+        (
+            &self.src_infos.as_ref().unwrap().0,
+            &self.scratch.as_ref().unwrap().0,
+            &self.dst_addresses.as_ref().unwrap().0,
+        )
+    }
+}
+
 /// Render-world resource owning the shared topologies, their template sets, and
 /// the CLAS slab arena procedural meshes instantiate into.
 #[derive(Resource)]
@@ -201,21 +283,13 @@ pub struct ProceduralClusters {
     slab_storage: SparseBuffer,
     slab_alloc: RangeAllocator<u64>,
     slabs: HashMap<AssetId<ClusterMesh>, Range<u64>>,
-    /// Slabs of removed meshes, parked until the GPU can no longer reference
-    /// their old CLAS (`(release_at_frame, range)`). Freeing immediately and
-    /// re-instantiating into the same bytes device-losts: the despawned
-    /// instance's BLAS/PTLAS references drain over the next frames, not
-    /// synchronously with the asset event.
-    retired_slabs: Vec<(u64, Range<u64>)>,
-    /// Per-batch instantiate transients (src_infos / scratch / dst_addresses),
-    /// parked until their submitted AS op is provably done. The raw-VK build
-    /// references them BY DEVICE ADDRESS — invisible to wgpu's lifetime
-    /// tracker — so dropping them at end-of-system destroys them mid-build:
-    /// Aftermath shows exactly that (DMA WRITE page fault, "AS Build or
-    /// Refit", resource Destroyed:Yes). The proven upload paths dodge this by
-    /// poll(Wait)ing before returning; this path exists to NOT wait.
-    in_flight_transients: Vec<(u64, (Buffer, wgpu::Buffer, wgpu::Buffer))>,
-    frame: u64,
+    /// Slabs of removed meshes, parked INDEFINITELY: a stale PTLAS slot /
+    /// shared-BLAS entry can hold the old CLAS addresses until overwritten, so
+    /// reuse device-losts. Real recycling lands with geometry eviction.
+    /// Cost ~64–128 KB committed pages per retired patch ([`Self::retired_slab_bytes`]).
+    retired_slabs: Vec<Range<u64>>,
+    /// Reused instantiate batch inputs (see [`BatchBufs`]).
+    batch_bufs: BatchBufs,
 }
 
 impl ProceduralClusters {
@@ -233,53 +307,13 @@ impl ProceduralClusters {
             slab_alloc: RangeAllocator::new(0..PROCEDURAL_CLAS_VIRTUAL_BYTES),
             slabs: HashMap::default(),
             retired_slabs: Vec::new(),
-            in_flight_transients: Vec::new(),
-            frame: 0,
+            batch_bufs: BatchBufs::default(),
         }
-    }
-
-    /// Frames a retired slab stays parked before its bytes can be reused.
-    /// ONLY honored under `SOLARI_PROC_EAGER_SLAB_REUSE` (debug): empirically,
-    /// a removed mesh's CLAS stays dereferenceable long past any small frame
-    /// window (reuse at 16 frames still device-losts — a stale PTLAS slot /
-    /// shared-BLAS entry appears to hold CLAS addresses until overwritten), so
-    /// the DEFAULT is to park retired slabs indefinitely. Real recycling lands
-    /// with the geometry-eviction follow-up (same lifetime problem as the
-    /// monotonic geometry ids). Cost: ~64–128 KB of committed pages per
-    /// retired patch, visible via [`Self::retired_slab_bytes`].
-    const SLAB_RETIRE_FRAMES: u64 = 16;
-
-    /// Per-frame housekeeping: advance the frame, release in-flight instantiate
-    /// transients whose GPU work is long done (and, under the debug env var,
-    /// eagerly recycle parked slabs — crashes, kept for bisecting).
-    fn tick(&mut self) {
-        self.frame += 1;
-        let frame = self.frame;
-        // Dropping = destroying: safe once the submit is `SLAB_RETIRE_FRAMES`
-        // behind (far beyond frames-in-flight).
-        self.in_flight_transients
-            .retain(|(release_at, _)| frame < *release_at);
-        if std::env::var_os("SOLARI_PROC_EAGER_SLAB_REUSE").is_none() {
-            return;
-        }
-        let frame = self.frame;
-        let slab_alloc = &mut self.slab_alloc;
-        self.retired_slabs.retain(|(release_at, range)| {
-            if frame >= *release_at {
-                slab_alloc.free_range(range.clone());
-                false
-            } else {
-                true
-            }
-        });
     }
 
     /// Bytes parked in retired (unreusable) slabs — leak telemetry.
     pub fn retired_slab_bytes(&self) -> u64 {
-        self.retired_slabs
-            .iter()
-            .map(|(_, r)| r.end - r.start)
-            .sum()
+        self.retired_slabs.iter().map(|r| r.end - r.start).sum()
     }
 
     /// Register a canonical topology. Call before any mesh with this key binds
@@ -304,20 +338,18 @@ impl ProceduralClusters {
     }
 
     /// Retire a removed mesh's CLAS slab. Called from the same asset-event path
-    /// that frees the mesh pools (`instance_manager`); the bytes become
-    /// reusable only after [`Self::SLAB_RETIRE_FRAMES`] (see `retired_slabs`).
+    /// that frees the mesh pools (`instance_manager`); parked forever — see
+    /// `retired_slabs`.
     pub fn remove(&mut self, asset_id: &AssetId<ClusterMesh>) {
         if let Some(slab) = self.slabs.remove(asset_id) {
-            self.retired_slabs
-                .push((self.frame + Self::SLAB_RETIRE_FRAMES, slab));
+            self.retired_slabs.push(slab);
         }
     }
 
     /// Build (once) the shared template set for `(key, band)` — one
     /// `BUILD_TRIANGLE_CLUSTER_TEMPLATE` submit + poll-wait + address readback,
-    /// mirroring `clas_template::upload_mesh_templates` / the A/B
-    /// `upload_mesh_via_template` step 1. Deliberately synchronous: it runs once
-    /// per distinct patch scale, not per mesh.
+    /// mirroring `clas_template::upload_mesh_templates`. Deliberately
+    /// synchronous: it runs once per distinct patch scale, not per mesh.
     #[allow(clippy::too_many_arguments)]
     fn ensure_template_set(
         &mut self,
@@ -676,15 +708,17 @@ pub fn drain_pending_procedural(
     fns: Option<Res<ClusterExtensionFns>>,
     mut cluster_meshes: Option<ResMut<ClusterMeshManager>>,
     procedural: Option<ResMut<ProceduralClusters>>,
+    clas_arena: Option<Res<ClasArena>>,
     mut ranges: ResMut<ProceduralMeshRanges>,
     mut fill_queue: ResMut<ProceduralFillQueue>,
 ) {
-    let (Some(allocator), Some(fns), Some(cluster_meshes), Some(mut procedural)) =
-        (allocator, fns, cluster_meshes.as_deref_mut(), procedural)
+    let (Some(allocator), Some(fns), Some(cluster_meshes), Some(mut procedural), Some(clas_arena)) =
+        (allocator, fns, cluster_meshes.as_deref_mut(), procedural, clas_arena)
     else {
         return;
     };
-    procedural.tick();
+    let mut clear_encoder: Option<wgpu::CommandEncoder> = None;
+    let mut clas_windows: Vec<Range<u64>> = Vec::new();
     for pending in cluster_meshes.pending_procedural.drain(..) {
         let ok = procedural.ensure_template_set(
             &render_device,
@@ -701,8 +735,33 @@ pub fn drain_pending_procedural(
             // already logged). The mesh stays resident but never traceable.
             continue;
         }
+        // The mesh is registered (selector-visible) from THIS point, but its
+        // CLAS addresses land at instantiate time — potentially FRAMES later
+        // when the fill queue backs up under heavy streaming. Commit + zero
+        // its table window NOW so any early reader sees mapped, deterministic
+        // zeros instead of unmapped pages (DMA-read translate fault in AS
+        // Build) or undefined garbage addresses.
+        let window_start = (pending.ranges.cluster_base.0 as u64) * 8;
+        let window_len = (pending.ranges.cluster_count as u64) * 8;
+        clas_windows.push(window_start..window_start + window_len);
+        clear_encoder
+            .get_or_insert_with(|| {
+                render_device.create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("procedural.reserve.zero_clas_windows"),
+                })
+            })
+            .clear_buffer(
+                &clas_arena.cluster_clas_addresses.wgpu_buffer,
+                window_start,
+                Some(window_len),
+            );
         ranges.0.insert(pending.asset_id, pending.ranges);
         fill_queue.0.push(pending.asset_id);
+    }
+    // One sparse bind + fence wait for every window, then the zeroing submit.
+    clas_arena.cluster_clas_addresses.commit_many(clas_windows);
+    if let Some(encoder) = clear_encoder {
+        render_queue.submit([encoder.finish()]);
     }
 }
 
@@ -721,16 +780,10 @@ pub fn instantiate_procedural(
     procedural: Option<ResMut<ProceduralClusters>>,
     ranges: Res<ProceduralMeshRanges>,
     mut queue: ResMut<ProceduralInstantiateQueue>,
+    mut retire: ResMut<GpuRetire>,
     ready: Res<ProceduralReadyChannel>,
 ) {
     if queue.0.is_empty() {
-        return;
-    }
-    // Debug bisect: report ready without building any CLAS (meshes invisible).
-    if std::env::var_os("SOLARI_SKIP_INSTANTIATE").is_some() {
-        if let Ok(mut ready) = ready.0.lock() {
-            ready.extend(queue.0.drain(..));
-        }
         return;
     }
     let (Some(allocator), Some(fns), Some(cluster_meshes), Some(clas_arena), Some(mut procedural)) =
@@ -761,6 +814,9 @@ pub fn instantiate_procedural(
     let inst_stride =
         size_of::<vk::ClusterAccelerationStructureInstantiateClusterInfoNV>() as u64;
     let mut scratch_cursor = 0u64;
+    // Sparse commits gathered across the batch → one bind + wait per buffer.
+    let mut slab_commits: Vec<Range<u64>> = Vec::new();
+    let mut window_commits: Vec<Range<u64>> = Vec::new();
     for asset_id in batch {
         let Some(r) = ranges.0.get(&asset_id) else {
             tracing::warn!(
@@ -812,17 +868,16 @@ pub fn instantiate_procedural(
                 .slab_alloc
                 .allocate_range_aligned(clas_slab_size, CLAS_STORAGE_ALIGN)
                 .expect("procedural: CLAS slab virtual-address space exhausted");
-            procedural.slab_storage.commit(slab.clone());
+            slab_commits.push(slab.clone());
             procedural.slabs.insert(asset_id, slab.clone());
             slab
         };
 
-        // Commit this mesh's window of the global CLAS-address table (the
-        // GPU-side copy below lands the instantiated addresses there).
+        // This mesh's window of the global CLAS-address table (the GPU-side
+        // copy below lands the instantiated addresses there).
         let addr_table_byte_start = (r.cluster_base.0 as u64) * 8;
-        clas_arena
-            .cluster_clas_addresses
-            .commit(addr_table_byte_start..addr_table_byte_start + (r.cluster_count as u64) * 8);
+        window_commits
+            .push(addr_table_byte_start..addr_table_byte_start + (r.cluster_count as u64) * 8);
 
         let scratch_offset = scratch_cursor;
         scratch_cursor += align_up(op_scratch_size, CLAS_SCRATCH_ALIGN);
@@ -841,6 +896,10 @@ pub fn instantiate_procedural(
     if ops.is_empty() {
         return;
     }
+    // Commit before any submit touches the pages: slabs are the AS builds'
+    // implicit destinations, windows the copy's destination.
+    procedural.slab_storage.commit_many(slab_commits);
+    clas_arena.cluster_clas_addresses.commit_many(window_commits);
 
     // Upload the batch's descriptors.
     let desc_bytes_len = (descriptors.len() as u64) * inst_stride;
@@ -848,48 +907,27 @@ pub fn instantiate_procedural(
     let desc_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(descriptors.as_ptr().cast::<u8>(), desc_bytes_len as usize)
     };
-    let src_infos_buf = render_device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("procedural.instantiate.src_infos"),
-        size: desc_bytes_len,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::BLAS_INPUT
-            | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    render_queue.write_buffer(&src_infos_buf, 0, desc_bytes);
-    let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos_buf);
-
-    // One shared scratch buffer, per-op aligned regions (independent — no
-    // intra-submit hazard between ops).
-    let scratch_buf = allocator.create_buffer(
+    // Reused batch inputs: src_infos (CPU-written), one shared scratch with
+    // per-op aligned regions, and the dst-addresses staging the GPU copies
+    // into the global table (which lacks AS-storage usage) — no CPU wait.
+    let total_clusters: u64 = ops.iter().map(|op| op.cluster_count as u64).sum();
+    procedural.batch_bufs.ensure(
         &render_device,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-        wgpu::BufferUsages::STORAGE,
-        scratch_cursor.max(1) + CLAS_SCRATCH_ALIGN - 1,
-        MemoryLocation::GpuOnly,
-        "procedural.instantiate.scratch",
+        &allocator,
+        &mut retire,
+        &render_queue,
+        desc_bytes_len,
+        scratch_cursor.max(1),
+        total_clusters * 8,
     );
+    let (src_infos_buf, scratch_buf, dst_addresses_buf) = procedural.batch_bufs.bufs();
+    render_queue.write_buffer(src_infos_buf, 0, desc_bytes);
+    let src_infos_addr = allocator.wgpu_buffer_device_address(src_infos_buf);
     let scratch_base = align_up(
-        allocator.wgpu_buffer_device_address(&scratch_buf),
+        allocator.wgpu_buffer_device_address(scratch_buf),
         CLAS_SCRATCH_ALIGN,
     );
-
-    // Per-batch dst-addresses buffer with the SAME usage set every other CLAS
-    // build in the fork uses (the global table lacks AS-storage usage, so the
-    // op must not write it directly); a GPU copy lands the addresses in the
-    // table afterwards — still no CPU wait.
-    let total_clusters: u64 = ops.iter().map(|op| op.cluster_count as u64).sum();
-    let dst_addresses_buf = allocator.create_buffer(
-        &render_device,
-        vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
-            | vk::BufferUsageFlags::TRANSFER_SRC,
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        total_clusters * 8,
-        MemoryLocation::GpuOnly,
-        "procedural.instantiate.dst_addresses",
-    );
-    let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses_buf);
+    let dst_addresses_addr = allocator.wgpu_buffer_device_address(dst_addresses_buf);
     // Per-op byte offset into the dst buffer, in `ops` order.
     let mut dst_offsets: Vec<u64> = Vec::with_capacity(ops.len());
     {
@@ -984,7 +1022,7 @@ pub fn instantiate_procedural(
     });
     for (op, &dst_offset) in ops.iter().zip(&dst_offsets) {
         copy_encoder.copy_buffer_to_buffer(
-            &dst_addresses_buf,
+            dst_addresses_buf,
             dst_offset,
             &clas_arena.cluster_clas_addresses.wgpu_buffer,
             op.addr_table_byte_start,
@@ -993,13 +1031,10 @@ pub fn instantiate_procedural(
     }
     render_queue.submit([copy_encoder.finish()]);
 
-    // Park this batch's transients until the AS op is provably done — the raw
-    // build references them by device address (wgpu can't extend their
-    // lifetimes), so dropping them here is a GPU use-after-free.
-    let release_at = procedural.frame + ProceduralClusters::SLAB_RETIRE_FRAMES;
-    procedural
-        .in_flight_transients
-        .push((release_at, (src_infos_buf, scratch_buf, dst_addresses_buf)));
+    tracing::debug!(
+        "procedural: batch src 0x{src_infos_addr:x}+{desc_bytes_len} scratch 0x{scratch_base:x} dst 0x{dst_addresses_addr:x}+{}",
+        total_clusters * 8,
+    );
 
     // Report readiness (instantiate + address copy submitted; the barriers +
     // the BLAS/TLAS passes' own submission order make it traceable this frame).

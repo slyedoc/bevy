@@ -89,6 +89,8 @@ pub fn ptlas_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_read_only_sized(false, None), // 14 node_slots (instance → node)
                 storage_buffer_read_only_sized(false, None), // 15 static_flags (node-indexed)
                 storage_buffer_sized(false, None),           // 16 instance_written_partition
+                storage_buffer_sized(false, None),           // 17 validate_report (debug)
+                storage_buffer_sized(false, None),           // 18 seed_epoch
             ),
         ),
     )

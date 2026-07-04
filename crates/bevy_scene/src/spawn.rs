@@ -801,7 +801,11 @@ impl QueuedScenes {
         for (entity, handle) in core::mem::take(&mut self.new_scene_entities) {
             let patches = world.resource::<Assets<ScenePatch>>();
             if let Some(resolved) = patches.get(&handle).and_then(|p| p.resolved.clone()) {
-                let mut entity_mut = world.get_entity_mut(entity).unwrap();
+                // The target can die between queueing and this apply (streamed
+                // content despawned by LOD churn) — a dead target is a no-op.
+                let Ok(mut entity_mut) = world.get_entity_mut(entity) else {
+                    continue;
+                };
                 if let Err(err) = resolved.apply(&mut entity_mut, bundle_scratch) {
                     let scene_patch_instance = scene_patch_instances.get(world, entity).unwrap();
                     let handle = &scene_patch_instance.0;

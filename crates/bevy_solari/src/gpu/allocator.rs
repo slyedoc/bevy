@@ -106,6 +106,9 @@ struct AllocatorInner {
     /// wgpu submits and our sparse binds via system ordering; a
     /// proper fix would route everything through wgpu's queue.
     queue: Mutex<vk::Queue>,
+    /// (min, max) VA over every sparse reservation — the "plausible device
+    /// address" span for debug validation (`SOLARI_PTLAS_VALIDATE`).
+    sparse_va_span: Mutex<(u64, u64)>,
 }
 
 impl Allocator {
@@ -142,8 +145,15 @@ impl Allocator {
                 physical_device,
                 memory_properties,
                 queue: Mutex::new(queue),
+                sparse_va_span: Mutex::new((u64::MAX, 0)),
             }),
         })
+    }
+
+    /// (min, max) VA across all sparse reservations so far — every pool-held
+    /// BLAS/CLAS device address lives inside this span.
+    pub fn sparse_va_span(&self) -> (u64, u64) {
+        *self.inner.sparse_va_span.lock().unwrap()
     }
 
     /// Raw `ash::Device` for callers issuing raw Vulkan commands
@@ -305,6 +315,19 @@ impl Allocator {
                 },
             )
         };
+        // Crash forensics: dedicated allocation ⇒ this VA range is exclusively
+        // this buffer's, so an Aftermath fault VA inside it names it directly.
+        let addr = unsafe {
+            device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(raw_buffer),
+            )
+        };
+        tracing::debug!(
+            "buffer {label}: va 0x{addr:x}..0x{:x} ({} KiB)",
+            addr + requirements.size,
+            requirements.size >> 10,
+        );
+
         (wgpu_buffer, raw_buffer)
     }
 
@@ -386,6 +409,20 @@ impl Allocator {
             )
         };
 
+        // Crash forensics: an Aftermath dump names only a faulting GPU VA —
+        // this line is the map from that VA back to a buffer. Grep the run
+        // log for the range containing the fault address.
+        tracing::info!(
+            "sparse buffer {label}: va 0x{address:x}..0x{:x} ({} MiB virtual)",
+            address + virtual_size,
+            virtual_size >> 20,
+        );
+        {
+            let mut span = self.inner.sparse_va_span.lock().unwrap();
+            span.0 = span.0.min(address);
+            span.1 = span.1.max(address + virtual_size);
+        }
+
         let bevy_buffer = Buffer::from(wgpu_buffer.clone());
         SparseBuffer {
             raw: raw_buffer,
@@ -419,11 +456,16 @@ impl Allocator {
         };
         // SAFETY: raw is a live VkBuffer; SHADER_DEVICE_ADDRESS
         // guaranteed by the contract above.
-        unsafe {
+        let addr = unsafe {
             self.inner.device.get_buffer_device_address(
                 &vk::BufferDeviceAddressInfo::default().buffer(raw),
             )
-        }
+        };
+        // Crash forensics: every buffer a raw-VK op references by address
+        // passes through here — an Aftermath fault VA inside [addr, addr+size)
+        // names it. Debug-gated (persistent consumers re-query per frame).
+        tracing::debug!("addr taken: 0x{addr:x}+{} ({:?})", buf.size(), buf);
+        addr
     }
 
     fn find_memory_type(
@@ -510,73 +552,82 @@ impl SparseBuffer {
     }
 
     /// Ensure every page covering `byte_range` is backed by memory.
-    /// Already-committed pages are skipped. Submits at most one
-    /// `vkQueueBindSparse` per call; CPU-blocks until the binding
-    /// completes (sparse-bind ops aren't ordered against subsequent
-    /// queue submits without explicit sync — fence wait is simplest).
+    /// See [`Self::commit_many`] — one bind + fence wait per call, so
+    /// batch scattered ranges through that instead of looping this.
+    pub fn commit(&self, byte_range: Range<u64>) {
+        self.commit_many(core::iter::once(byte_range));
+    }
+
+    /// Ensure every page covering each range is backed by memory.
+    /// Already-committed pages are skipped. ALL ranges fold into one
+    /// `vkQueueBindSparse` + one CPU fence wait (sparse binds aren't
+    /// ordered against subsequent queue submits without explicit sync).
     ///
     /// # Panics
     ///
     /// Panics on `vkAllocateMemory` / `vkQueueBindSparse` /
     /// `vkWaitForFences` failure.
-    pub fn commit(&self, byte_range: Range<u64>) {
+    pub fn commit_many(&self, byte_ranges: impl IntoIterator<Item = Range<u64>>) {
         let _span = tracing::info_span!("SparseBuffer::commit", label = self.label).entered();
         let page_size = self.page_size;
-        let start_page = byte_range.start / page_size;
-        let end_page = byte_range.end.div_ceil(page_size);
-        debug_assert!((end_page * page_size) <= self.virtual_size);
 
         let mut committed = self.committed_pages.lock().unwrap();
-        // Grow bitset to cover up to end_page.
-        let needed_bytes = (end_page as usize).div_ceil(8);
-        if committed.len() < needed_bytes {
-            committed.resize(needed_bytes, 0u8);
-        }
-
-        // Find contiguous runs of uncommitted pages and bind them in
-        // one VkSparseMemoryBind per run.
         let mut binds: Vec<vk::SparseMemoryBind> = Vec::new();
         let mut new_memories: Vec<vk::DeviceMemory> = Vec::new();
-        let mut p = start_page;
-        while p < end_page {
-            // Skip already-committed pages.
-            while p < end_page && bit_get(&committed, p as usize) {
-                p += 1;
-            }
-            if p >= end_page {
-                break;
-            }
-            let run_start = p;
-            while p < end_page && !bit_get(&committed, p as usize) {
-                bit_set(&mut committed, p as usize);
-                p += 1;
-            }
-            let run_pages = p - run_start;
-            let run_bytes = run_pages * page_size;
+        for byte_range in byte_ranges {
+            let start_page = byte_range.start / page_size;
+            let end_page = byte_range.end.div_ceil(page_size);
+            debug_assert!((end_page * page_size) <= self.virtual_size);
 
-            // Allocate fresh VkDeviceMemory for this run, split into chunks no
-            // larger than `MAX_CHUNK_BYTES`: a single `vkAllocateMemory` must stay
-            // under `maxMemoryAllocationSize` (~4 GB on NV), and large OMM-bearing
-            // BLAS pools blow past that in one run. Page-aligned so each bind lands
-            // on a page boundary. Sub-allocating from a shared pool would reduce the
-            // VkDeviceMemory count; first-version keeps it dumb.
-            const MAX_CHUNK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-            let max_chunk = (MAX_CHUNK_BYTES / page_size) * page_size;
-            let mut chunk_offset = run_start * page_size;
-            let mut remaining = run_bytes;
-            while remaining > 0 {
-                let chunk = remaining.min(max_chunk);
-                let memory = self.allocate_chunk(chunk);
-                new_memories.push(memory);
-                binds.push(vk::SparseMemoryBind {
-                    resource_offset: chunk_offset,
-                    size: chunk,
-                    memory,
-                    memory_offset: 0,
-                    flags: vk::SparseMemoryBindFlags::empty(),
-                });
-                chunk_offset += chunk;
-                remaining -= chunk;
+            // Grow bitset to cover up to end_page.
+            let needed_bytes = (end_page as usize).div_ceil(8);
+            if committed.len() < needed_bytes {
+                committed.resize(needed_bytes, 0u8);
+            }
+
+            // Find contiguous runs of uncommitted pages and bind them in
+            // one VkSparseMemoryBind per run.
+            let mut p = start_page;
+            while p < end_page {
+                // Skip already-committed pages.
+                while p < end_page && bit_get(&committed, p as usize) {
+                    p += 1;
+                }
+                if p >= end_page {
+                    break;
+                }
+                let run_start = p;
+                while p < end_page && !bit_get(&committed, p as usize) {
+                    bit_set(&mut committed, p as usize);
+                    p += 1;
+                }
+                let run_pages = p - run_start;
+                let run_bytes = run_pages * page_size;
+
+                // Allocate fresh VkDeviceMemory for this run, split into chunks no
+                // larger than `MAX_CHUNK_BYTES`: a single `vkAllocateMemory` must stay
+                // under `maxMemoryAllocationSize` (~4 GB on NV), and large OMM-bearing
+                // BLAS pools blow past that in one run. Page-aligned so each bind lands
+                // on a page boundary. Sub-allocating from a shared pool would reduce the
+                // VkDeviceMemory count; first-version keeps it dumb.
+                const MAX_CHUNK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+                let max_chunk = (MAX_CHUNK_BYTES / page_size) * page_size;
+                let mut chunk_offset = run_start * page_size;
+                let mut remaining = run_bytes;
+                while remaining > 0 {
+                    let chunk = remaining.min(max_chunk);
+                    let memory = self.allocate_chunk(chunk);
+                    new_memories.push(memory);
+                    binds.push(vk::SparseMemoryBind {
+                        resource_offset: chunk_offset,
+                        size: chunk,
+                        memory,
+                        memory_offset: 0,
+                        flags: vk::SparseMemoryBindFlags::empty(),
+                    });
+                    chunk_offset += chunk;
+                    remaining -= chunk;
+                }
             }
         }
 
@@ -629,9 +680,12 @@ impl SparseBuffer {
             device
                 .queue_bind_sparse(*queue, &bind_infos, fence)
                 .expect("SparseBuffer.commit: vkQueueBindSparse failed");
-            device
-                .wait_for_fences(&[fence], true, u64::MAX)
-                .expect("SparseBuffer.commit: vkWaitForFences failed");
+            if let Err(err) = device.wait_for_fences(&[fence], true, u64::MAX) {
+                // Device lost: name the last AS pass the GPU reached before
+                // dying (per-pass checkpoints), then die as before.
+                crate::gpu::extension::report_queue_checkpoints(*queue);
+                panic!("SparseBuffer.commit: vkWaitForFences failed: {err:?}");
+            }
             device.destroy_fence(fence, None);
         }
         drop(queue);

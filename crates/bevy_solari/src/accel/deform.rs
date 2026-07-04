@@ -43,6 +43,7 @@ use crate::bindings::RaytracingMesh3d;
 use crate::ecs_gpu::{GpuColumn, GpuSlot};
 use crate::geometry::ClusterMeshManager;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
+use crate::gpu::retire::GpuRetire;
 use crate::instance::{Affine3x4, InstanceManager, RaytracingGpuEntity};
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
@@ -405,6 +406,7 @@ pub fn prepare_deform(
     deform: Option<ResMut<Deform>>,
     instances: Option<Res<InstanceManager>>,
     allocator: Option<Res<Allocator>>,
+    mut retire: ResMut<GpuRetire>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
@@ -428,8 +430,14 @@ pub fn prepare_deform(
     let high_water = instances.map(|i| i.slot_high_water()).unwrap_or(0).max(1);
     if high_water > deform.animated_table_capacity {
         deform.animated_table_capacity = high_water.next_power_of_two();
-        deform.animated_table =
+        let new_table =
             make_animated_table(&allocator, &render_device, deform.animated_table_capacity);
+        // In-flight traces still read the OLD table via its captured raw
+        // address (`animated_table_addr` → `physical_load`, untracked by
+        // wgpu) — park it on the reaper; dropping it here frees the memory
+        // under them → MMU fault → device lost.
+        let old = core::mem::replace(&mut deform.animated_table, new_table);
+        retire.retire(&render_queue, "deform.animated_table", old);
         let zeros = vec![0u8; (deform.animated_table_capacity as u64 * stride) as usize];
         render_queue.write_buffer(&deform.animated_table, 0, &zeros);
         deform.prev_animated.clear();

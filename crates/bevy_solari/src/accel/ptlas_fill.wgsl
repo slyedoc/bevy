@@ -65,6 +65,8 @@ struct PtlasFillParams {
     /// 1 → OR `FORCE_OPACITY_MICROMAP_2_STATE` into OMM instances so "unknown"
     /// micro-triangles collapse to opaque/transparent and the any-hit never runs.
     omm_force_2_state: u32,
+    /// This build's seed-epoch stamp (≥1, bumped per build) — see `seed_epoch`.
+    epoch: u32,
 }
 
 /// `VK_GEOMETRY_INSTANCE_FORCE_OPACITY_MICROMAP_2_STATE_EXT` — treat the OMM as
@@ -249,6 +251,7 @@ fn fill_seed(
         addr = instance_blas_address[slot];
     }
     write_data[i] = make_record(slot, addr);
+    seed_epoch[slot] = params.epoch;
 }
 
 /// Move + band-cross detection over active instances. Appends a WRITE record
@@ -265,6 +268,11 @@ fn fill_incremental(
         return;
     }
     let slot = active_to_slot[d];
+    // Already CPU-seeded this build — a second WRITE for the same instance in
+    // one op is spec-UB (and corrupts the partitioned build under churn).
+    if seed_epoch[slot] == params.epoch {
+        return;
+    }
     let geom = instance_geometry_ids[slot];
     // Not a full rebuild and the shared BLAS wasn't rebuilt → only re-specify
     // this instance if it MOVED: its gathered world transform differs from last
@@ -301,4 +309,73 @@ fn fill_incremental(
 @compute @workgroup_size(1)
 fn finalize() {
     src_infos[1] = atomicLoad(&write_count[0]);
+}
+
+// slot-indexed: the epoch `fill_seed` last wrote this slot's record in.
+// `fill_incremental` skips epoch-stamped slots — an instance must be WRITTEN
+// at most once per partitioned-AS build (a CPU-seeded add would otherwise
+// also be appended as a "mover": its fresh slot's previous transform never
+// matches). The CPU seed is authoritative.
+@group(1) @binding(18) var<storage, read_write> seed_epoch: array<u32>;
+
+// Debug lane (SOLARI_PTLAS_VALIDATE): [0..4)=valid VA span lo/hi (CPU-written
+// u64 halves), [4]=instance capacity, [5]=partition count, [6]=bad count,
+// [7..)=up to 15 × (kind, record, slot, value.x, value.y). kind: 1=address
+// outside the span, 2=instance_index >= capacity, 3=bad partition_index.
+@group(1) @binding(17) var<storage, read_write> validate_report: array<atomic<u32>>;
+
+fn addr_ge(a: vec2<u32>, b: vec2<u32>) -> bool {
+    return a.y > b.y || (a.y == b.y && a.x >= b.x);
+}
+
+fn validate_flag(kind: u32, record: u32, slot: u32, value: vec2<u32>) {
+    let n = atomicAdd(&validate_report[6], 1u);
+    if n < 15u {
+        let e = 7u + n * 5u;
+        atomicStore(&validate_report[e], kind);
+        atomicStore(&validate_report[e + 1u], record);
+        atomicStore(&validate_report[e + 2u], slot);
+        atomicStore(&validate_report[e + 3u], value.x);
+        atomicStore(&validate_report[e + 4u], value.y);
+    }
+}
+
+/// SOLARI_PTLAS_VALIDATE: after finalize, flag + defuse any record that would
+/// MMU-fault the partitioned-AS build: a BLAS address outside the allocator's
+/// sparse VA span, an instance_index past the build's instance_count, or a
+/// partition_index that is neither GLOBAL nor a real partition.
+@compute @workgroup_size(64)
+fn validate(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    let i = gid.x + gid.y * num_workgroups.x * 64u;
+    if i >= atomicLoad(&write_count[0]) {
+        return;
+    }
+    let slot = write_data[i].instance_index;
+    let cap = atomicLoad(&validate_report[4]);
+    if slot >= cap {
+        validate_flag(2u, i, slot, vec2(slot, 0u));
+        // Defuse: retarget the record at instance 0 as a null write.
+        write_data[i].instance_index = 0u;
+        write_data[i].acceleration_structure = vec2(0u, 0u);
+        return;
+    }
+    let part = write_data[i].partition_index;
+    if part != PTLAS_GLOBAL_PARTITION && part >= atomicLoad(&validate_report[5]) {
+        validate_flag(3u, i, slot, vec2(part, 0u));
+        write_data[i].partition_index = PTLAS_GLOBAL_PARTITION;
+    }
+    let addr = write_data[i].acceleration_structure;
+    if (addr.x | addr.y) == 0u {
+        return;
+    }
+    let lo = vec2(atomicLoad(&validate_report[0]), atomicLoad(&validate_report[1]));
+    let hi = vec2(atomicLoad(&validate_report[2]), atomicLoad(&validate_report[3]));
+    if addr_ge(addr, lo) && !addr_ge(addr, hi) {
+        return;
+    }
+    validate_flag(1u, i, slot, addr);
+    write_data[i].acceleration_structure = vec2(0u, 0u);
 }

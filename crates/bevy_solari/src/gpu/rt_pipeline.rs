@@ -531,7 +531,7 @@ impl RtPipeline {
         // raygen, primary miss, N hit groups (registry), shadow miss — computed above.
         const MISS_COUNT: u64 = 2; // miss index 0 = primary, 1 = shadow
         const HIT_RECORD_DATA: u64 = 4; // bytes of shader-record data (u32 material id)
-        const RECORD_HEADROOM: u32 = 64; // absorb a little material growth post-build
+        const RECORD_HEADROOM: u32 = 1024; // absorb streaming material growth post-build
         // One extra hit record, appended AFTER the per-material records, baked with
         // the hair hit-group handle (group 4). Hair instances route to it
         // (`hair_sbt_record`) via `ptlas_hair_write`; it's a single shared record
@@ -682,7 +682,17 @@ impl RtPipeline {
     /// needs a rebuild. The dispatch checks this alongside [`Self::capacity`] and
     /// drains + recreates the pipeline when it returns `true`.
     pub fn classes_changed(&self, current: &[u32]) -> bool {
-        self.material_classes != current
+        let n = self.material_classes.len();
+        if current.len() < n {
+            return self.material_classes.as_slice() != current;
+        }
+        // Baked prefix must match exactly; records past it were baked with the
+        // opaque (class 0) handle + their record index, so a NEW class-0
+        // material inside the headroom is already routed correctly — only a
+        // non-opaque class arriving there forces a rebuild. (The old exact
+        // Vec compare rebuilt the whole RT pipeline — a ~2 s driver compile —
+        // every time ANY material streamed in, making the headroom dead code.)
+        self.material_classes[..] != current[..n] || current[n..].iter().any(|&c| c != 0)
     }
 
     /// Build the per-view set-1 resources (descriptor set) for one view: a fresh pool,

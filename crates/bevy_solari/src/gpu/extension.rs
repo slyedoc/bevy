@@ -58,6 +58,10 @@ use wgpu::hal::api::Vulkan as VkApi;
 /// adapter.
 pub struct ClusterAccelerationStructureFeature;
 
+/// Marker type for `VK_NV_device_diagnostic_checkpoints` (crash forensics:
+/// per-pass GPU checkpoints reported on device loss).
+pub struct DiagnosticCheckpointsFeature;
+
 /// Marker type for `VK_NV_partitioned_acceleration_structure`.
 pub struct PartitionedAccelerationStructureFeature;
 
@@ -209,6 +213,11 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 *args.create_info = core::mem::take(args.create_info).push(features);
             }
 
+            if supports(nv::device_diagnostic_checkpoints::NAME) {
+                args.extensions.push(nv::device_diagnostic_checkpoints::NAME);
+                additional.insert::<DiagnosticCheckpointsFeature>();
+            }
+
             if supports(nv::partitioned_acceleration_structure::NAME) {
                 args.extensions
                     .push(nv::partitioned_acceleration_structure::NAME);
@@ -336,20 +345,20 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
             // micro-regions. The NV cluster CLAS build references the OMM array +
             // per-triangle index buffer (see `clas_arena`). Needs the extension here;
             // `VK_KHR_acceleration_structure` (enabled by wgpu) is the other half.
-            // if supports(ext::opacity_micromap::NAME) {
-            //     args.extensions.push(ext::opacity_micromap::NAME);
-            //     additional.insert::<OpacityMicromapFeature>();
-            //     OPACITY_MICROMAP_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
-            //     let features = Box::leak(Box::new(
-            //         vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true),
-            //     ));
-            //     *args.create_info = core::mem::take(args.create_info).push(features);
-            // } else {
-            //     tracing::warn!(
-            //         "VK_EXT_opacity_micromap NOT exposed by this device — alpha cutouts fall back to \
-            //          pure any-hit (no OMM acceleration)."
-            //     );
-            // }
+            if supports(ext::opacity_micromap::NAME) {
+                args.extensions.push(ext::opacity_micromap::NAME);
+                additional.insert::<OpacityMicromapFeature>();
+                OPACITY_MICROMAP_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
+                let features = Box::leak(Box::new(
+                    vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true),
+                ));
+                *args.create_info = core::mem::take(args.create_info).push(features);
+            } else {
+                tracing::warn!(
+                    "VK_EXT_opacity_micromap NOT exposed by this device — alpha cutouts fall back to \
+                     pure any-hit (no OMM acceleration)."
+                );
+            }
 
             // if supports(nv::ray_tracing_validation::NAME) {
             //     args.extensions.push(nv::ray_tracing_validation::NAME);
@@ -382,6 +391,10 @@ pub struct ClusterExtensionFns {
     /// `VK_NV_partitioned_acceleration_structure`. `None` if the
     /// extension wasn't enabled at device creation.
     pub partitioned: Option<nv::partitioned_acceleration_structure::Device>,
+    /// Per-device function table for `VK_NV_device_diagnostic_checkpoints`
+    /// — per-pass GPU checkpoints, read back on device loss to name the
+    /// last AS pass the GPU reached. `None` when unsupported.
+    pub checkpoints: Option<nv::device_diagnostic_checkpoints::Device>,
     /// Per-device function table for
     /// `VK_KHR_acceleration_structure` — needed to create the
     /// `vk::AccelerationStructureKHR` handle that ray-trace shaders
@@ -431,7 +444,14 @@ impl ClusterExtensionFns {
         let acceleration_structure =
             khr::acceleration_structure::Device::load(raw_instance, raw_device);
 
+        let checkpoints = additional.has::<DiagnosticCheckpointsFeature>().then(|| {
+            let fns = nv::device_diagnostic_checkpoints::Device::load(raw_instance, raw_device);
+            let _ = CHECKPOINT_FNS.set(fns.clone());
+            fns
+        });
+
         Self {
+            checkpoints,
             cluster: has_cluster.then(|| {
                 nv::cluster_acceleration_structure::Device::load(raw_instance, raw_device)
             }),
@@ -492,6 +512,43 @@ pub fn init_cluster_extension_fns(
 /// info array's device addresses must point at valid per-op input
 /// structs; `fns.cluster` must be `Some` (the extension was
 /// enabled at device creation).
+/// Global checkpoint fn table for device-lost reporting from anywhere (the
+/// fence-wait victim sites don't carry `ClusterExtensionFns`).
+static CHECKPOINT_FNS: std::sync::OnceLock<nv::device_diagnostic_checkpoints::Device> =
+    std::sync::OnceLock::new();
+
+/// On device loss: print the checkpoints the GPU last reached on `queue` —
+/// each raw AS pass stamps one (marker encodes the op), so this names the
+/// faulting pass. Safe to call with the queue externally synchronized.
+pub fn report_queue_checkpoints(queue: vk::Queue) {
+    let Some(fns) = CHECKPOINT_FNS.get() else {
+        return;
+    };
+    // SAFETY: queue is valid + externally synchronized by the caller.
+    unsafe {
+        let len = fns.get_queue_checkpoint_data_len(queue);
+        let mut data = vec![vk::CheckpointDataNV::default(); len];
+        fns.get_queue_checkpoint_data(queue, &mut data);
+        for d in &data {
+            tracing::error!(
+                "GPU checkpoint reached: marker {:#x} at stage {:?}",
+                d.p_checkpoint_marker as usize,
+                d.stage,
+            );
+        }
+        if data.is_empty() {
+            tracing::error!("GPU checkpoints: none reported on this queue");
+        }
+    }
+}
+
+/// Checkpoint marker base for cluster-AS ops: `0x1000 + op_type` —
+/// 0x1000=move, 0x1001=BLAS-from-CLAS, 0x1002=direct CLAS build,
+/// 0x1003=template build, 0x1004=instantiate. PTLAS = 0x2000, OMM = 0x3000.
+pub const CKPT_CLUSTER_OP_BASE: usize = 0x1000;
+pub const CKPT_PTLAS: usize = 0x2000;
+pub const CKPT_MICROMAP: usize = 0x3000;
+
 pub unsafe fn cmd_build_cluster_acceleration_structures_indirect(
     encoder: &mut wgpu::CommandEncoder,
     fns: &ClusterExtensionFns,
@@ -515,6 +572,10 @@ pub unsafe fn cmd_build_cluster_acceleration_structures_indirect(
                 "cmd_build_cluster_acceleration_structures_indirect requires Vulkan backend",
             );
             let command_buffer = hal_encoder.raw_handle();
+            if let Some(ck) = &fns.checkpoints {
+                let marker = CKPT_CLUSTER_OP_BASE + commands_info.input.op_type.as_raw() as usize;
+                (ck.fp().cmd_set_checkpoint_nv)(command_buffer, marker as *const _);
+            }
             (cluster.fp().cmd_build_cluster_acceleration_structure_indirect_nv)(
                 command_buffer,
                 commands_info,
@@ -720,6 +781,9 @@ pub unsafe fn cmd_build_micromaps(
             let hal_encoder =
                 hal_encoder.expect("cmd_build_micromaps requires Vulkan backend");
             let command_buffer = hal_encoder.raw_handle();
+            if let Some(ck) = &fns.checkpoints {
+                (ck.fp().cmd_set_checkpoint_nv)(command_buffer, CKPT_MICROMAP as *const _);
+            }
             // ash exposes only the raw fp for this extension (no safe wrapper).
             (omm.fp().cmd_build_micromaps_ext)(command_buffer, 1, build_info);
         });
@@ -743,6 +807,9 @@ pub unsafe fn cmd_build_partitioned_acceleration_structures(
                 "cmd_build_partitioned_acceleration_structures requires Vulkan backend",
             );
             let command_buffer = hal_encoder.raw_handle();
+            if let Some(ck) = &fns.checkpoints {
+                (ck.fp().cmd_set_checkpoint_nv)(command_buffer, CKPT_PTLAS as *const _);
+            }
             (partitioned
                 .fp()
                 .cmd_build_partitioned_acceleration_structures_nv)(

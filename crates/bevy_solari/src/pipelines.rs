@@ -57,6 +57,9 @@ pub struct SolariPipelines {
     pub ptlas_seed: CachedComputePipelineId,
     pub ptlas_incremental: CachedComputePipelineId,
     pub ptlas_finalize: CachedComputePipelineId,
+    /// Debug (SOLARI_PTLAS_VALIDATE): flags + nulls corrupt BLAS addresses in
+    /// the WRITE stream before the partitioned-AS build consumes them.
+    pub ptlas_validate: CachedComputePipelineId,
 
     /// Appends hair instances to the PTLAS WRITE stream (`hair/ptlas_hair_write.wgsl`).
     pub ptlas_hair_write: CachedComputePipelineId,
@@ -269,6 +272,7 @@ pub fn init_solari_pipelines(
     let ptlas_seed = ptlas_make("fill_seed");
     let ptlas_incremental = ptlas_make("fill_incremental");
     let ptlas_finalize = ptlas_make("finalize");
+    let ptlas_validate = ptlas_make("validate");
 
     // Hair PTLAS-write — a single self-contained `@group(0)` (no scene group).
     let ptlas_hair_write = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -341,6 +345,7 @@ pub fn init_solari_pipelines(
         ptlas_seed,
         ptlas_incremental,
         ptlas_finalize,
+        ptlas_validate,
         ptlas_hair_write,
         ray_query,
         deform,

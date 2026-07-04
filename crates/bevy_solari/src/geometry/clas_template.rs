@@ -28,6 +28,7 @@ use super::clas_arena::{CLAS_SCRATCH_ALIGN, CLAS_STORAGE_ALIGN, CLUSTER_CLAS_ADD
 use super::{Cluster, ClusterBloatAabb, ClusterIndex, ClusterMesh, ClusterMeshManager};
 use crate::gpu::allocator::{Allocator, MemoryLocation, SparseBuffer};
 use crate::gpu::extension::ClusterExtensionFns;
+use crate::gpu::retire::GpuRetire;
 
 /// Virtual address space reserved for the template-CLAS storage arena —
 /// 16 GB, sparse-backed (we pay only for committed pages). Templates are
@@ -109,6 +110,7 @@ impl ClusterTemplateArena {
         render_queue: &RenderQueue,
         allocator: &Allocator,
         fns: &ClusterExtensionFns,
+        retire: &mut GpuRetire,
         asset_id: AssetId<ClusterMesh>,
         clusters: &[Cluster],
         bloat_aabbs: &[ClusterBloatAabb],
@@ -377,16 +379,9 @@ impl ClusterTemplateArena {
             );
             crate::gpu::extension::cmd_global_as_barrier(&mut encoder, render_device, false);
         }
-        let build_idx = render_queue.submit([encoder.finish()]);
-        // Block until the build finishes so the wgpu copy below sees the
-        // freshly written template addresses (same rationale as clas_arena).
-        {
-            let _span = tracing::info_span!("clas_template.build_poll_wait").entered();
-            let _ = render_device.wgpu_device().poll(wgpu::PollType::Wait {
-                submission_index: Some(build_idx),
-                timeout: None,
-            });
-        }
+        // No CPU wait: trailing global AS barrier + submission order make the
+        // template addresses visible to the copy.
+        render_queue.submit([encoder.finish()]);
 
         // 6. Copy dst_addresses → global template-address table.
         let mut copy_encoder =
@@ -408,6 +403,12 @@ impl ClusterTemplateArena {
                 storage_range,
                 cluster_count: cluster_count as u32,
             },
+        );
+        // The raw build references these by device address — reaper-owned.
+        retire.retire(
+            render_queue,
+            "clas_template.upload_transients",
+            (bbox_buf, src_infos_buf, count_buf, scratch_buf, dst_addresses_buf),
         );
     }
 }
@@ -436,6 +437,7 @@ pub fn upload_pending_templates(
     fns: Option<Res<ClusterExtensionFns>>,
     cluster_meshes: Res<ClusterMeshManager>,
     arena: Option<ResMut<ClusterTemplateArena>>,
+    mut retire: ResMut<GpuRetire>,
 ) {
     let (Some(allocator), Some(fns), Some(mut arena)) = (allocator, fns, arena) else {
         return;
@@ -457,6 +459,7 @@ pub fn upload_pending_templates(
             &render_queue,
             &allocator,
             &fns,
+            &mut retire,
             entry.asset_id,
             &entry.clusters,
             &entry.bloat_aabbs,

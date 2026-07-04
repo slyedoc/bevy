@@ -159,7 +159,13 @@ fn classify_level(slot: u32, root_group: u32) -> u32 {
     let focal_px = view_focal_px();
     let world_center = apply_affine(slot, root.traversal_sphere.xyz);
     let world_radius = root.traversal_sphere.w * scale;
-    let center_dist = length(world_center - view.world_position);
+    // `cluster_instance_transforms` is the ORIGIN-RELATIVE world (`world_rel`,
+    // origin = the camera itself), so the camera sits at (0,0,0) in this
+    // space. Subtracting `view.world_position` (ABSOLUTE) mixed spaces: at
+    // 9e6 m from the origin every instance classified as ~9e6 m away →
+    // coarsest LOD band (foliage decimation), and camera motion spuriously
+    // crossed bands → shared-BLAS rebuild storms (movement hitches).
+    let center_dist = length(world_center);
     let surface_dist = max(params.near_distance, center_dist - world_radius);
     let denom = max(scale * focal_px, 1e-12);
     let e_ideal = params.pixel_error_threshold * surface_dist / denom;

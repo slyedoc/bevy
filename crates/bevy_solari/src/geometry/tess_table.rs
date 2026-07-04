@@ -4,8 +4,8 @@
 // Ported from `vk_tessellated_clusters/src/tessellation_table.cpp`. Where that
 // sample builds templates with 8-bit cluster indices, we expand the table's
 // packed 8-bit indices to 32-bit and the UV-packed barycentrics to `vec3` so the
-// CLAS-template build reuses the exact 32-bit path already proven by
-// `ClasArena::upload_mesh_via_template` (super::clas_arena). The output is a
+// CLAS-template build reuses the exact 32-bit path already proven during the
+// template-path A/B bring-up (since removed). The output is a
 // per-edge-segment lookup table of cluster-template addresses + instantiation
 // sizes that the GPU classify/tessellate passes (Phases B/C) index by a
 // triangle's three edge factors — giving crack-free adaptive tessellation.

@@ -85,22 +85,33 @@ impl<T: PersistentGpuBufferable> PersistentGpuBuffer<T> {
         buffer_slice
     }
 
-    /// Allocate a range with NO CPU payload — for regions a GPU compute pass will
-    /// write (procedural/GPU-authored meshes). Pages for the range are committed at
-    /// the next [`perform_writes`](Self::perform_writes) (which runs every frame in
-    /// `PrepareAssets`, before any procedural fill dispatch reads or writes the
-    /// range). Contents are undefined until the fill pass writes them; consumers
-    /// must not read the range before then.
+    /// Allocate a range with NO CPU payload — for regions a GPU compute pass
+    /// will write (procedural/GPU-authored meshes). Pages are committed before
+    /// returning: a reserve is never addressable-but-unmapped.
     pub fn queue_reserve(&mut self, size_bytes: u64) -> Range<BufferAddress> {
         debug_assert!(size_bytes.is_multiple_of(COPY_BUFFER_ALIGNMENT));
-        if let Ok(buffer_slice) = self.allocation_planner.allocate_range(size_bytes) {
-            return buffer_slice;
+        let range = if let Ok(buffer_slice) = self.allocation_planner.allocate_range(size_bytes) {
+            buffer_slice
+        } else {
+            let buffer_size = self.allocation_planner.initial_range();
+            let double_buffer_size = (buffer_size.end - buffer_size.start) * 2;
+            let new_size = double_buffer_size.max(size_bytes);
+            self.allocation_planner.grow_to(buffer_size.end + new_size);
+            self.allocation_planner.allocate_range(size_bytes).unwrap()
+        };
+        self.commit_reserved();
+        range
+    }
+
+    /// Commit sparse pages up to the planner high-water WITHOUT uploading.
+    /// Uncommitted-but-reserved pages fault GPU consumers (DMA "failed to
+    /// translate" in AS Build → device loss), so both alloc paths call this.
+    pub fn commit_reserved(&mut self) {
+        let needed = self.allocation_planner.initial_range().end;
+        if needed > self.committed_bytes {
+            self.buffer.commit(0..needed);
+            self.committed_bytes = needed;
         }
-        let buffer_size = self.allocation_planner.initial_range();
-        let double_buffer_size = (buffer_size.end - buffer_size.start) * 2;
-        let new_size = double_buffer_size.max(size_bytes);
-        self.allocation_planner.grow_to(buffer_size.end + new_size);
-        self.allocation_planner.allocate_range(size_bytes).unwrap()
     }
 
     /// Upload all pending data to the GPU buffer, committing more sparse pages
@@ -111,11 +122,7 @@ impl<T: PersistentGpuBufferable> PersistentGpuBuffer<T> {
         // old→new copy and no bind-group invalidation. Newly-committed pages are
         // undefined, but every byte a consumer reads is in a written allocation
         // (inter-allocation gaps are never indexed).
-        let needed = self.allocation_planner.initial_range().end;
-        if needed > self.committed_bytes {
-            self.buffer.commit(0..needed);
-            self.committed_bytes = needed;
-        }
+        self.commit_reserved();
 
         let queue_count = self.write_queue.len();
 

@@ -143,6 +143,11 @@ pub struct BlasSharing {
     geometry_count: u32,
     /// One-time init of the persistent `geometry_built_level` to NO_LEVEL.
     needs_init: bool,
+    /// Slots / geometries whose freshly committed table pages were zeroed —
+    /// sparse pages are UNDEFINED on commit, and these tables hold device
+    /// addresses AS builds dereference (garbage → MMU fault → device loss).
+    cleared_slots: u64,
+    cleared_geoms: u64,
 
     /// Per-frame bind group, rebuilt in `Render::PrepareBindGroups`. The compute
     /// pipeline ids live on [`SolariPipelines`], the layout on [`SolariResourceManager`].
@@ -198,22 +203,23 @@ pub fn init_blas_sharing(
     let geometry_dst_addresses = allocator.create_sparse_buffer(
         &render_device,
         vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
-        wgpu::BufferUsages::STORAGE,
+            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+            | vk::BufferUsageFlags::TRANSFER_DST,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         GEOMETRY_DST_VIRTUAL_BYTES,
         "blas_sharing.geometry_dst_addresses",
     );
     let instance_blas_address = allocator.create_sparse_buffer(
         &render_device,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-        wgpu::BufferUsages::STORAGE,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         SLOT_BUFFER_VIRTUAL_BYTES,
         "blas_sharing.instance_blas_address",
     );
     let instance_e_build = allocator.create_sparse_buffer(
         &render_device,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-        wgpu::BufferUsages::STORAGE,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         SLOT_BUFFER_VIRTUAL_BYTES,
         "blas_sharing.instance_e_build",
     );
@@ -258,6 +264,8 @@ pub fn init_blas_sharing(
         params,
         geometry_count: 1,
         needs_init: true,
+        cleared_slots: 0,
+        cleared_geoms: 0,
         bind_group: None,
     });
 }
@@ -392,6 +400,39 @@ pub fn prepare_blas_sharing(
     resources
         .instance_e_build
         .commit(0..(high_water * 4).max(1));
+
+    // Zero newly committed regions: unwritten slots must read address 0 (the
+    // PTLAS fill's null/inactive encoding), never undefined page contents —
+    // an active instance whose geometry hasn't built yet otherwise hands the
+    // partitioned-AS build a garbage BLAS address.
+    let geoms = geometry_count as u64;
+    if high_water > resources.cleared_slots || geoms > resources.cleared_geoms {
+        let mut encoder = render_device.create_command_encoder(&Default::default());
+        if high_water > resources.cleared_slots {
+            let lo = resources.cleared_slots;
+            encoder.clear_buffer(
+                &resources.instance_blas_address.wgpu_buffer,
+                lo * 8,
+                Some((high_water - lo) * 8),
+            );
+            encoder.clear_buffer(
+                &resources.instance_e_build.wgpu_buffer,
+                lo * 4,
+                Some((high_water - lo) * 4),
+            );
+            resources.cleared_slots = high_water;
+        }
+        if geoms > resources.cleared_geoms {
+            let lo = resources.cleared_geoms;
+            encoder.clear_buffer(
+                &resources.geometry_dst_addresses.wgpu_buffer,
+                lo * 8,
+                Some((geoms - lo) * 8),
+            );
+            resources.cleared_geoms = geoms;
+        }
+        render_queue.submit([encoder.finish()]);
+    }
 }
 
 /// `Render::PrepareBindGroups`: rebuild the sharing bind group.
