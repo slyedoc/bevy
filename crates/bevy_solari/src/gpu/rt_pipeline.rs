@@ -1105,6 +1105,8 @@ fn rt_capabilities() -> naga::valid::Capabilities {
         // f64 for planet-scale domain math in user composable modules
         // (SHADER_F64 is a required solari device feature post-transform_f64).
         | naga::valid::Capabilities::FLOAT64
+        // f16 pack/unpack builtins (planet erosion maps decode 4×f16 texels).
+        | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
 }
 
 /// Build a naga_oil composer pre-loaded with the built-in importable modules the RT

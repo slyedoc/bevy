@@ -1,5 +1,9 @@
 mod ui;
 
+/// The shared per-camera debug card root — external crates (e.g. the planet
+/// crate's terrain-view dropdown) append their own rows into it.
+pub use ui::ViewPanelRoot;
+
 use bevy_app::{App, Plugin, Update};
 use bevy_feathers::FeathersCorePlugin;
 

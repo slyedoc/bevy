@@ -146,7 +146,10 @@ pub fn update_render_debug_label(
 // (`SolariShowDisplacement.enabled`). In heatmap view the two sliders (center,
 // contrast) appear and the DLSS dropdown hides; otherwise it's the reverse.
 
-pub use view_panel::{spawn_view_panels, toggle_heatmap_controls, update_stats_label, update_view_label};
+pub use view_panel::{
+    spawn_view_panels, toggle_heatmap_controls, update_stats_label, update_view_label,
+    ViewPanelRoot,
+};
 
 mod view_panel {
     use super::*;
@@ -442,7 +445,7 @@ mod dlss_dropdown {
     /// dropdown / sliders), so the debug widgets read as one panel.
     pub fn spawn_dlss_panels(
         cameras: Query<(), (With<SolariCamera>, Without<DlssPanelSpawned>)>,
-        panels: Query<(Entity, &UiTargetCamera), With<view_panel::ViewPanelRoot>>,
+        panels: Query<(Entity, &UiTargetCamera), With<ViewPanelRoot>>,
         mut commands: Commands,
     ) {
         for (panel, target) in &panels {
