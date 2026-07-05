@@ -703,12 +703,15 @@ pub(crate) fn rt_pipeline(
         };
     // Match the megakernel (view_cull.rs): the baked atmosphere cube is already
     // physical radiance (brightness 1.0); otherwise the skybox's raw cd/m²; else 0
-    // (no sky ⇒ miss stays at the clear color). NB: `Skybox` is stripped from the
-    // render world, so brightness comes from `SolariEnvironmentMap`.
+    // (no sky ⇒ miss stays at the clear color). Brightness stays 0 while the skybox
+    // image is still loading — the stand-in is the WHITE fallback cube, and lighting
+    // it up would flash the whole sky white until the real cubemap lands.
     let environment_brightness = if atmosphere_view.is_some() {
         1.0
     } else {
-        environment_map.map_or(0.0, |env| env.brightness)
+        environment_map
+            .filter(|env| env_images.texture_assets.get(&env.image).is_some())
+            .map_or(0.0, |env| env.brightness)
     };
 
     // Scene (set 0) + columns (set 2) bind groups — built each frame by the

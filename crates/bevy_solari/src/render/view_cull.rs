@@ -29,9 +29,11 @@ use bevy_ecs::{
 use bevy_image::Image;
 use bevy_math::{UVec4, Vec3};
 use bevy_render::{
+    render_asset::RenderAssets,
     render_resource::{DynamicUniformBuffer, ShaderType},
     renderer::{RenderDevice, RenderQueue},
     sync_world::RenderEntity,
+    texture::GpuImage,
     Extract, MainWorld,
 };
 
@@ -215,6 +217,7 @@ pub fn prepare_solari_view_uniforms(
         ),
         With<SolariCamera>,
     >,
+    gpu_images: Res<RenderAssets<GpuImage>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut commands: Commands,
@@ -228,11 +231,15 @@ pub fn prepare_solari_view_uniforms(
     {
         // The baked atmosphere cube already holds physical radiance (scaled by sun
         // illuminance), so it's used as-is (brightness 1.0). Otherwise the skybox's
-        // raw cd/m² brightness, or 0.0 (no sky ⇒ miss stays black).
+        // raw cd/m² brightness, or 0.0 (no sky ⇒ miss stays black). Brightness stays
+        // 0 while the skybox image is loading — its stand-in is the WHITE fallback
+        // cube, and lighting it up flashes the sky white until the cubemap lands.
         let environment_brightness = if atmosphere_view.is_some() {
             1.0
         } else {
-            environment_map.map_or(0.0, |env| env.brightness)
+            environment_map
+                .filter(|env| gpu_images.get(&env.image).is_some())
+                .map_or(0.0, |env| env.brightness)
         };
         // Photographer aperture → physical lens radius, with bevy DoF's own
         // focal-length convention (`calculate_focal_length`: focal =
