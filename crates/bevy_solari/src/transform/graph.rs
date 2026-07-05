@@ -37,6 +37,10 @@ use super::readback::NoGpuGlobalTransformReadback;
 /// `world = local`. Must match `ROOT_PARENT` in `transform_propagate.wgsl`.
 pub const ROOT_PARENT: u32 = u32::MAX;
 
+/// Chain sentinel in the `first_child`/`next_sibling` columns: end of the sibling
+/// list / childless node. Must match `NO_NODE` in `transform_frontier.wgsl`.
+pub const NO_NODE: u32 = u32::MAX;
+
 /// A node's local translation on the wire: 3×`f64` = 24 B, bound as `array<f64>`
 /// by the propagate walk. Element `k` of node `n` sits at byte `24n + 8k` — always
 /// 8-aligned, so the flat-`f64` view needs no padding.
@@ -71,6 +75,12 @@ crate::gpu_table! {
             // f32 rotation quat + scale.
             LocalRSColumn => local_rs: LocalRS = "transform.local_rs",
             ParentColumn => parent: u32 = "transform.parent",
+            // Downward topology for the GPU frontier expansion (`super::frontier`):
+            // intrusive child list per node. Written at first sight and on
+            // `Changed<Children>`; `NO_NODE` terminates. The frontier pass walks
+            // these to re-walk a moved parent's descendants entirely GPU-side.
+            FirstChildColumn  => first_child: u32 = "transform.first_child",
+            NextSiblingColumn => next_sibling: u32 = "transform.next_sibling",
             // 1 if the node opts out of CPU `GlobalTransform` readback
             // (`NoGpuGlobalTransformReadback`). Read by the readback gather to skip it.
             NoReadbackColumn => no_readback: u32 = "transform.no_readback",
@@ -84,30 +94,24 @@ crate::gpu_table! {
     }
 }
 
-/// A **moving parent whose subtree must re-walk**: opt a parent into a **descendant re-walk**
-/// when *it* moves. Purely the downward change-propagation fix — precision needs no marker.
-///
-/// The change-driven propagate re-walks only nodes whose *own* `local` changed, so a parent
-/// that moves would leave its descendants with a **stale world** (they didn't move relative to
-/// the parent). Tagging the parent `SolariFrame` re-pushes every descendant's (unchanged) `local`
-/// when the parent moves — including `TransformStatic` static-local children the change filter
-/// otherwise skips — so the ancestor walk recomposes them through the moved parent. Only tag
-/// parents whose motion must drive their children on the RT path; a continuously rotating one
-/// re-walks its subtree every frame (intrinsic — its geometry *is* moving in origin space).
+/// **No-op since the GPU frontier** ([`super::frontier`]): every moving parent's descendants
+/// are re-walked automatically on the GPU (the changed node seeds a frontier that expands
+/// through the `first_child`/`next_sibling` columns). Kept only so existing spawns compile;
+/// remove uses at leisure.
 #[derive(Component, Default, Clone, Copy, Debug)]
 pub struct SolariFrame;
 
-/// A **GPU-moved parent whose subtree must re-walk**: like [`SolariFrame`], but its motion comes
-/// from a GPU pass writing its `local`/world directly (e.g. an orbital-mechanics compute pass),
-/// with **no CPU-side change**, so the change filter never dispatches it or its subtree.
-///
-/// Tagging it `SolariGpuFrame` opts the node **and its descendants** into an **unconditional
-/// re-walk every frame**: the extract seeds the node itself (so its own `local` lands in the
-/// dispatch) and walks its current children (so streamed-in LOD tiles are picked up the frame
-/// after they spawn). Use this **instead of** [`SolariFrame`] when the motion is GPU-driven. Cost
-/// is one subtree re-walk per frame, the same a continuously-spinning [`SolariFrame`] pays.
+/// A **GPU-moved node**: its motion comes from a GPU pass writing its `local`/world directly
+/// (e.g. an orbital-mechanics compute pass), with **no CPU-side change**, so the change filter
+/// never sees it. Tagged nodes are appended to the frontier **seed** every frame; the GPU
+/// frontier then expands to their descendants. (The old per-frame CPU subtree re-push is gone.)
 #[derive(Component, Default, Clone, Copy, Debug)]
 pub struct SolariGpuFrame;
+
+/// Render-world list of [`SolariGpuFrame`] node slots, refreshed each extract — the extra
+/// frontier seeds beyond the changed-`local` delta (see `super::frontier`).
+#[derive(Resource, Default)]
+pub struct GpuFrameSeeds(pub Vec<u32>);
 
 /// Opt **out** of per-frame transform extraction: this entity's local `Transform`
 /// is scattered to the GPU table **once** (first sight) and then never re-scanned
@@ -224,6 +228,8 @@ pub struct TransformDeltaBuf {
     parent: Vec<u32>,
     no_readback: Vec<u32>,
     entity: Vec<u32>,
+    first_child: Vec<u32>,
+    next_sibling: Vec<u32>,
 }
 
 impl TransformDeltaBuf {
@@ -248,6 +254,42 @@ impl TransformDeltaBuf {
     fn push_entity(&mut self, slot: u32, entity_bits: [u32; 2]) {
         push_record(&mut self.entity, slot, entity_bits);
     }
+    #[inline]
+    fn push_chain(
+        &mut self,
+        parent_slot: u32,
+        children: Option<&Children>,
+        nodes: &Query<&GpuSlot<TransformGraph>>,
+    ) {
+        push_children_chain(&mut self.first_child, &mut self.next_sibling, parent_slot, children, nodes);
+    }
+}
+
+/// Write a node's whole child chain: `first_child[parent]` plus each slotted child's
+/// `next_sibling`, `NO_NODE`-terminated. Unslotted children (no `GlobalTransform`)
+/// are skipped, keeping the chain closed over table nodes.
+fn push_children_chain(
+    first_child: &mut Vec<u32>,
+    next_sibling: &mut Vec<u32>,
+    parent_slot: u32,
+    children: Option<&Children>,
+    nodes: &Query<&GpuSlot<TransformGraph>>,
+) {
+    let mut head = NO_NODE;
+    let mut prev: Option<u32> = None;
+    for child in children.into_iter().flat_map(Children::iter) {
+        let Ok(slot) = nodes.get(child) else { continue };
+        let slot = slot.index();
+        match prev {
+            None => head = slot,
+            Some(prev) => push_record(next_sibling, prev, slot),
+        }
+        prev = Some(slot);
+    }
+    if let Some(last) = prev {
+        push_record(next_sibling, last, NO_NODE);
+    }
+    push_record(first_child, parent_slot, head);
 }
 
 /// `ExtractSchedule`: mirror each changed entity's local `Transform` + parent
@@ -272,27 +314,22 @@ pub fn extract_transform_graph(
                 Option<Ref<ChildOf>>,
                 Ref<GpuSlot<TransformGraph>>,
                 Has<NoGpuGlobalTransformReadback>,
+                Option<&Children>,
             ),
             TransformChangeFilter,
         >,
     >,
     nodes: Extract<Query<&GpuSlot<TransformGraph>>>,
-    // Frames whose pose changed this frame — their subtree must re-walk (below).
-    moved_frames: Extract<
-        Query<
-            Entity,
-            (
-                With<SolariFrame>,
-                Or<(Changed<Transform>, Changed<ChildOf>)>,
-            ),
-        >,
-    >,
-    // GPU-driven frames: re-walked unconditionally every frame (their world is written on
-    // the GPU with no CPU change, so the change filter never dispatches them or their subtree).
-    gpu_frames: Extract<Query<Entity, With<SolariGpuFrame>>>,
-    // Hierarchy + per-descendant (local, slot) for the moved-frame subtree re-walk.
-    children_q: Extract<Query<&Children>>,
-    frame_descendants: Extract<Query<(&Transform, &GpuSlot<TransformGraph>)>>,
+    // Child-list maintenance for the GPU frontier's downward topology (chain rewrite
+    // on `Changed<Children>`, chain clear on removal, gpu-frame seed refresh) —
+    // tupled to stay under the system-param limit.
+    (children_changed, mut children_removed, has_children, gpu_frames, mut gpu_seeds): (
+        Extract<Query<(Ref<GpuSlot<TransformGraph>>, &Children), Changed<Children>>>,
+        Extract<RemovedComponents<Children>>,
+        Extract<Query<(), With<Children>>>,
+        Extract<Query<&GpuSlot<TransformGraph>, With<SolariGpuFrame>>>,
+        ResMut<GpuFrameSeeds>,
+    ),
     marker_added: Extract<Query<&GpuSlot<TransformGraph>, Added<NoGpuGlobalTransformReadback>>>,
     mut marker_removed: Extract<RemovedComponents<NoGpuGlobalTransformReadback>>,
     // Born-static first sight: entities the change query skips (archetype prune) get their one
@@ -304,40 +341,44 @@ pub fn extract_transform_graph(
             Option<&ChildOf>,
             &GpuSlot<TransformGraph>,
             Has<NoGpuGlobalTransformReadback>,
+            Option<&Children>,
         )>,
     >,
-    mut table: ResMut<TransformGraph>,
+    table: ResMut<TransformGraph>,
     local_t_column: Option<ResMut<GpuColumn<LocalTranslationColumn>>>,
     local_rs_column: Option<ResMut<GpuColumn<LocalRSColumn>>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut queues: Local<Parallel<TransformDeltaBuf>>,
 ) {
+    // Plain `&mut` so disjoint column-`Vec` borrows work (`ResMut` derefs whole).
+    let table = table.into_inner();
     members.par_iter().for_each_init(
         || queues.borrow_local_mut(),
-        |buf, (entity, transform, child_of, slot, no_cpu_global)| {
+        |buf, (entity, transform, child_of, slot, no_cpu_global, children)| {
             // First sight = the frame the slot landed; drives the one-time uploads below. Keyed on
             // the slot (not `transform.is_added()`) so a node whose slot arrives after its
             // Transform-change edge went stale still uploads exactly once.
             let first = slot.is_added();
             let slot = slot.index();
-            // The local pair (f64 translation + f32 RS) — re-pushed whenever the node
-            // moves, and once at first sight (so a node whose change edge was consumed
-            // before its slot existed still uploads).
-            if first || transform.is_changed() {
+            // The local pair (f64 translation + f32 RS) — re-pushed whenever the node moves,
+            // once at first sight, and on a bare reparent (the re-push seeds the GPU frontier,
+            // which recomposes the node AND its descendants through the new ancestry).
+            let parent_changed = child_of.as_ref().is_some_and(Ref::is_changed);
+            if first || transform.is_changed() || parent_changed {
                 buf.push_local(slot, &transform);
             }
-            // Readback opt-out flag + owning-entity bits: first sight only — neither changes
-            // over an occupant's lifetime, so movers never re-send them. A reused slot is
-            // "first seen" by its new occupant (its `GpuSlot` is freshly `Added`), overwriting
-            // the previous occupant's. Later marker adds/removes are caught by the passes below.
+            // Readback opt-out flag + owning-entity bits + the child chain: first sight only.
+            // A reused slot is "first seen" by its new occupant (its `GpuSlot` is freshly
+            // `Added`), overwriting the previous occupant's records. Later changes are caught
+            // by the marker passes / `Changed<Children>` below.
             if first {
                 buf.push_no_readback(slot, no_cpu_global as u32);
                 let bits = entity.to_bits();
                 buf.push_entity(slot, [bits as u32, (bits >> 32) as u32]);
+                buf.push_chain(slot, children, &nodes);
             }
             // Parent slot: at first sight and on reparent. Roots (no `ChildOf`) → `ROOT_PARENT`.
-            let parent_changed = child_of.as_ref().is_some_and(Ref::is_changed);
             if first || parent_changed {
                 let parent = match &child_of {
                     Some(child_of) => nodes
@@ -350,13 +391,44 @@ pub fn extract_transform_graph(
             }
         },
     );
-    // `parent` / `no_readback` / `entity` are tiny (reparent / first-sight only) —
-    // serial.
+    // `parent` / `no_readback` / `entity` / chain columns are tiny (reparent /
+    // first-sight / child-list churn only) — serial.
     for buf in queues.iter_mut() {
         table.parent.append(&mut buf.parent);
         table.no_readback.append(&mut buf.no_readback);
         table.entity.append(&mut buf.entity);
+        table.first_child.append(&mut buf.first_child);
+        table.next_sibling.append(&mut buf.next_sibling);
     }
+
+    // Child-list churn after first sight: rewrite the changed node's whole chain.
+    // First-sight slots are skipped — the mover/static paths just wrote theirs, and
+    // a duplicate record for one slot in a frame's delta is a scatter race.
+    for (slot, children) in &children_changed {
+        if slot.is_added() {
+            continue;
+        }
+        push_children_chain(
+            &mut table.first_child,
+            &mut table.next_sibling,
+            slot.index(),
+            Some(children),
+            &nodes,
+        );
+    }
+    // Last child removed → `Children` is gone entirely. Skip if it was re-added the
+    // same frame (the `Changed<Children>` pass above already wrote the new chain).
+    for entity in children_removed.read() {
+        if has_children.contains(entity) {
+            continue;
+        }
+        if let Ok(slot) = nodes.get(entity) {
+            push_record(&mut table.first_child, slot.index(), NO_NODE);
+        }
+    }
+    // GPU-driven nodes seed the frontier every frame (their motion has no CPU edge).
+    gpu_seeds.0.clear();
+    gpu_seeds.0.extend(gpu_frames.iter().map(GpuSlot::index));
 
     // Readback opt-out flag changes after first sight. Removals first: an entity
     // whose marker was removed *and* re-added this frame still matches the
@@ -385,51 +457,14 @@ pub fn extract_transform_graph(
         return;
     };
 
-    // Moved-frame subtree re-walk. The change-driven propagate recomputes only
-    // nodes whose *own* `local` changed; a frame's descendants didn't move
-    // relative to the frame, so a rotating/translating frame would leave them
-    // with a stale world (this includes `TransformStatic` static-local children
-    // the change filter never visits). For each moved `SolariFrame`, re-push every
-    // descendant's (unchanged) `local` so its slot lands in this frame's dispatch
-    // and the ancestor walk recomposes it through the moved frame. Serial — frames
-    // are few; a continuously spinning frame pays its subtree every frame (the
-    // intrinsic cost of geometry that is genuinely moving in origin space).
-    let mut frame_subtree_t: Vec<u32> = Vec::new();
-    let mut frame_subtree_rs: Vec<u32> = Vec::new();
-    if !moved_frames.is_empty() || !gpu_frames.is_empty() {
-        let mut stack: Vec<Entity> = Vec::new();
-        // CPU-moved frames: the frame's own `local` was already pushed by the par_iter
-        // (its `Transform` changed), so seed only its children — re-walk descendants.
-        for frame in &moved_frames {
-            if let Ok(children) = children_q.get(frame) {
-                stack.extend(children.iter());
-            }
-        }
-        // GPU-driven frames: the frame's world is written on the GPU with no CPU
-        // `Transform` change, so the par_iter never dispatched it. Seed the frame ITSELF
-        // so the walk pushes its own `local` AND every descendant, every frame.
-        for frame in &gpu_frames {
-            stack.push(frame);
-        }
-        while let Some(entity) = stack.pop() {
-            if let Ok((transform, slot)) = frame_descendants.get(entity) {
-                let (t, rs) = local_records(transform);
-                push_record(&mut frame_subtree_t, slot.index(), t);
-                push_record(&mut frame_subtree_rs, slot.index(), rs);
-            }
-            if let Ok(children) = children_q.get(entity) {
-                stack.extend(children.iter());
-            }
-        }
-    }
-
     // Born-static first sight: entities tagged `TransformStatic` before their first extract are
     // skipped by the change query (archetype prune), so do their one upload here. Idempotent for
     // statics tagged late (re-scatters identical records). Merged into the single local write.
     let mut static_t: Vec<u32> = Vec::new();
     let mut static_rs: Vec<u32> = Vec::new();
     for &entity in &static_queue.entities {
-        let Ok((transform, child_of, slot, no_cpu_global)) = static_data.get(entity) else {
+        let Ok((transform, child_of, slot, no_cpu_global, children)) = static_data.get(entity)
+        else {
             continue; // despawned / lost its slot before we ran
         };
         let slot = slot.index();
@@ -439,6 +474,7 @@ pub fn extract_transform_graph(
         push_record(&mut table.no_readback, slot, no_cpu_global as u32);
         let bits = entity.to_bits();
         push_record(&mut table.entity, slot, [bits as u32, (bits >> 32) as u32]);
+        push_children_chain(&mut table.first_child, &mut table.next_sibling, slot, children, &nodes);
         let parent = match child_of {
             Some(child_of) => nodes
                 .get(child_of.parent())
@@ -453,7 +489,7 @@ pub fn extract_transform_graph(
     fn write_parts<'a, C: crate::ecs_gpu::GpuColumnDesc>(
         column: &mut GpuColumn<C>,
         mut parts: Vec<&'a [u32]>,
-        extra: [&'a [u32]; 2],
+        extra: [&'a [u32]; 1],
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
     ) {
@@ -485,7 +521,7 @@ pub fn extract_transform_graph(
     write_parts(
         &mut local_t_column,
         t_bufs,
-        [frame_subtree_t.as_slice(), static_t.as_slice()],
+        [static_t.as_slice()],
         &render_device,
         &render_queue,
     );
@@ -493,7 +529,7 @@ pub fn extract_transform_graph(
     write_parts(
         &mut local_rs_column,
         rs_bufs,
-        [frame_subtree_rs.as_slice(), static_rs.as_slice()],
+        [static_rs.as_slice()],
         &render_device,
         &render_queue,
     );

@@ -49,6 +49,7 @@ use crate::gpu::allocator::{Allocator, SparseBuffer};
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 
+use super::frontier::{TransformFrontier, CONSUMER_ARGS_OFFSET};
 use super::graph::{LocalRSColumn, LocalTranslationColumn, ParentColumn, TransformGraph};
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -133,7 +134,7 @@ pub fn transform_propagate_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_read_only_sized(false, None), // 2 parent
                 storage_buffer_sized(false, None),           // 3 world_abs_linear (rw, persistent)
                 storage_buffer_sized(false, None),           // 4 world_abs_t (rw, persistent)
-                storage_buffer_read_only_sized(false, None), // 5 changed (delta records)
+                storage_buffer_read_only_sized(false, None), // 5 frontier worklist (count + slots)
                 uniform_buffer::<PropagateParams>(false),    // 6 params
             ),
         ),
@@ -238,11 +239,12 @@ pub fn init_transform_propagate(
 pub fn prepare_transform_propagate(
     mut propagate: Option<ResMut<TransformPropagate>>,
     graph: Option<Res<TransformGraph>>,
-    local_t: Option<Res<GpuColumn<LocalTranslationColumn>>>,
+    frontier: Option<Res<TransformFrontier>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
-    let (Some(propagate), Some(graph), Some(local_t)) = (propagate.as_deref_mut(), graph, local_t)
+    let (Some(propagate), Some(graph), Some(frontier)) =
+        (propagate.as_deref_mut(), graph, frontier)
     else {
         return;
     };
@@ -275,20 +277,20 @@ pub fn prepare_transform_propagate(
     }
 
     let full_rebuild = propagate.needs_full_rebuild;
-    // The two local columns are pushed in lockstep (see `graph.rs`), so the
-    // translation column's delta is THE changed-nodes list.
-    let changed_count = local_t.pending();
+    // The frontier's seed count (changed records + gpu-frame seeds) gates the walk;
+    // the true dispatch count — seeds + GPU-expanded descendants — lives GPU-side
+    // and is consumed via indirect dispatch.
     propagate.dispatch_count = if full_rebuild {
         propagate.node_count
     } else {
-        changed_count
+        frontier.seed_count()
     };
     // The subtract pass re-runs iff the walk wrote anything (a node — possibly the camera
     // origin — moved) or a growth needs its first fill; an idle frame leaves `world_rel` as is.
     propagate.world_dirty = propagate.dispatch_count > 0 || grew;
     *propagate.params.get_mut() = PropagateParams {
         count: propagate.dispatch_count,
-        record_stride: local_t.record_stride(),
+        record_stride: 1,
         full_rebuild: full_rebuild as u32,
         _pad: 0,
     };
@@ -304,26 +306,32 @@ pub fn prepare_transform_propagate_bind_groups(
     local_t: Option<Res<GpuColumn<LocalTranslationColumn>>>,
     local_rs: Option<Res<GpuColumn<LocalRSColumn>>>,
     parent: Option<Res<GpuColumn<ParentColumn>>>,
+    frontier: Option<Res<TransformFrontier>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
-    let (Some(propagate), Some(resource_manager), Some(local_t), Some(local_rs), Some(parent)) = (
+    let (
+        Some(propagate),
+        Some(resource_manager),
+        Some(local_t),
+        Some(local_rs),
+        Some(parent),
+        Some(frontier),
+    ) = (
         propagate.as_deref_mut(),
         resource_manager,
         local_t,
         local_rs,
         parent,
-    ) else {
+        frontier,
+    )
+    else {
         return;
     };
     let layout = pipeline_cache.get_bind_group_layout(&resource_manager.transform_propagate);
     let Some(params) = propagate.params.binding() else {
         return;
     };
-    // The changed-slot list. When empty (`pending == 0`) the dispatch is skipped
-    // or the shader returns before reading it, so a fallback buffer is harmless —
-    // bind the always-present `parent` buffer so the bind group is still valid.
-    let changed = local_t.delta_buffer().unwrap_or_else(|| parent.buffer());
 
     let bind_group = render_device.create_bind_group(
         "transform_propagate",
@@ -334,7 +342,7 @@ pub fn prepare_transform_propagate_bind_groups(
             parent.buffer().as_entire_binding(),
             propagate.world_abs_linear.buffer().as_entire_binding(),
             propagate.world_abs_t.buffer().as_entire_binding(),
-            changed.as_entire_binding(),
+            frontier.frontier_buffer().as_entire_binding(),
             params,
         )),
     );
@@ -348,6 +356,7 @@ pub fn prepare_transform_propagate_bind_groups(
 /// world slots, so a single pass is exact.
 pub fn dispatch_transform_propagate(
     propagate: Option<ResMut<TransformPropagate>>,
+    frontier: Option<Res<TransformFrontier>>,
     pipelines: Res<SolariPipelines>,
     pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
@@ -397,13 +406,23 @@ pub fn dispatch_transform_propagate(
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
                 let d = diagnostics.time_span(&mut pass, "transform_propagate");
-                // 2D-split to stay under the 65535 per-dimension dispatch limit
-                // (node_count / 64 exceeds it past ~4.2M nodes); the shader
-                // reconstructs the flat index from `gid` + `num_workgroups`.
-                let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(groups);
-                pass.dispatch_workgroups(gx, gy, gz);
+                if propagate.needs_full_rebuild {
+                    // 2D-split to stay under the 65535 per-dimension dispatch limit
+                    // (node_count / 64 exceeds it past ~4.2M nodes); the shader
+                    // reconstructs the flat index from `gid` + `num_workgroups`.
+                    let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(groups);
+                    pass.dispatch_workgroups(gx, gy, gz);
+                    walked = true;
+                } else if let Some(frontier) = frontier.as_ref() {
+                    // Changed path: the dispatch size is GPU-side (seeds + expanded
+                    // descendants) — consume the frontier's indirect args.
+                    pass.dispatch_workgroups_indirect(
+                        frontier.indirect_buffer(),
+                        CONSUMER_ARGS_OFFSET,
+                    );
+                    walked = true;
+                }
                 d.end(&mut pass);
-                walked = true;
             }
         }
     }

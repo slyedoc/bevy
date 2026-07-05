@@ -26,21 +26,28 @@ use crate::ecs_gpu::{GpuColumnPrepareSet, GpuPresenceColumnPlugin};
 use crate::pipelines::SolariPipelines;
 use crate::{SolariClusterSystems, SolariSetup};
 
+mod frontier;
 mod gather;
 mod graph;
 mod propagate;
 mod readback;
 mod subtract;
 
+pub use frontier::{
+    dispatch_transform_frontier, init_transform_frontier, prepare_transform_frontier,
+    prepare_transform_frontier_bind_group, transform_frontier_bind_group_layout,
+    TransformFrontier,
+};
 pub use gather::{
     dispatch_transform_gather, init_transform_gather, prepare_transform_gather,
     prepare_transform_gather_bind_group, transform_gather_bind_group_layout, TransformGather,
 };
 pub use graph::{
     clear_static_first_sight, enqueue_node_first_sight, enqueue_static_first_sight,
-    extract_transform_graph, transform_columns_ready, LocalRSColumn, LocalTranslationColumn,
-    NodeEntityColumn, ParentColumn, SolariFrame, SolariGpuFrame, StaticColumn,
-    StaticFirstSightQueue, TransformGraph, TransformStatic, TransformTablePlugin, ROOT_PARENT,
+    extract_transform_graph, transform_columns_ready, FirstChildColumn, GpuFrameSeeds,
+    LocalRSColumn, LocalTranslationColumn, NextSiblingColumn, NodeEntityColumn, ParentColumn,
+    SolariFrame, SolariGpuFrame, StaticColumn, StaticFirstSightQueue, TransformGraph,
+    TransformStatic, TransformTablePlugin, NO_NODE, ROOT_PARENT,
 };
 pub use propagate::{
     dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,
@@ -118,6 +125,8 @@ impl Plugin for SolariTransformPlugin {
             // pass reads `world_abs_t[camera_slot]` as the f64 origin on the GPU — the CPU only
             // carries the slot index, so a camera childed to a player/ship/patch renders at 0.
             .init_resource::<SolariOriginSlot>()
+            // The gpu-frame frontier seeds, refreshed by the table extract.
+            .init_resource::<GpuFrameSeeds>()
             .add_systems(ExtractSchedule, extract_origin_slot)
             // Drain the born-static first-sight queue the extract just consumed. Same cold-start
             // gate as the extract (so events accumulate until pipelines compile), ordered after it.
@@ -130,6 +139,7 @@ impl Plugin for SolariTransformPlugin {
             .add_systems(
                 RenderStartup,
                 (
+                    init_transform_frontier,
                     init_transform_propagate,
                     init_transform_subtract,
                     init_transform_gather,
@@ -141,6 +151,7 @@ impl Plugin for SolariTransformPlugin {
                 Render,
                 (
                     (
+                        prepare_transform_frontier,
                         prepare_transform_propagate,
                         prepare_transform_subtract,
                         prepare_transform_gather,
@@ -150,6 +161,7 @@ impl Plugin for SolariTransformPlugin {
                         .in_set(RenderSystems::Prepare)
                         .after(GpuColumnPrepareSet),
                     (
+                        prepare_transform_frontier_bind_group,
                         prepare_transform_propagate_bind_groups,
                         prepare_transform_subtract_bind_group,
                         prepare_transform_gather_bind_group,
@@ -160,10 +172,12 @@ impl Plugin for SolariTransformPlugin {
             )
             .add_systems(
                 RenderGraph,
-                // Propagate (ancestor-walk → absolute f64 world) → subtract the camera
-                // origin (→ relative f32 world) → gather into the instance TransformColumn
+                // Frontier (changed set → +descendants, GPU-expanded) → propagate
+                // (ancestor-walk → absolute f64 world) → subtract the camera origin
+                // (→ relative f32 world) → gather into the instance TransformColumn
                 // → readback gather for marked entities.
                 (
+                    dispatch_transform_frontier,
                     dispatch_transform_propagate,
                     dispatch_transform_subtract,
                     dispatch_transform_gather,

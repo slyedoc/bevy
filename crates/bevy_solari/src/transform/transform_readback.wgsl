@@ -21,13 +21,15 @@
 //             entity from these and writes its GlobalTransform (entity-keyed identity)
 
 struct ReadbackParams {
-    changed_count: u32,
-    record_stride: u32,  // words per `local` delta record (slot at k*stride)
+    changed_count: u32,  // unused on the frontier path (count is GPU-side)
+    record_stride: u32,  // unused on the frontier path (slots are flat)
     node_count: u32,
     capacity: u32,       // max output records
 }
 
-@group(0) @binding(0) var<storage, read> changed: array<u32>;        // local delta [slot, words…]
+// The frontier worklist (changed nodes + GPU-expanded descendants): count at
+// word 1, slots from `FRONTIER_HEADER`. Must match `transform_frontier.wgsl`.
+@group(0) @binding(0) var<storage, read> frontier: array<u32>;
 @group(0) @binding(1) var<storage, read> world_abs_linear: array<vec4<f32>>; // 3 per node (.w unused)
 // The f64 translation buffer viewed as raw word pairs — the gather just moves
 // bits, so it needs no SHADER_F64 itself; the CPU reassembles f64 from the words.
@@ -40,6 +42,7 @@ struct ReadbackParams {
 
 const HEADER: u32 = 4u;
 const RECORD: u32 = 18u;
+const FRONTIER_HEADER: u32 = 24u;
 // Root sentinel — must match `ROOT_PARENT` in graph.rs / transform_propagate.wgsl.
 const ROOT_PARENT: u32 = 0xffffffffu;
 // Ancestor-walk depth guard (cycle / corrupt-parent backstop).
@@ -71,10 +74,10 @@ fn readback(
 ) {
     // Flat index across a 2D-split dispatch (X capped at 65535, rest in Y).
     let k = gid.x + gid.y * num_workgroups.x * 64u;
-    if k >= params.changed_count {
+    if k >= frontier[1u] {
         return;
     }
-    let slot = changed[k * params.record_stride];
+    let slot = frontier[FRONTIER_HEADER + k];
     if slot >= params.node_count {
         return; // unassigned / out-of-range node.
     }

@@ -32,8 +32,9 @@ use crate::gpu::allocator::Allocator;
 use crate::lights::light_resolve_bind_group_layout;
 use crate::render::atmosphere::{atmosphere_bind_group_layout, atmosphere_lut_bind_group_layout};
 use crate::transform::{
-    transform_gather_bind_group_layout, transform_propagate_bind_group_layout,
-    transform_readback_bind_group_layout, transform_subtract_bind_group_layout,
+    transform_frontier_bind_group_layout, transform_gather_bind_group_layout,
+    transform_propagate_bind_group_layout, transform_readback_bind_group_layout,
+    transform_subtract_bind_group_layout,
 };
 
 /// Every solari pass bind-group layout, built once at `RenderStartup`. Field names
@@ -46,6 +47,7 @@ use crate::transform::{
 /// — never come into existence there.
 #[derive(Resource)]
 pub struct SolariResourceManager {
+    pub transform_frontier: BindGroupLayoutDescriptor,
     pub transform_propagate: BindGroupLayoutDescriptor,
     pub transform_subtract: BindGroupLayoutDescriptor,
     pub transform_gather: BindGroupLayoutDescriptor,
@@ -80,6 +82,7 @@ pub fn init_solari_resource_manager(mut commands: Commands, allocator: Option<Re
         return;
     }
     commands.insert_resource(SolariResourceManager {
+        transform_frontier: transform_frontier_bind_group_layout(),
         transform_propagate: transform_propagate_bind_group_layout(),
         transform_subtract: transform_subtract_bind_group_layout(),
         transform_gather: transform_gather_bind_group_layout(),

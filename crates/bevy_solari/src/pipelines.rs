@@ -36,6 +36,9 @@ use crate::resource_manager::SolariResourceManager;
 /// solari needs (the manager gates on the allocator).
 #[derive(Resource)]
 pub struct SolariPipelines {
+    pub transform_frontier_seed: CachedComputePipelineId,
+    pub transform_frontier_expand: CachedComputePipelineId,
+    pub transform_frontier_finalize: CachedComputePipelineId,
     pub transform_propagate: CachedComputePipelineId,
     pub transform_subtract: CachedComputePipelineId,
     pub transform_gather: CachedComputePipelineId,
@@ -80,6 +83,7 @@ pub struct SolariPipelines {
 /// `load_embedded_asset!` in [`init_solari_pipelines`] are co-located — the
 /// embedded path matches by construction, no cross-module path drift.
 pub fn embed_solari_shaders(app: &mut App) {
+    embedded_asset!(app, "transform/transform_frontier.wgsl");
     embedded_asset!(app, "transform/transform_propagate.wgsl");
     embedded_asset!(app, "transform/transform_subtract.wgsl");
     embedded_asset!(app, "transform/transform_gather.wgsl");
@@ -138,6 +142,40 @@ pub fn init_solari_pipelines(
         zero_initialize_workgroup_memory: false,
         constants: vec![],
     });
+    let frontier_shader =
+        load_embedded_asset!(asset_server.as_ref(), "transform/transform_frontier.wgsl");
+    let transform_frontier_seed = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("transform_frontier_seed".into()),
+        layout: vec![resource_manager.transform_frontier.clone()],
+        shader: frontier_shader.clone(),
+        shader_defs: vec![],
+        entry_point: Some("seed".into()),
+        immediate_size: 0,
+        zero_initialize_workgroup_memory: false,
+        constants: vec![],
+    });
+    let transform_frontier_expand =
+        pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("transform_frontier_expand".into()),
+            layout: vec![resource_manager.transform_frontier.clone()],
+            shader: frontier_shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("expand".into()),
+            immediate_size: 0,
+            zero_initialize_workgroup_memory: false,
+            constants: vec![],
+        });
+    let transform_frontier_finalize =
+        pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("transform_frontier_finalize".into()),
+            layout: vec![resource_manager.transform_frontier.clone()],
+            shader: frontier_shader,
+            shader_defs: vec![],
+            entry_point: Some("finalize".into()),
+            immediate_size: 0,
+            zero_initialize_workgroup_memory: false,
+            constants: vec![],
+        });
     let transform_propagate = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("transform_propagate".into()),
         layout: vec![resource_manager.transform_propagate.clone()],
@@ -327,6 +365,9 @@ pub fn init_solari_pipelines(
     });
 
     commands.insert_resource(SolariPipelines {
+        transform_frontier_seed,
+        transform_frontier_expand,
+        transform_frontier_finalize,
         transform_propagate,
         transform_subtract,
         transform_gather,

@@ -33,12 +33,14 @@
 // NOTE: unsuffixed WGSL float literals are f32 — f64 constants need explicit typing.
 
 struct PropagateParams {
-    // Threads to dispatch: `full_rebuild` → node_count; else changed-record count.
+    // Threads to dispatch on the `full_rebuild` path (node_count); the changed
+    // path's true count lives GPU-side in the frontier header (word 1).
     count: u32,
-    // Words per changed record (`WORDS + 1`); the slot is at `k * record_stride`.
+    // Unused on the frontier path (slots are flat); kept for layout stability.
     record_stride: u32,
     // 1 → node = thread id (walk every node, e.g. after a growth); 0 → node =
-    // `changed[k * record_stride]` (walk only this frame's changed nodes).
+    // `frontier[HEADER + k]` (this frame's changed nodes + their descendants,
+    // expanded GPU-side by `transform_frontier.wgsl`).
     full_rebuild: u32,
     _pad: u32,
 }
@@ -52,8 +54,12 @@ const MAX_DEPTH: u32 = 64u;
 @group(0) @binding(2) var<storage, read> parent: array<u32>;                 // 1 per node
 @group(0) @binding(3) var<storage, read_write> world_abs_linear: array<vec4<f32>>; // 3 per node (persistent)
 @group(0) @binding(4) var<storage, read_write> world_abs_t: array<f64>;      // 3 per node (persistent)
-@group(0) @binding(5) var<storage, read> changed: array<u32>;                // [slot, words…] per record
+// The frontier worklist: `[total(unused here), count, level state…]` header then
+// node slots from `FRONTIER_HEADER`. Must match `transform_frontier.wgsl`.
+@group(0) @binding(5) var<storage, read> frontier: array<u32>;
 @group(0) @binding(6) var<uniform> params: PropagateParams;
+
+const FRONTIER_HEADER: u32 = 24u;
 
 // A node's local transform: linear rows (rotation·scale, f32) + f64 translation.
 struct Local {
@@ -98,13 +104,14 @@ fn propagate(
     @builtin(num_workgroups) num_workgroups: vec3<u32>,
 ) {
     let k = gid.x + gid.y * num_workgroups.x * 64u;
-    if k >= params.count {
-        return;
-    }
-
     var node = k;
     if params.full_rebuild == 0u {
-        node = changed[k * params.record_stride];
+        if k >= frontier[1u] {
+            return;
+        }
+        node = frontier[FRONTIER_HEADER + k];
+    } else if k >= params.count {
+        return;
     }
 
     // M starts as the node's own local; left-compose each ancestor walking up to the

@@ -54,7 +54,8 @@ use crate::ecs_gpu::GpuColumn;
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 
-use super::graph::{LocalTranslationColumn, NoReadbackColumn, NodeEntityColumn, ParentColumn};
+use super::frontier::{TransformFrontier, CONSUMER_ARGS_OFFSET};
+use super::graph::{NoReadbackColumn, NodeEntityColumn, ParentColumn};
 use super::propagate::TransformPropagate;
 
 /// Master switch for the whole readback (gather dispatch + the `GlobalTransform`
@@ -189,20 +190,22 @@ pub fn init_transform_readback(mut commands: Commands) {
 /// there). The readback set is the changed nodes — same delta propagation walks.
 pub fn prepare_transform_readback(
     mut readback: ResMut<TransformReadback>,
-    local: Option<Res<GpuColumn<LocalTranslationColumn>>>,
+    frontier: Option<Res<TransformFrontier>>,
     propagate: Option<Res<TransformPropagate>>,
     target: Option<Res<TransformReadbackTarget>>,
     gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
-    let (Some(local), Some(propagate), Some(target)) = (local, propagate, target) else {
+    let (Some(frontier), Some(propagate), Some(target)) = (frontier, propagate, target) else {
         return;
     };
-    readback.changed_count = local.pending();
+    // Seed count is the CPU-visible "anything moved?" gate; the true gather count
+    // (seeds + GPU-expanded descendants) is in the frontier header, dispatched indirect.
+    readback.changed_count = frontier.seed_count();
     *readback.params.get_mut() = ReadbackParams {
         changed_count: readback.changed_count,
-        record_stride: local.record_stride(),
+        record_stride: 1,
         node_count: propagate.node_count(),
         capacity: READBACK_CAPACITY,
     };
@@ -233,7 +236,7 @@ pub fn prepare_transform_readback(
 pub fn prepare_transform_readback_bind_group(
     mut readback: ResMut<TransformReadback>,
     resource_manager: Option<Res<SolariResourceManager>>,
-    local: Option<Res<GpuColumn<LocalTranslationColumn>>>,
+    frontier: Option<Res<TransformFrontier>>,
     no_readback: Option<Res<GpuColumn<NoReadbackColumn>>>,
     parent: Option<Res<GpuColumn<ParentColumn>>>,
     entity: Option<Res<GpuColumn<NodeEntityColumn>>>,
@@ -245,7 +248,7 @@ pub fn prepare_transform_readback_bind_group(
 ) {
     let (
         Some(resource_manager),
-        Some(local),
+        Some(frontier),
         Some(no_readback),
         Some(parent),
         Some(entity),
@@ -253,7 +256,7 @@ pub fn prepare_transform_readback_bind_group(
         Some(target),
     ) = (
         resource_manager,
-        local,
+        frontier,
         no_readback,
         parent,
         entity,
@@ -269,15 +272,12 @@ pub fn prepare_transform_readback_bind_group(
         readback.bind_group = None;
         return;
     };
-    // When the delta is empty, fall back to the column buffer for the binding
-    // (the shader returns before reading it — `changed_count` is 0).
-    let changed = local.delta_buffer().unwrap_or_else(|| local.buffer());
     let layout = pipeline_cache.get_bind_group_layout(&resource_manager.transform_readback);
     readback.bind_group = Some(render_device.create_bind_group(
         "transform_readback",
         &layout,
         &BindGroupEntries::sequential((
-            changed.as_entire_binding(),
+            frontier.frontier_buffer().as_entire_binding(),
             propagate.world_abs_linear().as_entire_binding(),
             propagate.world_abs_t().as_entire_binding(),
             out.buffer.as_entire_binding(),
@@ -294,6 +294,7 @@ pub fn prepare_transform_readback_bind_group(
 /// (`RenderSystems::Cleanup`, after this) streams the buffer to the main world.
 pub fn dispatch_transform_readback(
     readback: Option<Res<TransformReadback>>,
+    frontier: Option<Res<TransformFrontier>>,
     pipelines: Res<SolariPipelines>,
     pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
@@ -301,7 +302,7 @@ pub fn dispatch_transform_readback(
     if !READBACK_ENABLED {
         return;
     }
-    let Some(readback) = readback else {
+    let (Some(readback), Some(frontier)) = (readback, frontier) else {
         return;
     };
     if readback.changed_count == 0 {
@@ -313,7 +314,6 @@ pub fn dispatch_transform_readback(
     let Some(bind_group) = readback.bind_group.as_ref() else {
         return;
     };
-    let groups = crate::ecs_gpu::linear_dispatch(readback.changed_count.div_ceil(WORKGROUP_SIZE));
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let encoder = ctx.command_encoder();
@@ -325,7 +325,9 @@ pub fn dispatch_transform_readback(
     pass.set_bind_group(0, bind_group, &[]);
     // Times the gather + ancestor-walk (the per-node `parent`-chain opt-out scan).
     let d = diagnostics.time_span(&mut pass, "transform_readback");
-    pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+    // The gather set (seeds + GPU-expanded descendants) is GPU-sized — share the
+    // frontier's consumer indirect args with the propagate walk.
+    pass.dispatch_workgroups_indirect(frontier.indirect_buffer(), CONSUMER_ARGS_OFFSET);
     d.end(&mut pass);
 }
 
