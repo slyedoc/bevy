@@ -46,8 +46,8 @@ pub use graph::{
     clear_static_first_sight, enqueue_node_first_sight, enqueue_static_first_sight,
     extract_transform_graph, transform_columns_ready, FirstChildColumn, GpuFrameSeeds,
     LocalRSColumn, LocalTranslationColumn, NextSiblingColumn, NodeEntityColumn, ParentColumn,
-    SolariFrame, SolariGpuFrame, StaticColumn, StaticFirstSightQueue, TransformGraph,
-    TransformStatic, TransformTablePlugin, NO_NODE, ROOT_PARENT,
+    SolariGpuFrame, StaticColumn, StaticFirstSightQueue, TransformGraph, TransformStatic,
+    TransformTablePlugin, NO_NODE, ROOT_PARENT,
 };
 pub use propagate::{
     dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,

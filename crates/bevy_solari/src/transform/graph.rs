@@ -94,13 +94,6 @@ crate::gpu_table! {
     }
 }
 
-/// **No-op since the GPU frontier** ([`super::frontier`]): every moving parent's descendants
-/// are re-walked automatically on the GPU (the changed node seeds a frontier that expands
-/// through the `first_child`/`next_sibling` columns). Kept only so existing spawns compile;
-/// remove uses at leisure.
-#[derive(Component, Default, Clone, Copy, Debug)]
-pub struct SolariFrame;
-
 /// A **GPU-moved node**: its motion comes from a GPU pass writing its `local`/world directly
 /// (e.g. an orbital-mechanics compute pass), with **no CPU-side change**, so the change filter
 /// never sees it. Tagged nodes are appended to the frontier **seed** every frame; the GPU

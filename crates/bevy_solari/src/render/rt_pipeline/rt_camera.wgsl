@@ -4,7 +4,7 @@
 // DLSS passes read. This makes the camera "just another transform-table node":
 // its view is composed on the GPU through any hierarchy + floating-origin cell
 // offset, same-frame, with no dependence on a CPU `GlobalTransform` — so a camera
-// childed to a moving `SolariFrame` (ship, station) renders correctly with no
+// childed to a moving parent (ship, station) renders correctly with no
 // leaf rule and no `NoGpuGlobalTransformReadback`. Only the projection (CPU-
 // authored) and the per-frame scalars (jitter/frame/sky) cross from the CPU, in
 // `CameraPassParams`. Runs after `transform_propagate`, before the RT trace reads

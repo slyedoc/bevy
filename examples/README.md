@@ -200,7 +200,7 @@ Example | Description
 [Solari (many lights stress test)](../examples/3d/solari/many_lights.rs) | 400 emissive sphere lights over 8000 cubes — Bevy Solari scaling stress test, with the `SolariDebugPlugin` overlay.
 [Solari (pica_pica)](../examples/3d/solari/pica_pica.rs) | Realtime ray-traced lighting on the pica_pica diorama (Bevy Solari), with the `SolariDebugPlugin` overlay.
 [Solari (portals)](../examples/3d/solari/portal.rs) | Ray portals — surfaces that teleport rays to a paired portal, routed to a dedicated SBT hit group (Bevy Solari).
-[Solari (reference frames)](../examples/3d/solari/frames.rs) | A moving SolariFrame whose children ride its pose on the GPU transform table — a spinning station against a fixed world; the foundation for co-resident multi-world (frame → PTLAS partition).
+[Solari (reference frames)](../examples/3d/solari/frames.rs) | A moving parent whose children ride its pose on the GPU transform table (frontier-expanded, no marker) — a spinning station against a fixed world; the foundation for co-resident multi-world (frame → PTLAS partition).
 [Solari (refraction)](../examples/3d/solari/refraction.rs) | Transmissive glass: a Bistro wine bottle and glass path-traced with refraction, TIR, and Beer-Lambert absorption.
 [Solari (scope)](../examples/3d/solari/scope.rs) | A working 4x Galilean telescope built from real lens geometry - magnification emerges from refraction.
 [Solari (split screen)](../examples/3d/solari/split_screen.rs) | The same scene side by side: Solari ray tracing vs the standard Bevy rasterizer, separated by `RenderLayers`.

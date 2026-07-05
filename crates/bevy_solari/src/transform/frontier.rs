@@ -3,7 +3,7 @@
 //!
 //! The propagate walk recomposes only the nodes in its dispatch list; a moving
 //! parent's descendants didn't change their own `local`, so they used to need a
-//! CPU-side `SolariFrame` subtree re-push. This pass replaces that: the changed
+//! CPU-side marker + subtree re-push (the late `SolariFrame`). This pass replaces that: the changed
 //! `local` delta (plus [`GpuFrameSeeds`] — GPU-moved nodes with no CPU change edge)
 //! seeds a worklist that expands level-by-level through the `first_child` /
 //! `next_sibling` columns, deduped by a per-node frame-epoch stamp. The result —

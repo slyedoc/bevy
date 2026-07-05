@@ -14,7 +14,7 @@ use crate::render::SolariCamera;
 /// frame.
 ///
 /// Two reasons, because a floating-origin **reframe** (a recenter, or a frame
-/// handoff when the camera crosses from one [`SolariFrame`](crate::transform::SolariFrame)
+/// handoff when the camera crosses from one reference frame's basis
 /// into another) is stronger than a plain history drop: the previous frame's
 /// instance transforms *and* view-projection were expressed in the OLD origin
 /// frame, so motion-vector reprojection across the discontinuity is invalid —
@@ -93,7 +93,7 @@ pub fn reset_render_on_view_state_change(
 }
 
 /// A one-frame, **motion-vector-continuous** basis correction for a floating-origin
-/// frame handoff (the camera crossed from one [`SolariFrame`](crate::transform::SolariFrame)'s
+/// frame handoff (the camera crossed from one reference frame's
 /// basis into another). Where [`CameraReset::reframe`] *drops* temporal history at the
 /// discontinuity, this **re-expresses** last frame's view-projection in the new origin
 /// basis, so motion vectors stay continuous through the handoff — prefer it when the

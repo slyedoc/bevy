@@ -1,5 +1,5 @@
-//! Bevy Solari **reference frames** — a moving [`SolariFrame`] whose children are
-//! expressed relative to it and tracked on the GPU transform table as the frame moves.
+//! Bevy Solari **reference frames** — a moving parent whose children are expressed
+//! relative to it and tracked on the GPU transform table as the parent moves.
 //!
 //! A slowly spinning "station" sits in front of the camera. Its hub and a ring of
 //! emissive panels are **children of the frame** — they carry small frame-local
@@ -8,12 +8,12 @@
 //! the frame: they stay rock-steady while the station turns, so you can see the frame's
 //! subtree moving against a fixed world.
 //!
-//! The point this validates: solari's change-driven propagate only re-walks nodes whose
-//! *own* local transform changed, so a moving parent would normally leave its children
-//! with a stale world. Tagging the parent [`SolariFrame`] opts its whole subtree into a
-//! re-walk each frame the frame moves — including static-local children. This is the
-//! foundation for co-resident multi-world (each frame → one PTLAS partition): a ship, a
-//! station, or a spinning planet whose surface tiles ride the frame.
+//! The point this validates: solari's change-driven propagate re-walks only nodes whose
+//! *own* local transform changed — a moving parent's descendants are pulled in by the
+//! GPU frontier pass, which expands the changed set through the child columns with no
+//! marker and no CPU traversal. This is the foundation for co-resident multi-world
+//! (each frame → one PTLAS partition): a ship, a station, or a spinning planet whose
+//! surface tiles ride the frame.
 //!
 //! A floating origin composes for free (the station sits 1 AU out): `Transform` is
 //! double-precision, the GPU walk carries the frame's big world in native f64, and the
@@ -71,7 +71,7 @@ fn main() {
         .run();
 }
 
-/// Rotate the station frame about its Y axis. Because the station is a [`SolariFrame`],
+/// Rotate the station frame about its Y axis. The GPU frontier re-walks its subtree, so
 /// its children re-walk through the new orientation each frame — they orbit with it
 /// without carrying any motion of their own.
 fn spin_station(time: Res<Time>, mut frames: Query<&mut Transform, With<Station>>) {
@@ -101,7 +101,7 @@ fn setup(
         },
     ));
 
-    // ── The station: a SolariFrame, one cell out along +X, slowly spinning. ──────────
+    // ── The station: a moving parent, one cell out along +X, slowly spinning. ────────
     // Children below are parented to it and compose through its pose on the GPU walk.
     let hub_mesh = meshes.add(Cuboid::new(4.0, 4.0, 4.0));
     let panel_mesh = meshes.add(Cuboid::new(1.0, 6.0, 0.4));
@@ -122,7 +122,6 @@ fn setup(
     commands
         .spawn((
             Station,
-            SolariFrame,
             // The frame's big world (1 AU out) — an ordinary f64 `Transform`.
             Transform::from_translation(station_pos),
         ))

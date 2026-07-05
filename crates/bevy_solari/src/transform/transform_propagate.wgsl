@@ -21,10 +21,9 @@
 // De-fusing the subtract from the walk is what keeps this pass changed-only: the
 // origin moving every frame re-runs only the cheap flat subtract, not this walk.
 //
-// Boundary: this updates a changed node's own world. A change that moves a node's
-// DESCENDANTS without changing their own `local` (animating a parent, or a bare
-// re-parent) won't re-walk those descendants unless a `SolariFrame`/`SolariGpuFrame`
-// re-pushes their locals (see graph.rs).
+// Descendants of a moved parent are included automatically: the frontier pass
+// (`transform_frontier.wgsl`) expands the changed set through the child columns
+// GPU-side, and this walk consumes the expanded worklist via indirect dispatch.
 //
 // Layout: `local_t` is a flat array<f64>, 3 per node; `local_rs` is 7 f32 per node
 // (rotation xyzw quat, scale .xyz), matching graph.rs's `LocalTranslation`/`LocalRS`.

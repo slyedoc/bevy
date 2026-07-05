@@ -195,7 +195,7 @@ pub mod prelude {
         render::CameraReframe,
         render::CameraReset,
         render::SolariCamera,
-        transform::{NoGpuGlobalTransformReadback, SolariFrame, SolariGpuFrame, TransformStatic},
+        transform::{NoGpuGlobalTransformReadback, SolariGpuFrame, TransformStatic},
         SolariInitPlugin, SolariPlugin,
     };
 

@@ -23,10 +23,10 @@
 //!
 //! How it works: `TransformPlugin` is disabled, so there is no CPU `GlobalTransform` — solari's
 //! change-driven propagate composes worlds on the GPU. That pass re-walks only nodes whose own
-//! local changed, so a moving parent would leave a static-local child stale; tagging the
-//! spinning **root** [`SolariFrame`] opts its whole subtree (arms, hands, *and* the static
-//! fingers) into a re-walk each frame it moves. The floating origin is the f64 successor to
-//! `big_space` (Aevyrie, MIT/Apache — credited). It just loops — nothing is despawned.
+//! local changed; the GPU frontier pass expands the changed set to descendants (arms, hands,
+//! *and* the static fingers) through the child columns, so the spinning root needs no marker.
+//! The floating origin is the f64 successor to `big_space` (Aevyrie, MIT/Apache — credited).
+//! It just loops — nothing is despawned.
 
 use bevy::{
     camera::CameraMainTextureUsages,
@@ -94,8 +94,8 @@ fn main() {
         .run();
 }
 
-/// Rotate the root. It's a [`SolariFrame`], so its whole subtree — the arms and their
-/// static-local hands — re-walks through the new pose each frame.
+/// Rotate the root. The GPU frontier expands its whole subtree — the arms and their
+/// static-local hands — so everything re-walks through the new pose each frame.
 fn spin_root(time: Res<Time>, mut roots: Query<&mut Transform, With<Root>>) {
     for mut transform in &mut roots {
         transform.rotate_y(0.5 * f64::from(time.delta_secs()));
@@ -169,13 +169,12 @@ fn setup(
         ..default()
     });
 
-    // ── The hierarchy: root → arm → hand. The ROOT carries the big offset — its f64
-    // `Transform` (1 AU out) *and* the `SolariFrame` tag that re-walks the whole subtree
-    // each spin. Children stay frame-local; their `Transform`s are the small local detail. ──
+    // ── The hierarchy: root → arm → hand. The ROOT carries the big offset in its f64
+    // `Transform` (1 AU out); the GPU frontier re-walks the whole subtree each spin.
+    // Children stay frame-local; their `Transform`s are the small local detail. ──
     commands
         .spawn((
             Root,
-            SolariFrame,
             Mesh3d(root_mesh),
             MeshMaterial3d(root_mat),
             Transform::from_translation(scene_pos + DVec3::new(0.0, 1.0, 0.0)),

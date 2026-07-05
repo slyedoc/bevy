@@ -21,10 +21,9 @@
 //! changed-only: the origin moving every frame re-runs only the cheap flat
 //! subtract, not this walk.
 //!
-//! Boundary (see the shader): updates a *changed* node's own world. Animating a
-//! parent (descendants move without their own `local` changing) or a bare
-//! re-parent won't re-walk the descendants unless a `SolariFrame`/`SolariGpuFrame`
-//! re-pushes their locals (see `graph.rs`).
+//! Descendants of a moved parent are re-walked automatically: the frontier pass
+//! ([`super::frontier`]) expands the changed set through the child columns
+//! GPU-side, and this walk consumes the expanded worklist via indirect dispatch.
 
 use ash::vk;
 use bevy_ecs::{
