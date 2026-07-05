@@ -261,6 +261,10 @@ pub struct RtViewBindings {
     /// component if the view's output buffer changes (resize) — the descriptor is
     /// written once and never updated (updating an in-flight set device-losts).
     output_buffer: vk::Buffer,
+    /// The env cube view baked into binding 2, for the same rebuild check: a
+    /// skybox that finishes loading (or is swapped) changes the view, and the
+    /// baked-once set would otherwise sample the stale cube forever.
+    env_map_view: vk::ImageView,
 }
 
 // SAFETY: the host-visible geometry-address mapping is written only from the single
@@ -869,6 +873,7 @@ impl RtPipeline {
             env_map_sampler,
             env_map_image,
             output_buffer,
+            env_map_view,
         })
     }
 
@@ -1035,6 +1040,12 @@ impl RtViewBindings {
     /// the view's current output buffer to detect a resize-driven reallocation.
     pub fn output_buffer(&self) -> vk::Buffer {
         self.output_buffer
+    }
+
+    /// The env cube view baked into binding 2. The dispatch compares this to the
+    /// view's current environment view to detect a loaded/swapped skybox.
+    pub fn env_map_view(&self) -> vk::ImageView {
+        self.env_map_view
     }
 
     /// Upload this frame's bindless geometry addresses (host-visible, coherent).

@@ -781,14 +781,27 @@ pub(crate) fn rt_pipeline(
     // output with their own camera/env. Built lazily once the env cube is ready
     // (baked into the set once — building before it exists would freeze the
     // fallback cube in as the sky) and rebuilt if the view's output buffer was
-    // reallocated (viewport resize), since the set is written once, never updated.
+    // reallocated (viewport resize) OR the env view changed (a skybox that
+    // finished loading / got swapped), since the set is written once, never updated.
+    let current_env_view = raw_image_view(environment_map_view);
     let view_bindings = match view_bindings {
-        Some(vb) if vb.output_buffer() == output.raw => vb,
+        Some(vb)
+            if vb.output_buffer() == output.raw
+                && Some(vb.env_map_view()) == current_env_view =>
+        {
+            vb
+        }
         existing => {
-            let env_ready = atmosphere_view.is_none() || atmosphere_sky.is_some();
+            // Ready = the declared sky actually exists: a pending atmosphere bake or a
+            // still-loading skybox image would bake the (white) fallback cube in forever.
+            let env_ready = if atmosphere_view.is_some() {
+                atmosphere_sky.is_some()
+            } else {
+                environment_map
+                    .is_none_or(|env| env_images.texture_assets.get(&env.image).is_some())
+            };
             if env_ready {
-                if let (Some(allocator), Some(env_view)) =
-                    (allocator.as_deref(), raw_image_view(environment_map_view))
+                if let (Some(allocator), Some(env_view)) = (allocator.as_deref(), current_env_view)
                 {
                     // Resize rebuild: the old bindings point at a freed output
                     // buffer (RtOutputBuffer realloc'd). Drain the GPU so dropping
