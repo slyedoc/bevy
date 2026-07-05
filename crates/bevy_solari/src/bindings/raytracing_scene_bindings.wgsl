@@ -56,6 +56,11 @@ struct Material {
     displacement_texture_id: u32,
     displacement_scale: f32,
     displacement_bias: f32,
+    // Layered `texture_arrays` pool slots for custom closest-hits (terrain layer
+    // painting); `TEXTURE_MAP_NONE` when absent.
+    texture_array_a_id: u32,
+    texture_array_b_id: u32,
+    texture_array_c_id: u32,
     // Opaque per-material data for a custom closest-hit (StandardSolariMaterial::chit_data).
     chit_data: vec4<u32>,
 }
@@ -163,6 +168,17 @@ struct HairSceneParams {
 @group(0) @binding(11) var<storage> hair_params: HairSceneParams;
 // GPU transform table: 3 `vec4` rows (mat3x4) per node, indexed `slot*3 + k`.
 @group(0) @binding(12) var<storage> hair_world: array<vec4<f32>>;
+
+// Layered texture arrays (`Material.texture_array_{a,b}_id`) — a separate SIZED
+// pool: D2Array views can't share the `texture_2d` pool, and sized ⇒ no SPIR-V
+// binding-size override needed. One shared trilinear REPEAT sampler (tiling).
+@group(0) @binding(13) var texture_arrays: binding_array<texture_2d_array<f32>, 16>;
+@group(0) @binding(14) var texture_arrays_sampler: sampler;
+
+// Sample one layer of a `texture_arrays` entry at an explicit ray-cone LOD.
+fn sample_texture_array(id: u32, layer: u32, uv: vec2<f32>, lod: f32) -> vec3<f32> {
+    return textureSampleLevel(texture_arrays[id], texture_arrays_sampler, uv, layer, max(lod, 0.0)).rgb;
+}
 
 /// A hit's PTLAS `instance_index` lands in the hair range.
 fn is_hair_instance(instance_index: u32) -> bool {

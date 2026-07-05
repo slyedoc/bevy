@@ -59,6 +59,9 @@ fn solari_material_from_gltf(
         depth_map: None,
         depth_scale: 1.0,
         depth_bias: 0.0,
+        texture_array_a: None,
+        texture_array_b: None,
+        texture_array_c: None,
         // Custom hit-group routing (portal, planet, …) is opt-in via `chit_class`.
         chit_class: 0,
         chit_data: [0; 4],

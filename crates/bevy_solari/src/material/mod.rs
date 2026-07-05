@@ -98,6 +98,13 @@ pub struct StandardSolariMaterial {
     /// Added to the (negated) scaled depth (so a mid-grey-centered map can push the
     /// surface both inward and outward).
     pub depth_bias: f32,
+    /// Optional layered (`texture_2d_array`) textures for a custom `chit_class`
+    /// shader (terrain layer painting); sampled via `sample_texture_array`.
+    pub texture_array_a: Option<Handle<Image>>,
+    /// Second layered-texture slot (e.g. packed AO/roughness/metallic layers).
+    pub texture_array_b: Option<Handle<Image>>,
+    /// Third layered-texture slot (e.g. tangent-space normal layers).
+    pub texture_array_c: Option<Handle<Image>>,
     /// SBT hit-group class (`0` = opaque/glass routing); set from a [`SolariMaterialClass<S>`](crate::SolariMaterialClass).
     pub chit_class: u32,
     /// Per-material data for the `chit_class` shader, read as `load_material_bindless(id).chit_data`.
@@ -157,6 +164,9 @@ impl Default for StandardSolariMaterial {
             depth_map: None,
             depth_scale: 1.0,
             depth_bias: 0.0,
+            texture_array_a: None,
+            texture_array_b: None,
+            texture_array_c: None,
             chit_class: 0,
             chit_data: [0; 4],
         }
@@ -193,6 +203,9 @@ impl From<&StandardMaterial> for StandardSolariMaterial {
             depth_map: None,
             depth_scale: 1.0,
             depth_bias: 0.0,
+            texture_array_a: None,
+            texture_array_b: None,
+            texture_array_c: None,
             // Custom hit-group routing (portal, planet, …) is opt-in via `chit_class`.
             chit_class: 0,
             chit_data: [0; 4],

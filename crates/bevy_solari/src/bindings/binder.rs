@@ -27,6 +27,10 @@ use core::{hash::Hash, num::NonZeroU32, ops::Deref};
 
 pub(crate) const MAX_TEXTURE_COUNT: NonZeroU32 = NonZeroU32::new(5_000).unwrap();
 
+/// Size of the layered `texture_arrays` pool — must match the sized
+/// `binding_array<texture_2d_array<f32>, 16>` in `raytracing_scene_bindings.wgsl`.
+pub(crate) const MAX_TEXTURE_ARRAY_COUNT: NonZeroU32 = NonZeroU32::new(16).unwrap();
+
 const TEXTURE_MAP_NONE: u32 = u32::MAX;
 
 #[derive(Resource)]
@@ -56,6 +60,9 @@ pub struct SolariSceneBuffers {
     light_sources: StableStorageBuffer<Vec<GpuLightSource>>,
     /// Uniform-pick active-light list (scene bind group binding 8).
     active_light_list: StableStorageBuffer<Vec<u32>>,
+    /// Trilinear REPEAT sampler shared by every `texture_arrays` entry (binding 14)
+    /// — tiling terrain layers; per-image samplers would be clamp-to-edge.
+    array_sampler: Sampler,
 }
 
 /// `RenderStartup` (after `SolariSetup`): build the persistent scene buffers.
@@ -72,6 +79,16 @@ pub fn init_solari_scene_buffers(
         materials: StableStorageBuffer::new(Vec::new(), &allocator, &render_device, "solari.materials"),
         light_sources: StableStorageBuffer::new(Vec::new(), &allocator, &render_device, "solari.light_sources"),
         active_light_list: StableStorageBuffer::new(Vec::new(), &allocator, &render_device, "solari.active_light_list"),
+        array_sampler: render_device.create_sampler(&SamplerDescriptor {
+            label: Some("solari.texture_arrays_sampler"),
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::Repeat,
+            address_mode_w: AddressMode::Repeat,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
+            ..Default::default()
+        }),
     });
 }
 
@@ -154,6 +171,7 @@ pub fn prepare_raytracing_scene_bindings(
         materials,
         light_sources,
         active_light_list,
+        array_sampler,
     } = &mut *scene_buffers;
     // Per-instance `transforms` / `previous_frame_transforms` /
     // `material_ids` are slot-indexed GPU columns now (`GpuInstances`,
@@ -176,6 +194,25 @@ pub fn prepare_raytracing_scene_bindings(
                 None => None,
             },
             None => Some(TEXTURE_MAP_NONE),
+        }
+    };
+
+    // Layered pool (`texture_arrays`, binding 13). Only D2Array views may enter —
+    // a plain D2 image would fail bind-group validation. Unlike flat textures a
+    // still-loading array degrades to NONE (not a material skip): array-painted
+    // chits carry a procedural fallback, so they shade flat until the pop-in.
+    let mut texture_arrays = CachedBindingArray::new();
+    let mut process_texture_array = |texture_handle: &Option<Handle<_>>| -> u32 {
+        match texture_handle {
+            Some(texture_handle) => match texture_assets.get(texture_handle.id()) {
+                Some(texture) if texture.texture.depth_or_array_layers() > 1 => {
+                    let (texture_id, _) =
+                        texture_arrays.push_if_absent(texture.texture_view.deref(), texture_handle.id());
+                    texture_id
+                }
+                _ => TEXTURE_MAP_NONE,
+            },
+            None => TEXTURE_MAP_NONE,
         }
     };
 
@@ -213,12 +250,17 @@ pub fn prepare_raytracing_scene_bindings(
         let Some(displacement_texture_id) = process_texture(&material.depth_map) else {
             continue;
         };
+        let texture_array_a_id = process_texture_array(&material.texture_array_a);
+        let texture_array_b_id = process_texture_array(&material.texture_array_b);
+        let texture_array_c_id = process_texture_array(&material.texture_array_c);
 
         // Texture-size term of the ray-cone LOD, from the base-color texture
-        // (representative of the material's maps). 0 ⇒ no base-color texture.
+        // (representative of the material's maps; texture_array_a stands in for
+        // array-painted materials). 0 ⇒ untextured.
         let texel_lod_bias = material
             .base_color_texture
             .as_ref()
+            .or(material.texture_array_a.as_ref())
             .and_then(|handle| texture_assets.get(handle.id()))
             .map(|image| {
                 let size = image.texture_descriptor.size;
@@ -264,6 +306,9 @@ pub fn prepare_raytracing_scene_bindings(
             displacement_texture_id,
             displacement_scale: material.depth_scale,
             displacement_bias: material.depth_bias,
+            texture_array_a_id,
+            texture_array_b_id,
+            texture_array_c_id,
             chit_data: UVec4::from_array(material.chit_data),
         };
     }
@@ -271,6 +316,9 @@ pub fn prepare_raytracing_scene_bindings(
     if textures.is_empty() {
         textures.vec.push(fallback_texture.d2.texture_view.deref());
         samplers.push(fallback_texture.d2.sampler.deref());
+    }
+    if texture_arrays.is_empty() {
+        texture_arrays.vec.push(fallback_texture.d2_array.texture_view.deref());
     }
 
     // The light-source table (`crate::lights::LightSources`, rebuilt
@@ -318,7 +366,7 @@ pub fn prepare_raytracing_scene_bindings(
         // Vertex attributes + materials are reached bindlessly by
         // buffer-device-address (the RT pipeline's `geometry_addresses` uniform),
         // so only the cluster index/table, textures, TLAS, lights, and hair are
-        // bound here. Bindings are CONTIGUOUS (0..12) — the raw RT pipeline reads
+        // bound here. Bindings are CONTIGUOUS (0..14) — the raw RT pipeline reads
         // the layout's raw `VkDescriptorSetLayout`, and wgpu compacts sparse
         // (gappy) layouts to contiguous physical slots while the naga SPIR-V keeps
         // the logical numbers; a gap would desync the two. Order must match the
@@ -339,6 +387,8 @@ pub fn prepare_raytracing_scene_bindings(
             hair_instance_buffer.as_entire_binding(),       // 10 hair_instances
             hair_params,                                    // 11 hair_params
             transform_propagate.current_world().as_entire_binding(), // 12 hair_world
+            texture_arrays.as_slice(),                      // 13 texture_arrays
+            &*array_sampler,                                // 14 texture_arrays_sampler
         )),
     ));
 }
@@ -356,7 +406,7 @@ impl RaytracingSceneBindings {
                 // Vertex attributes + materials are reached bindlessly by
                 // buffer-device-address, so the cluster vertex pools and materials
                 // are no longer bound, and deform is gone with the animation
-                // subsystem. Bindings are CONTIGUOUS (0..12) — a sparse/gappy layout
+                // subsystem. Bindings are CONTIGUOUS (0..14) — a sparse/gappy layout
                 // would be compacted by wgpu to contiguous physical slots, desyncing
                 // it from the naga SPIR-V (which keeps the logical numbers) in the
                 // raw RT pipeline. Order matches `raytracing_scene_bindings.wgsl`.
@@ -383,6 +433,9 @@ impl RaytracingSceneBindings {
                         storage_buffer_read_only_sized(false, None), // 10 hair_instances
                         storage_buffer_read_only_sized(false, None), // 11 hair_params
                         storage_buffer_read_only_sized(false, None), // 12 hair_world
+                        texture_2d_array(TextureSampleType::Float { filterable: true })
+                            .count(MAX_TEXTURE_ARRAY_COUNT), // 13 texture_arrays
+                        sampler(SamplerBindingType::Filtering), // 14 texture_arrays_sampler
                     ),
                 ),
             ),
@@ -471,6 +524,11 @@ struct GpuMaterial {
     displacement_texture_id: u32,
     displacement_scale: f32,
     displacement_bias: f32,
+    // Layered `texture_arrays` pool slots for custom closest-hits; `TEXTURE_MAP_NONE`
+    // if absent. Field order matches the WGSL `Material` struct (std430).
+    texture_array_a_id: u32,
+    texture_array_b_id: u32,
+    texture_array_c_id: u32,
     // Opaque per-material data for a custom closest-hit (StandardSolariMaterial::chit_data).
     chit_data: UVec4,
 }
@@ -498,6 +556,9 @@ impl Default for GpuMaterial {
             displacement_texture_id: TEXTURE_MAP_NONE,
             displacement_scale: 0.0,
             displacement_bias: 0.0,
+            texture_array_a_id: TEXTURE_MAP_NONE,
+            texture_array_b_id: TEXTURE_MAP_NONE,
+            texture_array_c_id: TEXTURE_MAP_NONE,
             chit_data: UVec4::ZERO,
         }
     }
