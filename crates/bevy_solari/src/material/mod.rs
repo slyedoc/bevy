@@ -10,7 +10,7 @@ use bevy_asset::{Asset, AssetApp, AssetId, Assets, Handle, RenderAssetUsages};
 use bevy_color::{Color, LinearRgba};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{component::Component, prelude::ReflectComponent, template::FromTemplate};
-use bevy_image::{CompressedImageFormats, Image, ImageSampler, ImageType};
+use bevy_image::{Image, ImageSampler};
 use bevy_material::AlphaMode;
 use bevy_pbr::{DfgLut, StandardMaterial};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};

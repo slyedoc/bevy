@@ -64,7 +64,6 @@ use super::propagate::TransformPropagate;
 /// CPU. Per-entity opt-out is [`NoGpuGlobalTransformReadback`]; this is the global off.
 const READBACK_ENABLED: bool = true;
 
-const WORKGROUP_SIZE: u32 = 64;
 /// `u32`s of header at the front of the readback buffer: `[count, _, _, _]`.
 const HEADER_WORDS: u32 = 4;
 /// `u32`s per record: `slot` + the absolute world's 3×3 linear (9 floats) + its

@@ -424,10 +424,12 @@ fn raygen(
                 break;
             }
 
-            // Russian roulette from bounce 3 (unbiased — the ÷p compensates; capped
-            // below 1 so lossless paths still terminate). Earlier bounces carry most
-            // of the image's energy; rouletting them only buys noise.
-            if bounce >= 3u {
+            // Russian roulette (unbiased — the ÷p compensates; capped below 1 so
+            // lossless paths still terminate). Reference mode defers it to bounce 3
+            // (early bounces carry most of the energy; rouletting them buys noise);
+            // realtime keeps the aggressive kill — low-albedo scenes would otherwise
+            // trace 2×+ the bounce rays per frame.
+            if !reference || bounce >= 3u {
                 let p = min(luminance(throughput), 0.95);
                 if rand_f(&rng) > p {
                     break;
