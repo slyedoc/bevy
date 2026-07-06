@@ -58,6 +58,8 @@ impl Plugin for SolarRenderPlugin {
             // Solari prepare/render system keys off; it must be extracted or those
             // systems match nothing and nothing renders.
             .add_plugins(ExtractComponentPlugin::<SolariCamera>::default())
+            .add_plugins(ExtractComponentPlugin::<SolariReference>::default())
+            .register_type::<SolariReference>()
             // Solari does its own light sampling and never reads the clustered-forward
             // light clusters, so opt every `SolariCamera` out of the per-view cluster
             // assignment (bevy_light's `assign_objects_to_clusters`) — a free CPU win.
@@ -246,3 +248,22 @@ impl Plugin for SolarRenderPlugin {
 #[reflect(Component, Default, Clone)]
 #[require(Hdr, CameraReset, CameraReframe)]
 pub struct SolariCamera;
+
+/// Reference path-tracer mode: while the camera holds still, every frame's samples
+/// are averaged into the output buffer (progressive accumulation) — the ground-truth
+/// image every realtime technique is validated against. Any camera move, projection,
+/// exposure, or viewport change resets the accumulator. Assumes a static scene
+/// (movers keep re-rendering into the average as ghosting). Debug views and DLSS
+/// bypass accumulation — don't combine.
+#[derive(Component, Reflect, Clone, ExtractComponent)]
+#[reflect(Component, Default, Clone)]
+pub struct SolariReference {
+    /// Paths traced per pixel per frame (inner raygen loop). Raise to converge faster.
+    pub samples_per_frame: u32,
+}
+
+impl Default for SolariReference {
+    fn default() -> Self {
+        Self { samples_per_frame: 4 }
+    }
+}

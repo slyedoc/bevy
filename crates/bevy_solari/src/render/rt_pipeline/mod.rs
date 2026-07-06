@@ -53,7 +53,7 @@ use crate::render::atmosphere::{
     AtmosphereSky, SolariAtmosphereGpu, SolariAtmosphereView, SolariAtmosphereVolumesGpu,
 };
 use crate::render::view_cull::SolariEnvironmentMap;
-use crate::render::{CameraReframe, SolariCamera};
+use crate::render::{CameraReframe, SolariCamera, SolariReference};
 use crate::resource_manager::SolariResourceManager;
 use crate::transform::{TransformGraph, TransformPropagate};
 use bevy_render::extract_resource::ExtractResource;
@@ -317,6 +317,18 @@ pub struct RtPrevViewProj {
 #[derive(Component, Default)]
 pub struct SolariDlssJitter {
     pub offset: Vec2,
+}
+
+/// Per-view reference-accumulation progress ([`SolariReference`]): samples averaged
+/// so far and the camera/exposure/viewport state they were taken under — any change
+/// resets `n` to 0 (the mean restarts). Written back each dispatch.
+#[derive(Component, Clone)]
+pub struct RtAccumulation {
+    pub n: u32,
+    camera: bevy_transform::components::GlobalTransform,
+    clip_from_view: Mat4,
+    exposure: f32,
+    pixels: u32,
 }
 
 /// One DLSS ray-reconstruction guide buffer: a `pixels` × `vec4<f32>` GPU storage
@@ -638,6 +650,8 @@ pub(crate) fn rt_pipeline(
         Option<&SolariDlssJitter>,
         Option<&CameraReframe>,
         Option<&RtCameraSlot>,
+        Option<&SolariReference>,
+        Option<&RtAccumulation>,
     )>,
     rt: Option<Res<RtPipeline>>,
     rt_blit: Res<RtBlit>,
@@ -694,6 +708,8 @@ pub(crate) fn rt_pipeline(
         dlss_jitter,
         reframe,
         camera_slot,
+        reference,
+        accumulation,
     ) = view.into_inner();
 
     // Environment cube the miss shader samples (same priority as the megakernel):
@@ -886,6 +902,58 @@ pub(crate) fn rt_pipeline(
     if let Some(reframe) = reframe.filter(|r| !r.is_identity()) {
         prev_clip_from_world *= reframe.prev_from_current;
     }
+    // Debug-view selector, hoisted so the reference accumulator can bypass itself
+    // while a debug view owns the pixel.
+    let debug_view = if debug.cost_heatmap.as_deref().is_some_and(|h| h.enabled) {
+        1u32
+    } else if debug.anyhit_heatmap.as_deref().is_some_and(|h| h.enabled) {
+        2u32
+    } else if debug.cluster_view.as_deref().is_some_and(|v| v.enabled) {
+        3u32
+    } else if debug.triangle_view.as_deref().is_some_and(|v| v.enabled) {
+        4u32
+    } else if debug.normal_facing.as_deref().is_some_and(|v| v.enabled) {
+        5u32
+    } else {
+        0u32
+    };
+    let show_displacement = debug.show_displacement.as_deref().is_some_and(|d| d.enabled);
+
+    // Reference accumulation ([`SolariReference`]): misc.z = samples already in the
+    // mean, misc.w = samples this frame (0 ⇒ off). Any camera/exposure/viewport/debug
+    // change restarts the mean. `n` advances CPU-side; the raygen blends by
+    // spf/(n_prev+spf) in place in the output buffer.
+    let mut accum_n = 0u32;
+    let mut accum_spf = 0u32;
+    if let Some(reference) = reference {
+        if debug_view == 0 && !show_displacement {
+            accum_spf = reference.samples_per_frame.max(1);
+            let same = accumulation.is_some_and(|a| {
+                a.camera == view.world_from_view
+                    && a.clip_from_view == view.clip_from_view
+                    && a.exposure == camera.exposure
+                    && a.pixels == output.pixels
+            });
+            accum_n = if same { accumulation.unwrap().n } else { 0 };
+            let n_new = accum_n + accum_spf;
+            if accum_n == 0 || n_new.leading_zeros() != accum_n.leading_zeros() {
+                bevy_log::info!("solari reference: {n_new} spp");
+            }
+            if dlss_jitter.is_some() {
+                bevy_log::warn_once!(
+                    "SolariReference with DLSS active: the resolve overwrites the accumulated image — disable DLSS on this camera"
+                );
+            }
+            commands.entity(view_entity).insert(RtAccumulation {
+                n: n_new,
+                camera: view.world_from_view,
+                clip_from_view: view.clip_from_view,
+                exposure: camera.exposure,
+                pixels: output.pixels,
+            });
+        }
+    }
+
     let camera_inputs = RtCamera {
         inverse_view_proj: world_from_clip.to_cols_array(),
         view_from_world: view_from_world.to_cols_array(),
@@ -905,25 +973,10 @@ pub(crate) fn rt_pipeline(
             // 3 = per-cluster color, 4 = per-triangle color, 5 = normal-facing
             // (blue toward camera / red away). The view dropdown keeps these
             // mutually exclusive.
-            if debug.cost_heatmap.as_deref().is_some_and(|h| h.enabled) {
-                1u32
-            } else if debug.anyhit_heatmap.as_deref().is_some_and(|h| h.enabled) {
-                2u32
-            } else if debug.cluster_view.as_deref().is_some_and(|v| v.enabled) {
-                3u32
-            } else if debug.triangle_view.as_deref().is_some_and(|v| v.enabled) {
-                4u32
-            } else if debug.normal_facing.as_deref().is_some_and(|v| v.enabled) {
-                5u32
-            } else {
-                0u32
-            },
+            debug_view,
             // .w = displacement debug view (1 = on); the opaque chit shows each
             // surface's height map (grayscale) to validate the displacement wiring.
-            debug
-                .show_displacement
-                .as_deref()
-                .is_some_and(|d| d.enabled) as u32,
+            show_displacement as u32,
         ],
         // .x = sky brightness; .yzw = clear color (black for bevy_city).
         sky: [environment_brightness, 0.0, 0.0, 0.0],
@@ -951,8 +1004,10 @@ pub(crate) fn rt_pipeline(
         misc: [
             time.elapsed_secs_wrapped(),
             2.0 / (view.clip_from_view.y_axis.y * viewport.y as f32),
-            0.0,
-            0.0,
+            // .z = reference samples already accumulated; .w = samples this frame
+            // (0 ⇒ reference mode off — the raygen renders one fresh sample).
+            accum_n as f32,
+            accum_spf as f32,
         ],
         // World→bake sky rotation (identity unless a spherical-planet
         // atmosphere set one) — the miss shader rotates cube sample dirs.

@@ -229,21 +229,16 @@ fn raygen(
     @builtin(ray_invocation_id) id: vec3<u32>,
     @builtin(num_ray_invocations) dims: vec3<u32>,
 ) {
-    // Sub-pixel camera jitter for DLSS temporal accumulation (zero on the non-DLSS
-    // path, so this is a no-op there).
-    let pixel = vec2<f32>(id.xy) + 0.5 + camera.jitter.xy;
-    let ndc = (pixel / vec2<f32>(dims.xy)) * 2.0 - 1.0;
-    let far = camera.inverse_view_proj * vec4<f32>(ndc.x, -ndc.y, 1.0, 1.0);
-    var origin = camera.camera_position.xyz;
-    var direction = normalize(far.xyz / far.w - origin);
-    // Primary ray (pre-bounce) for the atmosphere-volume march.
-    let cam_origin = origin;
-    let cam_direction = direction;
-    var primary_t = 1e30;
+    let pixel_index = id.x + id.y * dims.x;
+    // Reference accumulation (SolariReference): misc.z = samples already in the
+    // mean, misc.w = paths this frame (0 = off -> one fresh sample, DLSS jitter).
+    let accum_n = camera.misc.z;
+    let ref_spf = u32(camera.misc.w);
+    let reference = ref_spf > 0u;
+    let rounds = max(ref_spf, 1u);
 
-    var radiance = vec3<f32>(0.0);
-    var throughput = vec3<f32>(1.0);
-    var captured = false;
+    // This frame's sample average (numerator; /rounds after the loop).
+    var frame_sum = vec3<f32>(0.0);
     // Total alpha any-hit invocations across all primary/bounce traces this pixel
     // (the OMM-effectiveness heatmap). Shadow-ray any-hits use the shadow payload's
     // own counter and aren't summed here.
@@ -253,18 +248,13 @@ fn raygen(
     var primary_primitive = 0u;
     var primary_normal_oct = 0u;
     var primary_geo_normal_oct = 0u;
-    // pdf of the BRDF sample that produced this segment (0 on the primary ray),
-    // threaded into the hit shader so it can MIS-weight its emissive vs NEE.
-    var p_bounce = 0.0;
-    // Per-pixel RNG, seeded by (pixel, frame) and threaded through the payload so
-    // each hit shader's sampling advances the same stream.
-    let pixel_index = id.x + id.y * dims.x;
-    var rng = pixel_index + camera.frame.x * 5782582u;
-
     // Primary-hit depth (reverse-Z NDC) for the gizmo-depth bridge, written into
     // the always-present output buffer's alpha so rasterized overlays (gizmos)
     // occlude against the ray-traced scene — with or without DLSS. -1 = miss/sky.
     var primary_depth = -1.0;
+    // Last sample's primary direction (normal-facing debug view reads it post-loop).
+    var cam_direction = vec3<f32>(0.0, 0.0, 1.0);
+    var rng = 0u;
 
 #ifdef SOLARI_DLSS
     // Default this pixel's guide to "no surface" (sky/miss); a primary hit overwrites
@@ -287,144 +277,180 @@ fn raygen(
     var clk0 = 0u;
     if camera.frame.z == 1u {
         clk0 = u32(shader_clock());
-        rng = rng ^ clk0;
     }
 #endif
 
-    for (var bounce = 0u; bounce < MAX_BOUNCES; bounce += 1u) {
-        // Black-hole geodesic (stand-in): bend the ray toward the mass and
-        // terminate if it crosses the capture radius.
-        if BH_STRENGTH > 0.0 {
-            let to_center = BH_CENTER - origin;
-            let dist = length(to_center);
-            if dist < BH_CAPTURE_RADIUS {
-                captured = true;
+    for (var s = 0u; s < rounds; s += 1u) {
+        // Per-sample RNG stream: (pixel, frame, sample) so every path is decorrelated.
+        rng = pixel_index + (camera.frame.x * rounds + s) * 5782582u;
+#ifdef SOLARI_SHADER_CLOCK
+        rng = rng ^ clk0; // pins the start clock read before the loop (see above)
+#endif
+        // Sub-pixel jitter: DLSS's when realtime; uniform pixel-area AA when accumulating.
+        var jitter = camera.jitter.xy;
+        if reference {
+            jitter = vec2<f32>(rand_f(&rng), rand_f(&rng)) - 0.5;
+        }
+        let pixel = vec2<f32>(id.xy) + 0.5 + jitter;
+        let ndc = (pixel / vec2<f32>(dims.xy)) * 2.0 - 1.0;
+        let far = camera.inverse_view_proj * vec4<f32>(ndc.x, -ndc.y, 1.0, 1.0);
+        var origin = camera.camera_position.xyz;
+        var direction = normalize(far.xyz / far.w - origin);
+        // Primary ray (pre-bounce) for the atmosphere-volume march.
+        let cam_origin = origin;
+        cam_direction = direction;
+        var primary_t = 1e30;
+
+        var radiance = vec3<f32>(0.0);
+        var throughput = vec3<f32>(1.0);
+        var captured = false;
+        // pdf of the BRDF sample that produced this segment (0 on the primary ray),
+        // threaded into the hit shader so it can MIS-weight its emissive vs NEE.
+        var p_bounce = 0.0;
+
+        for (var bounce = 0u; bounce < MAX_BOUNCES; bounce += 1u) {
+            // Black-hole geodesic (stand-in): bend the ray toward the mass and
+            // terminate if it crosses the capture radius.
+            if BH_STRENGTH > 0.0 {
+                let to_center = BH_CENTER - origin;
+                let dist = length(to_center);
+                if dist < BH_CAPTURE_RADIUS {
+                    captured = true;
+                    break;
+                }
+                direction = normalize(direction + (BH_STRENGTH / (dist * dist)) * normalize(to_center));
+            }
+
+            payload.emitted = vec3<f32>(0.0);
+            payload.attenuation = vec3<f32>(0.0);
+            payload.next_origin = origin;
+            payload.next_direction = direction;
+            payload.bounce = 0u;
+            payload.rng = rng;
+            payload.p_bounce = p_bounce;
+            payload.anyhit_count = 0u;
+            // Sentinel so a primary miss (sky) reads as "no cluster" (the miss shader
+            // doesn't write these); the closest-hit overwrites on a hit.
+            payload.hit_cluster = 0xffffffffu;
+#ifdef SOLARI_DLSS
+            // Only the primary hit produces the visible guide; later bounces pass the
+            // sentinel so their closest-hit leaves the G-buffer untouched.
+            payload.gbuffer_pixel = select(NO_GBUFFER, pixel_index, bounce == 0u);
+#endif
+            // Shader Execution Reordering: trace into a hit object, regroup the warp
+            // by MATERIAL, then run the selected closest-hit. With per-material SBT
+            // records (instance_contribution_to_hit_group_index = material slot), the
+            // hit object's SBT record index IS the material id — read it back and feed
+            // it as an explicit coherence hint. Every record runs the same opaque
+            // closest-hit, so the default `reorderThread(hit)` (which keys on the
+            // shader to run) would NOT separate materials; the explicit hint does, and
+            // it scales — huge scenes reuse a few materials across millions of
+            // instances, so this packs each warp with one material → uniform
+            // `materials[id]` + texture-array fetches, no descriptor divergence.
+            // `camera.frame.y` carries ceil(log2(material_count)) hint bits.
+            var hit: hit_object;
+            hitObjectTraceRay(
+                &hit,
+                tlas,
+                RayDesc(RAY_FLAG_NONE, 0xffu, RAY_T_MIN, RAY_T_MAX, origin, direction),
+                &payload,
+            );
+            let material_hint = hitObjectGetSbtRecordIndex(&hit);
+            reorderThread(&hit, material_hint, camera.frame.y);
+            hitObjectExecuteShader(&hit, &payload);
+            rng = payload.rng;
+            // Count any-hits on the PRIMARY ray only — its pass-through of unknown
+            // cutout micro-regions before it commits, i.e. the any-hit cost of the
+            // directly-visible pixel. Bounce (GI) rays would otherwise paint nearby
+            // foliage onto the surfaces they illuminate ("plants through walls").
+            if bounce == 0u {
+                total_anyhit = payload.anyhit_count;
+                // Capture the primary hit's cluster + triangle for the geometry-debug views.
+                primary_cluster = payload.hit_cluster;
+                primary_primitive = payload.hit_primitive;
+                primary_normal_oct = payload.hit_normal_oct;
+                primary_geo_normal_oct = payload.hit_geo_normal_oct;
+            }
+
+            // Capture the PRIMARY hit's depth on bounce 0. A miss leaves
+            // `payload.next_origin` at the camera ray origin (the miss shader doesn't
+            // touch it; raygen seeded it to `origin`), so a moved origin marks a hit.
+            // `origin` is still the primary ray origin here — it's advanced below.
+            if bounce == 0u {
+                let hit_pos = payload.next_origin;
+                if dot(hit_pos - origin, hit_pos - origin) > 1e-10 {
+                    let clip = camera.clip_from_world * vec4<f32>(hit_pos, 1.0);
+                    primary_depth = clip.z / clip.w;
+                    primary_t = length(hit_pos - origin);
+                }
+            }
+
+#ifdef SOLARI_DLSS
+            // DLSS specular hit-distance guide. The primary surface's first
+            // continuation ray (≈ the specular reflection in this 1-spp path) only
+            // reveals where it lands HERE, after bounce 1 — the primary closest-hit
+            // emitted the ray but not its hit point. Record that world-space distance
+            // (primary hit → bounce-1 hit; `origin` is still the primary hit point at
+            // this point in the loop) into the primary pixel's specular `.w`. A missed
+            // or absorbed reflection leaves the cleared 0 (RR reads that as no
+            // reflection lag); RR weights this by the specular albedo already in
+            // `.xyz`, so writing it for every surface, not only mirrors, is correct.
+            if bounce == 1u && payload.bounce == 1u {
+                gbuffer_specular[pixel_index].w = length(payload.next_origin - origin);
+            }
+#endif
+
+            // Fog extinction (stand-in): attenuate over the traversed segment.
+            if FOG_DENSITY > 0.0 {
+                let seg = length(payload.next_origin - origin);
+                throughput *= exp(-FOG_DENSITY * seg);
+            }
+
+            radiance += throughput * payload.emitted;
+            if payload.bounce == 0u {
                 break;
             }
-            direction = normalize(direction + (BH_STRENGTH / (dist * dist)) * normalize(to_center));
-        }
+            throughput *= payload.attenuation;
+            origin = payload.next_origin;
+            direction = payload.next_direction;
+            p_bounce = payload.p_bounce;
 
-        payload.emitted = vec3<f32>(0.0);
-        payload.attenuation = vec3<f32>(0.0);
-        payload.next_origin = origin;
-        payload.next_direction = direction;
-        payload.bounce = 0u;
-        payload.rng = rng;
-        payload.p_bounce = p_bounce;
-        payload.anyhit_count = 0u;
-        // Sentinel so a primary miss (sky) reads as "no cluster" (the miss shader
-        // doesn't write these); the closest-hit overwrites on a hit.
-        payload.hit_cluster = 0xffffffffu;
-#ifdef SOLARI_DLSS
-        // Only the primary hit produces the visible guide; later bounces pass the
-        // sentinel so their closest-hit leaves the G-buffer untouched.
-        payload.gbuffer_pixel = select(NO_GBUFFER, pixel_index, bounce == 0u);
-#endif
-        // Shader Execution Reordering: trace into a hit object, regroup the warp
-        // by MATERIAL, then run the selected closest-hit. With per-material SBT
-        // records (instance_contribution_to_hit_group_index = material slot), the
-        // hit object's SBT record index IS the material id — read it back and feed
-        // it as an explicit coherence hint. Every record runs the same opaque
-        // closest-hit, so the default `reorderThread(hit)` (which keys on the
-        // shader to run) would NOT separate materials; the explicit hint does, and
-        // it scales — huge scenes reuse a few materials across millions of
-        // instances, so this packs each warp with one material → uniform
-        // `materials[id]` + texture-array fetches, no descriptor divergence.
-        // `camera.frame.y` carries ceil(log2(material_count)) hint bits.
-        var hit: hit_object;
-        hitObjectTraceRay(
-            &hit,
-            tlas,
-            RayDesc(RAY_FLAG_NONE, 0xffu, RAY_T_MIN, RAY_T_MAX, origin, direction),
-            &payload,
-        );
-        let material_hint = hitObjectGetSbtRecordIndex(&hit);
-        reorderThread(&hit, material_hint, camera.frame.y);
-        hitObjectExecuteShader(&hit, &payload);
-        rng = payload.rng;
-        // Count any-hits on the PRIMARY ray only — its pass-through of unknown
-        // cutout micro-regions before it commits, i.e. the any-hit cost of the
-        // directly-visible pixel. Bounce (GI) rays would otherwise paint nearby
-        // foliage onto the surfaces they illuminate ("plants through walls").
-        if bounce == 0u {
-            total_anyhit = payload.anyhit_count;
-            // Capture the primary hit's cluster + triangle for the geometry-debug views.
-            primary_cluster = payload.hit_cluster;
-            primary_primitive = payload.hit_primitive;
-            primary_normal_oct = payload.hit_normal_oct;
-            primary_geo_normal_oct = payload.hit_geo_normal_oct;
-        }
-
-        // Capture the PRIMARY hit's depth on bounce 0. A miss leaves
-        // `payload.next_origin` at the camera ray origin (the miss shader doesn't
-        // touch it; raygen seeded it to `origin`), so a moved origin marks a hit.
-        // `origin` is still the primary ray origin here — it's advanced below.
-        if bounce == 0u {
-            let hit_pos = payload.next_origin;
-            if dot(hit_pos - origin, hit_pos - origin) > 1e-10 {
-                let clip = camera.clip_from_world * vec4<f32>(hit_pos, 1.0);
-                primary_depth = clip.z / clip.w;
-                primary_t = length(hit_pos - origin);
+            // Never feed a degenerate (zero-length or non-finite) direction to the next
+            // traceRay — the RT core hangs the GPU on a zero-length ray. A hit shader
+            // can produce one from a float edge (e.g. glass critical-angle refraction)
+            // or a bad normal; terminate the path instead of hanging. `dot > eps` is
+            // false for both zero and NaN.
+            if !(dot(direction, direction) > 1.0e-8) {
+                break;
             }
+
+            // Russian roulette: survival capped below 1 (unbiased — the ÷p
+            // compensates) so even lossless paths terminate.
+            let p = min(luminance(throughput), 0.95);
+            if rand_f(&rng) > p {
+                break;
+            }
+            throughput /= p;
         }
 
-#ifdef SOLARI_DLSS
-        // DLSS specular hit-distance guide. The primary surface's first
-        // continuation ray (≈ the specular reflection in this 1-spp path) only
-        // reveals where it lands HERE, after bounce 1 — the primary closest-hit
-        // emitted the ray but not its hit point. Record that world-space distance
-        // (primary hit → bounce-1 hit; `origin` is still the primary hit point at
-        // this point in the loop) into the primary pixel's specular `.w`. A missed
-        // or absorbed reflection leaves the cleared 0 (RR reads that as no
-        // reflection lag); RR weights this by the specular albedo already in
-        // `.xyz`, so writing it for every surface, not only mirrors, is correct.
-        if bounce == 1u && payload.bounce == 1u {
-            gbuffer_specular[pixel_index].w = length(payload.next_origin - origin);
-        }
-#endif
-
-        // Fog extinction (stand-in): attenuate over the traversed segment.
-        if FOG_DENSITY > 0.0 {
-            let seg = length(payload.next_origin - origin);
-            throughput *= exp(-FOG_DENSITY * seg);
-        }
-
-        radiance += throughput * payload.emitted;
-        if payload.bounce == 0u {
-            break;
-        }
-        throughput *= payload.attenuation;
-        origin = payload.next_origin;
-        direction = payload.next_direction;
-        p_bounce = payload.p_bounce;
-
-        // Never feed a degenerate (zero-length or non-finite) direction to the next
-        // traceRay — the RT core hangs the GPU on a zero-length ray. A hit shader
-        // can produce one from a float edge (e.g. glass critical-angle refraction)
-        // or a bad normal; terminate the path instead of hanging. `dot > eps` is
-        // false for both zero and NaN.
-        if !(dot(direction, direction) > 1.0e-8) {
-            break;
-        }
-
-        // Russian roulette: survival capped below 1 (unbiased — the ÷p
-        // compensates) so even lossless paths terminate.
-        let p = min(luminance(throughput), 0.95);
-        if rand_f(&rng) > p {
-            break;
-        }
-        throughput /= p;
-    }
-
-    // Atmosphere volumes: attenuate + in-scatter over the primary segment
-    // (aerial perspective / limb / sky-through-shell). Before exposure.
-    radiance = atmosphere_volumes_apply(radiance, cam_origin, cam_direction, primary_t);
+        // Atmosphere volumes: attenuate + in-scatter over the primary segment
+        // (aerial perspective / limb / sky-through-shell). Per sample, before exposure.
+        radiance = atmosphere_volumes_apply(radiance, cam_origin, cam_direction, primary_t);
+        frame_sum += select(radiance, vec3<f32>(0.0), captured);
+    } // sample loop
 
     // Camera exposure (matches the megakernel's `radiance *= view.exposure`); the
     // physical sky/light radiance is otherwise far too bright. `.w` of the camera
     // position carries the exposure.
-    var final_color = select(radiance, vec3<f32>(0.0), captured);
+    var final_color = frame_sum / f32(rounds);
     final_color *= camera.camera_position.w;
+
+    // Reference accumulation: fold this frame's average into the running mean held
+    // in the output buffer. Post-exposure (an exposure change resets CPU-side).
+    if reference && accum_n > 0.0 {
+        let w = f32(ref_spf) / (accum_n + f32(ref_spf));
+        final_color = mix(output[pixel_index].rgb, final_color, w);
+    }
 
 #ifdef SOLARI_SHADER_CLOCK
     // Cost heatmap debug view (frame.z == 1): replace the shaded color with a
