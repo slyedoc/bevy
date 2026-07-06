@@ -420,6 +420,10 @@ pub struct RestirSpatial {
     pub shader: bevy_asset::Handle<bevy_shader::Shader>,
     /// 48-byte `SpatialParams` uniform (see `restir_spatial.wgsl`).
     pub params: bevy_render::render_resource::Buffer,
+    /// group(1) binding(4): `scene_bindings` hard-codes `geometry_addresses` here and
+    /// it rides in transitively via brdf. The spatial pass never dereferences it (no
+    /// `physical_load`), but the binding must exist — a zeroed uniform satisfies it.
+    pub geo_addr: bevy_render::render_resource::Buffer,
 }
 
 /// CPU mirror of `restir_spatial.wgsl::SpatialParams`.
@@ -457,6 +461,8 @@ pub fn init_restir_spatial(
                 storage_buffer_read_only_sized(false, None), // 1: surfaces
                 storage_buffer_sized(false, None),           // 2: rt_output (rw, += DI)
                 uniform_buffer_sized(false, None),           // 3: params
+                uniform_buffer_sized(false, None),           // 4: geometry_addresses (unused, transitive)
+                storage_buffer_read_only_sized(false, None), // 5: light_samples (chit-written)
             ),
         ),
     );
@@ -467,8 +473,14 @@ pub fn init_restir_spatial(
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let geo_addr = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("restir_spatial_geo_addr"),
+        size: size_of::<RtGeometryAddresses>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let _ = &pipeline_cache; // pipeline queued lazily (needs the columns layout)
-    commands.insert_resource(RestirSpatial { layout, pipeline: None, shader, params });
+    commands.insert_resource(RestirSpatial { layout, pipeline: None, shader, params, geo_addr });
 }
 
 /// Per-view output: a `width*height` `vec4<f32>` storage buffer the raygen shader
@@ -503,6 +515,12 @@ pub struct RtOutputBuffer {
     pub surface: bevy_render::render_resource::Buffer,
     pub surface_raw: vk::Buffer,
     pub surface_size: u64,
+    /// ReSTIR winner resolved-light samples: 2 slots/pixel × 48 B, slot-indexed like
+    /// `reservoirs`. Chit-written (it has `physical_load`); the wgpu spatial pass
+    /// reads it to reshade neighbors without bindless loads.
+    pub light_samples: bevy_render::render_resource::Buffer,
+    pub light_samples_raw: vk::Buffer,
+    pub light_samples_size: u64,
     /// DLSS ray-reconstruction guide G-buffers — normal+roughness, diffuse+depth,
     /// specular+hit-distance, and motion vectors — each `pixels` × `vec4<f32>`,
     /// allocated and reallocated alongside the color output. Written by the
@@ -675,11 +693,28 @@ pub fn prepare_rt_output(
             .map(|b| b.raw_handle())
             .expect("rt_restir_surface buffer must be Vulkan-backed");
         let surface: bevy_render::render_resource::Buffer = surface.into();
+        // Winner samples: 2 slots × 64 B per pixel (resolved light + chit's exact
+        // f/p̂), slot-indexed like the reservoirs; zero-cleared (gated by M anyway).
+        let light_samples_size = pixels as u64 * 128;
+        let light_samples = allocator.create_buffer(
+            &render_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            light_samples_size,
+            MemoryLocation::GpuOnly,
+            "rt_restir_light_samples",
+        );
+        // SAFETY: Vulkan-backed (Allocator only builds VkBuffers).
+        let light_samples_raw = unsafe { light_samples.as_hal::<VkApi>() }
+            .map(|b| b.raw_handle())
+            .expect("rt_restir_light_samples buffer must be Vulkan-backed");
+        let light_samples: bevy_render::render_resource::Buffer = light_samples.into();
         let mut clear_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("rt_reservoirs_clear"),
         });
         clear_encoder.clear_buffer(&reservoirs, 0, None);
         clear_encoder.clear_buffer(&surface, 0, None);
+        clear_encoder.clear_buffer(&light_samples, 0, None);
         render_queue.submit([clear_encoder.finish()]);
         commands.entity(entity).insert(RtOutputBuffer {
             buffer: buffer.into(),
@@ -695,6 +730,9 @@ pub fn prepare_rt_output(
             surface,
             surface_raw,
             surface_size,
+            light_samples,
+            light_samples_raw,
+            light_samples_size,
             #[cfg(feature = "dlss")]
             gbuffer,
         });
@@ -949,7 +987,7 @@ pub(crate) fn rt_pipeline(
         Option<Res<SolariResourceManager>>,
         Option<Res<TransformPropagate>>,
         Res<bevy_time::Time>,
-        Option<ResMut<'static, RestirSpatial>>,
+        Option<ResMut<RestirSpatial>>,
     ),
     mut frame_counter: Local<u32>,
     mut commands: Commands,
@@ -1129,6 +1167,7 @@ pub(crate) fn rt_pipeline(
                         &gbuffers,
                         (output.reservoirs_raw, output.reservoirs_size),
                         (output.surface_raw, output.surface_size),
+                        (output.light_samples_raw, output.light_samples_size),
                         env_view,
                         environment_map_image,
                     ) {
@@ -1207,9 +1246,19 @@ pub(crate) fn rt_pipeline(
         | (reference.is_some_and(|r| r.restir && r.spatial) as u32) << 3
         | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8);
     if let Some(reference) = reference {
+        // The spatial pass compiles lazily; until its pipeline is ready its DI is
+        // absent, so accumulating those warmup frames bakes ~K zero-DI samples into
+        // the running mean (a permanent ~K/N darkening). Hold accumulation off until
+        // ready, then start fresh — the readiness-gate lesson from startup_race.md.
+        let spatial_pending = reference.restir
+            && reference.spatial
+            && !restir_spatial
+                .as_deref()
+                .and_then(|rs| rs.pipeline)
+                .is_some_and(|id| pipeline_cache.get_compute_pipeline(id).is_some());
         // `accumulate: false` = fresh frames (estimator levers stay live) — the
         // per-frame variance instrument; accum_spf 0 disables the raygen blend.
-        if debug_view == 0 && !show_displacement && reference.accumulate {
+        if debug_view == 0 && !show_displacement && reference.accumulate && !spatial_pending {
             accum_spf = reference.samples_per_frame.max(1);
             let same = accumulation.is_some_and(|a| {
                 a.camera == view.world_from_view
@@ -1372,12 +1421,12 @@ pub(crate) fn rt_pipeline(
     // from stable-address (`RawTraceBindable`) buffers, so the captured addresses
     // stay valid for any in-flight trace — `trace_device_address` won't compile on a
     // reallocating buffer. The materials address is captured at bind time (binder.rs).
-    if let Some(cluster_mesh_manager) = cluster_mesh_manager.as_deref() {
+    let geo_addrs = cluster_mesh_manager.as_deref().map(|cluster_mesh_manager| {
         // Smooth-tess metadata table address (0 when the smooth path is off → the
         // closest-hit falls back to the facet normal). The GPU-classify path's per-part
         // metadata (real UVs + smooth normals) reached via `geometry_addresses.tess_clusters`.
         let tess_clusters = tess_classify.as_ref().map_or(0, |c| c.gen_attrs_meta_addr);
-        view_bindings.set_geometry_addresses(&RtGeometryAddresses {
+        RtGeometryAddresses {
             vertex_packed: cluster_mesh_manager.vertex_packed.trace_device_address().get(),
             vertex_positions: cluster_mesh_manager.vertex_positions.trace_device_address().get(),
             materials: scene_bindings.materials_device_address.get(),
@@ -1388,7 +1437,10 @@ pub(crate) fn rt_pipeline(
             deform_normals: deform.as_ref().map_or(0, |d| d.normals_addr.get()),
             deform_tangents: deform.as_ref().map_or(0, |d| d.tangents_addr.get()),
             animated_table: deform.as_ref().map_or(0, |d| d.animated_table_addr.get()),
-        });
+        }
+    });
+    if let Some(ga) = geo_addrs.as_ref() {
+        view_bindings.set_geometry_addresses(ga);
     }
 
     // The raw cmd_trace_rays must go in its OWN command buffer — wgpu-core
@@ -1479,6 +1531,11 @@ pub(crate) fn rt_pipeline(
                     pad_c: 0,
                 };
                 render_queue.write_buffer(&rs.params, 0, bytemuck::bytes_of(&params));
+                render_queue.write_buffer(
+                    &rs.geo_addr,
+                    0,
+                    bytemuck::bytes_of(&geo_addrs.unwrap_or(bytemuck::Zeroable::zeroed())),
+                );
                 let bind_group = render_device.create_bind_group(
                     "restir_spatial_bind_group",
                     &pipeline_cache.get_bind_group_layout(&rs.layout),
@@ -1487,6 +1544,8 @@ pub(crate) fn rt_pipeline(
                         output.surface.as_entire_binding(),
                         output.buffer.as_entire_binding(),
                         rs.params.as_entire_binding(),
+                        rs.geo_addr.as_entire_binding(),
+                        output.light_samples.as_entire_binding(),
                     )),
                 );
                 let encoder = ctx.command_encoder();

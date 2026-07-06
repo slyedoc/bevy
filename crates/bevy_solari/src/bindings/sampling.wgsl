@@ -128,7 +128,8 @@ struct SurfaceGbuf {
     color_b_metallic: u32,
     rough_prough: u32,   // pack2x16float(roughness, perceptual_roughness)
     reflectance: u32,    // pack2x16float(reflectance, 0)
-    pad_a: u32,
+    wo_oct: u32,         // view dir (-ray_direction) — world_position is ABSOLUTE, so
+                         // the pass can't reconstruct wo from position alone
     pad_b: u32,
 }
 
@@ -137,6 +138,45 @@ struct ResolvedLightSample {
     world_normal: vec3<f32>,
     radiance: vec3<f32>,
     inverse_pdf: f32,
+}
+
+// Per-reservoir-slot winner sample (64 B), written by the chit (which has the
+// bindless `physical_load` resolve) so the wgpu spatial pass — which CAN'T
+// `physical_load` — reshades from stored data alone. Two halves: the RESOLVED
+// LIGHT (for neighbors re-targeting this sample at THEIR surface) and the chit's
+// EXACT shaded f + p̂ (for the OWN pixel, so its shade can't drift from the chit's
+// live value — the G-buffer-reconstructed recompute darkens dim pixels ~6%).
+// Plain f32 so it matches the chit under the 1% gate.
+struct StoredLight {
+    px: f32, py: f32, pz: f32, pw: f32, // world_position (w = 1 area, 0 directional)
+    nx: f32, ny: f32, nz: f32,          // world_normal
+    rr: f32, rg: f32, rb: f32,          // radiance
+    inv_pdf: f32,
+    fr: f32, fg: f32, fb: f32,          // chit's exact winner f (w_mis · L · BRDF)
+    phat: f32,                          // chit's exact p̂ = luminance(f)
+    pad: f32,                           // pad to 64 B — a struct SHARED between the
+                                        // raw-VK RT shaders and the wgpu compute pass
+                                        // MUST be 16-byte-aligned in size (else the two
+                                        // naga paths lay out the tail fields differently)
+}
+
+fn pack_stored_light(r: ResolvedLightSample, f: vec3<f32>, phat: f32) -> StoredLight {
+    return StoredLight(
+        r.world_position.x, r.world_position.y, r.world_position.z, r.world_position.w,
+        r.world_normal.x, r.world_normal.y, r.world_normal.z,
+        r.radiance.x, r.radiance.y, r.radiance.z,
+        r.inverse_pdf,
+        f.x, f.y, f.z, phat, 0.0,
+    );
+}
+
+fn unpack_stored_light(s: StoredLight) -> ResolvedLightSample {
+    return ResolvedLightSample(
+        vec4<f32>(s.px, s.py, s.pz, s.pw),
+        vec3<f32>(s.nx, s.ny, s.nz),
+        vec3<f32>(s.rr, s.rg, s.rb),
+        s.inv_pdf,
+    );
 }
 
 struct LightContribution {

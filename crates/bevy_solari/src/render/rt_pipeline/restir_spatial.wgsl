@@ -15,9 +15,9 @@
 //       count only the M that could have produced it (Bitterli Alg. 6).
 enable wgpu_ray_query;
 
-#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, LightSample, NULL_LIGHT_ID, resolve_emissive_for_restir, calculate_resolved_light_contribution, trace_light_visibility, power_heuristic, pick_luminance}
+#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, StoredLight, ResolvedLightSample, unpack_stored_light, NULL_LIGHT_ID, calculate_resolved_light_contribution, power_heuristic, pick_luminance}
 #import bevy_solari::brdf::{evaluate_brdf, brdf_pdf, F_AB}
-#import bevy_solari::scene_bindings::{offset_ray_origin, ResolvedMaterial}
+#import bevy_solari::scene_bindings::{offset_ray_origin, ResolvedMaterial, tlas, RAY_T_MIN, RAY_T_MAX, RAY_NO_CULL}
 #import bevy_solari::pbr::rand_f
 #import bevy_render::utils::octahedral_decode_signed
 
@@ -40,6 +40,11 @@ struct SpatialParams {
 @group(1) @binding(1) var<storage, read> surfaces: array<SurfaceGbuf>;
 @group(1) @binding(2) var<storage, read_write> output: array<vec4<f32>>;
 @group(1) @binding(3) var<uniform> params: SpatialParams;
+// Chit-resolved winner sample per reservoir slot — the pass reshades from this
+// instead of `resolve_emissive_for_restir` (bindless loads a wgpu pass can't do).
+// Binding 5: scene_bindings hard-codes `geometry_addresses` at group(1) binding(4)
+// (pulled in transitively via brdf), so this slot stays clear of it.
+@group(1) @binding(5) var<storage, read> light_samples: array<StoredLight>;
 
 const MAX_TAPS: u32 = 8u;
 
@@ -78,8 +83,9 @@ fn load_surf(px: u32) -> Surf {
     m.extinction = vec3<f32>(0.0);
     m.nested_priority = 0u;
     out.mat = m;
-    // Camera-relative trace space: the eye is the origin.
-    out.wo = normalize(-out.pos);
+    // View dir stored by the chit (world_position is absolute, not camera-relative,
+    // so it can't be reconstructed as normalize(-pos)).
+    out.wo = octahedral_decode_signed(unpack2x16snorm(s.wo_oct));
     out.f_ab = F_AB(m.perceptual_roughness, max(dot(out.ns, out.wo), 1.0e-4));
     return out;
 }
@@ -92,8 +98,7 @@ struct TargetEval {
     light_pos: vec4<f32>,
 }
 
-fn eval_target(surf: Surf, ls: LightSample) -> TargetEval {
-    let resolved = resolve_emissive_for_restir(ls);
+fn eval_target(surf: Surf, resolved: ResolvedLightSample) -> TargetEval {
     let lc = calculate_resolved_light_contribution(resolved, surf.pos, surf.ns);
     if lc.inverse_pdf <= 0.0 {
         return TargetEval(vec3<f32>(0.0), 0.0, resolved.world_position);
@@ -104,6 +109,34 @@ fn eval_target(surf: Surf, ls: LightSample) -> TargetEval {
     }
     let f = w_mis * lc.radiance * evaluate_brdf(surf.wo, lc.wi, surf.ns, surf.mat, surf.f_ab);
     return TargetEval(f, pick_luminance(f), resolved.world_position);
+}
+
+// Self-contained opaque visibility (no `physical_load`): the shared
+// `trace_light_visibility` alpha-tests cutouts, which needs bindless material
+// loads a wgpu compute pass can't do. Alpha-masked candidates are confirmed as
+// opaque (conservative — a cutout occludes rather than leaks light), matching
+// `ray_query.wgsl`. `light_pos.w == 1` = area point; `w == 0` = directional dir.
+fn spatial_visibility(ray_origin: vec3<f32>, light_pos: vec4<f32>) -> f32 {
+    var dir = light_pos.xyz;
+    var t_max = RAY_T_MAX;
+    if light_pos.w == 1.0 {
+        let to = dir - ray_origin;
+        let dist = length(to);
+        dir = to / dist;
+        t_max = dist - RAY_T_MIN;
+    }
+    if t_max < RAY_T_MIN {
+        return 0.0;
+    }
+    var rq: ray_query;
+    rayQueryInitialize(&rq, tlas, RayDesc(RAY_FLAG_TERMINATE_ON_FIRST_HIT, RAY_NO_CULL, RAY_T_MIN, t_max, ray_origin, dir));
+    while rayQueryProceed(&rq) {
+        let c = rayQueryGetCandidateIntersection(&rq);
+        if c.kind == RAY_QUERY_INTERSECTION_TRIANGLE {
+            rayQueryConfirmIntersection(&rq);
+        }
+    }
+    return f32(rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -132,20 +165,26 @@ fn spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Stream self first.
     var w_sum = 0.0;
-    var sel = LightSample(NULL_LIGHT_ID, 0u);
+    var sel_ls = ResolvedLightSample(vec4<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0);
     var sel_f = vec3<f32>(0.0);
     var sel_pos = vec4<f32>(0.0);
     var sel_phat = 0.0;
     var m_total = 0.0;
     if own.light_id != NULL_LIGHT_ID && own.w > 0.0 {
-        let e = eval_target(surf, LightSample(own.light_id, own.seed));
-        let w = e.phat * own.w * own.m;
+        let own_stored = light_samples[px * 2u + params.parity];
+        let own_ls = unpack_stored_light(own_stored);
+        // Own pixel: the chit's EXACT f/p̂ (same surface it was computed on) — a
+        // G-buffer recompute here drifts ~6% dark on dim pixels via w_mis.
+        // Own pixel: the chit's EXACT f/p̂ (computed on this same surface) — a
+        // G-buffer recompute here drifts ~6% dark on dim pixels via w_mis.
+        let phat = own_stored.phat;
+        let w = phat * own.w * own.m;
         if w > 0.0 {
             w_sum = w;
-            sel = LightSample(own.light_id, own.seed);
-            sel_f = e.f;
-            sel_pos = e.light_pos;
-            sel_phat = e.phat;
+            sel_ls = own_ls;
+            sel_f = vec3<f32>(own_stored.fr, own_stored.fg, own_stored.fb);
+            sel_pos = own_ls.world_position;
+            sel_phat = phat;
         }
     }
     m_total = own.m;
@@ -179,11 +218,12 @@ fn spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         // Re-target the neighbor's sample at OUR surface and stream it in.
         if nres.w > 0.0 {
-            let e = eval_target(surf, LightSample(nres.light_id, nres.seed));
+            let nls = unpack_stored_light(light_samples[npx * 2u + params.parity]);
+            let e = eval_target(surf, nls);
             let w = e.phat * nres.w * nres.m;
             w_sum += w;
             if w > 0.0 && rand_f(&rng) * w_sum < w {
-                sel = LightSample(nres.light_id, nres.seed);
+                sel_ls = nls;
                 sel_f = e.f;
                 sel_pos = e.light_pos;
                 sel_phat = e.phat;
@@ -214,7 +254,7 @@ fn spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
                 z += src_m[s]; // own p̂(winner) > 0 by construction
                 continue;
             }
-            let e = eval_target(load_surf(src_px[s]), sel);
+            let e = eval_target(load_surf(src_px[s]), sel_ls);
             if e.phat > 0.0 {
                 z += src_m[s];
             }
@@ -224,7 +264,7 @@ fn spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let big_w = w_sum / max(m_denom * sel_phat, 1.0e-12);
     let origin = offset_ray_origin(surf.pos, surf.ng);
-    let visible = trace_light_visibility(origin, sel_pos);
+    let visible = spatial_visibility(origin, sel_pos);
     // Debug: BLUE = winner occluded (all-blue floor = ray query broken);
     // GREEN = visible, DI would land. Numbers via the probe readback.
     if debug {

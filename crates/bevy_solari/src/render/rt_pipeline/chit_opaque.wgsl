@@ -13,7 +13,7 @@ enable primitive_index;
 #import bevy_solari::rt_payload::{RtPayload, ShadowPayload, RtCamera}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::pbr::{rand_f, rand_u}
-#import bevy_solari::sampling::{generate_random_light_sample, generate_random_emissive_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, random_emissive_light_pdf_flux, resolve_emissive_for_restir, resolve_light_sample, emissive_light_count, directional_light_count, power_heuristic, pick_luminance, LightSample, Reservoir, SurfaceGbuf, NULL_LIGHT_ID}
+#import bevy_solari::sampling::{generate_random_light_sample, generate_random_emissive_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, random_emissive_light_pdf_flux, resolve_emissive_for_restir, resolve_light_sample, emissive_light_count, directional_light_count, power_heuristic, pick_luminance, LightSample, Reservoir, SurfaceGbuf, StoredLight, pack_stored_light, ResolvedLightSample, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, load_material_bindless, sample_texture_lod, TEXTURE_MAP_NONE, light_sources, active_light_list}
 #import bevy_render::utils::{octahedral_encode, octahedral_decode_signed}
 
@@ -45,6 +45,9 @@ var<hit_attribute> bary: vec2<f32>;
 // with spatial on, the chit stores the post-temporal reservoir + this surface
 // and SKIPS the emissive winner's shadow ray — the pass owns merge+shade.
 @group(1) @binding(10) var<storage, read_write> surfaces: array<SurfaceGbuf>;
+// Winner's resolved emissive sample per reservoir slot — the spatial pass reshades
+// neighbors from this (it can't `physical_load`). Slot-indexed like `reservoirs`.
+@group(1) @binding(11) var<storage, read_write> light_samples: array<StoredLight>;
 const NO_GBUFFER: u32 = 0xffffffffu;
 
 
@@ -422,9 +425,18 @@ fn chit_opaque(
                     pack2x16float(vec2<f32>(ray_hit.material.base_color.b, ray_hit.material.metallic)),
                     pack2x16float(vec2<f32>(ray_hit.material.roughness, ray_hit.material.perceptual_roughness)),
                     pack2x16float(vec2<f32>(ray_hit.material.reflectance, 0.0)),
-                    0u,
+                    pack2x16snorm(octahedral_encode(wo) * 2.0 - 1.0),
                     0u,
                 );
+                // Resolve the winner once here (chit has `physical_load`) and store it
+                // so the wgpu spatial pass can reshade neighbors without bindless loads.
+                let slot = payload.gbuffer_pixel * 2u + (camera.frame.x & 1u);
+                if sel.light_id != NULL_LIGHT_ID {
+                    light_samples[slot] = pack_stored_light(resolve_emissive_for_restir(sel), sel_f, sel_phat);
+                } else {
+                    light_samples[slot] = pack_stored_light(
+                        ResolvedLightSample(vec4<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0.0), vec3<f32>(0.0), 0.0);
+                }
             }
         }
     }
