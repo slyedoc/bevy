@@ -76,6 +76,9 @@ fn chit_opaque(
     // ClusterIDNV).
     @builtin(primitive_index) primitive_index: u32,
     @builtin(world_ray_direction) ray_direction: vec3<f32>,
+    // Hit distance (world units) — converts the light's area pdf to solid angle
+    // for the emissive-vs-NEE MIS weight.
+    @builtin(ray_t_current_max) ray_t: f32,
     // The instance's object→world transform straight from the TLAS hit — no need
     // to read `transforms[instance_id]` (the acceleration structure already holds
     // it). `ObjectToWorldKHR` is mat4x3 (4 columns × 3 rows); convert to the
@@ -142,9 +145,14 @@ fn chit_opaque(
     let nee_off = (bitcast<u32>(camera.atmo.w) & 1u) != 0u;
 
     // Emissive contribution, MIS-weighted against NEE on all but the primary ray.
+    // Both pdfs in SOLID-ANGLE measure: NEE's pdf is per-light-area, so convert by
+    // the d²/cosθ Jacobian of the same direction the BRDF pdf is expressed in —
+    // mismatched measures still partition unity (unbiased) but skew the balance
+    // with distance, paying variance near large emitters.
     var mis_weight = 1.0;
     if payload.p_bounce != 0.0 && !nee_off {
-        let p_light = random_emissive_light_pdf(ray_hit);
+        let cos_l = abs(dot(ray_direction, ray_hit.geometric_world_normal));
+        let p_light = random_emissive_light_pdf(ray_hit) * (ray_t * ray_t) / max(cos_l, 1e-4);
         mis_weight = power_heuristic(payload.p_bounce, p_light);
     }
     var emitted = mis_weight * ray_hit.material.emissive;
@@ -194,7 +202,7 @@ fn chit_opaque(
                     var nee_mis = 1.0;
                     if lc.brdf_rays_can_hit {
                         let pdf_of_bounce = brdf_pdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
-                        nee_mis = power_heuristic(1.0 / lc.inverse_pdf, pdf_of_bounce);
+                        nee_mis = power_heuristic(lc.pdf_solid, pdf_of_bounce);
                     }
                     let direct_brdf = evaluate_brdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
                     emitted += nee_mis * lc.radiance * lc.inverse_pdf * direct_brdf;

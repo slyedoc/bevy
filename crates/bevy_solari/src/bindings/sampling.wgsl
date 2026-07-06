@@ -106,6 +106,10 @@ struct LightContribution {
     inverse_pdf: f32,
     wi: vec3<f32>,
     brdf_rays_can_hit: bool,
+    /// The sample's pdf in SOLID-ANGLE measure (area pdf × d²/cosθ_light) — the
+    /// value MIS weights compare against a BRDF pdf. `inverse_pdf` stays area-measure
+    /// (the estimator's `cosθ/d²` is folded into `radiance`).
+    pdf_solid: f32,
 }
 
 struct LightContributionNoPdf {
@@ -131,7 +135,7 @@ fn directional_light_count() -> u32 {
 fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rng: ptr<function, u32>) -> LightContribution {
     let sample = generate_random_light_sample(rng);
     if sample.light_sample.light_id == NULL_LIGHT_ID {
-        return LightContribution(vec3(0.0), 0.0, vec3(0.0, 1.0, 0.0), false);
+        return LightContribution(vec3(0.0), 0.0, vec3(0.0, 1.0, 0.0), false, 0.0);
     }
     var light_contribution = calculate_resolved_light_contribution(sample.resolved_light_sample, ray_origin, origin_world_normal);
     // Tinted visibility: stained glass between the surface and the light colors
@@ -317,7 +321,12 @@ fn calculate_resolved_light_contribution(resolved_light_sample: ResolvedLightSam
 
     let radiance = resolved_light_sample.radiance * (cos_theta_light / light_distance_squared);
 
-    return LightContribution(radiance, resolved_light_sample.inverse_pdf, wi, resolved_light_sample.world_position.w == 1.0);
+    // Solid-angle pdf for MIS: area pdf × d²/cosθ. For a directional light (w == 0)
+    // d = 1 and cosθ = 1, so this is already its per-solid-angle cone pdf.
+    let pdf_area = select(0.0, 1.0 / resolved_light_sample.inverse_pdf, resolved_light_sample.inverse_pdf > 0.0);
+    let pdf_solid = pdf_area * light_distance_squared / max(cos_theta_light, 1e-4);
+
+    return LightContribution(radiance, resolved_light_sample.inverse_pdf, wi, resolved_light_sample.world_position.w == 1.0, pdf_solid);
 }
 
 fn resolve_and_calculate_light_contribution(light_sample: LightSample, ray_origin: vec3<f32>, origin_world_normal: vec3<f32>) -> LightContributionNoPdf {

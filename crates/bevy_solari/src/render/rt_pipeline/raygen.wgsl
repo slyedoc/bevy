@@ -424,13 +424,16 @@ fn raygen(
                 break;
             }
 
-            // Russian roulette: survival capped below 1 (unbiased — the ÷p
-            // compensates) so even lossless paths terminate.
-            let p = min(luminance(throughput), 0.95);
-            if rand_f(&rng) > p {
-                break;
+            // Russian roulette from bounce 3 (unbiased — the ÷p compensates; capped
+            // below 1 so lossless paths still terminate). Earlier bounces carry most
+            // of the image's energy; rouletting them only buys noise.
+            if bounce >= 3u {
+                let p = min(luminance(throughput), 0.95);
+                if rand_f(&rng) > p {
+                    break;
+                }
+                throughput /= p;
             }
-            throughput /= p;
         }
 
         // Atmosphere volumes: attenuate + in-scatter over the primary segment
