@@ -1156,9 +1156,12 @@ pub(crate) fn rt_pipeline(
             .map_or([0.0, 0.0, 0.0, 1.0], |a| a.sky_frame.to_array()),
         // Atmosphere volumes: device address (bit-preserved through f32) +
         // live count. Zero count ⇒ raygen skips the march entirely.
-        // .w = estimator flags (bit 0 = NEE off — SolariReference validation lever).
+        // .w = estimator flags: bit 0 = NEE off; bits 8..15 = RIS candidate count
+        // (0 → 1 = plain NEE). SolariReference levers.
         atmo: {
-            let flags = f32::from_bits(reference.is_some_and(|r| r.nee_off) as u32);
+            let bits = reference.is_some_and(|r| r.nee_off) as u32
+                | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8);
+            let flags = f32::from_bits(bits);
             atmosphere_volumes.as_deref().map_or([0.0, 0.0, 0.0, flags], |v| {
                 [
                     f32::from_bits(v.address as u32),

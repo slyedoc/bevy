@@ -12,7 +12,8 @@ enable primitive_index;
 
 #import bevy_solari::rt_payload::{RtPayload, ShadowPayload, RtCamera}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
-#import bevy_solari::sampling::{generate_random_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, power_heuristic, NULL_LIGHT_ID}
+#import bevy_solari::pbr::rand_f
+#import bevy_solari::sampling::{generate_random_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, power_heuristic, pick_luminance, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, load_material_bindless, sample_texture_lod, TEXTURE_MAP_NONE}
 #import bevy_render::utils::octahedral_encode
 
@@ -157,56 +158,86 @@ fn chit_opaque(
     }
     var emitted = mis_weight * ray_hit.material.emissive;
 
-    // Next-event estimation (skip on mirror-like surfaces — a delta lobe can't be
-    // importance-sampled by area-light NEE).
+    // Direct lighting via RIS (rung 2): stream M light candidates through a
+    // one-slot weighted reservoir — each weighted w = p̂/p, where the target
+    // p̂ = luminance(w_mis · BRDF · L · G) folds the NEE-vs-BSDF MIS weight into
+    // the technique's integrand (RIS is unbiased for ANY integrand, and the
+    // emissive-hit MIS side keeps using the SOURCE pdf, so the pair stays exact).
+    // One shadow ray for the winner only; shade by f(y) · W with the unbiased
+    // contribution weight W = Σw / (M·p̂(y)). M = 1 reduces algebraically to
+    // plain NEE (W = 1/p). M rides estimator-flag bits 8..15 (SolariReference).
     let is_perfectly_specular =
         ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
     if !is_perfectly_specular && !nee_off {
-        let sample = generate_random_light_sample(&rng);
-        if sample.light_sample.light_id != NULL_LIGHT_ID {
+        let ris_m = max((bitcast<u32>(camera.atmo.w) >> 8u) & 0xffu, 1u);
+        var w_sum = 0.0;
+        var sel_f = vec3<f32>(0.0);
+        var sel_pos = vec4<f32>(0.0);
+        var sel_phat = 0.0;
+        for (var c = 0u; c < ris_m; c += 1u) {
+            let cand = generate_random_light_sample(&rng);
+            if cand.light_sample.light_id == NULL_LIGHT_ID {
+                break; // no lights in the scene
+            }
             let lc = calculate_resolved_light_contribution(
-                sample.resolved_light_sample,
+                cand.resolved_light_sample,
                 ray_hit.world_position,
                 world_normal,
             );
-            if lc.inverse_pdf > 0.0 {
-                // Build the shadow ray toward the sampled light (positional w==1 →
-                // finite range to the light; directional w==0 → far miss).
-                let shadow_origin =
-                    offset_ray_origin(ray_hit.world_position, ray_hit.geometric_world_normal);
-                let light_pos = sample.resolved_light_sample.world_position;
-                var shadow_dir = light_pos.xyz;
-                var shadow_tmax = RAY_T_MAX;
-                if light_pos.w == 1.0 {
-                    let to_light = shadow_dir - shadow_origin;
-                    let dist = length(to_light);
-                    shadow_dir = to_light / dist;
-                    shadow_tmax = dist - RAY_T_MIN;
-                }
-                var visible = false;
-                if shadow_tmax >= RAY_T_MIN {
-                    // Assume occluded; `miss_shadow` clears this iff the ray reaches
-                    // the light. Fixed-function traversal → no register cost here.
-                    shadow_payload.occluded = 1u;
-                    traceRay(
-                        tlas,
-                        RayDesc(SHADOW_RAY_FLAGS, 0xffu, RAY_T_MIN, shadow_tmax, shadow_origin, shadow_dir),
-                        0u,
-                        0u,
-                        SHADOW_MISS_INDEX,
-                        &shadow_payload,
-                    );
-                    visible = shadow_payload.occluded == 0u;
-                }
-                if visible {
-                    var nee_mis = 1.0;
-                    if lc.brdf_rays_can_hit {
-                        let pdf_of_bounce = brdf_pdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
-                        nee_mis = power_heuristic(lc.pdf_solid, pdf_of_bounce);
-                    }
-                    let direct_brdf = evaluate_brdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
-                    emitted += nee_mis * lc.radiance * lc.inverse_pdf * direct_brdf;
-                }
+            if lc.inverse_pdf <= 0.0 {
+                continue;
+            }
+            var w_mis = 1.0;
+            if lc.brdf_rays_can_hit {
+                let pdf_of_bounce = brdf_pdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
+                w_mis = power_heuristic(lc.pdf_solid, pdf_of_bounce);
+            }
+            let f = w_mis * lc.radiance * evaluate_brdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
+            let phat = pick_luminance(f);
+            let w = phat * lc.inverse_pdf;
+            if w <= 0.0 {
+                continue;
+            }
+            w_sum += w;
+            // Streaming keep: first survivor unconditionally (no rand — keeps M=1
+            // stream-identical to plain NEE), then probability w/w_sum.
+            if w == w_sum || rand_f(&rng) * w_sum < w {
+                sel_f = f;
+                sel_pos = cand.resolved_light_sample.world_position;
+                sel_phat = phat;
+            }
+        }
+        if sel_phat > 0.0 {
+            // Shadow ray toward the WINNER (positional w==1 → finite range to the
+            // light; directional w==0 → far miss).
+            let shadow_origin =
+                offset_ray_origin(ray_hit.world_position, ray_hit.geometric_world_normal);
+            var shadow_dir = sel_pos.xyz;
+            var shadow_tmax = RAY_T_MAX;
+            if sel_pos.w == 1.0 {
+                let to_light = shadow_dir - shadow_origin;
+                let dist = length(to_light);
+                shadow_dir = to_light / dist;
+                shadow_tmax = dist - RAY_T_MIN;
+            }
+            var visible = false;
+            if shadow_tmax >= RAY_T_MIN {
+                // Assume occluded; `miss_shadow` clears this iff the ray reaches
+                // the light. Fixed-function traversal → no register cost here.
+                shadow_payload.occluded = 1u;
+                traceRay(
+                    tlas,
+                    RayDesc(SHADOW_RAY_FLAGS, 0xffu, RAY_T_MIN, shadow_tmax, shadow_origin, shadow_dir),
+                    0u,
+                    0u,
+                    SHADOW_MISS_INDEX,
+                    &shadow_payload,
+                );
+                visible = shadow_payload.occluded == 0u;
+            }
+            if visible {
+                let big_w = w_sum / (f32(ris_m) * sel_phat);
+                emitted += sel_f * big_w;
             }
         }
     }

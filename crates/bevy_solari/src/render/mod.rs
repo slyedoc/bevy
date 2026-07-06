@@ -270,10 +270,14 @@ pub struct SolariReference {
     /// Disable next-event estimation (BSDF-only brute force). Validation lever: NEE
     /// on and off MUST converge to the same image — any difference is a pdf/MIS bug.
     pub nee_off: bool,
+    /// RIS candidates per NEE sample (rung 2): M light candidates stream through a
+    /// one-slot reservoir, one shadow ray for the winner. 1 = plain NEE (identical
+    /// estimator); raise for receiver-aware light selection (clamped to 255).
+    pub ris_candidates: u32,
 }
 
 impl Default for SolariReference {
     fn default() -> Self {
-        Self { samples_per_frame: 4, nee_off: false }
+        Self { samples_per_frame: 4, nee_off: false, ris_candidates: 1 }
     }
 }
