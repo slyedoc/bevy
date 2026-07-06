@@ -282,6 +282,14 @@ pub struct SolariReference {
     /// Temporal history cap, ×`ris_candidates` — history counts for at most this
     /// many frames' worth of candidates (uncapped M = frozen shadows/stale lights).
     pub restir_m_cap: f32,
+    /// Direct illumination only: terminate every path at the primary vertex
+    /// (emissive + one NEE/reservoir estimate, no bounces). The standard ReSTIR
+    /// evaluation image — indirect noise otherwise buries the DI variance win.
+    pub di_only: bool,
+    /// When false, render fresh frames instead of averaging (estimator levers stay
+    /// active). With the rung-0 dump this captures a SINGLE warmed restir frame —
+    /// the per-frame variance metric temporal reuse actually improves.
+    pub accumulate: bool,
 }
 
 impl Default for SolariReference {
@@ -292,6 +300,8 @@ impl Default for SolariReference {
             ris_candidates: 1,
             restir: false,
             restir_m_cap: 20.0,
+            di_only: false,
+            accumulate: true,
         }
     }
 }

@@ -185,45 +185,6 @@ fn chit_opaque(
     let is_perfectly_specular =
         ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
     if !is_perfectly_specular && !nee_off {
-        // Restir mode: the sun (and any directional) is shaded deterministically,
-        // one NEE sample per light, at EVERY vertex — never through a reservoir
-        // (a one-slot reservoir arbitrating sun-vs-lamp patchworks the screen).
-        // brdf_rays_can_hit is false for directionals, so no MIS weight applies
-        // (directional lights are NEE-only in this tracer).
-        if restir_mode {
-            let dir_count = directional_light_count();
-            let em_count = emissive_light_count();
-            for (var d = 0u; d < dir_count; d += 1u) {
-                let slot = active_light_list[2u + em_count + d];
-                let dls = LightSample(slot << 16u, rand_u(&rng));
-                let dresolved = resolve_light_sample(dls, light_sources[slot]);
-                let dlc = calculate_resolved_light_contribution(
-                    dresolved, ray_hit.world_position, world_normal);
-                if dlc.inverse_pdf <= 0.0 {
-                    continue;
-                }
-                let df = dlc.radiance * evaluate_brdf(wo, dlc.wi, world_normal, ray_hit.material, F_ab)
-                    * dlc.inverse_pdf;
-                if pick_luminance(df) <= 0.0 {
-                    continue;
-                }
-                let dorigin = offset_ray_origin(ray_hit.world_position, ray_hit.geometric_world_normal);
-                shadow_payload.occluded = 1u;
-                traceRay(
-                    tlas,
-                    // Directional sample: world_position.xyz IS the (unit) direction.
-                    RayDesc(SHADOW_RAY_FLAGS, 0xffu, RAY_T_MIN, RAY_T_MAX, dorigin, dresolved.world_position.xyz),
-                    0u,
-                    0u,
-                    SHADOW_MISS_INDEX,
-                    &shadow_payload,
-                );
-                if shadow_payload.occluded == 0u {
-                    emitted += df;
-                }
-            }
-        }
-
         // Emissive DI: all three paths below fill the same reservoir state and
         // share the winner's shadow ray + shade (estimator = sel_f · Σw/(M·p̂)).
         let ris_m = max((flags >> 8u) & 0xffu, 1u);
@@ -355,37 +316,72 @@ fn chit_opaque(
             }
             res_m = f32(ris_m);
         }
-        if sel_phat > 0.0 {
-            // Shadow ray toward the WINNER (positional w==1 → finite range to the
-            // light; directional w==0 → far miss).
+        // Visibility rays — the chit's SINGLE traceRay call site. Iterations
+        // 0..dir_rays are the deterministic directional lights (restir mode: the
+        // sun is shaded per light at every vertex, never through a reservoir —
+        // a one-slot reservoir arbitrating sun-vs-lamp patchworks the screen;
+        // brdf_rays_can_hit is false for directionals so no MIS weight applies);
+        // the FINAL iteration is the emissive reservoir winner. Single-site is a
+        // hard rule: a second OpTraceRayKHR in this closest-hit miscompiles on
+        // current drivers (whole-scene black, or Xid 13 — bisected 2026-07-06).
+        var dir_rays = 0u;
+        if restir_mode {
+            dir_rays = directional_light_count();
+        }
+        for (var v = 0u; v <= dir_rays; v += 1u) {
+            var f_vis = vec3<f32>(0.0);
+            var vis_target = vec4<f32>(0.0);
+            if v < dir_rays {
+                let slot = active_light_list[2u + emissive_light_count() + v];
+                let dls = LightSample(slot << 16u, rand_u(&rng));
+                let dresolved = resolve_light_sample(dls, light_sources[slot]);
+                let dlc = calculate_resolved_light_contribution(
+                    dresolved, ray_hit.world_position, world_normal);
+                if dlc.inverse_pdf <= 0.0 {
+                    continue;
+                }
+                f_vis = dlc.radiance * evaluate_brdf(wo, dlc.wi, world_normal, ray_hit.material, F_ab)
+                    * dlc.inverse_pdf;
+                // Directional sample: world_position = (unit direction, w=0).
+                vis_target = dresolved.world_position;
+            } else {
+                if sel_phat <= 0.0 {
+                    continue;
+                }
+                f_vis = sel_f * (w_sum / (res_m * sel_phat));
+                vis_target = sel_pos;
+            }
+            if pick_luminance(f_vis) <= 0.0 {
+                continue;
+            }
+            // Positional target (w==1) → finite range to the light; directional
+            // (w==0) → far miss.
             let shadow_origin =
                 offset_ray_origin(ray_hit.world_position, ray_hit.geometric_world_normal);
-            var shadow_dir = sel_pos.xyz;
+            var shadow_dir = vis_target.xyz;
             var shadow_tmax = RAY_T_MAX;
-            if sel_pos.w == 1.0 {
+            if vis_target.w == 1.0 {
                 let to_light = shadow_dir - shadow_origin;
                 let dist = length(to_light);
                 shadow_dir = to_light / dist;
                 shadow_tmax = dist - RAY_T_MIN;
             }
-            var visible = false;
-            if shadow_tmax >= RAY_T_MIN {
-                // Assume occluded; `miss_shadow` clears this iff the ray reaches
-                // the light. Fixed-function traversal → no register cost here.
-                shadow_payload.occluded = 1u;
-                traceRay(
-                    tlas,
-                    RayDesc(SHADOW_RAY_FLAGS, 0xffu, RAY_T_MIN, shadow_tmax, shadow_origin, shadow_dir),
-                    0u,
-                    0u,
-                    SHADOW_MISS_INDEX,
-                    &shadow_payload,
-                );
-                visible = shadow_payload.occluded == 0u;
+            if shadow_tmax < RAY_T_MIN {
+                continue;
             }
-            if visible {
-                let big_w = w_sum / (res_m * sel_phat);
-                emitted += sel_f * big_w;
+            // Assume occluded; `miss_shadow` clears this iff the ray reaches
+            // the light. Fixed-function traversal → no register cost here.
+            shadow_payload.occluded = 1u;
+            traceRay(
+                tlas,
+                RayDesc(SHADOW_RAY_FLAGS, 0xffu, RAY_T_MIN, shadow_tmax, shadow_origin, shadow_dir),
+                0u,
+                0u,
+                SHADOW_MISS_INDEX,
+                &shadow_payload,
+            );
+            if shadow_payload.occluded == 0u {
+                emitted += f_vis;
             }
         }
         // Persist the merged reservoir for next frame's temporal pass. Stored
@@ -453,6 +449,14 @@ fn chit_opaque(
     }
 
 #endif
+
+    // DI-only estimator (flag bit 2): terminate at this vertex — the standard
+    // ReSTIR evaluation image, where the DI variance win isn't buried in GI noise.
+    if (flags & 4u) != 0u {
+        payload.bounce = 0u;
+        payload.rng = rng;
+        return;
+    }
 
     // BRDF-sampled continuation ray for the next bounce.
     let next_bounce = evaluate_and_sample_brdf(wo, world_normal, ray_hit.material, F_ab, &rng);

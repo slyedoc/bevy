@@ -1102,12 +1102,15 @@ pub(crate) fn rt_pipeline(
     let mut accum_n = 0u32;
     let mut accum_spf = 0u32;
     // Estimator flags (also packed into `atmo.w` below): bit 0 = NEE off,
-    // bit 1 = ReSTIR DI, bits 8..15 = RIS candidate count.
+    // bit 1 = ReSTIR DI, bit 2 = DI only, bits 8..15 = RIS candidate count.
     let estimator_flags = reference.is_some_and(|r| r.nee_off) as u32
         | (reference.is_some_and(|r| r.restir) as u32) << 1
+        | (reference.is_some_and(|r| r.di_only) as u32) << 2
         | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8);
     if let Some(reference) = reference {
-        if debug_view == 0 && !show_displacement {
+        // `accumulate: false` = fresh frames (estimator levers stay live) — the
+        // per-frame variance instrument; accum_spf 0 disables the raygen blend.
+        if debug_view == 0 && !show_displacement && reference.accumulate {
             accum_spf = reference.samples_per_frame.max(1);
             let same = accumulation.is_some_and(|a| {
                 a.camera == view.world_from_view
