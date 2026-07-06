@@ -60,6 +60,8 @@ impl Plugin for SolarRenderPlugin {
             .add_plugins(ExtractComponentPlugin::<SolariCamera>::default())
             .add_plugins(ExtractComponentPlugin::<SolariReference>::default())
             .register_type::<SolariReference>()
+            .init_resource::<rt_pipeline::SolariFreezeDiff>()
+            .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariFreezeDiff>::default())
             // Solari does its own light sampling and never reads the clustered-forward
             // light clusters, so opt every `SolariCamera` out of the per-view cluster
             // assignment (bevy_light's `assign_objects_to_clusters`) — a free CPU win.
@@ -172,6 +174,11 @@ impl Plugin for SolarRenderPlugin {
             .add_systems(
                 Render,
                 atmosphere::prepare_atmosphere_bind_group.in_set(RenderSystems::PrepareBindGroups),
+            )
+            // Rung-0 harness ops (freeze snapshot / PFM dump) after the frame's trace.
+            .add_systems(
+                Render,
+                rt_pipeline::rt_freeze_ops.in_set(RenderSystems::Cleanup),
             )
             // Compose-FIRST: bake the sky, then trace + blit the RT image into the
             // view target BEFORE the raster main pass, so the rasterized opaque +

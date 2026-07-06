@@ -205,6 +205,7 @@ pub(crate) struct RtDebug<'w> {
     cluster_view: Option<Res<'w, SolariClusterView>>,
     triangle_view: Option<Res<'w, SolariTriangleView>>,
     normal_facing: Option<Res<'w, SolariNormalFacing>>,
+    freeze_diff: Option<Res<'w, SolariFreezeDiff>>,
 }
 
 /// Material routing inputs for the SBT, bundled into one [`SystemParam`] to keep
@@ -239,6 +240,124 @@ impl RtMaterials<'_> {
 pub struct RtBlit {
     pub layout: BindGroupLayoutDescriptor,
     pub pipeline: CachedComputePipelineId,
+    /// 16-byte uniform for the diff view: `[mode, scale, 0, 0]` (see `blit.wgsl`).
+    pub params: bevy_render::render_resource::Buffer,
+}
+
+/// Rung-0 diff harness controls (main-world, extracted). Bump `freeze_epoch` to
+/// snapshot the current accumulated image; `diff` displays `|current − frozen|`
+/// as a heatmap through the blit; bump `dump_epoch` to write the accumulation
+/// buffer as a PFM into `target/tmp/` for offline RMSE/FLIP.
+#[derive(Resource, Clone, bevy_render::extract_resource::ExtractResource)]
+pub struct SolariFreezeDiff {
+    pub freeze_epoch: u32,
+    pub dump_epoch: u32,
+    pub diff: bool,
+    pub diff_scale: f32,
+}
+
+impl Default for SolariFreezeDiff {
+    fn default() -> Self {
+        Self { freeze_epoch: 0, dump_epoch: 0, diff: false, diff_scale: 4.0 }
+    }
+}
+
+/// Per-view frozen snapshot of the accumulated output (rung-0 diff reference).
+#[derive(Component)]
+pub struct RtFrozen {
+    pub buffer: bevy_render::render_resource::Buffer,
+    pub pixels: u32,
+    pub spp: u32,
+}
+
+/// `Render` (`Cleanup`): execute [`SolariFreezeDiff`] epoch bumps — snapshot the
+/// accumulated output into [`RtFrozen`] (freeze) and/or write it as a PFM into
+/// `target/tmp/` (dump; blocking readback — a manual harness op, hitch accepted).
+pub fn rt_freeze_ops(
+    views: Query<(
+        Entity,
+        &RtOutputBuffer,
+        Option<&RtAccumulation>,
+        Option<&RtFrozen>,
+        &ExtractedCamera,
+    )>,
+    freeze_diff: Option<Res<SolariFreezeDiff>>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    mut seen: Local<(u32, u32)>,
+    mut commands: Commands,
+) {
+    let Some(fd) = freeze_diff else { return };
+    let do_freeze = fd.freeze_epoch != seen.0;
+    let do_dump = fd.dump_epoch != seen.1;
+    *seen = (fd.freeze_epoch, fd.dump_epoch);
+    if !do_freeze && !do_dump {
+        return;
+    }
+    for (entity, output, accumulation, frozen, camera) in &views {
+        let spp = accumulation.map_or(0, |a| a.n);
+        if do_freeze {
+            let buffer = match frozen {
+                Some(f) if f.buffer.size() == output.size => f.buffer.clone(),
+                _ => render_device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("rt_frozen"),
+                    size: output.size,
+                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+            };
+            let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("rt_freeze_copy"),
+            });
+            encoder.copy_buffer_to_buffer(&output.buffer, 0, &buffer, 0, output.size);
+            render_queue.submit([encoder.finish()]);
+            commands.entity(entity).insert(RtFrozen { buffer, pixels: output.pixels, spp });
+            bevy_log::info!("solari freeze: reference snapshot at {spp} spp");
+        }
+        if do_dump {
+            let Some(viewport) = camera.physical_viewport_size else { continue };
+            let staging = render_device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rt_dump_staging"),
+                size: output.size,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("rt_dump_copy"),
+            });
+            encoder.copy_buffer_to_buffer(&output.buffer, 0, &staging, 0, output.size);
+            render_queue.submit([encoder.finish()]);
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = render_device.poll(wgpu::PollType::wait_indefinitely());
+            if rx.recv().map(|r| r.is_err()).unwrap_or(true) {
+                bevy_log::warn!("solari dump: readback map failed");
+                continue;
+            }
+            let (w, h) = (viewport.x as usize, viewport.y as usize);
+            // PFM: little-endian (scale -1.0), rows bottom-to-top, RGB f32.
+            let mut pfm = format!("PF\n{w} {h}\n-1.0\n").into_bytes();
+            {
+                let data = slice.get_mapped_range();
+                for y in (0..h).rev() {
+                    let row = &data[y * w * 16..(y + 1) * w * 16];
+                    for px in row.chunks_exact(16) {
+                        pfm.extend_from_slice(&px[0..12]); // rgb, drop depth-alpha
+                    }
+                }
+            }
+            staging.unmap();
+            let _ = std::fs::create_dir_all("target/tmp");
+            let path = format!("target/tmp/solari-{w}x{h}-{spp}spp-{}.pfm", fd.dump_epoch);
+            match std::fs::write(&path, &pfm) {
+                Ok(()) => bevy_log::info!("solari dump: wrote {path} ({spp} spp)"),
+                Err(e) => bevy_log::warn!("solari dump: {e}"),
+            }
+        }
+    }
 }
 
 /// `RenderStartup`: build the blit pipeline (independent of `SolariPipelines`).
@@ -246,6 +365,7 @@ pub fn init_rt_blit(
     mut commands: Commands,
     pipeline_cache: Res<PipelineCache>,
     asset_server: Res<AssetServer>,
+    render_device: Res<RenderDevice>,
 ) {
     let layout = BindGroupLayoutDescriptor::new(
         "rt_blit_layout",
@@ -254,6 +374,8 @@ pub fn init_rt_blit(
             (
                 storage_buffer_read_only_sized(false, None), // 0: rt_output (array<vec4<f32>>)
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // 1: view_output
+                storage_buffer_read_only_sized(false, None), // 2: frozen snapshot (diff view)
+                bevy_render::render_resource::binding_types::uniform_buffer_sized(false, None), // 3: diff params
             ),
         ),
     );
@@ -267,7 +389,13 @@ pub fn init_rt_blit(
         zero_initialize_workgroup_memory: false,
         constants: vec![],
     });
-    commands.insert_resource(RtBlit { layout, pipeline });
+    let params = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rt_blit_params"),
+        size: 16,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    commands.insert_resource(RtBlit { layout, pipeline, params });
 }
 
 /// Per-view output: a `width*height` `vec4<f32>` storage buffer the raygen shader
@@ -653,6 +781,7 @@ pub(crate) fn rt_pipeline(
         Option<&RtCameraSlot>,
         Option<&SolariReference>,
         Option<&RtAccumulation>,
+        Option<&RtFrozen>,
     )>,
     rt: Option<Res<RtPipeline>>,
     rt_blit: Res<RtBlit>,
@@ -711,6 +840,7 @@ pub(crate) fn rt_pipeline(
         camera_slot,
         reference,
         accumulation,
+        frozen,
     ) = view.into_inner();
 
     // Environment cube the miss shader samples (same priority as the megakernel):
@@ -1136,13 +1266,28 @@ pub(crate) fn rt_pipeline(
 
     // Blit the per-pixel output buffer into the view's HDR storage texture (a
     // normal wgpu compute pass on the shared ctx encoder → runs after the trace
-    // buffer, so the view target stays wgpu-layout-tracked).
+    // buffer, so the view target stays wgpu-layout-tracked). The diff view
+    // (rung-0 harness) rides here: |current − frozen| heatmap when enabled.
+    let frozen_valid = frozen.filter(|f| f.pixels == output.pixels);
+    let diff_on = debug
+        .freeze_diff
+        .as_deref()
+        .is_some_and(|fd| fd.diff && frozen_valid.is_some());
+    let diff_scale = debug.freeze_diff.as_deref().map_or(4.0, |fd| fd.diff_scale);
+    render_queue.write_buffer(
+        &rt_blit.params,
+        0,
+        bytemuck::bytes_of(&[diff_on as u32 as f32, diff_scale, 0.0, 0.0]),
+    );
+    let frozen_binding = frozen_valid.map_or(&output.buffer, |f| &f.buffer);
     let bind_group = render_device.create_bind_group(
         "rt_blit_bind_group",
         &pipeline_cache.get_bind_group_layout(&rt_blit.layout),
         &BindGroupEntries::sequential((
             output.buffer.as_entire_binding(),
             view_target.get_unsampled_color_attachment().view,
+            frozen_binding.as_entire_binding(),
+            rt_blit.params.as_entire_binding(),
         )),
     );
     let encoder = ctx.command_encoder();

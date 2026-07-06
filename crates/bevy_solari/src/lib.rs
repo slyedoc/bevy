@@ -190,6 +190,7 @@ pub mod prelude {
         render::rt_pipeline::SolariAnyHitHeatmap,
         render::rt_pipeline::SolariClusterView,
         render::rt_pipeline::SolariCostHeatmap,
+        render::rt_pipeline::SolariFreezeDiff,
         render::rt_pipeline::SolariNormalFacing,
         render::rt_pipeline::SolariShowDisplacement,
         render::rt_pipeline::SolariTriangleView,
