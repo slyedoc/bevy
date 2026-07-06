@@ -295,17 +295,22 @@ fn insert_dfg_lut(app: &mut App) {
         return;
     }
 
-    let texture = app.world_mut().resource_mut::<Assets<Image>>().add(
-        Image::from_buffer(
-            include_bytes!("dfg.ktx2"),
-            ImageType::Extension("ktx2"),
-            CompressedImageFormats::NONE,
-            false,
-            ImageSampler::linear(),
-            RenderAssetUsages::RENDER_WORLD,
-        )
-        .expect("Failed to decode embedded DFG LUT"),
+    // Self-baked split-sum table (64×64 RG f16) integrating THIS crate's exact
+    // sampler/eval pair — tests/bake_dfg.rs regenerates it after any BRDF change.
+    // bevy_pbr's dfg.ktx2 disagreed ~2.4% at the roughness-1 row (furnace leak).
+    let mut lut = Image::new(
+        bevy_render::render_resource::Extent3d {
+            width: 64,
+            height: 64,
+            depth_or_array_layers: 1,
+        },
+        bevy_render::render_resource::TextureDimension::D2,
+        include_bytes!("dfg_baked.bin").to_vec(),
+        bevy_render::render_resource::TextureFormat::Rg16Float,
+        RenderAssetUsages::RENDER_WORLD,
     );
+    lut.sampler = ImageSampler::linear();
+    let texture = app.world_mut().resource_mut::<Assets<Image>>().add(lut);
 
     if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
         render_app.world_mut().insert_resource(DfgLut { texture });

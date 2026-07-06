@@ -267,7 +267,11 @@ fn bend_shading_normal(shading_normal: vec3<f32>, wo: vec3<f32>) -> vec3<f32> {
     return normalize(shading_normal + (eps - NdotV) * wo);
 }
 
-// Scale/bias approximation
+// Split-sum scale/bias from the self-baked 64×64 INCLUSIVE-grid LUT (texel j = the
+// value at j/63, endpoints included — see tests/bake_dfg.rs). The remap puts uv 0/1
+// exactly on the first/last texel centers, so the steep E falloff at roughness 1 is
+// representable (a plain clamp grid leaked ~2.5% energy there — the furnace test).
 fn F_AB(perceptual_roughness: f32, NdotV: f32) -> vec2<f32> {
-    return textureSampleLevel(brdf_dfg_lut, brdf_dfg_lut_sampler, vec2<f32>(NdotV, perceptual_roughness), 0.0).rg;
+    let uv = vec2<f32>(NdotV, perceptual_roughness) * (63.0 / 64.0) + (0.5 / 64.0);
+    return textureSampleLevel(brdf_dfg_lut, brdf_dfg_lut_sampler, uv, 0.0).rg;
 }
