@@ -42,22 +42,8 @@ struct RtPayload {
     gbuffer_pixel: u32,
 }
 
-// One ReSTIR DI reservoir (32 B). Two slots per pixel, INTERLEAVED by frame
-// parity (`pixel*2 + (frame&1)` = current, `pixel*2 + (1-(frame&1))` = previous)
-// so no stage needs the pixel total to find its halves. `light_id`/`seed`
-// reconstruct the light sample via `resolve_light_sample` (stable light slots);
-// `w` is the unbiased contribution weight W; `normal_oct`/`depth` validate
-// temporal reprojection (both from the frame the reservoir was written).
-struct Reservoir {
-    light_id: u32,
-    seed: u32,
-    m: f32,
-    w: f32,
-    normal_oct: u32,
-    depth: f32,
-    pad_a: u32,
-    pad_b: u32,
-}
+// The ReSTIR `Reservoir` + `SurfaceGbuf` structs live in `bevy_solari::sampling`
+// so the wgpu spatial pass shares them with the raw-VK RT shaders.
 
 // Shadow / visibility-ray payload — just an occlusion flag. The closest-hit sets
 // `occluded = 1` before tracing a `traceRay` toward the light (with

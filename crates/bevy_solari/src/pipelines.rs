@@ -96,6 +96,7 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "render/atmosphere_bake.wgsl");
     embedded_asset!(app, "render/atmosphere_lut_bake.wgsl");
     embedded_asset!(app, "render/rt_pipeline/blit.wgsl");
+    embedded_asset!(app, "render/rt_pipeline/restir_spatial.wgsl");
     #[cfg(feature = "dlss")]
     embedded_asset!(app, "render/dlss_resolve.wgsl");
     embedded_asset!(app, "geometry/tess_classify.wgsl");

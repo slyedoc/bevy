@@ -50,6 +50,9 @@ const BINDING_GBUFFER_MOTION: u32 = 8; // storage: screen-space motion vector.xy
 // present — a fixed binding number past the DLSS range; Vulkan set layouts
 // tolerate the 5–8 gap when the `dlss` feature is off.
 const BINDING_RESERVOIRS: u32 = 9;
+// ReSTIR primary-hit surface G-buffer (48 B/pixel): the chit writes it when the
+// spatial pass is on; the wgpu spatial pass reads it. Always bound.
+const BINDING_SURFACE: u32 = 10;
 
 /// Per-frame camera inputs the raygen shader reads — std140-compatible
 /// (mat4 + vec4). `inverse_view_proj` reconstructs a world-space ray per pixel;
@@ -464,15 +467,18 @@ impl RtPipeline {
             );
         }
         // ReSTIR reservoirs: raygen clears the current slot, the chit merges + stores.
-        bindings.push(
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(BINDING_RESERVOIRS)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(
-                    vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::CLOSEST_HIT_KHR,
-                ),
-        );
+        // Surface G-buffer: the chit writes it for the spatial merge+shade pass.
+        for binding in [BINDING_RESERVOIRS, BINDING_SURFACE] {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(
+                        vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                    ),
+            );
+        }
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         // SAFETY: well-formed create info; device live.
         let descriptor_set_layout =
@@ -739,6 +745,8 @@ impl RtPipeline {
         gbuffers: &[(vk::Buffer, u64)],
         // ReSTIR reservoir buffer `(VkBuffer, size)` bound at BINDING_RESERVOIRS.
         reservoirs: (vk::Buffer, u64),
+        // ReSTIR surface G-buffer `(VkBuffer, size)` bound at BINDING_SURFACE.
+        surface: (vk::Buffer, u64),
         env_map_view: vk::ImageView,
         env_map_image: Option<vk::Image>,
     ) -> Option<RtViewBindings> {
@@ -746,7 +754,7 @@ impl RtPipeline {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(2 + gbuffers.len() as u32), // output + reservoirs + DLSS guides
+                .descriptor_count(3 + gbuffers.len() as u32), // output + reservoirs + surface + DLSS guides
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(1), // camera (ringed)
@@ -828,6 +836,10 @@ impl RtPipeline {
             .buffer(reservoirs.0)
             .offset(0)
             .range(reservoirs.1)];
+        let surface_info = [vk::DescriptorBufferInfo::default()
+            .buffer(surface.0)
+            .offset(0)
+            .range(surface.1)];
         // DLSS guide descriptors built outside `writes` so the per-binding infos
         // outlive `update_descriptor_sets` (empty when the feature is off).
         #[cfg(feature = "dlss")]
@@ -872,6 +884,11 @@ impl RtPipeline {
                 .dst_binding(BINDING_RESERVOIRS)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&reservoirs_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_SURFACE)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&surface_info),
         ];
         #[cfg(feature = "dlss")]
         {
@@ -1462,6 +1479,12 @@ mod tests {
             (
                 "ahit_alpha.wgsl",
                 include_str!("../render/rt_pipeline/ahit_alpha.wgsl"),
+            ),
+            // The wgpu spatial pass — composed via PipelineCache at runtime, but
+            // its imports are all registered here too, so validate it headlessly.
+            (
+                "restir_spatial.wgsl",
+                include_str!("../render/rt_pipeline/restir_spatial.wgsl"),
             ),
         ] {
             if let Err(e) = try_compile_rt_wgsl(source, file, &[]) {

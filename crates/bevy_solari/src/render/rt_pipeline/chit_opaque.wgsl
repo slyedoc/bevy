@@ -10,10 +10,10 @@
 enable wgpu_ray_tracing_pipeline;
 enable primitive_index;
 
-#import bevy_solari::rt_payload::{RtPayload, ShadowPayload, RtCamera, Reservoir}
+#import bevy_solari::rt_payload::{RtPayload, ShadowPayload, RtCamera}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::pbr::{rand_f, rand_u}
-#import bevy_solari::sampling::{generate_random_light_sample, generate_random_emissive_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, random_emissive_light_pdf_flux, resolve_emissive_for_restir, resolve_light_sample, emissive_light_count, directional_light_count, power_heuristic, pick_luminance, LightSample, NULL_LIGHT_ID}
+#import bevy_solari::sampling::{generate_random_light_sample, generate_random_emissive_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, random_emissive_light_pdf_flux, resolve_emissive_for_restir, resolve_light_sample, emissive_light_count, directional_light_count, power_heuristic, pick_luminance, LightSample, Reservoir, SurfaceGbuf, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, load_material_bindless, sample_texture_lod, TEXTURE_MAP_NONE, light_sources, active_light_list}
 #import bevy_render::utils::{octahedral_encode, octahedral_decode_signed}
 
@@ -41,6 +41,10 @@ var<hit_attribute> bary: vec2<f32>;
 // ReSTIR DI reservoirs (rung 3): 2 interleaved slots per pixel (see `Reservoir`).
 // The primary hit merges last frame's slot temporally and writes this frame's.
 @group(1) @binding(9) var<storage, read_write> reservoirs: array<Reservoir>;
+// Primary-hit surface attributes for the spatial merge+shade pass (flag bit 3):
+// with spatial on, the chit stores the post-temporal reservoir + this surface
+// and SKIPS the emissive winner's shadow ray — the pass owns merge+shade.
+@group(1) @binding(10) var<storage, read_write> surfaces: array<SurfaceGbuf>;
 const NO_GBUFFER: u32 = 0xffffffffu;
 
 
@@ -153,6 +157,7 @@ fn chit_opaque(
     let flags = bitcast<u32>(camera.atmo.w);
     let nee_off = (flags & 1u) != 0u;
     let restir_mode = (flags & 2u) != 0u;
+    let spatial_on = restir_mode && (flags & 8u) != 0u;
     let is_primary = payload.gbuffer_pixel != NO_GBUFFER;
 
     // Emissive contribution, MIS-weighted against NEE on all but the primary ray.
@@ -345,7 +350,8 @@ fn chit_opaque(
                 // Directional sample: world_position = (unit direction, w=0).
                 vis_target = dresolved.world_position;
             } else {
-                if sel_phat <= 0.0 {
+                // Spatial pass owns the emissive winner's visibility + shade.
+                if spatial_on || sel_phat <= 0.0 {
                     continue;
                 }
                 f_vis = sel_f * (w_sum / (res_m * sel_phat));
@@ -403,6 +409,23 @@ fn chit_opaque(
                 0u,
                 0u,
             );
+            // Surface attrs for the spatial pass's p̂ re-target + shade.
+            if spatial_on {
+                surfaces[payload.gbuffer_pixel] = SurfaceGbuf(
+                    ray_hit.world_position.x,
+                    ray_hit.world_position.y,
+                    ray_hit.world_position.z,
+                    max(view_z, 1.0e-4),
+                    pack2x16snorm(octahedral_encode(world_normal) * 2.0 - 1.0),
+                    pack2x16snorm(octahedral_encode(ray_hit.geometric_world_normal) * 2.0 - 1.0),
+                    pack2x16float(ray_hit.material.base_color.rg),
+                    pack2x16float(vec2<f32>(ray_hit.material.base_color.b, ray_hit.material.metallic)),
+                    pack2x16float(vec2<f32>(ray_hit.material.roughness, ray_hit.material.perceptual_roughness)),
+                    pack2x16float(vec2<f32>(ray_hit.material.reflectance, 0.0)),
+                    0u,
+                    0u,
+                );
+            }
         }
     }
 

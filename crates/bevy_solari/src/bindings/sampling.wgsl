@@ -94,6 +94,44 @@ struct LightSample {
     seed: u32,
 }
 
+// One ReSTIR DI reservoir (32 B). Two slots per pixel, INTERLEAVED by frame
+// parity (`pixel*2 + (frame&1)` = current, `pixel*2 + (1-(frame&1))` = previous)
+// so no stage needs the pixel total to find its halves. `light_id`/`seed`
+// reconstruct the light sample via `resolve_light_sample` (stable light slots);
+// `w` is the unbiased contribution weight W; `normal_oct`/`depth` validate
+// temporal reprojection (both from the frame the reservoir was written).
+// Defined here (not rt_payload) so the wgpu spatial pass and the raw-VK RT
+// shaders share ONE definition — both shader registries load this module.
+struct Reservoir {
+    light_id: u32,
+    seed: u32,
+    m: f32,
+    w: f32,
+    normal_oct: u32,
+    depth: f32,
+    pad_a: u32,
+    pad_b: u32,
+}
+
+// Primary-hit surface attributes for the ReSTIR spatial pass (48 B/pixel): the
+// exact shading inputs `evaluate_brdf`/`brdf_pdf`/`F_AB` need, f16-packed
+// (≤~0.1% shade error vs the chit's textured resolve — far under the 1% gate).
+// Positions are camera-relative (trace space); `wo = -normalize(pos)`.
+struct SurfaceGbuf {
+    pos_x: f32,
+    pos_y: f32,
+    pos_z: f32,
+    view_z: f32,
+    normal_oct: u32,     // SHADING normal (bent), snorm-oct
+    geo_normal_oct: u32, // geometric normal (shadow-ray origin offset)
+    color_rg: u32,       // pack2x16float(base_color.rg)
+    color_b_metallic: u32,
+    rough_prough: u32,   // pack2x16float(roughness, perceptual_roughness)
+    reflectance: u32,    // pack2x16float(reflectance, 0)
+    pad_a: u32,
+    pad_b: u32,
+}
+
 struct ResolvedLightSample {
     world_position: vec4<f32>,
     world_normal: vec3<f32>,

@@ -10,7 +10,8 @@ enable wgpu_ray_tracing_pipeline;
 // The scene TLAS lives in the shared scene bind group (set 0) — imported so the
 // pipeline layout matches the wgpu-built scene bind group bound at trace time.
 #import bevy_solari::scene_bindings::{tlas, RAY_T_MIN, RAY_T_MAX}
-#import bevy_solari::rt_payload::{RtPayload, RtCamera, Reservoir}
+#import bevy_solari::rt_payload::{RtPayload, RtCamera}
+#import bevy_solari::sampling::Reservoir
 #import bevy_solari::pbr::rand_f
 #import bevy_solari::atmosphere::{atmosphere_ray_sphere_near, atmosphere_ray_sphere_far, atmosphere_rayleigh_phase, atmosphere_mie_phase}
 #import bevy_render::utils::octahedral_decode_signed

@@ -407,6 +407,70 @@ pub fn init_rt_blit(
     commands.insert_resource(RtBlit { layout, pipeline, params });
 }
 
+/// The ReSTIR spatial merge+shade pass (rung 3): pipeline + its group-1 layout
+/// (group 0 is the shared scene bind group — TLAS/lights/materials/DFG LUT).
+#[derive(Resource)]
+pub struct RestirSpatial {
+    pub layout: BindGroupLayoutDescriptor,
+    /// Queued lazily on the first dispatch frame: the pipeline layout needs the
+    /// scene-columns bind-group layout (the resolve reads `transforms` from it),
+    /// which doesn't exist yet at `RenderStartup` — same reason the RT pipeline
+    /// itself builds lazily.
+    pub pipeline: Option<CachedComputePipelineId>,
+    pub shader: bevy_asset::Handle<bevy_shader::Shader>,
+    /// 48-byte `SpatialParams` uniform (see `restir_spatial.wgsl`).
+    pub params: bevy_render::render_resource::Buffer,
+}
+
+/// CPU mirror of `restir_spatial.wgsl::SpatialParams`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RestirSpatialParams {
+    pub width: u32,
+    pub height: u32,
+    pub parity: u32,
+    pub frame: u32,
+    pub taps: u32,
+    pub radius: f32,
+    pub blend_w: f32,
+    pub exposure: f32,
+    pub unbiased: u32,
+    pub pad_a: u32,
+    pub pad_b: u32,
+    pub pad_c: u32,
+}
+
+/// `RenderStartup`: build the spatial pass pipeline (scene group 0 + own group 1).
+pub fn init_restir_spatial(
+    mut commands: Commands,
+    pipeline_cache: Res<PipelineCache>,
+    asset_server: Res<AssetServer>,
+    render_device: Res<RenderDevice>,
+) {
+    use bevy_render::render_resource::binding_types::{storage_buffer_sized, uniform_buffer_sized};
+    let layout = BindGroupLayoutDescriptor::new(
+        "restir_spatial_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_sized(false, None),           // 0: reservoirs (rw)
+                storage_buffer_read_only_sized(false, None), // 1: surfaces
+                storage_buffer_sized(false, None),           // 2: rt_output (rw, += DI)
+                uniform_buffer_sized(false, None),           // 3: params
+            ),
+        ),
+    );
+    let shader = load_embedded_asset!(asset_server.as_ref(), "restir_spatial.wgsl");
+    let params = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("restir_spatial_params"),
+        size: size_of::<RestirSpatialParams>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let _ = &pipeline_cache; // pipeline queued lazily (needs the columns layout)
+    commands.insert_resource(RestirSpatial { layout, pipeline: None, shader, params });
+}
+
 /// Per-view output: a `width*height` `vec4<f32>` storage buffer the raygen shader
 /// writes (raw) and the blit reads (wgpu). A `wgpu::Buffer` from [`Allocator`] so
 /// we hold both its raw `VkBuffer` (for the RT descriptor) and the wgpu handle.
@@ -434,6 +498,11 @@ pub struct RtOutputBuffer {
     pub reservoirs: bevy_render::render_resource::Buffer,
     pub reservoirs_raw: vk::Buffer,
     pub reservoirs_size: u64,
+    /// ReSTIR primary-hit surface G-buffer (48 B/pixel) — chit-written when the
+    /// spatial pass is on; read by `restir_spatial.wgsl` for p̂ re-target + shade.
+    pub surface: bevy_render::render_resource::Buffer,
+    pub surface_raw: vk::Buffer,
+    pub surface_size: u64,
     /// DLSS ray-reconstruction guide G-buffers — normal+roughness, diffuse+depth,
     /// specular+hit-distance, and motion vectors — each `pixels` × `vec4<f32>`,
     /// allocated and reallocated alongside the color output. Written by the
@@ -590,10 +659,27 @@ pub fn prepare_rt_output(
             .map(|b| b.raw_handle())
             .expect("rt_reservoirs buffer must be Vulkan-backed");
         let reservoirs: bevy_render::render_resource::Buffer = reservoirs.into();
+        // Spatial-pass surface G-buffer (48 B/pixel); stale data is gated by the
+        // reservoir's M anyway, zero-cleared once for hygiene.
+        let surface_size = pixels as u64 * 48;
+        let surface = allocator.create_buffer(
+            &render_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            surface_size,
+            MemoryLocation::GpuOnly,
+            "rt_restir_surface",
+        );
+        // SAFETY: Vulkan-backed (Allocator only builds VkBuffers).
+        let surface_raw = unsafe { surface.as_hal::<VkApi>() }
+            .map(|b| b.raw_handle())
+            .expect("rt_restir_surface buffer must be Vulkan-backed");
+        let surface: bevy_render::render_resource::Buffer = surface.into();
         let mut clear_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("rt_reservoirs_clear"),
         });
         clear_encoder.clear_buffer(&reservoirs, 0, None);
+        clear_encoder.clear_buffer(&surface, 0, None);
         render_queue.submit([clear_encoder.finish()]);
         commands.entity(entity).insert(RtOutputBuffer {
             buffer: buffer.into(),
@@ -606,6 +692,9 @@ pub fn prepare_rt_output(
             reservoirs,
             reservoirs_raw,
             reservoirs_size,
+            surface,
+            surface_raw,
+            surface_size,
             #[cfg(feature = "dlss")]
             gbuffer,
         });
@@ -860,13 +949,21 @@ pub(crate) fn rt_pipeline(
         Option<Res<SolariResourceManager>>,
         Option<Res<TransformPropagate>>,
         Res<bevy_time::Time>,
+        Option<ResMut<'static, RestirSpatial>>,
     ),
     mut frame_counter: Local<u32>,
     mut commands: Commands,
     mut ctx: RenderContext,
 ) {
-    let (render_device, render_queue, solari_pipelines, solari_resources, transform_propagate, time) =
-        render_res;
+    let (
+        render_device,
+        render_queue,
+        solari_pipelines,
+        solari_resources,
+        transform_propagate,
+        time,
+        mut restir_spatial,
+    ) = render_res;
     let (cluster_mesh_manager, tess_classify, hit_group_registry, deform) = geometry_res;
     let (atmosphere_sky, atmosphere_gpu, atmosphere_volumes) = atmosphere_res;
     let view_entity = view.entity();
@@ -1031,6 +1128,7 @@ pub(crate) fn rt_pipeline(
                         output.camera_raw,
                         &gbuffers,
                         (output.reservoirs_raw, output.reservoirs_size),
+                        (output.surface_raw, output.surface_size),
                         env_view,
                         environment_map_image,
                     ) {
@@ -1102,10 +1200,11 @@ pub(crate) fn rt_pipeline(
     let mut accum_n = 0u32;
     let mut accum_spf = 0u32;
     // Estimator flags (also packed into `atmo.w` below): bit 0 = NEE off,
-    // bit 1 = ReSTIR DI, bit 2 = DI only, bits 8..15 = RIS candidate count.
+    // bit 1 = ReSTIR DI, bit 2 = DI only, bit 3 = spatial pass, bits 8..15 = RIS M.
     let estimator_flags = reference.is_some_and(|r| r.nee_off) as u32
         | (reference.is_some_and(|r| r.restir) as u32) << 1
         | (reference.is_some_and(|r| r.di_only) as u32) << 2
+        | (reference.is_some_and(|r| r.restir && r.spatial) as u32) << 3
         | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8);
     if let Some(reference) = reference {
         // `accumulate: false` = fresh frames (estimator levers stay live) — the
@@ -1326,6 +1425,85 @@ pub(crate) fn rt_pipeline(
     trace_encoder.keep_bind_group_alive(scene_bg);
     trace_encoder.keep_bind_group_alive(columns_bg);
     ctx.add_command_buffer(trace_encoder.finish());
+
+    // ReSTIR spatial merge+shade (rung 3): after the trace (all reservoirs +
+    // surfaces exist), before the blit. Adds `blend_w · DI · exposure` into the
+    // accumulated output — the same blend weight the raygen used this frame, so
+    // accumulation composes without a history buffer.
+    if let Some(rs) = restir_spatial.as_deref_mut() {
+        let spatial_on = reference.is_some_and(|r| r.restir && r.spatial)
+            && debug_view == 0
+            && !show_displacement;
+        if spatial_on {
+            // Lazy queue: the resolve statically reads the scene-columns group
+            // (`transforms`), so the pipeline layout is [scene, own, columns] with
+            // the columns index fed via the SOLARI_SCENE_COLUMNS_GROUP shader def.
+            let pipeline_id = *rs.pipeline.get_or_insert_with(|| {
+                pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                    label: Some("restir_spatial".into()),
+                    layout: vec![
+                        scene_bindings.bind_group_layout.clone(),
+                        rs.layout.clone(),
+                        columns_layout_desc.clone(),
+                    ],
+                    shader: rs.shader.clone(),
+                    shader_defs: vec![bevy_shader::ShaderDefVal::UInt(
+                        "SOLARI_SCENE_COLUMNS_GROUP".into(),
+                        2,
+                    )],
+                    entry_point: Some("spatial".into()),
+                    immediate_size: 0,
+                    zero_initialize_workgroup_memory: false,
+                    constants: vec![],
+                })
+            });
+            if let Some(spatial_pipeline) = pipeline_cache.get_compute_pipeline(pipeline_id) {
+                let blend_w = if accum_spf > 0 && accum_n > 0 {
+                    accum_spf as f32 / (accum_n + accum_spf) as f32
+                } else {
+                    1.0
+                };
+                let r = reference.unwrap();
+                let params = RestirSpatialParams {
+                    width: viewport.x,
+                    height: viewport.y,
+                    parity: camera_inputs.frame[0] & 1,
+                    frame: camera_inputs.frame[0],
+                    taps: r.spatial_taps.min(8),
+                    radius: r.spatial_radius,
+                    blend_w,
+                    exposure: camera.exposure,
+                    unbiased: r.spatial_unbiased as u32,
+                    pad_a: r.spatial_debug as u32,
+                    pad_b: 0,
+                    pad_c: 0,
+                };
+                render_queue.write_buffer(&rs.params, 0, bytemuck::bytes_of(&params));
+                let bind_group = render_device.create_bind_group(
+                    "restir_spatial_bind_group",
+                    &pipeline_cache.get_bind_group_layout(&rs.layout),
+                    &BindGroupEntries::sequential((
+                        output.reservoirs.as_entire_binding(),
+                        output.surface.as_entire_binding(),
+                        output.buffer.as_entire_binding(),
+                        rs.params.as_entire_binding(),
+                    )),
+                );
+                let encoder = ctx.command_encoder();
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("restir_spatial"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(spatial_pipeline);
+                pass.set_bind_group(0, scene_bg, &[]);
+                pass.set_bind_group(1, &bind_group, &[]);
+                pass.set_bind_group(2, columns_bg, &[]);
+                pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
+            } else {
+                bevy_log::warn_once!("restir_spatial: pipeline not ready — DI missing this frame");
+            }
+        }
+    }
 
     // Blit the per-pixel output buffer into the view's HDR storage texture (a
     // normal wgpu compute pass on the shared ctx encoder → runs after the trace

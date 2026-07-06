@@ -137,6 +137,7 @@ impl Plugin for SolarRenderPlugin {
             .init_resource::<atmosphere::SolariAtmosphereVolumesGpu>()
             .add_systems(RenderStartup, atmosphere::init_atmosphere_pipeline)
             .add_systems(RenderStartup, rt_pipeline::init_rt_blit)
+            .add_systems(RenderStartup, rt_pipeline::init_restir_spatial)
             .add_systems(
                 ExtractSchedule,
                 (
@@ -290,6 +291,20 @@ pub struct SolariReference {
     /// active). With the rung-0 dump this captures a SINGLE warmed restir frame —
     /// the per-frame variance metric temporal reuse actually improves.
     pub accumulate: bool,
+    /// Spatial reuse (rung 3 session 2): a post-trace compute pass merges each
+    /// pixel's reservoir with `spatial_taps` disk neighbors and owns the winner's
+    /// visibility + shade. Requires `restir`.
+    pub spatial: bool,
+    /// Neighbor taps per pixel (≤8).
+    pub spatial_taps: u32,
+    /// Neighbor disk radius, pixels.
+    pub spatial_radius: f32,
+    /// false = naive M-sum combiner (BIASED — the visible-darkening study);
+    /// true = Z-count (only M whose surface could produce the winner).
+    pub spatial_unbiased: bool,
+    /// Debug: the spatial pass paints which stage killed each pixel
+    /// (red = dead reservoir, yellow = zero re-target, blue = occluded, green = lit).
+    pub spatial_debug: bool,
 }
 
 impl Default for SolariReference {
@@ -302,6 +317,11 @@ impl Default for SolariReference {
             restir_m_cap: 20.0,
             di_only: false,
             accumulate: true,
+            spatial: false,
+            spatial_taps: 5,
+            spatial_radius: 20.0,
+            spatial_unbiased: false,
+            spatial_debug: false,
         }
     }
 }
