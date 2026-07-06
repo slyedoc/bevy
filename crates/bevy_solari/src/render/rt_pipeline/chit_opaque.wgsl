@@ -14,6 +14,7 @@ enable primitive_index;
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::sampling::{generate_random_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, power_heuristic, NULL_LIGHT_ID}
 #import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, load_material_bindless, sample_texture_lod, TEXTURE_MAP_NONE}
+#import bevy_render::utils::octahedral_encode
 
 var<incoming_ray_payload> payload: RtPayload;
 // Outgoing payload for the NEE shadow ray (see `miss_shadow`).
@@ -100,6 +101,16 @@ fn chit_opaque(
         vec4<f32>(object_to_world[0].z, object_to_world[1].z, object_to_world[2].z, object_to_world[3].z),
     );
     let ray_hit = resolve_triangle_data_full_mat_fetch(instance_id, sbt.material_id, transform, cluster_id, primitive_index, barycentrics, hit_positions);
+
+    // Normal-facing debug view: stash the pre-bend shading normal + the RAW winding
+    // normal (cross of the fetched world positions, NOT ray_hit.geometric_world_normal
+    // which is sign-matched to the vertex normal). Same edge convention as the resolve.
+    payload.hit_normal_oct = pack2x16snorm(octahedral_encode(ray_hit.world_normal) * 2.0 - 1.0);
+    let wp0 = vec3<f32>(dot(transform[0].xyz, hit_positions[0]) + transform[0].w, dot(transform[1].xyz, hit_positions[0]) + transform[1].w, dot(transform[2].xyz, hit_positions[0]) + transform[2].w);
+    let wp1 = vec3<f32>(dot(transform[0].xyz, hit_positions[1]) + transform[0].w, dot(transform[1].xyz, hit_positions[1]) + transform[1].w, dot(transform[2].xyz, hit_positions[1]) + transform[2].w);
+    let wp2 = vec3<f32>(dot(transform[0].xyz, hit_positions[2]) + transform[0].w, dot(transform[1].xyz, hit_positions[2]) + transform[1].w, dot(transform[2].xyz, hit_positions[2]) + transform[2].w);
+    let geo_raw = normalize(cross(wp0 - wp1, wp0 - wp2));
+    payload.hit_geo_normal_oct = pack2x16snorm(octahedral_encode(geo_raw) * 2.0 - 1.0);
 
     // Displacement debug view (`frame.w == 1`): replace shading with the surface's height map in
     // grayscale, validating the displacement wiring (which map → which surface, the UVs, the sign)

@@ -30,6 +30,13 @@ struct RtPayload {
     // a sentinel (set by raygen before the trace) when the primary ray missed.
     hit_cluster: u32,
     hit_primitive: u32,
+    // Normal-facing debug view (frame.z == 5): primary hit's SHADING normal
+    // (pre-bend, world space), oct-packed to one word. raygen colors front-vs-back
+    // facing to expose inverted / back-wound normals.
+    hit_normal_oct: u32,
+    // Same view: the GEOMETRIC (winding/position) normal, so raygen can tell a
+    // back-wound triangle (red) from a merely bad vertex normal (yellow).
+    hit_geo_normal_oct: u32,
 #ifdef SOLARI_DLSS
     // Pixel index (row-major `y*width + x`) the primary-hit closest-hit writes its
     // ray-reconstruction G-buffer to, or `NO_GBUFFER` on secondary bounces (no

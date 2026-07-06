@@ -644,6 +644,16 @@ fn affine_transform_point(m: mat3x4<f32>, p: vec3<f32>) -> vec3<f32> {
 fn affine_transform_direction(m: mat3x4<f32>, v: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(dot(m[0].xyz, v), dot(m[1].xyz, v), dot(m[2].xyz, v));
 }
+// Transform a NORMAL by `m`'s linear part — the inverse-transpose (cofactor matrix),
+// NOT `affine_transform_direction`. Non-uniform / sheared transforms (e.g. scaled
+// retarget bones) skew normals unless the cofactor is used. Caller normalizes.
+// `cof(R) = R` for a rotation, so unscaled meshes are unchanged.
+fn affine_transform_normal(m: mat3x4<f32>, n: vec3<f32>) -> vec3<f32> {
+    let c0 = vec3<f32>(m[0].x, m[1].x, m[2].x);
+    let c1 = vec3<f32>(m[0].y, m[1].y, m[2].y);
+    let c2 = vec3<f32>(m[0].z, m[1].z, m[2].z);
+    return cross(c1, c2) * n.x + cross(c2, c0) * n.y + cross(c0, c1) * n.z;
+}
 
 // Nudge past the exit portal's surface so the continued ray doesn't immediately
 // re-hit it.
@@ -1081,7 +1091,7 @@ fn resolve_triangle_data_core(
     );
 
     let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics;
-    var world_normal = normalize(affine_transform_direction(transform, local_normal));
+    var world_normal = normalize(affine_transform_normal(transform, local_normal));
 
     let triangle_edge0 = world_vertices[0] - world_vertices[1];
     let triangle_edge1 = world_vertices[0] - world_vertices[2];

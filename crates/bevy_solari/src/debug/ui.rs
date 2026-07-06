@@ -154,8 +154,8 @@ pub use view_panel::{
 mod view_panel {
     use super::*;
     use crate::render::rt_pipeline::{
-        SolariAnyHitHeatmap, SolariClusterView, SolariCostHeatmap, SolariShowDisplacement,
-        SolariTriangleView,
+        SolariAnyHitHeatmap, SolariClusterView, SolariCostHeatmap, SolariNormalFacing,
+        SolariShowDisplacement, SolariTriangleView,
     };
     use crate::render::SolariCamera;
     use bevy_ecs::system::{Res, ResMut};
@@ -202,6 +202,7 @@ mod view_panel {
         displacement_on: bool,
         cluster_on: bool,
         triangle_on: bool,
+        facing_on: bool,
         label: &'static str,
     ) -> impl Scene {
         bsn! {
@@ -213,12 +214,14 @@ mod view_panel {
                      mut anyhit: ResMut<SolariAnyHitHeatmap>,
                      mut displacement: ResMut<SolariShowDisplacement>,
                      mut cluster: ResMut<SolariClusterView>,
-                     mut triangle: ResMut<SolariTriangleView>| {
+                     mut triangle: ResMut<SolariTriangleView>,
+                     mut facing: ResMut<SolariNormalFacing>| {
                 heatmap.enabled = heatmap_on;
                 anyhit.enabled = anyhit_on;
                 displacement.enabled = displacement_on;
                 cluster.enabled = cluster_on;
                 triangle.enabled = triangle_on;
+                facing.enabled = facing_on;
             })
         }
     }
@@ -282,12 +285,13 @@ mod view_panel {
                             (
                                 @FeathersMenuPopup
                                 Children [
-                                    view_item(false, false, false, false, false, "normal"),
-                                    view_item(true, false, false, false, false, "time heatmap"),
-                                    view_item(false, true, false, false, false, "any-hit count"),
-                                    view_item(false, false, true, false, false, "displacement"),
-                                    view_item(false, false, false, true, false, "clusters"),
-                                    view_item(false, false, false, false, true, "triangles"),
+                                    view_item(false, false, false, false, false, false, "normal"),
+                                    view_item(true, false, false, false, false, false, "time heatmap"),
+                                    view_item(false, true, false, false, false, false, "any-hit count"),
+                                    view_item(false, false, true, false, false, false, "displacement"),
+                                    view_item(false, false, false, true, false, false, "clusters"),
+                                    view_item(false, false, false, false, true, false, "triangles"),
+                                    view_item(false, false, false, false, false, true, "normal facing"),
                                 ]
                             )
                         ]
@@ -332,6 +336,7 @@ mod view_panel {
         displacement: Res<SolariShowDisplacement>,
         cluster: Res<SolariClusterView>,
         triangle: Res<SolariTriangleView>,
+        facing: Res<SolariNormalFacing>,
         mut labels: Query<&mut Text, With<ViewLabel>>,
     ) {
         let want = if heatmap.enabled {
@@ -344,6 +349,8 @@ mod view_panel {
             "view: clusters"
         } else if triangle.enabled {
             "view: triangles"
+        } else if facing.enabled {
+            "view: normal facing"
         } else {
             "view: normal"
         };

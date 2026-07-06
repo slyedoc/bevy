@@ -13,6 +13,7 @@ enable wgpu_ray_tracing_pipeline;
 #import bevy_solari::rt_payload::{RtPayload, RtCamera}
 #import bevy_solari::pbr::rand_f
 #import bevy_solari::atmosphere::{atmosphere_ray_sphere_near, atmosphere_ray_sphere_far, atmosphere_rayleigh_phase, atmosphere_mie_phase}
+#import bevy_render::utils::octahedral_decode_signed
 
 // Rec. 709 luminance, for Russian-roulette survival probability.
 fn luminance(c: vec3<f32>) -> f32 {
@@ -250,6 +251,8 @@ fn raygen(
     // Primary hit's cluster + triangle (geometry-debug views). Sentinel = primary miss.
     var primary_cluster = 0xffffffffu;
     var primary_primitive = 0u;
+    var primary_normal_oct = 0u;
+    var primary_geo_normal_oct = 0u;
     // pdf of the BRDF sample that produced this segment (0 on the primary ray),
     // threaded into the hit shader so it can MIS-weight its emissive vs NEE.
     var p_bounce = 0.0;
@@ -348,6 +351,8 @@ fn raygen(
             // Capture the primary hit's cluster + triangle for the geometry-debug views.
             primary_cluster = payload.hit_cluster;
             primary_primitive = payload.hit_primitive;
+            primary_normal_oct = payload.hit_normal_oct;
+            primary_geo_normal_oct = payload.hit_geo_normal_oct;
         }
 
         // Capture the PRIMARY hit's depth on bounce 0. A miss leaves
@@ -459,6 +464,33 @@ fn raygen(
             key = primary_cluster * 0x9e3779b1u + primary_primitive;
         }
         final_color = id_hash_color(key);
+    }
+
+    // Normal-facing debug view (frame.z == 5): classify the primary hit.
+    //   RED    = GEOMETRIC (winding) normal faces away → nearest hit is a back-wound
+    //            triangle (inverted winding / inside-out / frame bug).
+    //   ORANGE = shading normal is >90° from the true surface (dot(Ns,Ng) < 0) →
+    //            genuinely INVERTED vertex normal (bad data — fix at the source).
+    //   YELLOW = shading normal is valid (within 90° of the surface) but tilted past
+    //            the VIEW horizon → benign low-poly grazing; two-sided shading handles it.
+    //   BLUE   = shading normal faces you (correct); brightness = facing.
+    // On watertight, correctly-wound, correctly-normaled geometry: all blue.
+    if camera.frame.z == 5u && primary_cluster != 0xffffffffu {
+        let ns = octahedral_decode_signed(unpack2x16snorm(primary_normal_oct));
+        let ng = octahedral_decode_signed(unpack2x16snorm(primary_geo_normal_oct));
+        let wo = -cam_direction;
+        let sfacing = dot(ns, wo);
+        let gfacing = dot(ng, wo);
+        let sg = dot(ns, ng);          // shading vs true surface: < 0 means inverted
+        if gfacing < 0.0 {
+            final_color = vec3<f32>(1.0, 0.1, 0.1) * (0.15 + 0.85 * abs(gfacing));
+        } else if sg < 0.0 {
+            final_color = vec3<f32>(1.0, 0.45, 0.05) * (0.15 + 0.85 * abs(sg));
+        } else if sfacing < 0.0 {
+            final_color = vec3<f32>(1.0, 0.9, 0.15) * (0.15 + 0.85 * abs(sfacing));
+        } else {
+            final_color = vec3<f32>(0.1, 0.4, 1.0) * (0.15 + 0.85 * sfacing);
+        }
     }
 
     let index = id.y * dims.x + id.x;

@@ -105,6 +105,8 @@ impl Plugin for SolarRenderPlugin {
             .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariClusterView>::default());
         app.init_resource::<rt_pipeline::SolariTriangleView>()
             .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariTriangleView>::default());
+        app.init_resource::<rt_pipeline::SolariNormalFacing>()
+            .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariNormalFacing>::default());
         app.init_resource::<rt_pipeline::SolariShowDisplacement>()
             .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariShowDisplacement>::default());
         // In-situ tessellation: collect every displacement-mapped instance (main

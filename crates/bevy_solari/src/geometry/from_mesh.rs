@@ -20,7 +20,7 @@
 
 use alloc::sync::Arc;
 use bevy_math::{Vec2, Vec3, Vec3Swizzles, Vec4};
-use bevy_mesh::{Mesh, MeshVertexAttributeId, VertexAttributeValues};
+use bevy_mesh::{Indices, Mesh, MeshVertexAttributeId, VertexAttributeValues};
 use bevy_platform::collections::HashMap;
 use meshopt::{
     build_meshlets_spatial, generate_position_remap, partition_clusters, simplify_with_locks,
@@ -77,13 +77,39 @@ impl TryFrom<&Mesh> for ClusterMesh {
          let s = debug_span!("build cluster mesh");
         let _e = s.enter();
 
-        // Auto-generate tangents on a local clone if missing — keeps
-        // the input mesh untouched while satisfying the bake's
-        // tangent requirement.
-        let owned_with_tangents;
-        let mesh = if mesh.attribute(Mesh::ATTRIBUTE_TANGENT.id).is_none() {
-            owned_with_tangents = mesh.clone().with_generated_tangents()?;
-            &owned_with_tangents
+        // Make the mesh self-sufficient for the bake: synthesize any missing normals,
+        // UVs, or tangents on an owned clone so bare-geometry sources (CAD/URDF glbs
+        // that ship POSITION only) bake instead of erroring — no caller pre-processing
+        // required. Order matters: normals + UVs must exist before tangent generation.
+        let owned;
+        let mesh = if mesh.attribute(Mesh::ATTRIBUTE_NORMAL.id).is_none()
+            || mesh.attribute(Mesh::ATTRIBUTE_UV_0.id).is_none()
+            || mesh.attribute(Mesh::ATTRIBUTE_TANGENT.id).is_none()
+        {
+            let mut m = mesh.clone();
+            let n = m.count_vertices();
+            if m.attribute(Mesh::ATTRIBUTE_NORMAL.id).is_none() {
+                // Area-weighted, NOT `compute_normals` (angle-weighted): the angle guard
+                // zeroes contributions on the tiny triangles typical of dense CAD/URDF
+                // meshes, leaving zero normals that octahedral-encode to garbage.
+                if m.indices().is_none() {
+                    m.insert_indices(Indices::U32((0..n as u32).collect()));
+                }
+                m.compute_area_weighted_normals();
+            }
+            if m.attribute(Mesh::ATTRIBUTE_UV_0.id).is_none() {
+                // No texcoords: zero UV + identity tangent. These surfaces sample no
+                // normal map, so the tangent is unused; skipping mikktspace also avoids
+                // the garbage tangents it produces from degenerate (zero) UVs.
+                m.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32, 0.0]; n]);
+                if m.attribute(Mesh::ATTRIBUTE_TANGENT.id).is_none() {
+                    m.insert_attribute(Mesh::ATTRIBUTE_TANGENT, vec![[1.0f32, 0.0, 0.0, 1.0]; n]);
+                }
+            } else if m.attribute(Mesh::ATTRIBUTE_TANGENT.id).is_none() {
+                m = m.with_generated_tangents()?;
+            }
+            owned = m;
+            &owned
         } else {
             mesh
         };
@@ -796,3 +822,4 @@ fn extract_joint_weights(mesh: &Mesh) -> Result<Vec<Vec4>, MeshToClusterMeshConv
         None => Err(MeshToClusterMeshConversionError::MissingAttribute("JOINT_WEIGHT")),
     }
 }
+

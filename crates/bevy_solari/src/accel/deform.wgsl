@@ -82,6 +82,16 @@ fn affine_point(m: mat3x4<f32>, p: vec3<f32>) -> vec3<f32> {
 fn affine_dir(m: mat3x4<f32>, v: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(dot(m[0].xyz, v), dot(m[1].xyz, v), dot(m[2].xyz, v));
 }
+// Transform a NORMAL by `m`'s linear part — the inverse-transpose (cofactor matrix),
+// NOT `affine_dir`. Blending skin matrices shears/scales the linear part, and only
+// the cofactor keeps normals perpendicular to the deformed surface. Caller
+// normalizes. `cof(R) = R` for a rotation, so rigid single-joint verts are unchanged.
+fn affine_normal(m: mat3x4<f32>, n: vec3<f32>) -> vec3<f32> {
+    let c0 = vec3<f32>(m[0].x, m[1].x, m[2].x);
+    let c1 = vec3<f32>(m[0].y, m[1].y, m[2].y);
+    let c2 = vec3<f32>(m[0].z, m[1].z, m[2].z);
+    return cross(c1, c2) * n.x + cross(c2, c0) * n.y + cross(c0, c1) * n.z;
+}
 
 // Invert a `mat3x4` affine (rigid+scale). Returns the inverse in the same packing.
 fn affine_inverse(m: mat3x4<f32>) -> mat3x4<f32> {
@@ -223,18 +233,19 @@ fn deform(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The instance world is walked from the SAME local columns as the joints, so the
     // two are in the same absolute space and the huge shared translation cancels.
     let pos_world = affine_point(m, rest_pos);
-    let nrm_world = affine_dir(m, rest_nrm);
+    let nrm_world = affine_normal(m, rest_nrm);
     let rest_tan = rest_tangents[pos_slot];
     let tan_world = affine_dir(m, rest_tan.xyz);
     let inv_instance = affine_inverse(joint_world(s.node_slot));
     let pos_local = affine_point(inv_instance, pos_world);
-    let nrm_local = normalize(affine_dir(inv_instance, nrm_world));
+    let nrm_local = normalize(affine_normal(inv_instance, nrm_world));
     let tan_local = normalize(affine_dir(inv_instance, tan_world));
 
     let out_v = s.deform_pool_base + vid;
     deform_positions[out_v * 3u + 0u] = pos_local.x;
     deform_positions[out_v * 3u + 1u] = pos_local.y;
     deform_positions[out_v * 3u + 2u] = pos_local.z;
-    deform_normals[out_v] = pack2x16snorm(octahedral_encode(nrm_local));
+    // octahedral_encode returns [0,1]; the pool + octahedral_decode_signed use [-1,1].
+    deform_normals[out_v] = pack2x16snorm(octahedral_encode(nrm_local) * 2.0 - 1.0);
     deform_tangents[out_v] = vec4<f32>(tan_local, rest_tan.w); // w = bitangent sign (deform-invariant)
 }

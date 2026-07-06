@@ -184,6 +184,16 @@ pub struct SolariTriangleView {
     pub enabled: bool,
 }
 
+/// Debug view: color each primary hit by whether its SHADING normal faces the
+/// camera — blue toward the viewer, red away (inverted / back-wound), brightness
+/// = facing magnitude so grazing reads dark. On watertight, correctly-wound
+/// geometry everything is blue; red patches are the bug. Mutually exclusive with
+/// the other views.
+#[derive(Resource, Clone, Copy, Default, ExtractResource)]
+pub struct SolariNormalFacing {
+    pub enabled: bool,
+}
+
 /// Debug/feature inputs bundled into one [`SystemParam`] to keep the dispatch under
 /// bevy's 16-system-param limit: the device feature set + the debug-view toggles.
 #[derive(bevy_ecs::system::SystemParam)]
@@ -194,6 +204,7 @@ pub(crate) struct RtDebug<'w> {
     show_displacement: Option<Res<'w, SolariShowDisplacement>>,
     cluster_view: Option<Res<'w, SolariClusterView>>,
     triangle_view: Option<Res<'w, SolariTriangleView>>,
+    normal_facing: Option<Res<'w, SolariNormalFacing>>,
 }
 
 /// Material routing inputs for the SBT, bundled into one [`SystemParam`] to keep
@@ -891,8 +902,9 @@ pub(crate) fn rt_pipeline(
             (u32::BITS - materials.len().max(1).leading_zeros()),
             // .z = debug view selector: 0 = normal, 1 = cost (clock) heatmap (needs
             // SOLARI_SHADER_CLOCK), 2 = any-hit-count heatmap (OMM effectiveness),
-            // 3 = per-cluster color, 4 = per-triangle color. The view dropdown keeps
-            // these mutually exclusive.
+            // 3 = per-cluster color, 4 = per-triangle color, 5 = normal-facing
+            // (blue toward camera / red away). The view dropdown keeps these
+            // mutually exclusive.
             if debug.cost_heatmap.as_deref().is_some_and(|h| h.enabled) {
                 1u32
             } else if debug.anyhit_heatmap.as_deref().is_some_and(|h| h.enabled) {
@@ -901,6 +913,8 @@ pub(crate) fn rt_pipeline(
                 3u32
             } else if debug.triangle_view.as_deref().is_some_and(|v| v.enabled) {
                 4u32
+            } else if debug.normal_facing.as_deref().is_some_and(|v| v.enabled) {
+                5u32
             } else {
                 0u32
             },
