@@ -254,11 +254,14 @@ pub struct SolariFreezeDiff {
     pub dump_epoch: u32,
     pub diff: bool,
     pub diff_scale: f32,
+    /// Auto-dump once when the accumulation crosses this spp (0 = off) — the
+    /// fps-independent way to capture EQUAL-SAMPLE images for RMSE comparisons.
+    pub dump_at_spp: u32,
 }
 
 impl Default for SolariFreezeDiff {
     fn default() -> Self {
-        Self { freeze_epoch: 0, dump_epoch: 0, diff: false, diff_scale: 4.0 }
+        Self { freeze_epoch: 0, dump_epoch: 0, diff: false, diff_scale: 4.0, dump_at_spp: 0 }
     }
 }
 
@@ -284,18 +287,24 @@ pub fn rt_freeze_ops(
     freeze_diff: Option<Res<SolariFreezeDiff>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    mut seen: Local<(u32, u32)>,
+    mut seen: Local<(u32, u32, bool)>,
     mut commands: Commands,
 ) {
     let Some(fd) = freeze_diff else { return };
     let do_freeze = fd.freeze_epoch != seen.0;
-    let do_dump = fd.dump_epoch != seen.1;
-    *seen = (fd.freeze_epoch, fd.dump_epoch);
-    if !do_freeze && !do_dump {
-        return;
-    }
+    let mut do_dump = fd.dump_epoch != seen.1;
+    seen.0 = fd.freeze_epoch;
+    seen.1 = fd.dump_epoch;
     for (entity, output, accumulation, frozen, camera) in &views {
         let spp = accumulation.map_or(0, |a| a.n);
+        // Equal-sample capture: fire once when crossing the spp threshold.
+        if fd.dump_at_spp > 0 && spp >= fd.dump_at_spp && !seen.2 {
+            do_dump = true;
+            seen.2 = true;
+        }
+        if !do_freeze && !do_dump {
+            continue;
+        }
         if do_freeze {
             let buffer = match frozen {
                 Some(f) if f.buffer.size() == output.size => f.buffer.clone(),

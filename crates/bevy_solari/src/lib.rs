@@ -196,6 +196,7 @@ pub mod prelude {
         render::rt_pipeline::SolariTriangleView,
         render::CameraReframe,
         render::CameraReset,
+        lights::SolariUniformLights,
         render::SolariCamera,
         render::SolariReference,
         transform::{NoGpuGlobalTransformReadback, SolariGpuFrame, TransformStatic},

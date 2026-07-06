@@ -32,7 +32,7 @@ use bevy_ecs::{
     system::{Commands, Query, Res, ResMut},
 };
 use bevy_math::{ops::cos, Vec3};
-use bevy_platform::{collections::HashSet, hash::FixedHasher};
+use bevy_platform::{collections::{HashMap, HashSet}, hash::FixedHasher};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_render::{
     render_resource::{
@@ -241,11 +241,21 @@ pub struct LightSources {
     /// (strata contiguous so the stratified pick indexes directly).
     pub active: Vec<u32>,
     pool: SlotPool<LightKey>,
-    /// The emissive material set the table was built against — a diff catches a
-    /// material whose `emissive` was edited without any instance changing.
-    cached_assets: HashSet<AssetId<StandardSolariMaterial>, FixedHasher>,
+    /// Per-asset emissive luminance the table was built against — a diff catches a
+    /// material whose `emissive` was edited (including INTENSITY) without any
+    /// instance changing; the values also feed the power-weighted pick CDF.
+    cached_flux: HashMap<AssetId<StandardSolariMaterial>, f32, FixedHasher>,
     /// The directional lights-table slots the table was built against.
     cached_directional: Vec<u32>,
+    /// Whether the CDF was built in forced-uniform mode ([`SolariUniformLights`]).
+    cached_uniform: bool,
+}
+
+/// Validation lever (rung 1): force UNIFORM emissive-light picking instead of the
+/// power-weighted CDF. Converged images must match; only variance may differ.
+#[derive(Resource, Clone, Default, bevy_render::extract_resource::ExtractResource)]
+pub struct SolariUniformLights {
+    pub enabled: bool,
 }
 
 /// `Render::Prepare`: rebuild the light-source table — but only when the light
@@ -259,17 +269,26 @@ pub fn prepare_light_sources(
     materials: Res<SolariMaterialAssets>,
     instances: Res<InstanceManager>,
     active_directional: Res<ActiveDirectionalLights>,
+    uniform_pick: Option<Res<SolariUniformLights>>,
 ) {
-    // Material assets whose `emissive` is non-black.
-    let mut emissive_assets = HashSet::<AssetId<StandardSolariMaterial>, FixedHasher>::default();
+    // Emissive luminance per non-black material — the set membership AND the
+    // per-light flux basis (× triangle count). MUST mirror the WGSL side:
+    // `random_emissive_light_pdf` recomputes flux from the BASE (untextured)
+    // material emissive with the same Rec.709 luminance.
+    let mut emissive_assets =
+        HashMap::<AssetId<StandardSolariMaterial>, f32, FixedHasher>::default();
     for (asset_id, material) in materials.iter() {
-        if material.emissive.to_vec3() != Vec3::ZERO {
-            emissive_assets.insert(*asset_id);
+        let e = material.emissive;
+        if e.to_vec3() != Vec3::ZERO {
+            let lum = 0.2126 * e.red + 0.7152 * e.green + 0.0722 * e.blue;
+            emissive_assets.insert(*asset_id, lum);
         }
     }
+    let uniform = uniform_pick.is_some_and(|u| u.enabled);
     let directional: Vec<u32> = active_directional.0.iter().map(|&(_, slot)| slot).collect();
 
-    let changed = emissive_assets != lights.cached_assets
+    let changed = emissive_assets != lights.cached_flux
+        || uniform != lights.cached_uniform
         || directional != lights.cached_directional
         || !instances.added_slots().is_empty()
         || !instances.released_slots().is_empty()
@@ -278,17 +297,20 @@ pub fn prepare_light_sources(
         return;
     }
 
-    // The current light set, with each emissive instance's source entry.
+    // The current light set, with each emissive instance's source entry and its
+    // pick flux (luminance × triangle count; directional entries carry 0).
     let mut present: Vec<(LightKey, GpuLightSource)> = Vec::new();
+    let mut present_flux: Vec<f32> = Vec::new();
     for &slot in instances.active_slots() {
         let asset_id = instances.instance_material_asset_id(slot);
-        if emissive_assets.contains(&asset_id) {
+        if let Some(&lum) = emissive_assets.get(&asset_id) {
             let triangle_count = instances.instance_total_triangle_count(slot);
             if triangle_count > 0 && triangle_count <= u16::MAX as u32 {
                 present.push((
                     LightKey::Emissive(slot.0),
                     GpuLightSource::new_emissive_mesh_light(slot.0, triangle_count),
                 ));
+                present_flux.push(lum * triangle_count as f32);
             }
         }
     }
@@ -313,11 +335,13 @@ pub fn prepare_light_sources(
     table.resize(pool.len() as usize, GpuLightSource::NONE);
     active.clear();
     active.extend([0u32, 0u32]); // [emissive_count, directional_count]
-    for (key, source) in &present {
+    let mut emissive_flux: Vec<f32> = Vec::new();
+    for (i, (key, source)) in present.iter().enumerate() {
         let slot = pool.slot_of(*key).unwrap();
         table[slot as usize] = source.clone();
         if matches!(key, LightKey::Emissive(_)) {
             active.push(slot);
+            emissive_flux.push(present_flux[i]);
         }
     }
     active[0] = present.len() as u32 - directional.len() as u32;
@@ -327,9 +351,24 @@ pub fn prepare_light_sources(
             active.push(pool.slot_of(*key).unwrap());
         }
     }
+    // Power-weighted pick CDF (normalized, last entry pinned to exactly 1.0) +
+    // trailing total flux, appended as f32 bits — `sampling.wgsl` bitcasts them.
+    // total = 0 is the uniform-pick sentinel (forced by [`SolariUniformLights`],
+    // or a degenerate all-zero flux set).
+    let total: f32 = emissive_flux.iter().sum();
+    let n = emissive_flux.len();
+    let mut acc = 0.0f32;
+    for (i, f) in emissive_flux.iter().enumerate() {
+        acc += f;
+        let c = if i + 1 == n { 1.0 } else { acc / total.max(f32::MIN_POSITIVE) };
+        active.push(c.to_bits());
+    }
+    let sentinel = if uniform || !(total > 0.0) { 0.0f32 } else { total };
+    active.push(sentinel.to_bits());
 
-    lights.cached_assets = emissive_assets;
+    lights.cached_flux = emissive_assets;
     lights.cached_directional = directional;
+    lights.cached_uniform = uniform;
 }
 
 /// Uniform shared with `light_resolve.wgsl::ResolveParams`.
@@ -480,6 +519,9 @@ impl Plugin for SolariLightsPlugin {
         app.register_type::<SolariDirectionLight>();
         // Columns, slot index, change-driven extract, Cleanup clear — all generated.
         app.add_plugins(SolariLightsTablePlugin);
+        app.init_resource::<SolariUniformLights>().add_plugins(
+            bevy_render::extract_resource::ExtractResourcePlugin::<SolariUniformLights>::default(),
+        );
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;

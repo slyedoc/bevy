@@ -127,6 +127,49 @@ fn emissive_light_count() -> u32 {
     return active_light_list[0];
 }
 
+// Rec. 709 luminance — the CPU flux basis (`prepare_light_sources`) uses the
+// same coefficients; the two MUST stay identical or the pick pdf de-mirrors.
+fn pick_luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+struct WeightedPick {
+    index: u32,
+    prob: f32,
+}
+
+/// Power-weighted emissive pick: binary-search the normalized flux CDF appended
+/// (as f32 bits) after the slot lists in `active_light_list`, followed by the
+/// total flux (0 = uniform-pick sentinel, see `SolariUniformLights`).
+fn pick_emissive_weighted(
+    emissive_count: u32,
+    directional_count: u32,
+    rng: ptr<function, u32>,
+) -> WeightedPick {
+    let cdf_base = 2u + emissive_count + directional_count;
+    let total_flux = bitcast<f32>(active_light_list[cdf_base + emissive_count]);
+    if total_flux <= 0.0 {
+        return WeightedPick(rand_range_u(emissive_count, rng), 1.0 / f32(emissive_count));
+    }
+    let u = rand_f(rng);
+    var lo = 0u;
+    var hi = emissive_count - 1u;
+    while lo < hi {
+        let mid = (lo + hi) >> 1u;
+        if u < bitcast<f32>(active_light_list[cdf_base + mid]) {
+            hi = mid;
+        } else {
+            lo = mid + 1u;
+        }
+    }
+    let c1 = bitcast<f32>(active_light_list[cdf_base + lo]);
+    var c0 = 0.0;
+    if lo > 0u {
+        c0 = bitcast<f32>(active_light_list[cdf_base + lo - 1u]);
+    }
+    return WeightedPick(lo, max(c1 - c0, 1e-9));
+}
+
 /// Number of active directional lights (the `active_light_list` header).
 fn directional_light_count() -> u32 {
     return active_light_list[1];
@@ -149,8 +192,18 @@ fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rn
 /// stratified pick above exactly.
 fn random_emissive_light_pdf(hit: ResolvedRayHitFull) -> f32 {
     let emissive_count = emissive_light_count();
-    let stratum_probability = select(1.0, 0.5, directional_light_count() > 0u);
-    return stratum_probability / (f32(emissive_count) * f32(hit.triangle_count) * hit.triangle_area);
+    let directional_count = directional_light_count();
+    let stratum_probability = select(1.0, 0.5, directional_count > 0u);
+    let cdf_base = 2u + emissive_count + directional_count;
+    let total_flux = bitcast<f32>(active_light_list[cdf_base + emissive_count]);
+    var pick_prob = 1.0 / f32(emissive_count);
+    if total_flux > 0.0 {
+        // Flux from the BASE (untextured) material emissive — the CPU CDF has no
+        // access to textures, so the mirror must ignore them too.
+        let base = load_material_bindless(hit.material_id);
+        pick_prob = pick_luminance(base.emissive) * f32(hit.triangle_count) / total_flux;
+    }
+    return stratum_probability * pick_prob / (f32(hit.triangle_count) * hit.triangle_area);
 }
 
 /// One uniformly random EMISSIVE light sample — the light-tile pool's source.
@@ -166,8 +219,8 @@ fn generate_random_emissive_light_sample(rng: ptr<function, u32>) -> GenerateRan
         return GenerateRandomLightSampleResult(LightSample(NULL_LIGHT_ID, 0u), null_resolved);
     }
 
-    let pick = rand_range_u(emissive_count, rng);
-    let light_id = active_light_list[2u + pick];
+    let picked = pick_emissive_weighted(emissive_count, directional_light_count(), rng);
+    let light_id = active_light_list[2u + picked.index];
     let light_source = light_sources[light_id];
 
     let triangle_count = light_source.kind >> 1u;
@@ -177,7 +230,7 @@ fn generate_random_emissive_light_sample(rng: ptr<function, u32>) -> GenerateRan
     let light_sample = LightSample((light_id << 16u) | triangle_id, seed);
 
     var resolved_light_sample = resolve_light_sample(light_sample, light_source);
-    resolved_light_sample.inverse_pdf *= f32(emissive_count);
+    resolved_light_sample.inverse_pdf *= 1.0 / picked.prob;
 
     return GenerateRandomLightSampleResult(light_sample, resolved_light_sample);
 }
@@ -203,24 +256,26 @@ fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightS
     let emissive_count = emissive_light_count();
     let directional_count = directional_light_count();
 
-    var stratum_base = 0u;
-    var stratum_count = emissive_count;
+    var emissive_stratum = emissive_count > 0u;
     var stratum_probability = 1.0;
     if directional_count > 0u && emissive_count > 0u {
         stratum_probability = 0.5;
-        if rand_f(rng) < 0.5 {
-            stratum_base = emissive_count;
-            stratum_count = directional_count;
-        }
-    } else if directional_count > 0u {
-        stratum_base = emissive_count;
-        stratum_count = directional_count;
-    } else if emissive_count == 0u {
+        emissive_stratum = rand_f(rng) >= 0.5;
+    } else if emissive_count == 0u && directional_count == 0u {
         let null_resolved = ResolvedLightSample(vec4(0.0, 1.0, 0.0, 0.0), vec3(0.0, -1.0, 0.0), vec3(0.0), 0.0);
         return GenerateRandomLightSampleResult(LightSample(NULL_LIGHT_ID, 0u), null_resolved);
     }
 
-    let pick = stratum_base + rand_range_u(stratum_count, rng);
+    var pick: u32;
+    var pick_prob: f32;
+    if emissive_stratum {
+        let picked = pick_emissive_weighted(emissive_count, directional_count, rng);
+        pick = picked.index;
+        pick_prob = picked.prob;
+    } else {
+        pick = emissive_count + rand_range_u(directional_count, rng);
+        pick_prob = 1.0 / f32(directional_count);
+    }
     let light_id = active_light_list[2u + pick];
     let light_source = light_sources[light_id];
 
@@ -234,7 +289,7 @@ fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightS
     let light_sample = LightSample((light_id << 16u) | triangle_id, seed);
 
     var resolved_light_sample = resolve_light_sample(light_sample, light_source);
-    resolved_light_sample.inverse_pdf *= f32(stratum_count) / stratum_probability;
+    resolved_light_sample.inverse_pdf *= 1.0 / (pick_prob * stratum_probability);
 
     return GenerateRandomLightSampleResult(light_sample, resolved_light_sample);
 }
