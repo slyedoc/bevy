@@ -428,6 +428,12 @@ pub struct RtOutputBuffer {
     /// `valid` flag starts 0. Only the compute touches it — never bridged into the RT
     /// descriptor.
     pub camera_prev_buffer: bevy_render::render_resource::Buffer,
+    /// ReSTIR DI reservoirs: 2 interleaved 32-B slots per pixel (current/previous by
+    /// frame parity). Zero-cleared on creation (M=0 = dead history); persists across
+    /// frames — the trace both reads last frame's half and writes this frame's.
+    pub reservoirs: bevy_render::render_resource::Buffer,
+    pub reservoirs_raw: vk::Buffer,
+    pub reservoirs_size: u64,
     /// DLSS ray-reconstruction guide G-buffers — normal+roughness, diffuse+depth,
     /// specular+hit-distance, and motion vectors — each `pixels` × `vec4<f32>`,
     /// allocated and reallocated alongside the color output. Written by the
@@ -466,6 +472,9 @@ pub struct RtAccumulation {
     clip_from_view: Mat4,
     exposure: f32,
     pixels: u32,
+    /// Estimator flag bits (nee_off/restir/RIS-M) — an estimator switch restarts
+    /// the mean, otherwise a live A/B toggle averages two different estimators.
+    flags: u32,
 }
 
 /// One DLSS ray-reconstruction guide buffer: a `pixels` × `vec4<f32>` GPU storage
@@ -566,6 +575,26 @@ pub fn prepare_rt_output(
         );
         let camera_prev_buffer: bevy_render::render_resource::Buffer = camera_prev_buffer.into();
         render_queue.write_buffer(&camera_prev_buffer, 0, &[0u8; RT_PREV_CAMERA_SIZE as usize]);
+        // ReSTIR reservoirs: 2 slots × 32 B per pixel, zero-cleared (M=0 = no history).
+        let reservoirs_size = pixels as u64 * 64;
+        let reservoirs = allocator.create_buffer(
+            &render_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            reservoirs_size,
+            MemoryLocation::GpuOnly,
+            "rt_reservoirs",
+        );
+        // SAFETY: Vulkan-backed (Allocator only builds VkBuffers).
+        let reservoirs_raw = unsafe { reservoirs.as_hal::<VkApi>() }
+            .map(|b| b.raw_handle())
+            .expect("rt_reservoirs buffer must be Vulkan-backed");
+        let reservoirs: bevy_render::render_resource::Buffer = reservoirs.into();
+        let mut clear_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("rt_reservoirs_clear"),
+        });
+        clear_encoder.clear_buffer(&reservoirs, 0, None);
+        render_queue.submit([clear_encoder.finish()]);
         commands.entity(entity).insert(RtOutputBuffer {
             buffer: buffer.into(),
             raw,
@@ -574,6 +603,9 @@ pub fn prepare_rt_output(
             camera_buffer: camera_buffer.into(),
             camera_raw,
             camera_prev_buffer,
+            reservoirs,
+            reservoirs_raw,
+            reservoirs_size,
             #[cfg(feature = "dlss")]
             gbuffer,
         });
@@ -618,6 +650,8 @@ struct RtCameraGpuInputs {
     sky_frame: Vec4,
     /// Atmosphere-volume buffer address bits + count; see `RtCamera::atmo`.
     atmo: Vec4,
+    /// Viewport pixels + restir M-cap; see `RtCamera::dims`.
+    dims: Vec4,
     exposure: f32,
 }
 
@@ -663,6 +697,7 @@ fn try_dispatch_rt_camera(
         misc: inputs.misc,
         sky_frame: inputs.sky_frame,
         atmo: inputs.atmo,
+        dims: inputs.dims,
         camera_slot: slot.0,
         node_count,
         exposure: inputs.exposure,
@@ -995,6 +1030,7 @@ pub(crate) fn rt_pipeline(
                         output.size,
                         output.camera_raw,
                         &gbuffers,
+                        (output.reservoirs_raw, output.reservoirs_size),
                         env_view,
                         environment_map_image,
                     ) {
@@ -1065,6 +1101,11 @@ pub(crate) fn rt_pipeline(
     // spf/(n_prev+spf) in place in the output buffer.
     let mut accum_n = 0u32;
     let mut accum_spf = 0u32;
+    // Estimator flags (also packed into `atmo.w` below): bit 0 = NEE off,
+    // bit 1 = ReSTIR DI, bits 8..15 = RIS candidate count.
+    let estimator_flags = reference.is_some_and(|r| r.nee_off) as u32
+        | (reference.is_some_and(|r| r.restir) as u32) << 1
+        | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8);
     if let Some(reference) = reference {
         if debug_view == 0 && !show_displacement {
             accum_spf = reference.samples_per_frame.max(1);
@@ -1073,6 +1114,7 @@ pub(crate) fn rt_pipeline(
                     && a.clip_from_view == view.clip_from_view
                     && a.exposure == camera.exposure
                     && a.pixels == output.pixels
+                    && a.flags == estimator_flags
             });
             accum_n = if same { accumulation.unwrap().n } else { 0 };
             let n_new = accum_n + accum_spf;
@@ -1090,6 +1132,7 @@ pub(crate) fn rt_pipeline(
                 clip_from_view: view.clip_from_view,
                 exposure: camera.exposure,
                 pixels: output.pixels,
+                flags: estimator_flags,
             });
         }
     }
@@ -1156,12 +1199,9 @@ pub(crate) fn rt_pipeline(
             .map_or([0.0, 0.0, 0.0, 1.0], |a| a.sky_frame.to_array()),
         // Atmosphere volumes: device address (bit-preserved through f32) +
         // live count. Zero count ⇒ raygen skips the march entirely.
-        // .w = estimator flags: bit 0 = NEE off; bits 8..15 = RIS candidate count
-        // (0 → 1 = plain NEE). SolariReference levers.
+        // .w = estimator flags (see `estimator_flags` above). SolariReference levers.
         atmo: {
-            let bits = reference.is_some_and(|r| r.nee_off) as u32
-                | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8);
-            let flags = f32::from_bits(bits);
+            let flags = f32::from_bits(estimator_flags);
             atmosphere_volumes.as_deref().map_or([0.0, 0.0, 0.0, flags], |v| {
                 [
                     f32::from_bits(v.address as u32),
@@ -1171,6 +1211,13 @@ pub(crate) fn rt_pipeline(
                 ]
             })
         },
+        // Viewport pixels (restir temporal reprojection) + history M-cap.
+        dims: [
+            viewport.x as f32,
+            viewport.y as f32,
+            reference.map_or(20.0, |r| r.restir_m_cap),
+            0.0,
+        ],
     };
     // Fill this view's GPU camera buffer (bound at a constant dynamic offset 0). The
     // GPU-authoritative path derives the basis from `world[camera_slot]` in the
@@ -1204,6 +1251,7 @@ pub(crate) fn rt_pipeline(
                 misc: Vec4::from_array(camera_inputs.misc),
                 sky_frame: Vec4::from_array(camera_inputs.sky_frame),
                 atmo: Vec4::from_array(camera_inputs.atmo),
+                dims: Vec4::from_array(camera_inputs.dims),
                 exposure: camera.exposure,
             }
         },

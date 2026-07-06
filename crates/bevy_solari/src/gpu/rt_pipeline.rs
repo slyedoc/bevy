@@ -45,6 +45,11 @@ const BINDING_GBUFFER_DIFFUSE: u32 = 6; // storage: diffuse albedo.xyz + linear 
 const BINDING_GBUFFER_SPECULAR: u32 = 7; // storage: specular albedo.xyz + hit distance (.w)
 #[cfg(feature = "dlss")]
 const BINDING_GBUFFER_MOTION: u32 = 8; // storage: screen-space motion vector.xy (.zw unused)
+// ReSTIR DI reservoirs (rung 3): 2 interleaved 32-B slots per pixel, written by
+// raygen (current-slot clear) + the opaque closest-hit (merge/store). Always
+// present — a fixed binding number past the DLSS range; Vulkan set layouts
+// tolerate the 5–8 gap when the `dlss` feature is off.
+const BINDING_RESERVOIRS: u32 = 9;
 
 /// Per-frame camera inputs the raygen shader reads — std140-compatible
 /// (mat4 + vec4). `inverse_view_proj` reconstructs a world-space ray per pixel;
@@ -83,6 +88,9 @@ pub struct RtCamera {
     /// `GpuAtmosphereVolumes` buffer, `.z` = live volume count (0 ⇒ raygen
     /// skips the march and the miss shader keeps the cube on primary rays).
     pub atmo: [f32; 4],
+    /// `.xy` = viewport pixels (restir temporal reprojection); `.z` = history
+    /// M-cap as a multiple of the candidate count.
+    pub dims: [f32; 4],
 }
 
 /// Bindless geometry buffer-device-addresses the closest-hit reads via
@@ -455,6 +463,16 @@ impl RtPipeline {
                     ),
             );
         }
+        // ReSTIR reservoirs: raygen clears the current slot, the chit merges + stores.
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_RESERVOIRS)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(
+                    vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                ),
+        );
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         // SAFETY: well-formed create info; device live.
         let descriptor_set_layout =
@@ -719,6 +737,8 @@ impl RtPipeline {
         // Empty unless the `dlss` feature is on; its length sizes the storage-buffer
         // pool slot, so it must agree with the layout the pipeline was built with.
         gbuffers: &[(vk::Buffer, u64)],
+        // ReSTIR reservoir buffer `(VkBuffer, size)` bound at BINDING_RESERVOIRS.
+        reservoirs: (vk::Buffer, u64),
         env_map_view: vk::ImageView,
         env_map_image: Option<vk::Image>,
     ) -> Option<RtViewBindings> {
@@ -726,7 +746,7 @@ impl RtPipeline {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1 + gbuffers.len() as u32), // output + DLSS guides
+                .descriptor_count(2 + gbuffers.len() as u32), // output + reservoirs + DLSS guides
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(1), // camera (ringed)
@@ -804,6 +824,10 @@ impl RtPipeline {
             .buffer(geometry.buffer)
             .offset(0)
             .range(geometry.size)];
+        let reservoirs_info = [vk::DescriptorBufferInfo::default()
+            .buffer(reservoirs.0)
+            .offset(0)
+            .range(reservoirs.1)];
         // DLSS guide descriptors built outside `writes` so the per-binding infos
         // outlive `update_descriptor_sets` (empty when the feature is off).
         #[cfg(feature = "dlss")]
@@ -843,6 +867,11 @@ impl RtPipeline {
                 .dst_binding(BINDING_GEOMETRY)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(&geometry_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_RESERVOIRS)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&reservoirs_info),
         ];
         #[cfg(feature = "dlss")]
         {
@@ -1195,9 +1224,26 @@ fn compile_rt_wgsl(
     file_path: &str,
     extra_modules: &[(&'static str, &'static str)],
 ) -> Option<Vec<u32>> {
+    match try_compile_rt_wgsl(source, file_path, extra_modules) {
+        Ok(spv) => Some(spv),
+        Err(e) => {
+            bevy_log::error!("rt_pipeline: {file_path}: {e}");
+            None
+        }
+    }
+}
+
+/// [`compile_rt_wgsl`] with the failure as a value — the headless shader test
+/// asserts on it, so shader edits fail at `cargo test` with the real error.
+fn try_compile_rt_wgsl(
+    source: &str,
+    file_path: &str,
+    extra_modules: &[(&'static str, &'static str)],
+) -> Result<Vec<u32>, String> {
     use naga_oil::compose::{NagaModuleDescriptor, ShaderDefValue};
 
-    let mut composer = rt_composer(extra_modules)?;
+    let mut composer =
+        rt_composer(extra_modules).ok_or_else(|| "composable module registration failed".to_string())?;
 
     // Shader-def axes for the RT shaders. This is the "pipeline key": each def is a
     // compile-out feature axis the raygen/chits can `#ifdef` on. Keep the axes few
@@ -1221,27 +1267,17 @@ fn compile_rt_wgsl(
         shader_defs.insert("SOLARI_SHADER_CLOCK".to_string(), ShaderDefValue::Bool(true));
     }
 
-    let module = match composer.make_naga_module(NagaModuleDescriptor {
-        source,
-        file_path,
-        shader_defs,
-        ..Default::default()
-    }) {
-        Ok(m) => m,
-        Err(e) => {
-            bevy_log::error!("rt_pipeline: compose {file_path}: {e:?}");
-            return None;
-        }
-    };
-    let info = match naga::valid::Validator::new(naga::valid::ValidationFlags::all(), rt_capabilities())
+    let module = composer
+        .make_naga_module(NagaModuleDescriptor {
+            source,
+            file_path,
+            shader_defs,
+            ..Default::default()
+        })
+        .map_err(|e| format!("compose: {e:?}"))?;
+    let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), rt_capabilities())
         .validate(&module)
-    {
-        Ok(i) => i,
-        Err(e) => {
-            bevy_log::error!("rt_pipeline: WGSL validation failed: {e:?}");
-            return None;
-        }
-    };
+        .map_err(|e| format!("WGSL validation failed: {e:?}"))?;
     let mut options = naga::back::spv::Options::default();
     options.lang_version = (1, 4);
     // The scene `textures`/`samplers` are unsized `binding_array`s in WGSL. wgpu's
@@ -1261,13 +1297,8 @@ fn compile_rt_wgsl(
             },
         );
     }
-    match naga::back::spv::write_vec(&module, &info, &options, None) {
-        Ok(spv) => Some(spv),
-        Err(e) => {
-            bevy_log::error!("rt_pipeline: SPIR-V emit failed: {e:?}");
-            None
-        }
-    }
+    naga::back::spv::write_vec(&module, &info, &options, None)
+        .map_err(|e| format!("SPIR-V emit failed: {e:?}"))
 }
 
 fn create_shader_module(device: &ash::Device, spv: &[u32]) -> Option<vk::ShaderModule> {
@@ -1391,4 +1422,51 @@ fn alloc_mapped_buffer(
         size,
         device_address,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_compile_rt_wgsl;
+
+    // Headless compose→validate→SPIR-V of every built-in RT shader — shader edits
+    // fail here at `cargo test` time instead of as a runtime pipeline-build black
+    // screen (an expensive lesson when each GPU repro needs a supervised run).
+    #[test]
+    fn rt_shaders_compile() {
+        for (file, source) in [
+            (
+                "raygen.wgsl",
+                include_str!("../render/rt_pipeline/raygen.wgsl"),
+            ),
+            ("miss.wgsl", include_str!("../render/rt_pipeline/miss.wgsl")),
+            (
+                "miss_shadow.wgsl",
+                include_str!("../render/rt_pipeline/miss_shadow.wgsl"),
+            ),
+            (
+                "chit_opaque.wgsl",
+                include_str!("../render/rt_pipeline/chit_opaque.wgsl"),
+            ),
+            (
+                "chit_glass.wgsl",
+                include_str!("../render/rt_pipeline/chit_glass.wgsl"),
+            ),
+            (
+                "chit_hair.wgsl",
+                include_str!("../render/rt_pipeline/chit_hair.wgsl"),
+            ),
+            (
+                "chit_portal.wgsl",
+                include_str!("../render/rt_pipeline/chit_portal.wgsl"),
+            ),
+            (
+                "ahit_alpha.wgsl",
+                include_str!("../render/rt_pipeline/ahit_alpha.wgsl"),
+            ),
+        ] {
+            if let Err(e) = try_compile_rt_wgsl(source, file, &[]) {
+                panic!("{file}: {e}");
+            }
+        }
+    }
 }

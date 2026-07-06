@@ -274,10 +274,24 @@ pub struct SolariReference {
     /// one-slot reservoir, one shadow ray for the winner. 1 = plain NEE (identical
     /// estimator); raise for receiver-aware light selection (clamped to 255).
     pub ris_candidates: u32,
+    /// ReSTIR DI (rung 3): persist the primary vertex's reservoir per pixel and
+    /// temporally merge last frame's (reprojected + geometry-validated). Emissive
+    /// candidates then run at the primary vertex only; bounce vertices fall back
+    /// to single-sample emissive NEE and directionals are shaded per light.
+    pub restir: bool,
+    /// Temporal history cap, ×`ris_candidates` — history counts for at most this
+    /// many frames' worth of candidates (uncapped M = frozen shadows/stale lights).
+    pub restir_m_cap: f32,
 }
 
 impl Default for SolariReference {
     fn default() -> Self {
-        Self { samples_per_frame: 4, nee_off: false, ris_candidates: 1 }
+        Self {
+            samples_per_frame: 4,
+            nee_off: false,
+            ris_candidates: 1,
+            restir: false,
+            restir_m_cap: 20.0,
+        }
     }
 }

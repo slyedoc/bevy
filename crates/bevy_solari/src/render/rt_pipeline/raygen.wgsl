@@ -10,7 +10,7 @@ enable wgpu_ray_tracing_pipeline;
 // The scene TLAS lives in the shared scene bind group (set 0) — imported so the
 // pipeline layout matches the wgpu-built scene bind group bound at trace time.
 #import bevy_solari::scene_bindings::{tlas, RAY_T_MIN, RAY_T_MAX}
-#import bevy_solari::rt_payload::{RtPayload, RtCamera}
+#import bevy_solari::rt_payload::{RtPayload, RtCamera, Reservoir}
 #import bevy_solari::pbr::rand_f
 #import bevy_solari::atmosphere::{atmosphere_ray_sphere_near, atmosphere_ray_sphere_far, atmosphere_rayleigh_phase, atmosphere_mie_phase}
 #import bevy_render::utils::octahedral_decode_signed
@@ -43,9 +43,13 @@ const BH_CAPTURE_RADIUS: f32 = 0.5;
 @group(1) @binding(6) var<storage, read_write> gbuffer_diffuse: array<vec4<f32>>;
 @group(1) @binding(7) var<storage, read_write> gbuffer_specular: array<vec4<f32>>;
 @group(1) @binding(8) var<storage, read_write> gbuffer_motion: array<vec4<f32>>;
-// Sentinel pixel index: this bounce writes no guide (set on every non-primary bounce).
-const NO_GBUFFER: u32 = 0xffffffffu;
 #endif
+// ReSTIR DI reservoirs (rung 3): 2 slots per pixel, interleaved by frame parity
+// (see `Reservoir`). raygen clears this pixel's CURRENT slot; the opaque chit
+// fills it on a primary hit — sky/glass pixels then carry dead (M=0) history.
+@group(1) @binding(9) var<storage, read_write> reservoirs: array<Reservoir>;
+// Sentinel pixel index: this bounce writes no guide/reservoir (every non-primary bounce).
+const NO_GBUFFER: u32 = 0xffffffffu;
 
 var<ray_payload> payload: RtPayload;
 
@@ -266,6 +270,13 @@ fn raygen(
     gbuffer_motion[pixel_index] = vec4<f32>(0.0);
 #endif
 
+    // ReSTIR (estimator flag bit 1): clear this pixel's current-parity reservoir so
+    // a primary miss / non-opaque hit can't leave 2-frame-old history in the slot.
+    if (bitcast<u32>(camera.atmo.w) & 2u) != 0u {
+        let parity = camera.frame.x & 1u;
+        reservoirs[pixel_index * 2u + parity] = Reservoir(0u, 0u, 0.0, 0.0, 0u, 0.0, 0u, 0u);
+    }
+
 #ifdef SOLARI_SHADER_CLOCK
     // Per-pixel cost measurement (heatmap). Read the start clock (32-bit LO) and fold
     // it into the RNG so the compiler can't sink the read past the bounce loop: the
@@ -332,11 +343,9 @@ fn raygen(
             // Sentinel so a primary miss (sky) reads as "no cluster" (the miss shader
             // doesn't write these); the closest-hit overwrites on a hit.
             payload.hit_cluster = 0xffffffffu;
-#ifdef SOLARI_DLSS
-            // Only the primary hit produces the visible guide; later bounces pass the
-            // sentinel so their closest-hit leaves the G-buffer untouched.
+            // Only the primary hit produces the visible guide / reservoir write;
+            // later bounces pass the sentinel so their closest-hit skips both.
             payload.gbuffer_pixel = select(NO_GBUFFER, pixel_index, bounce == 0u);
-#endif
             // Shader Execution Reordering: trace into a hit object, regroup the warp
             // by MATERIAL, then run the selected closest-hit. With per-material SBT
             // records (instance_contribution_to_hit_group_index = material slot), the

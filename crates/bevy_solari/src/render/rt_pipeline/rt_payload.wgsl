@@ -37,14 +37,26 @@ struct RtPayload {
     // Same view: the GEOMETRIC (winding/position) normal, so raygen can tell a
     // back-wound triangle (red) from a merely bad vertex normal (yellow).
     hit_geo_normal_oct: u32,
-#ifdef SOLARI_DLSS
-    // Pixel index (row-major `y*width + x`) the primary-hit closest-hit writes its
-    // ray-reconstruction G-buffer to, or `NO_GBUFFER` on secondary bounces (no
-    // guide written there). The single word the DLSS guide costs the payload — the
-    // surface attributes themselves go straight to the G-buffer storage buffers
-    // from the closest-hit (chit-direct), never riding the payload across bounces.
+    // Pixel index (row-major `y*width + x`) on the PRIMARY bounce, sentinel after.
+    // The DLSS guides and the ReSTIR reservoir writes both key off it (chit-direct).
     gbuffer_pixel: u32,
-#endif
+}
+
+// One ReSTIR DI reservoir (32 B). Two slots per pixel, INTERLEAVED by frame
+// parity (`pixel*2 + (frame&1)` = current, `pixel*2 + (1-(frame&1))` = previous)
+// so no stage needs the pixel total to find its halves. `light_id`/`seed`
+// reconstruct the light sample via `resolve_light_sample` (stable light slots);
+// `w` is the unbiased contribution weight W; `normal_oct`/`depth` validate
+// temporal reprojection (both from the frame the reservoir was written).
+struct Reservoir {
+    light_id: u32,
+    seed: u32,
+    m: f32,
+    w: f32,
+    normal_oct: u32,
+    depth: f32,
+    pad_a: u32,
+    pad_b: u32,
 }
 
 // Shadow / visibility-ray payload — just an occlusion flag. The closest-hit sets
@@ -72,4 +84,5 @@ struct RtCamera {
     misc: vec4<f32>,           // .x = time (s, wrapped); .y = pixel ray-cone tan (footprint LOD); .zw reserved
     sky_frame: vec4<f32>,      // world→bake sky quaternion (xyzw); identity for flat scenes/skyboxes
     atmo: vec4<f32>,           // .xy = volume-buffer device address (lo/hi bits); .z = volume count
+    dims: vec4<f32>,           // .xy = viewport pixels (ReSTIR reprojection); .z = history M-cap ×M
 }

@@ -43,6 +43,8 @@ pub struct RtCameraPassParams {
     pub sky_frame: Vec4,
     /// Passthrough → `RtCamera.atmo` (volume buffer address bits + count).
     pub atmo: Vec4,
+    /// Passthrough → `RtCamera.dims` (`.xy` viewport pixels, `.z` restir M-cap).
+    pub dims: Vec4,
     /// The `SolariCamera`'s transform-table slot (`GpuSlot<TransformGraph>`).
     pub camera_slot: u32,
     /// World-buffer node high-water — bounds guard for `camera_slot`.

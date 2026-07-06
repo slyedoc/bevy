@@ -191,10 +191,15 @@ fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rn
 /// this emissive hit — the BSDF-vs-NEE MIS counterpart. Must mirror the
 /// stratified pick above exactly.
 fn random_emissive_light_pdf(hit: ResolvedRayHitFull) -> f32 {
+    let stratum_probability = select(1.0, 0.5, directional_light_count() > 0u);
+    return stratum_probability * random_emissive_light_pdf_flux(hit);
+}
+
+/// The same mirror WITHOUT the directional stratum factor — the restir estimator
+/// samples emissives and directionals as separate techniques (no 50/50 pick).
+fn random_emissive_light_pdf_flux(hit: ResolvedRayHitFull) -> f32 {
     let emissive_count = emissive_light_count();
-    let directional_count = directional_light_count();
-    let stratum_probability = select(1.0, 0.5, directional_count > 0u);
-    let cdf_base = 2u + emissive_count + directional_count;
+    let cdf_base = 2u + emissive_count + directional_light_count();
     let total_flux = bitcast<f32>(active_light_list[cdf_base + emissive_count]);
     var pick_prob = 1.0 / f32(emissive_count);
     if total_flux > 0.0 {
@@ -203,7 +208,28 @@ fn random_emissive_light_pdf(hit: ResolvedRayHitFull) -> f32 {
         let base = load_material_bindless(hit.material_id);
         pick_prob = pick_luminance(base.emissive) * f32(hit.triangle_count) / total_flux;
     }
-    return stratum_probability * pick_prob / (f32(hit.triangle_count) * hit.triangle_area);
+    return pick_prob / (f32(hit.triangle_count) * hit.triangle_area);
+}
+
+/// Re-resolve a stored reservoir sample at shading time with the FULL
+/// flux-weighted technique pdf folded into `inverse_pdf` — must produce the
+/// same pdf `generate_random_emissive_light_sample` gave the sample when it was
+/// a candidate, so a re-evaluated target p̂ is the same function of
+/// (surface, sample) on every pixel/frame that touches it.
+fn resolve_emissive_for_restir(ls: LightSample) -> ResolvedLightSample {
+    let light_source = light_sources[ls.light_id >> 16u];
+    var resolved = resolve_light_sample(ls, light_source);
+    let emissive_count = emissive_light_count();
+    let cdf_base = 2u + emissive_count + directional_light_count();
+    let total_flux = bitcast<f32>(active_light_list[cdf_base + emissive_count]);
+    var pick_prob = 1.0 / f32(emissive_count);
+    if total_flux > 0.0 {
+        let triangle_count = light_source.kind >> 1u;
+        let base = load_material_bindless(material_ids[light_source.id]);
+        pick_prob = pick_luminance(base.emissive) * f32(triangle_count) / total_flux;
+    }
+    resolved.inverse_pdf *= 1.0 / max(pick_prob, 1e-12);
+    return resolved;
 }
 
 /// One uniformly random EMISSIVE light sample — the light-tile pool's source.
