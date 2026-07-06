@@ -260,10 +260,13 @@ pub struct SolariCamera;
 pub struct SolariReference {
     /// Paths traced per pixel per frame (inner raygen loop). Raise to converge faster.
     pub samples_per_frame: u32,
+    /// Disable next-event estimation (BSDF-only brute force). Validation lever: NEE
+    /// on and off MUST converge to the same image — any difference is a pdf/MIS bug.
+    pub nee_off: bool,
 }
 
 impl Default for SolariReference {
     fn default() -> Self {
-        Self { samples_per_frame: 4 }
+        Self { samples_per_frame: 4, nee_off: false }
     }
 }

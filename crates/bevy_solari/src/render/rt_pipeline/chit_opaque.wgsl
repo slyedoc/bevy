@@ -136,9 +136,14 @@ fn chit_opaque(
     let NdotV = max(dot(world_normal, wo), 0.0001);
     let F_ab = F_AB(ray_hit.material.perceptual_roughness, NdotV);
 
+    // Estimator flags (RtCamera.atmo.w): bit 0 = NEE off (SolariReference validation
+    // lever — BSDF-only). With NEE off, emissive MIS weights MUST stay 1 or the
+    // technique's share of the energy is simply dropped (biased dark).
+    let nee_off = (bitcast<u32>(camera.atmo.w) & 1u) != 0u;
+
     // Emissive contribution, MIS-weighted against NEE on all but the primary ray.
     var mis_weight = 1.0;
-    if payload.p_bounce != 0.0 {
+    if payload.p_bounce != 0.0 && !nee_off {
         let p_light = random_emissive_light_pdf(ray_hit);
         mis_weight = power_heuristic(payload.p_bounce, p_light);
     }
@@ -148,7 +153,7 @@ fn chit_opaque(
     // importance-sampled by area-light NEE).
     let is_perfectly_specular =
         ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
-    if !is_perfectly_specular {
+    if !is_perfectly_specular && !nee_off {
         let sample = generate_random_light_sample(&rng);
         if sample.light_sample.light_id != NULL_LIGHT_ID {
             let lc = calculate_resolved_light_contribution(

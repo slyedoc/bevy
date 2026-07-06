@@ -13,7 +13,7 @@ use std::{
 };
 
 use argh::FromArgs;
-use bevy::pbr::ContactShadows;
+use bevy::{image::{ImageAddressMode, ImageSamplerDescriptor}, pbr::ContactShadows};
 use bevy::{
     anti_alias::taa::TemporalAntiAliasing,
     camera::visibility::{NoCpuCulling, NoFrustumCulling},
@@ -139,16 +139,26 @@ pub fn main() {
         bevy::asset::uuid::uuid!("b1f7d9e3-2a4c-4d6b-8f1e-3c5a7b9d0f2e"),
     ));
 
-    let default_plugins = DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "Bistro".into(),
-            resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
-            present_mode: PresentMode::AutoNoVsync,
-            position: WindowPosition::Centered(MonitorSelection::Primary),
+    let default_plugins = DefaultPlugins
+        .set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Bistro".into(),
+                resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
+                present_mode: PresentMode::AutoNoVsync,
+                position: WindowPosition::Centered(MonitorSelection::Primary),
+                ..default()
+            }),
             ..default()
-        }),
-        ..default()
-    });
+        })
+        .set(ImagePlugin {
+            default_sampler: ImageSamplerDescriptor {
+                address_mode_u: ImageAddressMode::Repeat,
+                address_mode_v: ImageAddressMode::Repeat,
+                address_mode_w: ImageAddressMode::Repeat,
+                ..ImageSamplerDescriptor::linear()
+            },
+            ..default()
+        });
     // Under `solari` the full-RT path replaces the raster mesh/material stack, so
     // disable `PbrPlugin` (bevy_solari owns its material/lights + vendors the DfgLut
     // + pbr shader helpers) and `TransformPlugin` (the GPU transform table drives

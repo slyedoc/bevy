@@ -364,10 +364,11 @@ pub fn prepare_rt_output(
             continue;
         }
         let size = pixels as u64 * 16;
+        // COPY_SRC: validation harnesses (furnace tests) read pixels back.
         let buffer = allocator.create_buffer(
             &render_device,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            BufferUsages::STORAGE,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             size,
             MemoryLocation::GpuOnly,
             "rt_output_buffer",
@@ -1016,14 +1017,18 @@ pub(crate) fn rt_pipeline(
             .map_or([0.0, 0.0, 0.0, 1.0], |a| a.sky_frame.to_array()),
         // Atmosphere volumes: device address (bit-preserved through f32) +
         // live count. Zero count ⇒ raygen skips the march entirely.
-        atmo: atmosphere_volumes.as_deref().map_or([0.0; 4], |v| {
-            [
-                f32::from_bits(v.address as u32),
-                f32::from_bits((v.address >> 32) as u32),
-                f32::from_bits(v.count),
-                0.0,
-            ]
-        }),
+        // .w = estimator flags (bit 0 = NEE off — SolariReference validation lever).
+        atmo: {
+            let flags = f32::from_bits(reference.is_some_and(|r| r.nee_off) as u32);
+            atmosphere_volumes.as_deref().map_or([0.0, 0.0, 0.0, flags], |v| {
+                [
+                    f32::from_bits(v.address as u32),
+                    f32::from_bits((v.address >> 32) as u32),
+                    f32::from_bits(v.count),
+                    flags,
+                ]
+            })
+        },
     };
     // Fill this view's GPU camera buffer (bound at a constant dynamic offset 0). The
     // GPU-authoritative path derives the basis from `world[camera_slot]` in the
