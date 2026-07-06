@@ -115,6 +115,12 @@ pub struct BlasSharing {
     /// geometry → static descriptor (group_base, cluster_base,
     /// cluster_count, root_group). Written by classify.
     pub geometry_desc: Buffer,
+    /// geometry → 1 once its CLAS bytes actually exist (CPU-written by the
+    /// static CLAS upload / procedural instantiate). `elect_dirty` refuses to
+    /// elect before this: electing over absent CLAS builds a hollow BLAS that
+    /// gets committed and baked into the TLAS as a zero-extent leaf — the
+    /// intermittent missing-static-scene startup race.
+    pub clas_ready: Buffer,
     /// dirty entry i → geometry id.
     pub dirty_gid: Buffer,
     /// dirty build count (atomic alloc). The selector guards its
@@ -229,6 +235,7 @@ pub fn init_blas_sharing(
     let geometry_built_level = storage_buf(&render_device, "blas_sharing.built_level", cap * 4);
     let geometry_dirty = storage_buf(&render_device, "blas_sharing.geometry_dirty", cap * 4);
     let geometry_desc = storage_buf(&render_device, "blas_sharing.geometry_desc", cap * 16);
+    let clas_ready = storage_buf(&render_device, "blas_sharing.clas_ready", cap * 4);
     let dirty_gid = storage_buf(&render_device, "blas_sharing.dirty_gid", cap * 4);
     let dirty_build_count = storage_buf(&render_device, "blas_sharing.dirty_count", 4);
     let build_desc = storage_buf(&render_device, "blas_sharing.build_desc", cap * 2 * 16);
@@ -253,6 +260,7 @@ pub fn init_blas_sharing(
         geometry_built_level,
         geometry_dirty,
         geometry_desc,
+        clas_ready,
         dirty_gid,
         dirty_build_count,
         build_count,
@@ -441,13 +449,16 @@ pub fn prepare_blas_sharing_bind_group(
     resource_manager: Option<Res<SolariResourceManager>>,
     pipeline_cache: Res<PipelineCache>,
     geometry_ids: Option<Res<GpuColumn<GeometryIdColumn>>>,
+    selector: Option<Res<super::selector::Selector>>,
     view_uniforms: Res<ViewUniforms>,
     render_device: Res<RenderDevice>,
 ) {
     let Some(sharing) = sharing.as_deref_mut() else {
         return;
     };
-    let (Some(resource_manager), Some(geometry_ids)) = (resource_manager, geometry_ids) else {
+    let (Some(resource_manager), Some(geometry_ids), Some(selector)) =
+        (resource_manager, geometry_ids, selector)
+    else {
         sharing.bind_group = None;
         return;
     };
@@ -480,6 +491,8 @@ pub fn prepare_blas_sharing_bind_group(
             sharing.build_count.as_entire_binding(),
             sharing.geometry_desc.as_entire_binding(),
             sharing.instance_e_build.wgpu_buffer.as_entire_binding(),
+            selector.args_buf.wgpu_buffer.as_entire_binding(),
+            sharing.clas_ready.as_entire_binding(),
         )),
     );
     sharing.bind_group = Some(group);

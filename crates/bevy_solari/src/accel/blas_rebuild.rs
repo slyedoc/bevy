@@ -38,7 +38,10 @@ use bevy_ecs::{
     resource::Resource,
     system::{Commands, Res, ResMut},
 };
+use bevy_render::render_resource::{ComputePassDescriptor, PipelineCache};
 use bevy_render::renderer::{RenderContext, RenderDevice};
+use bevy_render::camera::ExtractedCamera;
+use bevy_render::view::ViewUniformOffset;
 use wgpu::CommandEncoderDescriptor;
 
 use crate::instance::InstanceManager;
@@ -146,6 +149,10 @@ pub fn dispatch_blas_rebuild(
     selector: Option<Res<Selector>>,
     sharing: Option<Res<BlasSharing>>,
     instances: Option<Res<InstanceManager>>,
+    pipeline_cache: Res<PipelineCache>,
+    pipelines: Res<crate::pipelines::SolariPipelines>,
+    scene_bind_group: Res<crate::bindings::ClusterSceneBindGroup>,
+    view_query: bevy_ecs::system::Query<&ViewUniformOffset, bevy_ecs::query::With<ExtractedCamera>>,
     mut ctx: RenderContext,
 ) {
     let (
@@ -170,6 +177,13 @@ pub fn dispatch_blas_rebuild(
         None => return,
     };
     if instances.active_count() == 0 {
+        return;
+    }
+    // The selector didn't record this frame (cold-start) → its ref lists are
+    // stale/empty. Skip the build; `built_level` stays uncommitted, so elect
+    // re-fires next frame and the build retries (rebuild-until-built).
+    if !selector.recorded {
+        tracing::debug!("blas_rebuild: skipped (selector did not record)");
         return;
     }
     // Build capacity (CPU upper bound; the GPU `src_infos_count` is the
@@ -301,4 +315,27 @@ pub fn dispatch_blas_rebuild(
         crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
     }
     ctx.add_command_buffer(encoder.finish());
+
+    // The build is truly recorded — commit each dirty geometry's `built_level`
+    // (elect no longer commits optimistically; a bailed chain must re-elect).
+    // Recorded into the ctx encoder AFTER `add_command_buffer`, so it lands in
+    // a fresh encoder submitted after the build on the single queue.
+    let (Some(commit_pipe), Some(scene_bg), Some(sharing_bg), Some(view_offset)) = (
+        pipeline_cache.get_compute_pipeline(pipelines.blas_sharing_commit_built),
+        scene_bind_group.bind_group.as_ref(),
+        sharing.bind_group.as_ref(),
+        view_query.iter().next(),
+    ) else {
+        tracing::debug!("blas_rebuild: commit_built skipped (pipeline/bind groups cold)");
+        return;
+    };
+    let encoder = ctx.command_encoder();
+    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+        label: Some("blas_sharing.commit_built"),
+        timestamp_writes: None,
+    });
+    pass.set_bind_group(0, scene_bg, &[]);
+    pass.set_bind_group(1, sharing_bg, &[view_offset.offset]);
+    pass.set_pipeline(commit_pipe);
+    pass.dispatch_workgroups(bucket_capacity.div_ceil(64), 1, 1);
 }

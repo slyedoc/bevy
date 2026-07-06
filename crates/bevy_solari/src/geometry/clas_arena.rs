@@ -764,6 +764,9 @@ impl ClasArena {
         // created. We do NOT touch this encoder via wgpu commands
         // afterward — wgpu refuses to mix raw + high-level encoding.
         unsafe {
+            // Input barrier: the build reads staged `write_buffer` bytes by device
+            // address (untracked) — nothing else orders TRANSFER_WRITE → AS_BUILD.
+            crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
             // Build the opacity micro-map FIRST, then barrier so the cluster
             // build (which references it via `opacity_micromap_array`) sees the
             // finished data. Same encoder/submit → ordered before the CLAS build.
@@ -873,19 +876,33 @@ pub fn upload_pending_clas(
     fns: Option<Res<ClusterExtensionFns>>,
     mut cluster_meshes: ResMut<ClusterMeshManager>,
     clas_arena: Option<ResMut<ClasArena>>,
+    sharing: Option<Res<crate::accel::blas_sharing::BlasSharing>>,
     mut retire: ResMut<GpuRetire>,
 ) {
     let (Some(allocator), Some(fns), Some(mut clas_arena)) = (allocator, fns, clas_arena)
     else {
         // No cluster-AS support (or arena not initialized). Drop any
         // queued uploads on the floor — they'd never get serviced.
+        if !cluster_meshes.pending_clas_uploads.is_empty() {
+            tracing::warn!(
+                "clas: DROPPING {} queued upload(s) (allocator/fns/arena absent)",
+                cluster_meshes.pending_clas_uploads.len()
+            );
+        }
         cluster_meshes.pending_clas_uploads.clear();
         return;
     };
     if fns.cluster.is_none() || cluster_meshes.pending_clas_uploads.is_empty() {
+        if !cluster_meshes.pending_clas_uploads.is_empty() {
+            tracing::warn!(
+                "clas: DROPPING {} queued upload(s) (no cluster fns)",
+                cluster_meshes.pending_clas_uploads.len()
+            );
+        }
         cluster_meshes.pending_clas_uploads.clear();
         return;
     }
+    tracing::debug!("clas: uploading {} pending mesh(es)", cluster_meshes.pending_clas_uploads.len());
 
     let vertex_addr =
         allocator.wgpu_buffer_device_address(cluster_meshes.vertex_positions.buffer()).get();
@@ -909,5 +926,12 @@ pub fn upload_pending_clas(
             entry.index_base,
             entry.omm.as_ref(),
         );
+        // CLAS bytes now exist (build submitted above, queue-ordered before any
+        // later AS build) — unblock BLAS-sharing elections for this geometry.
+        if let (Some(sharing), Some(gid)) =
+            (sharing.as_ref(), cluster_meshes.geometry_id_of(entry.asset_id))
+        {
+            render_queue.write_buffer(&sharing.clas_ready, gid as u64 * 4, &1u32.to_le_bytes());
+        }
     }
 }

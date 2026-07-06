@@ -92,6 +92,11 @@ struct SharingParams {
 // slot → per-instance object-space error budget (`e_ideal`, unbanded). Written by
 // `classify` and consumed by the shared-BLAS per-instance DAG cut.
 @group(1) @binding(14) var<storage, read_write> instance_e_build: array<f32>;
+// dirty entry i → the selector's per-bucket build args; .x = emitted cluster
+// count (0 = empty/incomplete build → commit_built must not commit).
+@group(1) @binding(15) var<storage, read> build_args: array<vec4<u32>>;
+// geometry → 1 once its CLAS bytes exist (CPU-written at upload/instantiate).
+@group(1) @binding(16) var<storage, read> clas_ready: array<u32>;
 
 // ---------------------------------------------------------------------
 // 64-bit helpers (WGSL has no u64). Mirror selector.wgsl carry math.
@@ -234,15 +239,23 @@ fn elect_dirty(@builtin(global_invocation_id) gid: vec3<u32>) {
     if desired == NO_LEVEL {
         return; // no visible instance this frame
     }
+    // CLAS bytes not resident yet → electing now would build a hollow BLAS and
+    // bake a zero-extent leaf into the TLAS. Wait; re-checked every frame.
+    if clas_ready[g] == 0u {
+        return;
+    }
     if desired == geometry_built_level[g] {
         return; // resident BLAS already at the wanted level
     }
-    // Rebuild needed. Claim a dirty-build slot.
+    // Rebuild needed. Claim a dirty-build slot. `built_level` is NOT committed
+    // here: the selector/blas_rebuild consumers have their own cold-start bails,
+    // and an optimistic commit over a bailed build leaves a permanent lie
+    // ("built") over unbuilt pool bytes — the missing-static-scene startup race.
+    // `commit_built` below stamps it only after the build chain actually records.
     let i = atomicAdd(&dirty_count[0], 1u);
     if i >= params.geometry_capacity {
         return; // overflow (shouldn't happen — capacity == geometry_count)
     }
-    geometry_built_level[g] = desired;
     geometry_dirty[g] = 1u;
     dirty_gid[i] = g;
 
@@ -278,4 +291,26 @@ fn assign_address(
     }
     let slot = active_to_slot[d];
     instance_blas_address[slot] = geometry_address(instance_geometry_ids[slot]);
+}
+
+// =====================================================================
+// Pass 5 (dispatched from `dispatch_blas_rebuild`, AFTER the raw cluster-BLAS
+// build is recorded): commit each dirty geometry's built level. Gated on the
+// whole selector→build chain actually recording this frame — a cold-start bail
+// anywhere leaves `built_level` untouched, so `elect_dirty` re-fires next frame
+// and the build retries until it truly lands (rebuild-until-built).
+// =====================================================================
+@compute @workgroup_size(64)
+fn commit_built(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= min(atomicLoad(&dirty_count[0]), params.geometry_capacity) {
+        return;
+    }
+    // An empty cut (selector emitted no clusters — CLAS data not resident yet)
+    // must NOT commit: the pool holds a hollow BLAS. Leave built_level untouched
+    // so the bucket re-elects until a real cut lands.
+    if build_args[i].x == 0u {
+        return;
+    }
+    geometry_built_level[dirty_gid[i]] = bucket_desc[i * DESC_VEC4 + 1u].y;
 }

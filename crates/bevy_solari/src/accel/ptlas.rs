@@ -306,11 +306,32 @@ pub struct Ptlas {
     pub validate_report: Buffer,
     pub validate_staging: Buffer,
     pub validate_in_flight: bool,
+
+    /// Rebuild-until-clean: a build that stamps a record with a NULL BLAS address
+    /// (its transform or BLAS address hadn't landed yet — the pipeline-warmup race)
+    /// writes an instance that is INVISIBLE and, if it never moves, has no future
+    /// re-spec trigger — the intermittent missing-static-scene-on-startup bug. The
+    /// fill counts null records ([`NULL_COUNT_WORD`]); it's read back async and any
+    /// non-zero count forces another `force_all` full rebuild, restamping everything
+    /// until a build lands fully resolved. Readback latency (~2-4 frames) naturally
+    /// paces the retries; steady state reads 0 and never re-arms.
+    pub nulls_staging: Buffer,
+    /// 0 = idle, 1 = copied (map next frame), 2 = map in flight.
+    pub nulls_phase: u8,
+    /// map_async result: 0 pending, 1 ok, 2 error.
+    pub nulls_map_result: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    pub pending_null_rebuild: bool,
 }
 
 /// u32 words in the validation report: 4 span + capacity + partition count +
 /// bad count + 15 × 5-word entries.
-const VALIDATE_REPORT_WORDS: u64 = 7 + 15 * 5;
+// +2: trailing always-on heal counters (not just under SOLARI_PTLAS_VALIDATE):
+// [82] null-AS records, [83] regular-partition writes in an incremental build.
+// Both drive the rebuild-until-clean warmup heal below.
+const VALIDATE_REPORT_WORDS: u64 = 7 + 15 * 5 + 2;
+/// Report word holding the count of records the fill wrote with a null BLAS
+/// address (transform not propagated / BLAS address not assigned yet).
+const NULL_COUNT_WORD: u64 = 82;
 
 /// SOLARI_PTLAS_VALIDATE=1 → scan + null corrupt BLAS addresses each build,
 /// logging offenders (slot + address) instead of device-losting in the build.
@@ -445,6 +466,12 @@ pub fn init_ptlas(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let nulls_staging = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ptlas.nulls_staging"),
+        size: 8,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
 
     commands.insert_resource(Ptlas {
         storage,
@@ -476,6 +503,10 @@ pub fn init_ptlas(
         validate_report,
         validate_staging,
         validate_in_flight: false,
+        nulls_staging,
+        nulls_phase: 0,
+        nulls_map_result: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        pending_null_rebuild: false,
     });
 }
 
@@ -548,8 +579,13 @@ pub fn prepare_ptlas_params(
         || !instances.disabled_slots().is_empty()
         || !instances.rewrite_slots().is_empty()
         || !resources.deferred_adds.is_empty();
-    let full_rebuild =
-        !resources.has_built || grew || churn || ptlas_force_full_rebuild();
+    // `pending_null_rebuild`: last completed build stamped null-AS records
+    // (warmup race) — restamp everything until a build lands fully resolved.
+    let full_rebuild = !resources.has_built
+        || grew
+        || churn
+        || ptlas_force_full_rebuild()
+        || core::mem::take(&mut resources.pending_null_rebuild);
     if churn {
         tracing::debug!(
             "ptlas churn: +{} -{} ~{} deferred {}",
@@ -880,6 +916,57 @@ pub fn prepare_ptlas_params(
     }
 }
 
+/// Non-blocking drain of the null-AS record counter copied after each build's
+/// fill. Any non-zero count arms [`Ptlas::pending_null_rebuild`] — the
+/// rebuild-until-clean warmup heal (see the field docs).
+fn drain_null_count(resources: &mut Ptlas) {
+    use std::sync::atomic::Ordering;
+    match resources.nulls_phase {
+        // Copied last build → the copy is submitted; start the map.
+        1 => {
+            resources.nulls_map_result.store(0, Ordering::Relaxed);
+            let done = resources.nulls_map_result.clone();
+            resources.nulls_staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                done.store(if r.is_ok() { 1 } else { 2 }, Ordering::Relaxed);
+            });
+            resources.nulls_phase = 2;
+        }
+        2 => match resources.nulls_map_result.load(Ordering::Relaxed) {
+            1 => {
+                let (nulls, regular_writes) = {
+                    let data = resources.nulls_staging.slice(..).get_mapped_range();
+                    (
+                        u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+                        u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+                    )
+                };
+                resources.nulls_staging.unmap();
+                resources.nulls_phase = 0;
+                if nulls > 0 {
+                    resources.pending_null_rebuild = true;
+                    tracing::info!(
+                        "ptlas: {nulls} null-AS record(s) in last build (warmup race) — forcing a full restamp"
+                    );
+                }
+                if regular_writes > 0 {
+                    // Incremental writes into regular partitions are silently
+                    // driver-broken (the CPU-churn constraint, hit GPU-side) —
+                    // redo them via the safe full-rebuild path.
+                    resources.pending_null_rebuild = true;
+                    tracing::info!(
+                        "ptlas: {regular_writes} regular-partition write(s) in an incremental build — forcing a full restamp (driver constraint)"
+                    );
+                }
+            }
+            2 => {
+                resources.nulls_phase = 0; // map failed; retry after the next build
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
 /// `Render::PrepareBindGroups`: rebuild the fill-compute bind group.
 pub fn prepare_ptlas_fill_bind_group(
     mut ptlas: Option<ResMut<Ptlas>>,
@@ -975,6 +1062,7 @@ pub fn prepare_ptlas_fill_bind_group(
             ptlas.validate_report.as_entire_binding(),
             ptlas.seed_epoch.buffer().as_entire_binding(),
             partition_hints.buffer().as_entire_binding(),
+            sharing.geometry_built_level.as_entire_binding(),
         )),
     );
     ptlas.bind_group = Some(group);
@@ -1020,6 +1108,7 @@ pub fn dispatch_ptlas(
     }
     // Log what LAST build's validation pass caught (its copy has long retired).
     drain_ptlas_validation(resources, &render_device);
+    drain_null_count(resources);
     // `op_count == 0` means `prepare_ptlas_params` decided there was
     // nothing to build this frame (no delta) — `storage` already holds
     // the current PTLAS, so leave it alone.
@@ -1040,6 +1129,11 @@ pub fn dispatch_ptlas(
     let (Some(scene_bg), Some(fill_bg)) =
         (scene_bind_group.bind_group.as_ref(), resources.bind_group.as_ref())
     else {
+        tracing::debug!(
+            "ptlas.dispatch: build skipped (scene bg={} fill bg={})",
+            scene_bind_group.bind_group.is_some(),
+            resources.bind_group.is_some(),
+        );
         return;
     };
     let (Some(seed_pipe), Some(incremental_pipe), Some(finalize_pipe)) = (
@@ -1047,6 +1141,7 @@ pub fn dispatch_ptlas(
         pipeline_cache.get_compute_pipeline(pipelines.ptlas_incremental),
         pipeline_cache.get_compute_pipeline(pipelines.ptlas_finalize),
     ) else {
+        tracing::debug!("ptlas.dispatch: build skipped (fill pipelines compiling)");
         return;
     };
     let active_count = instances.active_count() as u32;
@@ -1109,6 +1204,13 @@ pub fn dispatch_ptlas(
         ];
         render_queue.write_buffer(&resources.validate_report, 0, bytemuck::cast_slice(&head));
     }
+    // Zero the heal counters every build (always on — they drive the
+    // rebuild-until-clean warmup heal, not just SOLARI_PTLAS_VALIDATE).
+    render_queue.write_buffer(
+        &resources.validate_report,
+        NULL_COUNT_WORD * 4,
+        bytemuck::cast_slice(&[0u32, 0u32]),
+    );
     let mut validate_recorded = false;
 
     // wgpu fill records into the shared render-context encoder; the raw-VK
@@ -1221,6 +1323,19 @@ pub fn dispatch_ptlas(
                 );
                 validate_recorded = true;
             }
+        }
+        // Rebuild-until-clean: pull this build's null-AS record count (always on;
+        // one 4-byte copy). Skipped while a previous readback is still in flight —
+        // that latency is the retry pacing.
+        if resources.nulls_phase == 0 {
+            encoder.copy_buffer_to_buffer(
+                &resources.validate_report,
+                NULL_COUNT_WORD * 4,
+                &resources.nulls_staging,
+                0,
+                8,
+            );
+            resources.nulls_phase = 1;
         }
         d.end(encoder);
     }

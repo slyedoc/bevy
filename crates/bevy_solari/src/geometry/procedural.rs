@@ -782,6 +782,7 @@ pub fn instantiate_procedural(
     mut queue: ResMut<ProceduralInstantiateQueue>,
     mut retire: ResMut<GpuRetire>,
     ready: Res<ProceduralReadyChannel>,
+    sharing: Option<Res<crate::accel::blas_sharing::BlasSharing>>,
 ) {
     if queue.0.is_empty() {
         return;
@@ -1065,6 +1066,14 @@ pub fn instantiate_procedural(
     // the BLAS/TLAS passes' own submission order make it traceable this frame).
     if let Ok(mut ready) = ready.0.lock() {
         ready.extend(ops.iter().map(|op| op.asset_id));
+    }
+    // CLAS bytes now exist — unblock BLAS-sharing elections (see `clas_ready`).
+    if let Some(sharing) = sharing.as_ref() {
+        for op in &ops {
+            if let Some(gid) = cluster_meshes.geometry_id_of(op.asset_id) {
+                render_queue.write_buffer(&sharing.clas_ready, gid as u64 * 4, &1u32.to_le_bytes());
+            }
+        }
     }
 }
 

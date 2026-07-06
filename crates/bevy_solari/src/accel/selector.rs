@@ -121,6 +121,10 @@ pub struct Selector {
     pub params: UniformBuffer<SelectorParamsGpu>,
     /// Per-frame bind group, rebuilt in `Render::PrepareBindGroups`.
     pub bind_group: Option<BindGroup>,
+    /// True iff [`dispatch_selector`] actually recorded this frame — the
+    /// downstream BLAS build (and its `commit_built`) gate on it, so a
+    /// cold-start bail here can't be papered over (rebuild-until-built).
+    pub recorded: bool,
 }
 
 /// `RenderStartup`: allocate the selector's sparse I/O buffers + insert
@@ -171,6 +175,7 @@ pub fn init_selector(
         per_bucket_counts,
         params,
         bind_group: None,
+        recorded: false,
     });
 }
 
@@ -264,7 +269,7 @@ pub fn prepare_selector_bind_group(
 /// capacity and let `select_main` early-out past `dirty_build_count`.
 pub fn dispatch_selector(
     pipeline_cache: Res<PipelineCache>,
-    selector: Option<Res<Selector>>,
+    selector: Option<ResMut<Selector>>,
     pipelines: Res<SolariPipelines>,
     scene_bind_group: Res<ClusterSceneBindGroup>,
     instances: Option<Res<InstanceManager>>,
@@ -274,6 +279,9 @@ pub fn dispatch_selector(
     let (Some(selector), Some(instances), Some(sharing)) = (selector, instances, sharing) else {
         return;
     };
+    let selector = selector.into_inner();
+    // Cleared every frame; only an actually-recorded dispatch below sets it.
+    selector.recorded = false;
     if instances.active_count() == 0 {
         return;
     }
@@ -313,4 +321,6 @@ pub fn dispatch_selector(
     // guard early-outs buckets past `dirty_build_count`.
     pass.dispatch_workgroups(bucket_capacity, 1, 1);
     d.end(&mut pass);
+    drop(pass);
+    selector.recorded = true;
 }

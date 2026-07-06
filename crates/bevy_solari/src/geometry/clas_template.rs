@@ -380,6 +380,9 @@ impl ClusterTemplateArena {
         // descriptor strides + addresses point at the buffers just created. No
         // wgpu commands touch this encoder afterward.
         unsafe {
+            // Input barrier: the build reads staged `write_buffer` bytes by device
+            // address (untracked) — nothing else orders TRANSFER_WRITE → AS_BUILD.
+            crate::gpu::extension::cmd_global_as_barrier(&mut encoder, render_device, false);
             crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
                 &mut encoder,
                 fns,

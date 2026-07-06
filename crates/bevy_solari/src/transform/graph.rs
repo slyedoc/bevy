@@ -173,10 +173,15 @@ pub fn clear_static_first_sight(mut main_world: ResMut<MainWorld>) {
 
 /// All transform columns' scatter pipelines compiled — the same cold-start gate the macro
 /// puts on [`extract_transform_graph`], reused to hold the queue clear back in lockstep.
+/// MUST check every `gpu_table!` column: a subset can flip true while the extract's
+/// all-column gate is still false → the clear drains a queue the extract never consumed
+/// (statics collapse at origin — the startup missing-static-scene race).
 pub fn transform_columns_ready(
     local_t: Res<GpuColumn<LocalTranslationColumn>>,
     local_rs: Res<GpuColumn<LocalRSColumn>>,
     parent: Res<GpuColumn<ParentColumn>>,
+    first_child: Res<GpuColumn<FirstChildColumn>>,
+    next_sibling: Res<GpuColumn<NextSiblingColumn>>,
     no_readback: Res<GpuColumn<NoReadbackColumn>>,
     entity: Res<GpuColumn<NodeEntityColumn>>,
     cache: Res<PipelineCache>,
@@ -184,6 +189,8 @@ pub fn transform_columns_ready(
     local_t.scatter_pipeline_ready(&cache)
         && local_rs.scatter_pipeline_ready(&cache)
         && parent.scatter_pipeline_ready(&cache)
+        && first_child.scatter_pipeline_ready(&cache)
+        && next_sibling.scatter_pipeline_ready(&cache)
         && no_readback.scatter_pipeline_ready(&cache)
         && entity.scatter_pipeline_ready(&cache)
 }

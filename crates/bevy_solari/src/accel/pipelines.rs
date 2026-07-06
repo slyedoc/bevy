@@ -60,6 +60,8 @@ pub fn blas_sharing_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_sized(false, None),           // 12 build_count
                 storage_buffer_sized(false, None),           // 13 geometry_desc
                 storage_buffer_sized(false, None),           // 14 instance_e_build
+                storage_buffer_read_only_sized(false, None), // 15 selector args (per-bucket built cluster counts)
+                storage_buffer_read_only_sized(false, None), // 16 clas_ready (geometry → CLAS bytes exist)
             ),
         ),
     )
@@ -92,6 +94,7 @@ pub fn ptlas_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_sized(false, None),           // 17 validate_report (debug)
                 storage_buffer_sized(false, None),           // 18 seed_epoch
                 storage_buffer_read_only_sized(false, None), // 19 partition_hints
+                storage_buffer_read_only_sized(false, None), // 20 geometry_built_level (BLAS content truth)
             ),
         ),
     )

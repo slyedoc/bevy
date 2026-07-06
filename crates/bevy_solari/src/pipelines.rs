@@ -56,6 +56,9 @@ pub struct SolariPipelines {
     pub blas_sharing_elect_dirty: CachedComputePipelineId,
     pub blas_sharing_finalize_count: CachedComputePipelineId,
     pub blas_sharing_assign_address: CachedComputePipelineId,
+    /// Commits `geometry_built_level` after the BLAS build chain truly records
+    /// (dispatched from `dispatch_blas_rebuild`) — the rebuild-until-built heal.
+    pub blas_sharing_commit_built: CachedComputePipelineId,
 
     pub ptlas_seed: CachedComputePipelineId,
     pub ptlas_incremental: CachedComputePipelineId,
@@ -292,6 +295,7 @@ pub fn init_solari_pipelines(
     let blas_sharing_elect_dirty = sharing_pipeline("elect_dirty");
     let blas_sharing_finalize_count = sharing_pipeline("finalize_count");
     let blas_sharing_assign_address = sharing_pipeline("assign_address");
+    let blas_sharing_commit_built = sharing_pipeline("commit_built");
 
     let ptlas_shader = load_embedded_asset!(asset_server.as_ref(), "accel/ptlas_fill.wgsl");
     let ptlas_pl = vec![scene, resource_manager.ptlas.clone()];
@@ -383,6 +387,7 @@ pub fn init_solari_pipelines(
         blas_sharing_elect_dirty,
         blas_sharing_finalize_count,
         blas_sharing_assign_address,
+        blas_sharing_commit_built,
         ptlas_seed,
         ptlas_incremental,
         ptlas_finalize,

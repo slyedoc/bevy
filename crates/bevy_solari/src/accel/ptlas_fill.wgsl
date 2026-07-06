@@ -256,6 +256,11 @@ fn fill_seed(
     if is_null == 0u && transform_ready(slot) {
         addr = instance_blas_address[slot];
     }
+    // Count unintended nulls (word 82; deliberate removals excluded) — feeds the
+    // CPU's rebuild-until-clean warmup heal, same as fill_incremental's counter.
+    if is_null == 0u && addr.x == 0u && addr.y == 0u {
+        atomicAdd(&validate_report[82], 1u);
+    }
     write_data[i] = make_record(slot, addr);
     seed_epoch[slot] = params.epoch;
 }
@@ -307,6 +312,23 @@ fn fill_incremental(
     if transform_ready(slot) {
         addr = instance_blas_address[slot];
     }
+    // Heal counters (word 82): (a) null-AS records — inactive with no future
+    // re-spec trigger; (b) records whose geometry's shared BLAS content hasn't
+    // actually been BUILT yet (address assigned ≠ bytes built — the multi-thread
+    // warmup window that bakes hollow zero-extent TLAS leaves). Either kind makes
+    // the CPU force full restamps until a build lands fully resolved.
+    let blas_unbuilt = geometry_built_level[geom] == BUILT_NO_LEVEL;
+    if (addr.x == 0u && addr.y == 0u) || blas_unbuilt {
+        atomicAdd(&validate_report[82], 1u);
+    }
+    // Count REGULAR-partition writes in INCREMENTAL builds (word 83): the NV
+    // driver (580.159) silently mishandles incremental partitioned writes into
+    // regular partitions (the same constraint that forces full rebuilds on CPU
+    // churn) — so a GPU-detected re-spec of a static instance lands here and the
+    // CPU answers with a driver-safe full rebuild next frame.
+    if params.force_all == 0u && resolve_partition(slot) != 0xffffffffu {
+        atomicAdd(&validate_report[83], 1u);
+    }
     let idx = atomicAdd(&write_count[0], 1u);
     write_data[idx] = make_record(slot, addr);
 }
@@ -320,6 +342,13 @@ fn finalize() {
 // slot-indexed: PTLAS regular-partition hint (0xffffffff = derive from the
 // static flag). CPU-assigned per streamed cell — tight per-cell partitions.
 @group(1) @binding(19) var<storage, read> partition_hints: array<u32>;
+// geometry → LOD level its shared BLAS was ACTUALLY built at (committed only
+// after the build chain records — `blas_sharing::commit_built`). `NO_LEVEL`
+// means the pool bytes at this geometry's address don't exist yet: a record
+// written now would bake a hollow zero-extent leaf into the TLAS. Count it into
+// the heal word so rebuild-until-clean restamps once the content lands.
+@group(1) @binding(20) var<storage, read> geometry_built_level: array<u32>;
+const BUILT_NO_LEVEL: u32 = 0xFFFFFFFFu;
 
 // slot-indexed: the epoch `fill_seed` last wrote this slot's record in.
 // `fill_incremental` skips epoch-stamped slots — an instance must be WRITTEN

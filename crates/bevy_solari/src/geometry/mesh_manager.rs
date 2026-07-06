@@ -243,6 +243,11 @@ pub fn init_cluster_mesh_manager(
 }
 
 impl ClusterMeshManager {
+    /// Dense geometry id for a registered mesh (BLAS-sharing pool index).
+    pub fn geometry_id_of(&self, asset_id: AssetId<ClusterMesh>) -> Option<u32> {
+        self.cluster_mesh_slices.get(&asset_id).map(|s| s.geometry_id)
+    }
+
     /// Queue a [`ClusterMesh`] for GPU upload if not already
     /// uploaded. Returns the global slot indices selectors and
     /// shaders need to bind into the persistent buffers.
