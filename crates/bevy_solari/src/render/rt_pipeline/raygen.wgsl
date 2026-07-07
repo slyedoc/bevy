@@ -567,44 +567,26 @@ fn raygen(
                     w_sum = sel_phat * sel.w * sel.m;
                 }
                 var m_total = sel.m;
+                // The canonical arm, kept for the shade-side re-merge below.
+                let canon = sel;
+                let canon_phat = sel_phat;
+                let canon_w_arm = w_sum;
+                var shade_done = false;
+                let decorrelate = (eflags & 524288u) != 0u;
                 let clip = camera.prev_clip_from_world * vec4<f32>(surf.pos, 1.0);
                 if clip.w > 1.0e-4 {
                     let uv = (clip.xy / clip.w) * vec2<f32>(0.5, -0.5) + 0.5;
                     if all(uv >= vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) {
-                        // Stochastic bilinear history pick (flag bit 19, the
-                        // RR/production path): nearest-neighbor quantization of
-                        // a translating reprojection is a zoomed lattice — a
-                        // visible moiré grid warping with camera distance.
-                        // Randomizing over the 2×2 footprint by its bilinear
-                        // weights turns that into white noise. The reference
-                        // keeps the certified nearest fetch.
-                        //
-                        // The jittered pick is used only if its record VALIDATES
-                        // against this surface — else fall back to nearest.
-                        // Without the fallback, pixels along creases and
-                        // silhouettes (where the jitter straddles a validation
-                        // boundary) reject history ~half the frames and run
-                        // chronically cold — the white edge fizz.
-                        let decorrelate = (eflags & 524288u) != 0u;
-                        var pp = vec2<u32>(uv * camera.dims.xy);
-                        if decorrelate {
-                            let pf = uv * camera.dims.xy - 0.5;
-                            let base = floor(pf);
-                            let fr = pf - base;
-                            let jit = base
-                                + vec2<f32>(select(0.0, 1.0, rand_f(&rng) < fr.x),
-                                            select(0.0, 1.0, rand_f(&rng) < fr.y));
-                            let pj = vec2<u32>(clamp(jit, vec2<f32>(0.0), camera.dims.xy - 1.0));
-                            let peek =
-                                gi_samples[(pj.y * u32(camera.dims.x) + pj.x) * 2u + ((camera.frame.x + 1u) & 1u)];
-                            let peek_n =
-                                octahedral_decode_signed(unpack2x16snorm(peek.surf_normal_oct));
-                            if peek.m > 0.0
-                                && abs(peek.surf_view_z - surf_raw.view_z) < 0.1 * surf_raw.view_z
-                                && dot(peek_n, surf.ns) > 0.9 {
-                                pp = pj;
-                            }
-                        }
+                        // THE CHAIN always merges the NEAREST fetch with the
+                        // certified math — never a jittered pick, never a
+                        // Jacobian. A Jacobian-corrected neighbor WRITTEN BACK
+                        // compounds its stand-in approximation error through
+                        // the fixed point (multiplicative noise, Jensen-biased
+                        // bright): panning turns seams into growing white
+                        // blobs. Decorrelation lives in the SHADE arm below,
+                        // which never touches storage (the spatial pass's
+                        // proven shade-only semantics).
+                        let pp = vec2<u32>(uv * camera.dims.xy);
                         var hist =
                             gi_samples[(pp.y * u32(camera.dims.x) + pp.x) * 2u + ((camera.frame.x + 1u) & 1u)];
                         // World_rel is camera-origin: last frame's stored x_s is
@@ -617,49 +599,54 @@ fn raygen(
                         let depth_ok = abs(hist.surf_view_z - surf_raw.view_z) < 0.1 * surf_raw.view_z;
                         if hist.m > 0.0 && depth_ok && dot(hn, surf.ns) > 0.9 {
                             let m_h = min(hist.m, camera.dims.z);
-                            if !decorrelate {
-                                // Reference path: exact self-fetch statically —
-                                // the certified merge, no Jacobian needed.
-                                let ph = gi_phat(surf, hist);
-                                let wh = ph * hist.w * m_h;
-                                w_sum += wh;
-                                m_total += m_h;
-                                if wh > 0.0 && rand_f(&rng) * w_sum < wh {
-                                    sel = hist;
-                                    sel_phat = ph;
-                                }
-                            } else if hist.w <= 0.0 {
-                                // Dead history still dilutes W (domain-split
-                                // law); its garbage x_s must not be jac-judged.
-                                m_total += m_h;
-                            } else {
-                                // Reconnection Jacobian, exactly like the
-                                // spatial pass: the (possibly jitter-fetched)
-                                // history was generated at pp's surface — its W
-                                // lives in THAT solid-angle measure. For an x_s
-                                // hovering cm above the surface the ratio
-                                // explodes between pixels (bright orb
-                                // fireflies) — rescale W, reject the
-                                // pathological band (stream dropped, m uncounted
-                                // — the spatial pass's acceptance semantics).
-                                //
-                                // pp's CURRENT surface stands in for the
-                                // generating one — valid only while it still
-                                // matches the record's stored depth/normal. At
-                                // edges under motion pp just changed owners
-                                // (disocclusion) and the stand-in is a different
-                                // surface: the mis-measured Jacobian sprays
-                                // white fizz along silhouettes. Drop instead.
-                                let nb_raw = surfaces[pp.y * u32(camera.dims.x) + pp.x];
+                            let ph = gi_phat(surf, hist);
+                            let wh = ph * hist.w * m_h;
+                            w_sum += wh;
+                            m_total += m_h;
+                            if wh > 0.0 && rand_f(&rng) * w_sum < wh {
+                                sel = hist;
+                                sel_phat = ph;
+                            }
+                        }
+                        // Shade-side decorrelation (flag bit 19, RR/production):
+                        // nearest-neighbor reprojection under motion is a zoomed
+                        // lattice — a moiré grid warping with camera distance.
+                        // Re-merge canonical + a stochastic-bilinear history
+                        // pick (validated, Jacobian-transported) for THIS
+                        // frame's shade only. Rejected pick ⇒ fall through to
+                        // the chain shade (warm), never a cold pixel.
+                        if decorrelate && !gi_pass_owns {
+                            let pf = uv * camera.dims.xy - 0.5;
+                            let base = floor(pf);
+                            let fr = pf - base;
+                            let jit = base
+                                + vec2<f32>(select(0.0, 1.0, rand_f(&rng) < fr.x),
+                                            select(0.0, 1.0, rand_f(&rng) < fr.y));
+                            let pj = vec2<u32>(clamp(jit, vec2<f32>(0.0), camera.dims.xy - 1.0));
+                            var hj =
+                                gi_samples[(pj.y * u32(camera.dims.x) + pj.x) * 2u + ((camera.frame.x + 1u) & 1u)];
+                            hj.pos_x -= camera.origin_delta.x;
+                            hj.pos_y -= camera.origin_delta.y;
+                            hj.pos_z -= camera.origin_delta.z;
+                            let hjn = octahedral_decode_signed(unpack2x16snorm(hj.surf_normal_oct));
+                            let hj_depth_ok =
+                                abs(hj.surf_view_z - surf_raw.view_z) < 0.1 * surf_raw.view_z;
+                            if hj.m > 0.0 && hj_depth_ok && dot(hjn, surf.ns) > 0.9
+                                && hj.w > 0.0 {
+                                // pj's CURRENT surface stands in for the record's
+                                // generating one — trusted only while it matches
+                                // the record's stored depth/normal (an edge pixel
+                                // that changed owners mis-measures the Jacobian).
+                                let nb_raw = surfaces[pj.y * u32(camera.dims.x) + pj.x];
                                 let nb_n = octahedral_decode_signed(
                                     unpack2x16snorm(nb_raw.normal_oct));
-                                let nb_ok = abs(nb_raw.view_z - hist.surf_view_z)
-                                    < 0.1 * hist.surf_view_z && dot(nb_n, hn) > 0.9;
+                                let nb_ok = abs(nb_raw.view_z - hj.surf_view_z)
+                                    < 0.1 * hj.surf_view_z && dot(nb_n, hjn) > 0.9;
                                 let nb_pos =
                                     vec3<f32>(nb_raw.pos_x, nb_raw.pos_y, nb_raw.pos_z);
-                                let xs = vec3<f32>(hist.pos_x, hist.pos_y, hist.pos_z);
+                                let xs = vec3<f32>(hj.pos_x, hj.pos_y, hj.pos_z);
                                 let n_s =
-                                    octahedral_decode_signed(unpack2x16snorm(hist.normal_oct));
+                                    octahedral_decode_signed(unpack2x16snorm(hj.normal_oct));
                                 let to_me = surf.pos - xs;
                                 let to_nb = nb_pos - xs;
                                 let d2_me = dot(to_me, to_me);
@@ -672,13 +659,23 @@ fn raygen(
                                     * (d2_nb / max(d2_me, 1.0e-8));
                                 if nb_ok && d2_me > 1.0e-8 && d2_nb > 1.0e-8
                                     && jac >= 0.1 && jac <= 10.0 {
-                                    let ph = gi_phat(surf, hist);
-                                    let wh = ph * hist.w * jac * m_h;
-                                    w_sum += wh;
-                                    m_total += m_h;
-                                    if wh > 0.0 && rand_f(&rng) * w_sum < wh {
-                                        sel = hist;
-                                        sel_phat = ph;
+                                    var sh_sel = canon;
+                                    var sh_phat = canon_phat;
+                                    var sh_wsum = canon_w_arm;
+                                    var sh_m = canon.m;
+                                    let m_hj = min(hj.m, camera.dims.z);
+                                    let ph_j = gi_phat(surf, hj);
+                                    let wh_j = ph_j * hj.w * jac * m_hj;
+                                    sh_wsum += wh_j;
+                                    sh_m += m_hj;
+                                    if wh_j > 0.0 && rand_f(&rng) * sh_wsum < wh_j {
+                                        sh_sel = hj;
+                                        sh_phat = ph_j;
+                                    }
+                                    if sh_phat > 0.0 && sh_m > 0.0 && sh_wsum > 0.0 {
+                                        let sh_w = sh_wsum / (sh_m * sh_phat);
+                                        gi_out += gi_shade(surf, sh_sel) * sh_w;
+                                        shade_done = true;
                                     }
                                 }
                             }
@@ -702,7 +699,7 @@ fn raygen(
                     sel.pad_b = bitcast<u32>(dbg_gi_lum_sum);
                 }
                 gi_samples[cur_slot] = sel;
-                if !gi_pass_owns && sel.w > 0.0 {
+                if !gi_pass_owns && !shade_done && sel.w > 0.0 {
                     gi_out += gi_shade(surf, sel) * sel.w;
                 }
             } else {
