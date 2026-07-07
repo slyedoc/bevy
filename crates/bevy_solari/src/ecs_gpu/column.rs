@@ -376,6 +376,7 @@ impl<C: GpuColumnDesc> Plugin for GpuColumnPlugin<C> {
             return;
         };
         render_app
+            .init_resource::<super::SolariPipelineRegistry>()
             .add_systems(RenderStartup, init_column::<C>.after(SolariSetup))
             .add_systems(
                 Render,
@@ -402,6 +403,7 @@ fn init_column<C: GpuColumnDesc>(
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
     allocator: Option<Res<Allocator>>,
+    mut registry: ResMut<super::SolariPipelineRegistry>,
 ) {
     debug_assert_eq!(
         size_of::<C::Value>() % 4,
@@ -469,6 +471,7 @@ fn init_column<C: GpuColumnDesc>(
         zero_initialize_workgroup_memory: false,
         constants: vec![],
     });
+    registry.register(C::LABEL, pipeline);
 
     let mut delta = RawBufferVec::<u32>::new(BufferUsages::STORAGE);
     delta.set_label(Some(C::LABEL));

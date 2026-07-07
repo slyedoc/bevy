@@ -83,6 +83,7 @@ pub fn init_rt_reconcile(
     journal: Option<Res<RtJournal>>,
     pipeline_cache: Res<PipelineCache>,
     asset_server: Res<AssetServer>,
+    mut registry: ResMut<super::SolariPipelineRegistry>,
 ) {
     if journal.is_none() {
         return;
@@ -95,6 +96,7 @@ pub fn init_rt_reconcile(
         entry_point: Some("reconcile_apply".into()),
         ..Default::default()
     });
+    registry.register("rt_reconcile", pipeline);
     let mut params = UniformBuffer::<ReconcileParams>::default();
     params.set_label(Some("rt_reconcile"));
     commands.insert_resource(RtReconcile {

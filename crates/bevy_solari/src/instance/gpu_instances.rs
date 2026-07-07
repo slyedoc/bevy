@@ -12,11 +12,9 @@
 use bevy_app::{App, Plugin};
 use bevy_ecs::system::{Res, SystemParam};
 use bevy_math::{Affine3, Affine3A, Affine3Ext, Vec4};
-use bevy_render::render_resource::PipelineCache;
 use bytemuck::{Pod, Zeroable};
 
-use crate::ecs_gpu::{GpuColumn, GpuColumnDesc, GpuColumnPlugin, GpuTable, Presence};
-use crate::transform::StaticColumn;
+use crate::ecs_gpu::{GpuColumn, GpuColumnDesc, GpuColumnPlugin, GpuTable};
 use super::instance_manager::{InstanceLodInputGpu, InstanceManager};
 
 /// The per-instance columns all live in the [`InstanceManager`] table; its slot
@@ -196,43 +194,6 @@ pub struct InstanceColumns<'w> {
     pub instance_masks: Res<'w, GpuColumn<InstanceMaskColumn>>,
     /// Per-instance transform-table node slot (transform-gather reads this).
     pub node_slots: Res<'w, GpuColumn<NodeSlotColumn>>,
-}
-
-/// Run condition for instance binding: true once every per-instance column's
-/// scatter compute pipeline has compiled.
-///
-/// Binding pushes a one-shot `[slot, value…]` delta per column; if it lands
-/// before the scatter pipeline is ready, [`crate::ecs_gpu::column::dispatch_column`]
-/// skips the scatter, and on a fully-static scene (all instances bound on one
-/// frame, nothing ever moves) that delta is never re-emitted — the column
-/// (transforms!) stays zero, every TLAS instance collapses, and the whole scene
-/// goes black. It also closes a race with the PTLAS, whose first full build
-/// latches `has_built`: gating the bind guarantees the columns are scattered
-/// before any instance reaches the acceleration-structure build.
-///
-/// Gating with `run_if` (rather than an in-body early return) preserves the
-/// `Added<RaytracingMesh3d>` change-ticks across the cold-pipeline frames, so no
-/// instance is missed once the gate opens.
-pub fn cluster_columns_ready(
-    columns: InstanceColumns,
-    // The `TransformStatic` presence flag the PTLAS reads to place an instance.
-    // Gate binding on it too: an instance placed before its static flag can
-    // scatter would be stuck in the global partition (the flag flips later, but
-    // a static instance is never re-written). `Option` (None = column not up yet
-    // → not ready) keeps this safe on a non-solari device.
-    static_flags: Option<Res<GpuColumn<Presence<StaticColumn>>>>,
-    partition_hints: Option<Res<GpuColumn<PartitionColumn>>>,
-    cache: Res<PipelineCache>,
-) -> bool {
-    columns.transforms.scatter_pipeline_ready(&cache)
-        && columns.material_ids.scatter_pipeline_ready(&cache)
-        && columns.group_bases.scatter_pipeline_ready(&cache)
-        && columns.lod_inputs.scatter_pipeline_ready(&cache)
-        && columns.geometry_ids.scatter_pipeline_ready(&cache)
-        && columns.instance_masks.scatter_pipeline_ready(&cache)
-        && columns.node_slots.scatter_pipeline_ready(&cache)
-        && partition_hints.is_some_and(|c| c.scatter_pipeline_ready(&cache))
-        && static_flags.is_some_and(|c| c.scatter_pipeline_ready(&cache))
 }
 
 /// Registers every per-instance GPU column as its own `GpuColumnPlugin` —

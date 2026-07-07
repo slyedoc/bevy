@@ -34,12 +34,14 @@ pub fn linear_dispatch(workgroups: u32) -> (u32, u32, u32) {
 
 pub mod column;
 pub mod presence;
+pub mod readiness;
 pub mod reconcile;
 pub mod scene_columns;
 pub mod slot;
 pub mod table;
 
 pub use column::{GpuColumn, GpuColumnDesc, GpuColumnPlugin, GpuColumnPrepareSet, GpuTable};
+pub use readiness::{log_pipeline_wait, solari_pipelines_ready, SolariPipelineRegistry};
 pub use reconcile::ReconcilePlugin;
 pub use presence::{
     GpuPresenceColumn, GpuPresenceColumnPlugin, Presence, PresenceEvents, PresenceTable,

@@ -21,7 +21,7 @@ use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer};
 use bevy_core_pipeline::FullscreenShader;
 use bevy_ecs::{
     resource::Resource,
-    system::{Commands, Res},
+    system::{Commands, Res, ResMut},
 };
 use bevy_render::render_resource::{
     CachedComputePipelineId, CachedRenderPipelineId, ComputePipelineDescriptor, PipelineCache,
@@ -132,6 +132,7 @@ pub fn init_solari_pipelines(
     scene_bindings: Res<RaytracingSceneBindings>,
     // Fullscreen vertex for the gizmo-depth bridge raster pass.
     fullscreen_shader: Res<FullscreenShader>,
+    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
 ) {
     let Some(resource_manager) = resource_manager else {
         return;
@@ -368,6 +369,41 @@ pub fn init_solari_pipelines(
         zero_initialize_workgroup_memory: false,
         constants: vec![],
     });
+
+    // Every id joins the one readiness gate ([`solari_pipelines_ready`]) —
+    // subset gates are the recurring startup-race class.
+    for (label, id) in [
+        ("transform_frontier_seed", transform_frontier_seed),
+        ("transform_frontier_expand", transform_frontier_expand),
+        ("transform_frontier_finalize", transform_frontier_finalize),
+        ("transform_propagate", transform_propagate),
+        ("transform_subtract", transform_subtract),
+        ("transform_gather", transform_gather),
+        ("transform_readback", transform_readback),
+        ("rt_camera", rt_camera),
+        ("light_resolve", light_resolve),
+        ("atmosphere", atmosphere),
+        ("atmosphere_lut", atmosphere_lut),
+        ("selector_reset", selector_reset),
+        ("selector_main", selector_main),
+        ("blas_sharing_geom_reset", blas_sharing_geom_reset),
+        ("blas_sharing_classify", blas_sharing_classify),
+        ("blas_sharing_elect_dirty", blas_sharing_elect_dirty),
+        ("blas_sharing_finalize_count", blas_sharing_finalize_count),
+        ("blas_sharing_assign_address", blas_sharing_assign_address),
+        ("blas_sharing_commit_built", blas_sharing_commit_built),
+        ("ptlas_seed", ptlas_seed),
+        ("ptlas_incremental", ptlas_incremental),
+        ("ptlas_finalize", ptlas_finalize),
+        ("ptlas_validate", ptlas_validate),
+        ("ptlas_hair_write", ptlas_hair_write),
+        ("ray_query", ray_query),
+        ("deform", deform),
+        ("animated_blas", animated_blas),
+    ] {
+        registry.register(label, id);
+    }
+    registry.register_render("gizmo_depth", gizmo_depth);
 
     commands.insert_resource(SolariPipelines {
         transform_frontier_seed,

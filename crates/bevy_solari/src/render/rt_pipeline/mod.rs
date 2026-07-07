@@ -375,6 +375,7 @@ pub fn init_rt_blit(
     pipeline_cache: Res<PipelineCache>,
     asset_server: Res<AssetServer>,
     render_device: Res<RenderDevice>,
+    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
 ) {
     let layout = BindGroupLayoutDescriptor::new(
         "rt_blit_layout",
@@ -398,6 +399,7 @@ pub fn init_rt_blit(
         zero_initialize_workgroup_memory: false,
         constants: vec![],
     });
+    registry.register("rt_blit", pipeline);
     let params = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("rt_blit_params"),
         size: 16,
@@ -1062,8 +1064,11 @@ pub(crate) fn rt_pipeline(
         Option<Res<TransformPropagate>>,
         Res<bevy_time::Time>,
         Option<ResMut<RestirSpatial>>,
+        Option<Res<crate::ecs_gpu::SolariPipelineRegistry>>,
+        Option<Res<crate::instance::RtJournal>>,
+        Option<Res<crate::accel::ptlas::Ptlas>>,
     ),
-    mut frame_counter: Local<u32>,
+    counters: (Local<u32>, Local<u32>),
     mut commands: Commands,
     mut ctx: RenderContext,
 ) {
@@ -1075,7 +1080,11 @@ pub(crate) fn rt_pipeline(
         transform_propagate,
         time,
         mut restir_spatial,
+        pipeline_registry,
+        journal,
+        ptlas,
     ) = render_res;
+    let (mut frame_counter, mut settle_frames) = counters;
     let (cluster_mesh_manager, tess_classify, hit_group_registry, deform) = geometry_res;
     let (atmosphere_sky, atmosphere_gpu, atmosphere_volumes) = atmosphere_res;
     let view_entity = view.entity();
@@ -1318,7 +1327,9 @@ pub(crate) fn rt_pipeline(
     // bit 1 = ReSTIR DI, bit 2 = DI only, bit 3 = spatial pass, bit 4 = GI only,
     // bit 5 = ReSTIR GI, bit 6 = GI shade reconstructed from the surface
     // G-buffer (vs the stored exact a0), bit 7 = GI temporal reuse,
-    // bits 8..15 = RIS M, bit 16 = GI spatial (the pass owns the GI shade).
+    // bits 8..15 = RIS M, bit 16 = GI spatial (the pass owns the GI shade),
+    // bit 17 = dead-canonical rate paint, bit 18 = spatial debug (raygen
+    // stashes its would-be GI shade for the pass's ratio paint).
     let estimator_flags = reference.is_some_and(|r| r.nee_off) as u32
         | (reference.is_some_and(|r| r.restir) as u32) << 1
         | (reference.is_some_and(|r| r.di_only) as u32) << 2
@@ -1328,45 +1339,85 @@ pub(crate) fn rt_pipeline(
         | (reference.is_some_and(|r| r.restir_gi && r.gi_recon) as u32) << 6
         | (reference.is_some_and(|r| r.restir_gi && r.gi_temporal) as u32) << 7
         | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8)
-        | (reference.is_some_and(|r| r.restir_gi && r.gi_spatial) as u32) << 16;
+        | (reference.is_some_and(|r| r.restir_gi && r.gi_spatial) as u32) << 16
+        | (reference.is_some_and(|r| r.restir_gi && r.gi_dead_view) as u32) << 17
+        | (reference.is_some_and(|r| r.spatial_debug) as u32) << 18;
     if let Some(reference) = reference {
-        // The spatial pass compiles lazily; until its pipeline is ready its DI is
-        // absent, so accumulating those warmup frames bakes ~K zero-DI samples into
-        // the running mean (a permanent ~K/N darkening). Hold accumulation off until
-        // ready, then start fresh — the readiness-gate lesson from startup_race.md.
+        // Hold accumulation until EVERY solari pipeline is compiled (the one
+        // readiness gate — a warmup frame with any column/pass missing bakes
+        // zero/garbage samples into the running mean permanently), plus the
+        // lazily-queued spatial pass when its levers are on. Pipelines are not
+        // enough: the cluster→BLAS→PTLAS stream lands the scene several frames
+        // AFTER the last pipeline compiles, and accumulating those black frames
+        // is a permanent ~K/N energy deficit (the cell 0.92 "estimator bug" was
+        // exactly this). So also require the scene quiet — no pending journal
+        // records or mesh uploads, PTLAS built — for a few consecutive frames
+        // (build latency the CPU can't observe directly).
         let spatial_pending = ((reference.restir && reference.spatial)
             || (reference.restir_gi && reference.gi_spatial))
             && !restir_spatial
                 .as_deref()
                 .and_then(|rs| rs.pipeline)
                 .is_some_and(|id| pipeline_cache.get_compute_pipeline(id).is_some());
+        let pipelines_ready = pipeline_registry.is_some_and(|r| r.ready(&pipeline_cache));
+        let scene_quiet = journal.is_none_or(|j| j.count == 0)
+            && cluster_mesh_manager.as_ref().is_none_or(|m| {
+                m.pending_clas_uploads.is_empty() && m.pending_procedural.is_empty()
+            })
+            && ptlas.is_some_and(|p| p.has_built);
+        *settle_frames = if pipelines_ready && scene_quiet && !spatial_pending {
+            settle_frames.saturating_add(1)
+        } else {
+            0
+        };
+        // Reservoir history must also match the ESTIMATOR the mean will run:
+        // chains only start warming once the scene is resident, and their
+        // stationary W depends on the RR mode (realtime RR ⇒ ~half the canonical
+        // draws are dead ⇒ legitimately diluted W). So warmup frames run the
+        // SAME reference estimator (spf on the GPU ⇒ reference RR), and the
+        // history-maturity window lets the chain reach ITS stationary state
+        // before n starts advancing — else the first m-cap frames shade ~0.4×
+        // and bake a permanent deficit (the cell 0.92 "estimator bug", part 2).
+        let history_frames = if reference.restir || reference.restir_gi {
+            reference.restir_m_cap.ceil() as u32 + 4
+        } else {
+            0
+        };
+        let warmup = *settle_frames < 8 + history_frames;
         // `accumulate: false` = fresh frames (estimator levers stay live) — the
         // per-frame variance instrument; accum_spf 0 disables the raygen blend.
-        if debug_view == 0 && !show_displacement && reference.accumulate && !spatial_pending {
+        if debug_view == 0 && !show_displacement && reference.accumulate {
             accum_spf = reference.samples_per_frame.max(1);
-            let same = accumulation.is_some_and(|a| {
-                a.camera == view.world_from_view
-                    && a.clip_from_view == view.clip_from_view
-                    && a.pixels == output.pixels
-                    && a.flags == estimator_flags
-            });
-            accum_n = if same { accumulation.unwrap().n } else { 0 };
-            let n_new = accum_n + accum_spf;
-            if accum_n == 0 || n_new.leading_zeros() != accum_n.leading_zeros() {
-                bevy_log::info!("solari reference: {n_new} spp");
+            if warmup {
+                // Reference estimator runs, mean doesn't: accum_n stays 0 (no
+                // raygen blend) and any stale accumulation state is dropped so
+                // the mean starts fresh at gate-open.
+                commands.entity(view_entity).remove::<RtAccumulation>();
+            } else {
+                let same = accumulation.is_some_and(|a| {
+                    a.camera == view.world_from_view
+                        && a.clip_from_view == view.clip_from_view
+                        && a.pixels == output.pixels
+                        && a.flags == estimator_flags
+                });
+                accum_n = if same { accumulation.unwrap().n } else { 0 };
+                let n_new = accum_n + accum_spf;
+                if accum_n == 0 || n_new.leading_zeros() != accum_n.leading_zeros() {
+                    bevy_log::info!("solari reference: {n_new} spp");
+                }
+                if dlss_jitter.is_some() {
+                    bevy_log::warn_once!(
+                        "SolariReference with DLSS active: the resolve overwrites the accumulated image — disable DLSS on this camera"
+                    );
+                }
+                commands.entity(view_entity).insert(RtAccumulation {
+                    n: n_new,
+                    camera: view.world_from_view,
+                    clip_from_view: view.clip_from_view,
+                    pixels: output.pixels,
+                    flags: estimator_flags,
+                });
             }
-            if dlss_jitter.is_some() {
-                bevy_log::warn_once!(
-                    "SolariReference with DLSS active: the resolve overwrites the accumulated image — disable DLSS on this camera"
-                );
-            }
-            commands.entity(view_entity).insert(RtAccumulation {
-                n: n_new,
-                camera: view.world_from_view,
-                clip_from_view: view.clip_from_view,
-                pixels: output.pixels,
-                flags: estimator_flags,
-            });
         }
     }
 
@@ -1671,8 +1722,9 @@ pub(crate) fn rt_pipeline(
         .as_deref()
         .is_some_and(|fd| fd.diff && frozen_valid.is_some());
     let diff_scale = debug.freeze_diff.as_deref().map_or(4.0, |fd| fd.diff_scale);
-    let debug_paint =
-        debug_view != 0 || show_displacement || reference.is_some_and(|r| r.spatial_debug);
+    let debug_paint = debug_view != 0
+        || show_displacement
+        || reference.is_some_and(|r| r.spatial_debug || r.gi_dead_view);
     let blit_exposure = if debug_paint { 1.0 } else { camera.exposure };
     render_queue.write_buffer(
         &rt_blit.params,

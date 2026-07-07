@@ -268,7 +268,15 @@ fn di_spatial(px: u32, gid: vec2<u32>) {
 // balance heuristic for GI); 0 = naive M-sum over the survivors.
 fn gi_spatial(px: u32, gid: vec2<u32>) {
     let own = gi_samples[px * 2u + params.parity];
+    let debug = params.pad_a == 1u;
+    // Debug paint at EVERY exit: R = pass shade lum, G = raygen's stashed
+    // would-be shade lum, B = exit code (1 dead own, 2 no streams, 3 zero
+    // target, 4 shaded). Deficit lives where G > R.
+    let dbg_ref = bitcast<f32>(own.pad_a);
     if own.m <= 0.0 || own.surf_view_z <= 0.0 {
+        if debug {
+            output[px] = vec4<f32>(0.0, dbg_ref, 1.0, output[px].a);
+        }
         return;
     }
     let surf = load_surf(px);
@@ -333,6 +341,9 @@ fn gi_spatial(px: u32, gid: vec2<u32>) {
         s_n += 1u;
     }
     if s_n == 0u {
+        if debug {
+            output[px] = vec4<f32>(0.0, dbg_ref, 2.0, output[px].a);
+        }
         return;
     }
 
@@ -384,6 +395,9 @@ fn gi_spatial(px: u32, gid: vec2<u32>) {
     }
 
     if sel_phat <= 0.0 || w_sum <= 0.0 {
+        if debug {
+            output[px] = vec4<f32>(0.0, dbg_ref, 3.0, output[px].a);
+        }
         return;
     }
     // Survivors are pre-validated visible; MIS weights partition unity so the
@@ -393,6 +407,12 @@ fn gi_spatial(px: u32, gid: vec2<u32>) {
         denom_final = sel_phat;
     }
     let big_w = w_sum / max(denom_final, 1.0e-12);
+    if debug {
+        let mine = pick_luminance(gi_shade(surf, sel) * big_w);
+        // B carries the own reservoir's m — the chain-maturity readout.
+        output[px] = vec4<f32>(mine, dbg_ref, own.m, 4.0);
+        return;
+    }
     let gi = gi_shade(surf, sel) * big_w * params.blend_w;
     output[px] = vec4<f32>(output[px].rgb + gi, output[px].a);
 }

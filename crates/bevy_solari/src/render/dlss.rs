@@ -33,7 +33,7 @@ use bevy_ecs::{
     entity::Entity,
     query::With,
     resource::Resource,
-    system::{Commands, Query, Res},
+    system::{Commands, Query, Res, ResMut},
 };
 use bevy_math::{Mat4, ToRender, UVec2, Vec2};
 use bevy_render::{
@@ -220,6 +220,7 @@ pub fn init_solari_dlss(
     mut commands: Commands,
     pipeline_cache: Res<PipelineCache>,
     asset_server: Res<AssetServer>,
+    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
 ) {
     let layout = BindGroupLayoutDescriptor::new(
         "solari_dlss_resolve_layout",
@@ -251,6 +252,7 @@ pub fn init_solari_dlss(
         zero_initialize_workgroup_memory: false,
         constants: vec![],
     });
+    registry.register("solari_dlss_resolve", pipeline);
     commands.insert_resource(SolariDlssResolve { layout, pipeline });
 }
 

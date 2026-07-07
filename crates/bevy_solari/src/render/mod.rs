@@ -324,6 +324,9 @@ pub struct SolariReference {
     /// Debug: the spatial pass paints which stage killed each pixel
     /// (red = dead reservoir, yellow = zero re-target, blue = occluded, green = lit).
     pub spatial_debug: bool,
+    /// Instrument: paint 1 where the canonical GI draw is dead (bounce-1 miss or
+    /// delta pdf), 0 where live — the accumulated mean IS the dead-draw rate.
+    pub gi_dead_view: bool,
 }
 
 impl Default for SolariReference {
@@ -346,6 +349,7 @@ impl Default for SolariReference {
             spatial_radius: 20.0,
             spatial_unbiased: false,
             spatial_debug: false,
+            gi_dead_view: false,
         }
     }
 }

@@ -44,10 +44,10 @@ pub use gather::{
 };
 pub use graph::{
     clear_static_first_sight, enqueue_node_first_sight, enqueue_static_first_sight,
-    extract_transform_graph, transform_columns_ready, FirstChildColumn, GpuFrameSeeds,
-    LocalRSColumn, LocalTranslationColumn, NextSiblingColumn, NodeEntityColumn, ParentColumn,
-    SolariGpuFrame, StaticColumn, StaticFirstSightQueue, TransformGraph, TransformStatic,
-    TransformTablePlugin, NO_NODE, ROOT_PARENT,
+    extract_transform_graph, FirstChildColumn, GpuFrameSeeds, LocalRSColumn,
+    LocalTranslationColumn, NextSiblingColumn, NodeEntityColumn, ParentColumn, SolariGpuFrame,
+    StaticColumn, StaticFirstSightQueue, TransformGraph, TransformStatic, TransformTablePlugin,
+    NO_NODE, ROOT_PARENT,
 };
 pub use propagate::{
     dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,
@@ -134,7 +134,7 @@ impl Plugin for SolariTransformPlugin {
                 ExtractSchedule,
                 clear_static_first_sight
                     .after(extract_transform_graph)
-                    .run_if(transform_columns_ready),
+                    .run_if(crate::ecs_gpu::solari_pipelines_ready),
             )
             .add_systems(
                 RenderStartup,

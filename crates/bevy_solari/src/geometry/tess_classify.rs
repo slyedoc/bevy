@@ -262,6 +262,7 @@ pub fn init_tess_classify(
     asset_server: Res<bevy_asset::AssetServer>,
     render_device: Res<RenderDevice>,
     allocator: Option<Res<Allocator>>,
+    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
 ) {
     if allocator.is_none() {
         return;
@@ -474,6 +475,17 @@ pub fn init_tess_classify(
     instances.set_label(Some("tess_classify.instances"));
     let mut work_clusters = RawBufferVec::<WorkClusterGpu>::new(wgpu::BufferUsages::STORAGE);
     work_clusters.set_label(Some("tess_classify.work_clusters"));
+
+    for (label, id) in [
+        ("tess_classify", pipeline),
+        ("tess_classify_finalize", finalize_pipeline),
+        ("tess_gen_verts", gen_pipeline),
+        ("tess_gen_attrs", attr_pipeline),
+        ("tess_instantiate", instantiate_pipeline),
+        ("tess_scatter", scatter_pipeline),
+    ] {
+        registry.register(label, id);
+    }
 
     commands.insert_resource(TessClassify {
         pipeline,

@@ -282,7 +282,12 @@ impl Plugin for SolariPlugin {
         };
         render_app
             .init_resource::<gpu::retire::GpuRetire>()
+            .init_resource::<ecs_gpu::SolariPipelineRegistry>()
             .add_systems(Render, gpu::retire::reap_retired.in_set(RenderSystems::Cleanup))
+            .add_systems(
+                Render,
+                ecs_gpu::log_pipeline_wait.in_set(RenderSystems::Prepare),
+            )
             .add_systems(
                 RenderStartup,
                 (

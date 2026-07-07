@@ -11,7 +11,7 @@ enable wgpu_ray_tracing_pipeline;
 // pipeline layout matches the wgpu-built scene bind group bound at trace time.
 #import bevy_solari::scene_bindings::{tlas, RAY_T_MIN, RAY_T_MAX}
 #import bevy_solari::rt_payload::{RtPayload, RtCamera}
-#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, GiSample, Surf, unpack_surface}
+#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, GiSample, Surf, unpack_surface, pick_luminance}
 #import bevy_solari::brdf::{F_AB, gi_shade, gi_phat}
 #import bevy_solari::pbr::rand_f
 #import bevy_solari::atmosphere::{atmosphere_ray_sphere_near, atmosphere_ray_sphere_far, atmosphere_rayleigh_phase, atmosphere_mie_phase}
@@ -251,6 +251,9 @@ fn raygen(
 
     // This frame's sample average (numerator; /rounds after the loop).
     var frame_sum = vec3<f32>(0.0);
+    // Instrument: per-frame SUM of the would-be GI shades across samples (pad_b),
+    // vs the last sample's (pad_a) — the pass's debug ratio paint reads both.
+    var dbg_gi_lum_sum = 0.0;
     // Total alpha any-hit invocations across all primary/bounce traces this pixel
     // (the OMM-effectiveness heatmap). Shadow-ray any-hits use the shadow payload's
     // own counter and aren't summed here.
@@ -516,6 +519,7 @@ fn raygen(
         // Estimator overrides, all built on the di0/GI split.
         let eflags = bitcast<u32>(camera.atmo.w);
         var gi_out = a0 * gi_L;
+        var dead_draw = 0.0;
         // ReSTIR GI (flag bit 5): store this pixel's canonical sample, then shade
         // GI from the store — the exact stored a0, or (bit 6) f·cos·L/pdf
         // re-evaluated from the surface G-buffer. Dead samples (sky/delta, pdf=0)
@@ -590,6 +594,17 @@ fn raygen(
                 if sel_phat > 0.0 && m_total > 0.0 {
                     sel.w = w_sum / (m_total * sel_phat);
                 }
+                // Spatial-debug instrument (flag bit 18): stash the shade raygen
+                // WOULD apply — the pass's ratio paint reads it (taps 0 ⇒ must be 1).
+                if gi_pass_owns && (eflags & 262144u) != 0u {
+                    var ref_lum = 0.0;
+                    if sel.w > 0.0 {
+                        ref_lum = pick_luminance(gi_shade(surf, sel) * sel.w);
+                    }
+                    dbg_gi_lum_sum += ref_lum;
+                    sel.pad_a = bitcast<u32>(ref_lum);
+                    sel.pad_b = bitcast<u32>(dbg_gi_lum_sum);
+                }
                 gi_samples[cur_slot] = sel;
                 if !gi_pass_owns && sel.w > 0.0 {
                     gi_out += gi_shade(surf, sel) * sel.w;
@@ -611,11 +626,17 @@ fn raygen(
                 }
             }
             radiance = di0 + gi_out;
+            dead_draw = select(1.0, 0.0, canon_ok);
         }
         // GI-only estimator (flag bit 4): the complement of di_only —
         // di_only + gi_only must sum to the full image.
         if (eflags & 16u) != 0u {
             radiance = gi_out;
+        }
+        // Dead-rate instrument (flag bit 17): paint the dead-canonical
+        // indicator; the accumulated mean IS the per-pixel dead-draw rate.
+        if (eflags & 131072u) != 0u {
+            radiance = vec3<f32>(dead_draw);
         }
 
         // Atmosphere volumes: attenuate + in-scatter over the primary segment

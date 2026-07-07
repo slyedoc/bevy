@@ -40,7 +40,7 @@ use bevy_render::{
 use crate::SolariClusterSystems;
 
 use super::{
-    column::{GpuColumn, GpuColumnDesc, GpuColumnPlugin, GpuTable},
+    column::{GpuColumnDesc, GpuColumnPlugin, GpuTable},
     slot::{push_record, GpuSlot, GpuSlotAllocator, GpuSlotTable},
 };
 
@@ -148,7 +148,7 @@ fn on_remove_marker<C: GpuPresenceColumn>(
 fn drain_presence<C: GpuPresenceColumn>(
     mut main_world: ResMut<MainWorld>,
     mut table: ResMut<PresenceTable<C>>,
-    column: Option<Res<GpuColumn<Presence<C>>>>,
+    registry: Option<Res<super::SolariPipelineRegistry>>,
     cache: Res<PipelineCache>,
     #[allow(clippy::type_complexity)] mut state: bevy_ecs::system::Local<
         Option<
@@ -169,8 +169,9 @@ fn drain_presence<C: GpuPresenceColumn>(
     };
     // Cover every handed-out slot so a read at any slot is in-bounds (0 default).
     table.high_water = allocator.high_water();
-    // Hold events until the scatter pipeline compiles, then drain them all.
-    if !column.is_some_and(|c| c.scatter_pipeline_ready(&cache)) {
+    // Hold events behind THE readiness gate, then drain them all — the consumers
+    // of these flags (PTLAS placement) must also be live, not just this scatter.
+    if !registry.is_some_and(|r| r.ready(&cache)) {
         return;
     }
     for (entity, present) in events.events.drain(..) {

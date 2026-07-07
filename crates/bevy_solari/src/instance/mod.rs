@@ -30,9 +30,8 @@ pub mod instance_manager;
 pub mod journal;
 
 pub use gpu_instances::{
-    cluster_columns_ready, Affine3x4, GeometryIdColumn, GroupBaseColumn, GpuInstancesPlugin,
-    InstanceColumns, InstanceMaskColumn, LodInputColumn, MaterialColumn, NodeSlotColumn,
-    PartitionColumn,
+    Affine3x4, GeometryIdColumn, GroupBaseColumn, GpuInstancesPlugin, InstanceColumns,
+    InstanceMaskColumn, LodInputColumn, MaterialColumn, NodeSlotColumn, PartitionColumn,
     TransformColumn,
 };
 pub use instance_manager::{SolariPartition, 
@@ -89,14 +88,13 @@ impl Plugin for InstancePlugin {
                 ),
             )
             // Serial flush: drain the change set, resolve slot, bind / update the
-            // `InstanceManager`. Gated until the column scatter pipelines have
-            // compiled — a bind whose delta can't be scattered yet would leave the
-            // column zero on a static scene (see `cluster_columns_ready`). The
-            // change set persists across the cold-pipeline frames (drained only
-            // when the flush runs), so no bind is missed.
+            // `InstanceManager`. Gated behind THE readiness gate — a bind whose
+            // delta can't be scattered yet would leave the column zero on a static
+            // scene. The change set persists across the cold-pipeline frames
+            // (drained only when the flush runs), so no bind is missed.
             .add_systems(
                 ExtractSchedule,
-                flush_cluster_instances.run_if(cluster_columns_ready),
+                flush_cluster_instances.run_if(crate::ecs_gpu::solari_pipelines_ready),
             )
             .add_observer(free_cluster_slot)
             .add_systems(

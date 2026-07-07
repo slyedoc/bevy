@@ -257,6 +257,7 @@ pub fn init_tess_ptlas_write(
     pipeline_cache: Res<PipelineCache>,
     asset_server: Res<bevy_asset::AssetServer>,
     allocator: Option<Res<Allocator>>,
+    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
 ) {
     if allocator.is_none() {
         return;
@@ -275,6 +276,7 @@ pub fn init_tess_ptlas_write(
         zero_initialize_workgroup_memory: false,
         constants: vec![],
     });
+    registry.register("tess_ptlas_write", pipeline);
     let mut params = UniformBuffer::<TessWriteParams>::default();
     params.set_label(Some("tess_ptlas_write"));
     let mut instances = StorageBuffer::<Vec<TessInstanceGpu>>::default();

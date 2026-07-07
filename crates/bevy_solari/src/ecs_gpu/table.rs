@@ -123,15 +123,10 @@ macro_rules! gpu_table {
                                 allocator.high_water(),
                             );
                         },
-                        // Gate the delta extract until every column's scatter
-                        // pipeline has compiled (cold-start delta-loss guard).
-                        ($extract).run_if(
-                            |$( $field: bevy_ecs::system::Res<$crate::ecs_gpu::GpuColumn<$Col>>, )+
-                             __cache: bevy_ecs::system::Res<bevy_render::render_resource::PipelineCache>|
-                                -> bool {
-                                true $( && $field.scatter_pipeline_ready(&__cache) )+
-                            }
-                        ),
+                        // Gate the delta extract behind THE readiness gate — every
+                        // solari pipeline compiled, not just this table's columns
+                        // (cold-start delta-loss guard; subset gates diverge).
+                        ($extract).run_if($crate::ecs_gpu::solari_pipelines_ready),
                     ),
                 );
                 render_app.add_systems(

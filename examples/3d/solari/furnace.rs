@@ -92,7 +92,9 @@ struct Args {
     restir: bool,
 
     /// debug view: `cluster` = flat per-cluster color from raygen (proves primary
-    /// rays hit + payload flows, independent of all shading/DI code)
+    /// rays hit + payload flows, independent of all shading/DI code); `spatial` =
+    /// the spatial pass's kill-stage paint; `gi-dead` = dead-canonical indicator
+    /// (accumulated mean = dead-draw rate; needs --restir-gi)
     #[argh(option, default = "String::new()")]
     debug_view: String,
 
@@ -209,6 +211,7 @@ fn main() {
             taps: args.taps,
             radius: args.radius,
             spatial_debug: args.debug_view == "spatial",
+            gi_dead: args.debug_view == "gi-dead",
             equal_lamps: args.lamp_law == "equal",
         })
         .insert_resource(SolariUniformLights { enabled: args.uniform_lights })
@@ -281,6 +284,7 @@ struct SceneArgs {
     taps: u32,
     radius: f32,
     spatial_debug: bool,
+    gi_dead: bool,
     equal_lamps: bool,
 }
 
@@ -566,6 +570,7 @@ fn setup_furnace(
             spatial_taps: args.taps,
             spatial_radius: args.radius,
             spatial_debug: args.spatial_debug,
+            gi_dead_view: args.gi_dead,
             ..default()
         },
         NoGpuGlobalTransformReadback,
@@ -736,6 +741,7 @@ fn setup_room(
             spatial_taps: args.taps,
             spatial_radius: args.radius,
             spatial_debug: args.spatial_debug,
+            gi_dead_view: args.gi_dead,
             ..default()
         },
         NoGpuGlobalTransformReadback,
@@ -829,6 +835,7 @@ fn setup_lamps(
             spatial_taps: args.taps,
             spatial_radius: args.radius,
             spatial_debug: args.spatial_debug,
+            gi_dead_view: args.gi_dead,
             ..default()
         },
         NoGpuGlobalTransformReadback,
@@ -948,6 +955,7 @@ fn setup_cell(
             spatial_taps: args.taps,
             spatial_radius: args.radius,
             spatial_debug: args.spatial_debug,
+            gi_dead_view: args.gi_dead,
             ..default()
         },
         NoGpuGlobalTransformReadback,
@@ -1039,6 +1047,7 @@ fn setup_yard(
             spatial_taps: args.taps,
             spatial_radius: args.radius,
             spatial_debug: args.spatial_debug,
+            gi_dead_view: args.gi_dead,
             ..default()
         },
         NoGpuGlobalTransformReadback,
