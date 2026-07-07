@@ -45,6 +45,10 @@ pub struct RtCameraPassParams {
     pub atmo: Vec4,
     /// Passthrough → `RtCamera.dims` (`.xy` viewport pixels, `.z` restir M-cap).
     pub dims: Vec4,
+    /// Passthrough → `RtCamera.window_arc` (cylindrical window: arc, radius, height).
+    pub window_arc: Vec4,
+    /// Passthrough → `RtCamera.window_eye` (`.xyz` eye in screen space).
+    pub window_eye: Vec4,
     /// The `SolariCamera`'s transform-table slot (`GpuSlot<TransformGraph>`).
     pub camera_slot: u32,
     /// World-buffer node high-water — bounds guard for `camera_slot`.

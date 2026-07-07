@@ -99,6 +99,16 @@ pub struct RtCamera {
     /// `.xy` = viewport pixels (restir temporal reprojection); `.z` = history
     /// M-cap as a multiple of the candidate count.
     pub dims: [f32; 4],
+    /// World-from-view camera basis — cylindrical-window raygen rotates view-space
+    /// ray directions into world space (w=0, so only the linear part is read).
+    pub world_from_view: [f32; 16],
+    /// Cylindrical window (head-coupled curved screen): `.x` = total horizontal arc
+    /// angle (rad), `.y` = curvature radius m (0 ⇒ mode off, planar unproject),
+    /// `.z` = screen height m, `.w` reserved.
+    pub window_arc: [f32; 4],
+    /// `.xyz` = viewer eye in screen space (screen-center origin, +X right, +Y up,
+    /// +Z toward viewer, meters) — matches the camera's local translation.
+    pub window_eye: [f32; 4],
 }
 
 /// Bindless geometry buffer-device-addresses the closest-hit reads via

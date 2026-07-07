@@ -15,8 +15,8 @@
 //       count only the M that could have produced it (Bitterli Alg. 6).
 enable wgpu_ray_query;
 
-#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, Surf, unpack_surface, StoredLight, ResolvedLightSample, unpack_stored_light, NULL_LIGHT_ID, calculate_resolved_light_contribution, power_heuristic, pick_luminance}
-#import bevy_solari::brdf::{evaluate_brdf, brdf_pdf, F_AB}
+#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, GiSample, Surf, unpack_surface, StoredLight, ResolvedLightSample, unpack_stored_light, NULL_LIGHT_ID, calculate_resolved_light_contribution, power_heuristic, pick_luminance}
+#import bevy_solari::brdf::{evaluate_brdf, brdf_pdf, F_AB, gi_shade, gi_phat}
 #import bevy_solari::scene_bindings::{offset_ray_origin, ResolvedMaterial, tlas, RAY_T_MIN, RAY_T_MAX, RAY_NO_CULL}
 #import bevy_solari::pbr::rand_f
 #import bevy_render::utils::octahedral_decode_signed
@@ -31,9 +31,9 @@ struct SpatialParams {
     blend_w: f32,     // raygen's accumulation weight this frame (1 = no accum)
     exposure: f32,
     unbiased: u32,    // 0 = naive M-sum, 1 = Z-count
-    pad_a: u32,
-    pad_b: u32,
-    pad_c: u32,
+    pad_a: u32,       // debug paint
+    di_on: u32,
+    gi_on: u32,
 }
 
 @group(1) @binding(0) var<storage, read_write> reservoirs: array<Reservoir>;
@@ -45,6 +45,8 @@ struct SpatialParams {
 // Binding 5: scene_bindings hard-codes `geometry_addresses` at group(1) binding(4)
 // (pulled in transitively via brdf), so this slot stays clear of it.
 @group(1) @binding(5) var<storage, read> light_samples: array<StoredLight>;
+// Raygen-written GI reservoirs (2 slots/pixel by parity, see `GiSample`).
+@group(1) @binding(6) var<storage, read> gi_samples: array<GiSample>;
 
 const MAX_TAPS: u32 = 8u;
 
@@ -110,6 +112,15 @@ fn spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let px = gid.y * params.width + gid.x;
+    if params.di_on == 1u {
+        di_spatial(px, gid.xy);
+    }
+    if params.gi_on == 1u {
+        gi_spatial(px, gid.xy);
+    }
+}
+
+fn di_spatial(px: u32, gid: vec2<u32>) {
     let own = reservoirs[px * 2u + params.parity];
     let debug = params.pad_a == 1u;
     // m == 0: sky / mirror / restir-off pixel (raygen cleared the slot).
@@ -247,4 +258,112 @@ fn spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
     let di = sel_f * big_w * visible * params.exposure * params.blend_w;
     // Alpha carries the gizmo depth — leave it untouched.
     output[px] = vec4<f32>(output[px].rgb + di, output[px].a);
+}
+
+// Spatial GI reuse: merge neighbors' reservoirs at this surface. A transplanted
+// sample changes solid-angle measure — the reconnection Jacobian
+// (cosθ_me/cosθ_nb)·(d_nb²/d_me²) rescales its W; extreme reconnections are
+// rejected rather than clamped (firefly control). One visibility ray, winner only.
+fn gi_spatial(px: u32, gid: vec2<u32>) {
+    let own = gi_samples[px * 2u + params.parity];
+    if own.m <= 0.0 || own.surf_view_z <= 0.0 {
+        return;
+    }
+    let surf = load_surf(px);
+    var rng = (px + params.frame * 5782582u) * 0x9e3779b1u + 0x1b873593u;
+
+    var src_px: array<u32, 9>;
+    var src_m: array<f32, 9>;
+    var src_n = 1u;
+    src_px[0] = px;
+    src_m[0] = own.m;
+
+    var sel = own;
+    var sel_phat = 0.0;
+    var w_sum = 0.0;
+    var m_total = own.m;
+    if own.w > 0.0 {
+        sel_phat = gi_phat(surf, own);
+        w_sum = sel_phat * own.w * own.m;
+    }
+
+    let taps = min(params.taps, MAX_TAPS);
+    for (var t = 0u; t < taps; t += 1u) {
+        let ang = rand_f(&rng) * 6.2831853;
+        let rad = sqrt(rand_f(&rng)) * params.radius;
+        let nx = i32(gid.x) + i32(round(cos(ang) * rad));
+        let ny = i32(gid.y) + i32(round(sin(ang) * rad));
+        if nx < 0 || ny < 0 || nx >= i32(params.width) || ny >= i32(params.height) {
+            continue;
+        }
+        let npx = u32(ny) * params.width + u32(nx);
+        if npx == px {
+            continue;
+        }
+        let ns = gi_samples[npx * 2u + params.parity];
+        if ns.m <= 0.0 || ns.w <= 0.0 || ns.surf_view_z <= 0.0 {
+            continue;
+        }
+        let nn = octahedral_decode_signed(unpack2x16snorm(ns.surf_normal_oct));
+        let depth_ok = abs(ns.surf_view_z - surf.view_z) <= 0.1 * max(ns.surf_view_z, surf.view_z);
+        if !depth_ok || dot(nn, surf.ns) < 0.9 {
+            continue;
+        }
+        let xs = vec3<f32>(ns.pos_x, ns.pos_y, ns.pos_z);
+        let n_s = octahedral_decode_signed(unpack2x16snorm(ns.normal_oct));
+        let nsurf = surfaces[npx];
+        let to_me = surf.pos - xs;
+        let to_nb = vec3<f32>(nsurf.pos_x, nsurf.pos_y, nsurf.pos_z) - xs;
+        let d2_me = dot(to_me, to_me);
+        let d2_nb = dot(to_nb, to_nb);
+        if d2_me < 1.0e-8 || d2_nb < 1.0e-8 {
+            continue;
+        }
+        let cos_me = abs(dot(n_s, to_me)) * inverseSqrt(d2_me);
+        let cos_nb = abs(dot(n_s, to_nb)) * inverseSqrt(d2_nb);
+        let jac = (cos_me / max(cos_nb, 1.0e-4)) * (d2_nb / max(d2_me, 1.0e-8));
+        if jac < 0.1 || jac > 10.0 {
+            continue;
+        }
+        let ph = gi_phat(surf, ns);
+        let w = ph * ns.w * jac * ns.m;
+        w_sum += w;
+        m_total += ns.m;
+        src_px[src_n] = npx;
+        src_m[src_n] = ns.m;
+        src_n += 1u;
+        if w > 0.0 && rand_f(&rng) * w_sum < w {
+            sel = ns;
+            sel_phat = ph;
+        }
+    }
+
+    if sel_phat <= 0.0 || w_sum <= 0.0 {
+        return;
+    }
+    let origin = offset_ray_origin(surf.pos, surf.ng);
+    let visible = spatial_visibility(
+        origin, vec4<f32>(sel.pos_x, sel.pos_y, sel.pos_z, 1.0));
+    if visible <= 0.0 {
+        return;
+    }
+    // Z-count denominator: count a contributor's M only if the winner lies in
+    // its domain (p̂ > 0 at ITS surface). Geometric only — no extra rays.
+    var m_denom = m_total;
+    if params.unbiased == 1u {
+        var z = 0.0;
+        for (var c = 0u; c < src_n; c += 1u) {
+            if src_px[c] == px {
+                if sel_phat > 0.0 {
+                    z += src_m[c];
+                }
+            } else if gi_phat(load_surf(src_px[c]), sel) > 0.0 {
+                z += src_m[c];
+            }
+        }
+        m_denom = max(z, 1.0e-4);
+    }
+    let big_w = w_sum / max(m_denom * sel_phat, 1.0e-12);
+    let gi = gi_shade(surf, sel) * big_w * params.exposure * params.blend_w;
+    output[px] = vec4<f32>(output[px].rgb + gi, output[px].a);
 }

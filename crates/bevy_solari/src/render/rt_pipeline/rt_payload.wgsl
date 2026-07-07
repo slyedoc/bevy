@@ -74,4 +74,7 @@ struct RtCamera {
     sky_frame: vec4<f32>,      // world→bake sky quaternion (xyzw); identity for flat scenes/skyboxes
     atmo: vec4<f32>,           // .xy = volume-buffer device address (lo/hi bits); .z = volume count
     dims: vec4<f32>,           // .xy = viewport pixels (ReSTIR reprojection); .z = history M-cap ×M
+    world_from_view: mat4x4<f32>, // camera basis: view→world ray dirs (cylindrical window)
+    window_arc: vec4<f32>,        // .x = arc angle (rad); .y = radius m (0 = flat); .z = height m
+    window_eye: vec4<f32>,        // .xyz = eye in screen space (center origin, +Z toward viewer)
 }

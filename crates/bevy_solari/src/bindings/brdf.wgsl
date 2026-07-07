@@ -8,6 +8,7 @@ enable wgpu_ray_query;
 #import bevy_render::maths::{PI, orthonormalize}
 #import bevy_solari::sampling::{sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid}
 #import bevy_solari::scene_bindings::{ResolvedMaterial, MIRROR_ROUGHNESS_THRESHOLD, brdf_dfg_lut, brdf_dfg_lut_sampler}
+#import bevy_solari::sampling::{GiSample, Surf, pick_luminance}
 
 // Rec. 709 luma. Inlined from `bevy_core_pipeline::tonemapping` so this module's
 // import graph stays within solari + bevy_render (the RT-pipeline composer
@@ -277,4 +278,20 @@ fn bend_shading_normal(shading_normal: vec3<f32>, wo: vec3<f32>) -> vec3<f32> {
 fn F_AB(perceptual_roughness: f32, NdotV: f32) -> vec2<f32> {
     let uv = vec2<f32>(NdotV, perceptual_roughness) * (63.0 / 64.0) + (0.5 / 64.0);
     return textureSampleLevel(brdf_dfg_lut, brdf_dfg_lut_sampler, uv, 0.0).rg;
+}
+
+// A GI sample's unweighted contribution at `surf`: f·cos·L toward x_s.
+fn gi_shade(surf: Surf, s: GiSample) -> vec3<f32> {
+    let to_s = vec3<f32>(s.pos_x, s.pos_y, s.pos_z) - surf.pos;
+    let dist = length(to_s);
+    if dist < 1.0e-6 {
+        return vec3<f32>(0.0);
+    }
+    let wi = to_s / dist;
+    return evaluate_brdf(surf.wo, wi, surf.ns, surf.mat, surf.f_ab)
+        * max(dot(surf.ns, wi), 0.0) * vec3<f32>(s.l_r, s.l_g, s.l_b);
+}
+
+fn gi_phat(surf: Surf, s: GiSample) -> f32 {
+    return pick_luminance(gi_shade(surf, s));
 }

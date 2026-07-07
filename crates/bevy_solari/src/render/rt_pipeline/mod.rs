@@ -440,8 +440,8 @@ pub struct RestirSpatialParams {
     pub exposure: f32,
     pub unbiased: u32,
     pub pad_a: u32,
-    pub pad_b: u32,
-    pub pad_c: u32,
+    pub di_on: u32,
+    pub gi_on: u32,
 }
 
 /// `RenderStartup`: build the spatial pass pipeline (scene group 0 + own group 1).
@@ -463,6 +463,7 @@ pub fn init_restir_spatial(
                 uniform_buffer_sized(false, None),           // 3: params
                 uniform_buffer_sized(false, None),           // 4: geometry_addresses (unused, transitive)
                 storage_buffer_read_only_sized(false, None), // 5: light_samples (chit-written)
+                storage_buffer_read_only_sized(false, None), // 6: gi_samples (raygen-written)
             ),
         ),
     );
@@ -785,6 +786,45 @@ pub fn extract_rt_camera_slot(
     }
 }
 
+/// Cylindrical-window raygen (head-coupled perspective on a curved monitor): primary
+/// rays go from the tracked eye through each pixel's physical point on the screen
+/// cylinder instead of a planar unproject — no 4×4 can map to a curved screen. The
+/// camera entity must sit at `eye` relative to the screen-center anchor with axes
+/// aligned to it (the same rig `OffAxisProjection` uses for flat screens); the
+/// CPU-authored projection is still used for culling/LOD, so supply a conservative
+/// (slightly inflated) off-axis frustum.
+#[derive(Component, Clone, Copy)]
+pub struct SolariCylindricalWindow {
+    /// Total horizontal arc angle, radians (arc_length / radius)
+    pub arc_angle: f32,
+    /// Curvature radius, meters (1000R = 1.0)
+    pub radius: f32,
+    /// Screen height, meters
+    pub height: f32,
+    /// Viewer eye in screen space (center origin, +X right, +Y up, +Z toward viewer)
+    pub eye: Vec3,
+}
+
+/// `ExtractSchedule`: mirror each camera's [`SolariCylindricalWindow`] (or its absence)
+/// onto the render-world view entity.
+pub fn extract_cylindrical_window(
+    mut commands: Commands,
+    cameras: Extract<Query<(&RenderEntity, Option<&SolariCylindricalWindow>), With<SolariCamera>>>,
+) {
+    for (render_entity, window) in &cameras {
+        match window {
+            Some(window) => {
+                commands.entity(render_entity.id()).insert(*window);
+            }
+            None => {
+                commands
+                    .entity(render_entity.id())
+                    .remove::<SolariCylindricalWindow>();
+            }
+        }
+    }
+}
+
 /// CPU-authored inputs to the `rt_camera` compute pass (projection + per-frame
 /// scalars). The transform-derived matrices come from `world[camera_slot]` on the GPU.
 struct RtCameraGpuInputs {
@@ -804,6 +844,9 @@ struct RtCameraGpuInputs {
     atmo: Vec4,
     /// Viewport pixels + restir M-cap; see `RtCamera::dims`.
     dims: Vec4,
+    /// Cylindrical window params; see `RtCamera::window_arc`/`window_eye`.
+    window_arc: Vec4,
+    window_eye: Vec4,
     exposure: f32,
 }
 
@@ -850,6 +893,8 @@ fn try_dispatch_rt_camera(
         sky_frame: inputs.sky_frame,
         atmo: inputs.atmo,
         dims: inputs.dims,
+        window_arc: inputs.window_arc,
+        window_eye: inputs.window_eye,
         camera_slot: slot.0,
         node_count,
         exposure: inputs.exposure,
@@ -978,6 +1023,7 @@ pub(crate) fn rt_pipeline(
         Option<&SolariReference>,
         Option<&RtAccumulation>,
         Option<&RtFrozen>,
+        Option<&SolariCylindricalWindow>,
     )>,
     rt: Option<Res<RtPipeline>>,
     rt_blit: Res<RtBlit>,
@@ -1045,6 +1091,7 @@ pub(crate) fn rt_pipeline(
         reference,
         accumulation,
         frozen,
+        cyl_window,
     ) = view.into_inner();
 
     // Environment cube the miss shader samples (same priority as the megakernel):
@@ -1268,7 +1315,7 @@ pub(crate) fn rt_pipeline(
     // bit 1 = ReSTIR DI, bit 2 = DI only, bit 3 = spatial pass, bit 4 = GI only,
     // bit 5 = ReSTIR GI, bit 6 = GI shade reconstructed from the surface
     // G-buffer (vs the stored exact a0), bit 7 = GI temporal reuse,
-    // bits 8..15 = RIS M.
+    // bits 8..15 = RIS M, bit 16 = GI spatial (the pass owns the GI shade).
     let estimator_flags = reference.is_some_and(|r| r.nee_off) as u32
         | (reference.is_some_and(|r| r.restir) as u32) << 1
         | (reference.is_some_and(|r| r.di_only) as u32) << 2
@@ -1277,14 +1324,15 @@ pub(crate) fn rt_pipeline(
         | (reference.is_some_and(|r| r.restir_gi) as u32) << 5
         | (reference.is_some_and(|r| r.restir_gi && r.gi_recon) as u32) << 6
         | (reference.is_some_and(|r| r.restir_gi && r.gi_temporal) as u32) << 7
-        | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8);
+        | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8)
+        | (reference.is_some_and(|r| r.restir_gi && r.gi_spatial) as u32) << 16;
     if let Some(reference) = reference {
         // The spatial pass compiles lazily; until its pipeline is ready its DI is
         // absent, so accumulating those warmup frames bakes ~K zero-DI samples into
         // the running mean (a permanent ~K/N darkening). Hold accumulation off until
         // ready, then start fresh — the readiness-gate lesson from startup_race.md.
-        let spatial_pending = reference.restir
-            && reference.spatial
+        let spatial_pending = ((reference.restir && reference.spatial)
+            || (reference.restir_gi && reference.gi_spatial))
             && !restir_spatial
                 .as_deref()
                 .and_then(|rs| rs.pipeline)
@@ -1320,6 +1368,12 @@ pub(crate) fn rt_pipeline(
             });
         }
     }
+
+    // Cylindrical-window raygen params (zeros = mode off, planar unproject).
+    let window_arc = cyl_window.map_or(Vec4::ZERO, |w| {
+        Vec4::new(w.arc_angle, w.radius, w.height, 0.0)
+    });
+    let window_eye = cyl_window.map_or(Vec4::ZERO, |w| w.eye.extend(0.0));
 
     let camera_inputs = RtCamera {
         inverse_view_proj: world_from_clip.to_cols_array(),
@@ -1402,6 +1456,9 @@ pub(crate) fn rt_pipeline(
             reference.map_or(20.0, |r| r.restir_m_cap),
             0.0,
         ],
+        world_from_view: world_from_view.to_cols_array(),
+        window_arc: window_arc.to_array(),
+        window_eye: window_eye.to_array(),
     };
     // Fill this view's GPU camera buffer (bound at a constant dynamic offset 0). The
     // GPU-authoritative path derives the basis from `world[camera_slot]` in the
@@ -1436,6 +1493,8 @@ pub(crate) fn rt_pipeline(
                 sky_frame: Vec4::from_array(camera_inputs.sky_frame),
                 atmo: Vec4::from_array(camera_inputs.atmo),
                 dims: Vec4::from_array(camera_inputs.dims),
+                window_arc,
+                window_eye,
                 exposure: camera.exposure,
             }
         },
@@ -1516,9 +1575,9 @@ pub(crate) fn rt_pipeline(
     // accumulated output — the same blend weight the raygen used this frame, so
     // accumulation composes without a history buffer.
     if let Some(rs) = restir_spatial.as_deref_mut() {
-        let spatial_on = reference.is_some_and(|r| r.restir && r.spatial)
-            && debug_view == 0
-            && !show_displacement;
+        let di_spatial = reference.is_some_and(|r| r.restir && r.spatial);
+        let gi_spatial = reference.is_some_and(|r| r.restir_gi && r.gi_spatial);
+        let spatial_on = (di_spatial || gi_spatial) && debug_view == 0 && !show_displacement;
         if spatial_on {
             // Lazy queue: the resolve statically reads the scene-columns group
             // (`transforms`), so the pipeline layout is [scene, own, columns] with
@@ -1560,8 +1619,8 @@ pub(crate) fn rt_pipeline(
                     exposure: camera.exposure,
                     unbiased: r.spatial_unbiased as u32,
                     pad_a: r.spatial_debug as u32,
-                    pad_b: 0,
-                    pad_c: 0,
+                    di_on: di_spatial as u32,
+                    gi_on: gi_spatial as u32,
                 };
                 render_queue.write_buffer(&rs.params, 0, bytemuck::bytes_of(&params));
                 render_queue.write_buffer(
@@ -1579,6 +1638,7 @@ pub(crate) fn rt_pipeline(
                         rs.params.as_entire_binding(),
                         rs.geo_addr.as_entire_binding(),
                         output.light_samples.as_entire_binding(),
+                        output.gi_samples.as_entire_binding(),
                     )),
                 );
                 let encoder = ctx.command_encoder();

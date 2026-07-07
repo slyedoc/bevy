@@ -121,6 +121,11 @@ struct Args {
     #[argh(switch)]
     gi_temporal: bool,
 
+    /// with --restir-gi: spatial GI reuse in the compute pass (jacobian-weighted
+    /// neighbors, winner visibility; --taps/--radius apply)
+    #[argh(switch)]
+    gi_spatial: bool,
+
     /// disable accumulation: fresh frames each frame (restir history stays warm).
     /// With `--rung0`, the 5s dump captures ONE frame — per-frame variance metric
     #[argh(switch)]
@@ -184,6 +189,7 @@ fn main() {
             restir_gi: args.restir_gi,
             gi_recon: args.gi_recon,
             gi_temporal: args.gi_temporal,
+            gi_spatial: args.gi_spatial,
             no_accum: args.no_accum,
             spatial: args.spatial,
             zcount: args.zcount,
@@ -255,6 +261,7 @@ struct SceneArgs {
     restir_gi: bool,
     gi_recon: bool,
     gi_temporal: bool,
+    gi_spatial: bool,
     no_accum: bool,
     spatial: bool,
     zcount: bool,
@@ -539,6 +546,7 @@ fn setup_furnace(
             restir_gi: args.restir_gi,
             gi_recon: args.gi_recon,
             gi_temporal: args.gi_temporal,
+            gi_spatial: args.gi_spatial,
             accumulate: !args.no_accum,
             spatial: args.spatial,
             spatial_unbiased: args.zcount,
@@ -708,6 +716,7 @@ fn setup_room(
             restir_gi: args.restir_gi,
             gi_recon: args.gi_recon,
             gi_temporal: args.gi_temporal,
+            gi_spatial: args.gi_spatial,
             accumulate: !args.no_accum,
             spatial: args.spatial,
             spatial_unbiased: args.zcount,
@@ -800,6 +809,7 @@ fn setup_lamps(
             restir_gi: args.restir_gi,
             gi_recon: args.gi_recon,
             gi_temporal: args.gi_temporal,
+            gi_spatial: args.gi_spatial,
             accumulate: !args.no_accum,
             spatial: args.spatial,
             spatial_unbiased: args.zcount,
@@ -918,6 +928,7 @@ fn setup_cell(
             restir_gi: args.restir_gi,
             gi_recon: args.gi_recon,
             gi_temporal: args.gi_temporal,
+            gi_spatial: args.gi_spatial,
             accumulate: !args.no_accum,
             spatial: args.spatial,
             spatial_unbiased: args.zcount,
@@ -1008,6 +1019,7 @@ fn setup_yard(
             restir_gi: args.restir_gi,
             gi_recon: args.gi_recon,
             gi_temporal: args.gi_temporal,
+            gi_spatial: args.gi_spatial,
             accumulate: !args.no_accum,
             spatial: args.spatial,
             spatial_unbiased: args.zcount,

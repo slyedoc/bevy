@@ -153,6 +153,7 @@ impl Plugin for SolarRenderPlugin {
                     atmosphere::extract_solari_atmosphere,
                     atmosphere::extract_atmosphere_volumes,
                     rt_pipeline::extract_rt_camera_slot,
+                    rt_pipeline::extract_cylindrical_window,
                 ),
             )
             .add_systems(
@@ -301,6 +302,9 @@ pub struct SolariReference {
     /// With `restir_gi`: temporally merge last frame's reprojected GI reservoir
     /// (surface depth/normal validated, capped by [`Self::restir_m_cap`]).
     pub gi_temporal: bool,
+    /// With `restir_gi`: the spatial pass merges neighbors' GI reservoirs
+    /// (reconnection-Jacobian weighted, winner visibility) and owns the GI shade.
+    pub gi_spatial: bool,
     /// When false, render fresh frames instead of averaging (estimator levers stay
     /// active). With the rung-0 dump this captures a SINGLE warmed restir frame —
     /// the per-frame variance metric temporal reuse actually improves.
@@ -334,6 +338,7 @@ impl Default for SolariReference {
             restir_gi: false,
             gi_recon: false,
             gi_temporal: false,
+            gi_spatial: false,
             accumulate: true,
             spatial: false,
             spatial_taps: 5,

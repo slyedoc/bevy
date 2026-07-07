@@ -27,6 +27,9 @@ struct RtCamera {
     sky_frame: vec4<f32>,
     atmo: vec4<f32>,
     dims: vec4<f32>,
+    world_from_view: mat4x4<f32>,
+    window_arc: vec4<f32>,
+    window_eye: vec4<f32>,
 }
 
 struct CameraPassParams {
@@ -44,6 +47,8 @@ struct CameraPassParams {
     sky_frame: vec4<f32>,                    // passthrough → RtCamera.sky_frame (world→bake quat)
     atmo: vec4<f32>,                         // passthrough → RtCamera.atmo (volume addr bits + count)
     dims: vec4<f32>,                         // passthrough → RtCamera.dims (viewport px + restir M-cap)
+    window_arc: vec4<f32>,                      // passthrough → RtCamera.window_arc (arc, radius, height)
+    window_eye: vec4<f32>,                      // passthrough → RtCamera.window_eye (eye in screen space)
     camera_slot: u32,                        // the SolariCamera's transform-table slot
     node_count: u32,                         // world-buffer node high-water (bounds guard)
     exposure: f32,                           // → camera_position.w
@@ -194,6 +199,9 @@ fn rt_camera() {
     prev_cam.origin_z = origin_z;
     prev_cam.valid = 1u;
 
+    out_camera.world_from_view = world_from_view;
+    out_camera.window_arc = params.window_arc;
+    out_camera.window_eye = params.window_eye;
     out_camera.camera_position = vec4<f32>(origin, params.exposure);
     out_camera.frame = params.frame;
     out_camera.sky = params.sky;

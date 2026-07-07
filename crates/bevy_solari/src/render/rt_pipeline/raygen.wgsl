@@ -12,7 +12,7 @@ enable wgpu_ray_tracing_pipeline;
 #import bevy_solari::scene_bindings::{tlas, RAY_T_MIN, RAY_T_MAX}
 #import bevy_solari::rt_payload::{RtPayload, RtCamera}
 #import bevy_solari::sampling::{Reservoir, SurfaceGbuf, GiSample, Surf, unpack_surface}
-#import bevy_solari::brdf::{evaluate_brdf, F_AB}
+#import bevy_solari::brdf::{F_AB, gi_shade, gi_phat}
 #import bevy_solari::pbr::rand_f
 #import bevy_solari::atmosphere::{atmosphere_ray_sphere_near, atmosphere_ray_sphere_far, atmosphere_rayleigh_phase, atmosphere_mie_phase}
 #import bevy_render::utils::octahedral_decode_signed
@@ -22,21 +22,6 @@ fn luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
-// A GI sample's unweighted contribution at `surf`: f·cos·L toward x_s.
-fn gi_shade(surf: Surf, s: GiSample) -> vec3<f32> {
-    let to_s = vec3<f32>(s.pos_x, s.pos_y, s.pos_z) - surf.pos;
-    let dist = length(to_s);
-    if dist < 1.0e-6 {
-        return vec3<f32>(0.0);
-    }
-    let wi = to_s / dist;
-    return evaluate_brdf(surf.wo, wi, surf.ns, surf.mat, surf.f_ab)
-        * max(dot(surf.ns, wi), 0.0) * vec3<f32>(s.l_r, s.l_g, s.l_b);
-}
-
-fn gi_phat(surf: Surf, s: GiSample) -> f32 {
-    return luminance(gi_shade(surf, s));
-}
 
 // Hard path-length cap; Russian roulette terminates almost every path far sooner.
 const MAX_BOUNCES: u32 = 32u;
@@ -326,10 +311,30 @@ fn raygen(
             jitter = vec2<f32>(rand_f(&rng), rand_f(&rng)) - 0.5;
         }
         let pixel = vec2<f32>(id.xy) + 0.5 + jitter;
-        let ndc = (pixel / vec2<f32>(dims.xy)) * 2.0 - 1.0;
-        let far = camera.inverse_view_proj * vec4<f32>(ndc.x, -ndc.y, 1.0, 1.0);
         var origin = camera.camera_position.xyz;
-        var direction = normalize(far.xyz / far.w - origin);
+        var direction: vec3<f32>;
+        if camera.window_arc.y > 0.0 {
+            // Cylindrical window (head-coupled curved screen): no matrix maps to a
+            // curved surface, so skip the projection entirely — the ray goes from the
+            // tracked eye through this pixel's physical point on the screen cylinder.
+            // Screen space: center origin, +X right, +Y up, +Z toward viewer; the
+            // camera sits at the eye with axes aligned to the screen, so a screen-
+            // space direction IS a view-space direction.
+            let uv = pixel / vec2<f32>(dims.xy);
+            let theta = (uv.x - 0.5) * camera.window_arc.x;
+            let r = camera.window_arc.y;
+            let p_screen = vec3<f32>(
+                r * sin(theta),
+                (0.5 - uv.y) * camera.window_arc.z,
+                r * (1.0 - cos(theta)), // concave: edges bow toward the viewer
+            );
+            let d_view = p_screen - camera.window_eye.xyz;
+            direction = normalize((camera.world_from_view * vec4<f32>(d_view, 0.0)).xyz);
+        } else {
+            let ndc = (pixel / vec2<f32>(dims.xy)) * 2.0 - 1.0;
+            let far = camera.inverse_view_proj * vec4<f32>(ndc.x, -ndc.y, 1.0, 1.0);
+            direction = normalize(far.xyz / far.w - origin);
+        }
         // Primary ray (pre-bounce) for the atmosphere-volume march.
         let cam_origin = origin;
         cam_direction = direction;
@@ -532,6 +537,12 @@ fn raygen(
             );
             let cur_slot = pixel_index * 2u + (camera.frame.x & 1u);
             let has_surface = primary_cluster != 0xffffffffu;
+            if !has_surface {
+                sel.surf_view_z = 0.0;
+            }
+            // Spatial pass owns the reservoir shade (flag bit 16); raygen keeps
+            // the per-pixel emission term and the dead-sample live fallback.
+            let gi_pass_owns = (eflags & 65536u) != 0u;
             if (eflags & 128u) != 0u && has_surface {
                 // Temporal merge with last frame's slot (prev parity), validated by
                 // the generating surface's depth/normal; p̂ re-evaluated here.
@@ -566,16 +577,22 @@ fn raygen(
                     sel.w = w_sum / (m_total * sel_phat);
                 }
                 gi_samples[cur_slot] = sel;
-                gi_out = a0 * gi_e1 + gi_shade(surf, sel) * sel.w;
+                if m_total > 0.0 {
+                    gi_out = a0 * gi_e1;
+                    if !gi_pass_owns {
+                        gi_out += gi_shade(surf, sel) * sel.w;
+                    }
+                }
             } else {
                 gi_samples[cur_slot] = sel;
                 let stored = gi_samples[cur_slot];
                 if stored.m > 0.0 {
-                    if (eflags & 64u) != 0u {
-                        gi_out = a0 * gi_e1 + gi_shade(surf, stored) * stored.w;
+                    gi_out = a0 * gi_e1;
+                    if gi_pass_owns {
+                    } else if (eflags & 64u) != 0u {
+                        gi_out += gi_shade(surf, stored) * stored.w;
                     } else {
-                        gi_out = a0 * gi_e1
-                            + vec3<f32>(stored.a0_r, stored.a0_g, stored.a0_b)
+                        gi_out += vec3<f32>(stored.a0_r, stored.a0_g, stored.a0_b)
                             * vec3<f32>(stored.l_r, stored.l_g, stored.l_b);
                     }
                 }
