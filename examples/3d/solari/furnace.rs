@@ -168,10 +168,19 @@ struct Args {
 
     /// production path: SolariRestir (full per-frame ReSTIR stack) + DLSS RR
     /// instead of the reference accumulator — the estimator flags above are
-    /// ignored; --taps/--radius apply. Probe expects will FAIL (per-frame
-    /// noise); this is the visual/perf smoke test, not an exam
+    /// ignored; --taps/--radius/--mcap/--clamp apply. Probe expects will FAIL
+    /// (per-frame noise); this is the visual/perf smoke test, not an exam
     #[argh(switch)]
     production: bool,
+
+    /// production temporal history cap (reservoir persistence in frames —
+    /// the temporal-correlation knob RR sees)
+    #[argh(option, default = "20.0")]
+    mcap: f32,
+
+    /// production GI firefly clamp, display-referred luminance (0 = off)
+    #[argh(option, default = "10.0")]
+    clamp: f32,
 }
 
 /// Uniform sky radiance (cd/m²) for the furnace scene.
@@ -225,6 +234,8 @@ fn main() {
             spatial_debug: args.debug_view == "spatial",
             gi_dead: args.debug_view == "gi-dead",
             equal_lamps: args.lamp_law == "equal",
+            mcap: args.mcap,
+            clamp: args.clamp,
         })
         .insert_resource(SolariUniformLights { enabled: args.uniform_lights })
         .insert_resource(SolariClusterView { enabled: args.debug_view == "cluster" })
@@ -298,6 +309,8 @@ struct SceneArgs {
     spatial_debug: bool,
     gi_dead: bool,
     equal_lamps: bool,
+    mcap: f32,
+    clamp: f32,
 }
 
 /// A named world-space point whose surrounding pixels get averaged each probe pass.
@@ -1080,6 +1093,8 @@ fn apply_production(
         commands.entity(entity).remove::<SolariReference>().insert(SolariRestir {
             spatial_taps: args.taps,
             spatial_radius: args.radius,
+            m_cap: args.mcap,
+            firefly_clamp: args.clamp,
             ..default()
         });
     }
