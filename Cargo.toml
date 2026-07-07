@@ -1623,6 +1623,25 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
+name = "solari_furnace"
+path = "examples/3d/solari/furnace.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_feathers",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_furnace]
+name = "Solari (furnace exam harness)"
+description = "Furnace/closed-form validation scenes + probe readback for the reference path tracer — the ReSTIR curriculum's referee."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
 name = "solari_split_screen"
 path = "examples/3d/solari/split_screen.rs"
 doc-scrape-examples = true
@@ -5860,12 +5879,14 @@ wasm = false
 # traceRay + ray-payload SPIR-V). The dependency #9450's wgpu RT-pipeline API
 # builds on; also unblocks bevy_solari's raw-VK RT pipeline.
 [patch.crates-io]
-wgpu             = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
-wgpu-core        = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
-wgpu-hal         = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
-wgpu-types       = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
-wgpu-naga-bridge = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
-naga             = { git = "https://github.com/slyedoc/wgpu.git", branch = "solari-rt-naga" }
+# Local checkout of slyedoc/wgpu#solari-rt-naga (matches zero's patch — fork
+# example runs and zero builds share one naga/wgpu tree).
+wgpu             = { path = "/mnt/code/f/wgpu/wgpu" }
+wgpu-core        = { path = "/mnt/code/f/wgpu/wgpu-core" }
+wgpu-hal         = { path = "/mnt/code/f/wgpu/wgpu-hal" }
+wgpu-types       = { path = "/mnt/code/f/wgpu/wgpu-types" }
+wgpu-naga-bridge = { path = "/mnt/code/f/wgpu/wgpu-naga-bridge" }
+naga             = { path = "/mnt/code/f/wgpu/naga" }
 # naga_oil matches naga's TypeInner exhaustively; the fork adds the SER
 # `HitObject` arm so it compiles against the naga RT/SER fork above.
 naga_oil         = { git = "https://github.com/slyedoc/naga_oil.git", branch = "solari-ser" }
