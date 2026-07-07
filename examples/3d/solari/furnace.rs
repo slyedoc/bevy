@@ -170,6 +170,12 @@ fn main() {
     let scene_yard = args.scene == "yard";
     let scene_cell = args.scene == "cell";
     let mut app = App::new();
+    // Exams time frames from logs: never let the unfocused 60 Hz throttle
+    // (WinitSettings::game default) poison the clock.
+    app.insert_resource(bevy::winit::WinitSettings {
+        focused_mode: bevy::winit::UpdateMode::Continuous,
+        unfocused_mode: bevy::winit::UpdateMode::Continuous,
+    });
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     app.insert_resource(DlssProjectId(uuid!("d5580e3b-691b-4fef-8dcd-58c0ae6df08e")));
     app.add_timeout_exit(args.timeout, 10.0)
