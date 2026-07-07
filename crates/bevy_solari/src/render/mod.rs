@@ -395,7 +395,7 @@ impl Default for SolariRestir {
             spatial_taps: 3,
             spatial_radius: 20.0,
             gi: true,
-            firefly_clamp: 25.0,
+            firefly_clamp: 10.0,
         }
     }
 }
