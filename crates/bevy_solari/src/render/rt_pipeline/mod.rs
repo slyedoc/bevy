@@ -482,8 +482,48 @@ pub fn init_restir_spatial(
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let _ = &pipeline_cache; // pipeline queued lazily (needs the columns layout)
+    let _ = &pipeline_cache; // pipeline queued by `queue_restir_spatial_pipeline`
     commands.insert_resource(RestirSpatial { layout, pipeline: None, shader, params, geo_addr });
+}
+
+/// `Render::Prepare`: queue the spatial pipeline the moment the scene-columns
+/// layout exists (frame ~2 — it can't be built at `RenderStartup`), so it
+/// compiles alongside the cold-start batch instead of lazily on first use
+/// (which shipped a ~0.5 s window with the pass's DI/GI missing). Registered
+/// into the one readiness gate like every other pipeline.
+pub fn queue_restir_spatial_pipeline(
+    restir_spatial: Option<ResMut<RestirSpatial>>,
+    scene_bindings: Res<RaytracingSceneBindings>,
+    scene_columns: Res<SceneColumns>,
+    pipeline_cache: Res<PipelineCache>,
+    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
+) {
+    let Some(mut rs) = restir_spatial else { return };
+    if rs.pipeline.is_some() {
+        return;
+    }
+    let Some(columns_layout) = scene_columns.layout() else {
+        return;
+    };
+    let id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("restir_spatial".into()),
+        layout: vec![
+            scene_bindings.bind_group_layout.clone(),
+            rs.layout.clone(),
+            columns_layout.clone(),
+        ],
+        shader: rs.shader.clone(),
+        shader_defs: vec![bevy_shader::ShaderDefVal::UInt(
+            "SOLARI_SCENE_COLUMNS_GROUP".into(),
+            2,
+        )],
+        entry_point: Some("spatial".into()),
+        immediate_size: 0,
+        zero_initialize_workgroup_memory: false,
+        constants: vec![],
+    });
+    rs.pipeline = Some(id);
+    registry.register("restir_spatial", id);
 }
 
 /// Per-view output: a `width*height` `vec4<f32>` storage buffer the raygen shader
@@ -1647,29 +1687,12 @@ pub(crate) fn rt_pipeline(
             || reference.is_some_and(|r| r.restir_gi && r.gi_spatial);
         let spatial_on = (di_spatial || gi_spatial) && debug_view == 0 && !show_displacement;
         if spatial_on {
-            // Lazy queue: the resolve statically reads the scene-columns group
-            // (`transforms`), so the pipeline layout is [scene, own, columns] with
-            // the columns index fed via the SOLARI_SCENE_COLUMNS_GROUP shader def.
-            let pipeline_id = *rs.pipeline.get_or_insert_with(|| {
-                pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-                    label: Some("restir_spatial".into()),
-                    layout: vec![
-                        scene_bindings.bind_group_layout.clone(),
-                        rs.layout.clone(),
-                        columns_layout_desc.clone(),
-                    ],
-                    shader: rs.shader.clone(),
-                    shader_defs: vec![bevy_shader::ShaderDefVal::UInt(
-                        "SOLARI_SCENE_COLUMNS_GROUP".into(),
-                        2,
-                    )],
-                    entry_point: Some("spatial".into()),
-                    immediate_size: 0,
-                    zero_initialize_workgroup_memory: false,
-                    constants: vec![],
-                })
-            });
-            if let Some(spatial_pipeline) = pipeline_cache.get_compute_pipeline(pipeline_id) {
+            // Queued by `queue_restir_spatial_pipeline` (Prepare) as soon as the
+            // scene-columns layout exists — compiled with the cold-start batch.
+            if let Some(spatial_pipeline) = rs
+                .pipeline
+                .and_then(|id| pipeline_cache.get_compute_pipeline(id))
+            {
                 let blend_w = if accum_spf > 0 && accum_n > 0 {
                     accum_spf as f32 / (accum_n + accum_spf) as f32
                 } else {

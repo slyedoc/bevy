@@ -141,6 +141,10 @@ impl Plugin for SolarRenderPlugin {
             .add_systems(RenderStartup, rt_pipeline::init_rt_blit)
             .add_systems(RenderStartup, rt_pipeline::init_restir_spatial)
             .add_systems(
+                Render,
+                rt_pipeline::queue_restir_spatial_pipeline.in_set(RenderSystems::PrepareResources),
+            )
+            .add_systems(
                 ExtractSchedule,
                 (
                     (
