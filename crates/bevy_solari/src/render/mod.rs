@@ -373,8 +373,11 @@ pub struct SolariRestir {
     /// Temporal history cap, ×`ris_candidates` — history counts for at most
     /// this many frames' worth of candidates.
     pub m_cap: f32,
-    /// Spatial neighbor taps per pixel (≤8). DI equal-time sweet spot is 2–3;
-    /// GI keeps earning through 8 (equal-time tables in restir_roadmap).
+    /// Spatial neighbor taps per pixel (≤8). DEFAULT 0 — under DLSS RR,
+    /// spatial reuse's disk-sized winner patches read as swimming pool-caustic
+    /// light (correlated noise poses as illumination structure); RR does the
+    /// variance reduction instead. The exam-certified spatial path stays
+    /// available for non-RR consumers (equal-time tables in restir_roadmap).
     pub spatial_taps: u32,
     /// Spatial neighbor disk radius, pixels.
     pub spatial_radius: f32,
@@ -392,7 +395,7 @@ impl Default for SolariRestir {
         Self {
             ris_candidates: 4,
             m_cap: 20.0,
-            spatial_taps: 3,
+            spatial_taps: 0,
             spatial_radius: 20.0,
             gi: true,
             firefly_clamp: 10.0,

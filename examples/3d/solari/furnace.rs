@@ -145,11 +145,11 @@ struct Args {
     #[argh(switch)]
     zcount: bool,
 
-    /// spatial neighbor taps (<=8). Default 3 = the equal-time sweet spot (5 taps
-    /// over-invests: lower per-frame noise but a net equal-time loss vs
-    /// temporal-only; 2-3 taps is the small net win)
-    #[argh(option, default = "3")]
-    taps: u32,
+    /// spatial neighbor taps (<=8). Exams default 3 (the equal-time sweet
+    /// spot); --production defaults 0 (spatial patches read as pool-caustics
+    /// under DLSS RR)
+    #[argh(option)]
+    taps: Option<u32>,
 
     /// spatial neighbor disk radius in pixels
     #[argh(option, default = "20.0")]
@@ -229,7 +229,8 @@ fn main() {
             no_accum: args.no_accum,
             spatial: args.spatial,
             zcount: args.zcount,
-            taps: args.taps,
+            taps: args.taps.unwrap_or(3),
+            production_taps: args.taps.unwrap_or(0),
             radius: args.radius,
             spatial_debug: args.debug_view == "spatial",
             gi_dead: args.debug_view == "gi-dead",
@@ -305,6 +306,7 @@ struct SceneArgs {
     spatial: bool,
     zcount: bool,
     taps: u32,
+    production_taps: u32,
     radius: f32,
     spatial_debug: bool,
     gi_dead: bool,
@@ -1091,7 +1093,7 @@ fn apply_production(
 ) {
     for entity in &cameras {
         commands.entity(entity).remove::<SolariReference>().insert(SolariRestir {
-            spatial_taps: args.taps,
+            spatial_taps: args.production_taps,
             spatial_radius: args.radius,
             m_cap: args.mcap,
             firefly_clamp: args.clamp,

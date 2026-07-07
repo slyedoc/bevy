@@ -1374,12 +1374,15 @@ pub(crate) fn rt_pipeline(
     // bit 17 = dead-canonical rate paint, bit 18 = spatial debug (raygen
     // stashes its would-be GI shade for the pass's ratio paint).
     let estimator_flags = if let Some(rt) = restir_rt {
-        // Production per-frame stack: ReSTIR DI (temporal + spatial) and,
-        // when `gi` is on, GI reconnection reservoirs (temporal + spatial,
-        // the pass owns the GI shade). DLSS RR is the denoiser downstream.
+        // Production per-frame stack: ReSTIR DI + GI reconnection reservoirs,
+        // temporal always, spatial only when taps > 0 (at 0 the pass doesn't
+        // run and the chit/raygen shade their own reservoirs directly). DLSS
+        // RR is the denoiser downstream.
+        let spatial = rt.spatial_taps > 0;
         1 << 1
-            | 1 << 3
-            | ((rt.gi as u32) * (1 << 5 | 1 << 7 | 1 << 16))
+            | (spatial as u32) << 3
+            | ((rt.gi as u32) * (1 << 5 | 1 << 7))
+            | ((rt.gi && spatial) as u32) << 16
             | (rt.ris_candidates.min(255) << 8)
     } else {
         reference.is_some_and(|r| r.nee_off) as u32
@@ -1687,9 +1690,9 @@ pub(crate) fn rt_pipeline(
     // into the accumulated output — the same blend weight the raygen used this
     // frame, so accumulation composes without a history buffer.
     if let Some(rs) = restir_spatial.as_deref_mut() {
-        let di_spatial =
-            restir_rt.is_some() || reference.is_some_and(|r| r.restir && r.spatial);
-        let gi_spatial = restir_rt.is_some_and(|rt| rt.gi)
+        let di_spatial = restir_rt.is_some_and(|rt| rt.spatial_taps > 0)
+            || reference.is_some_and(|r| r.restir && r.spatial);
+        let gi_spatial = restir_rt.is_some_and(|rt| rt.gi && rt.spatial_taps > 0)
             || reference.is_some_and(|r| r.restir_gi && r.gi_spatial);
         let spatial_on = (di_spatial || gi_spatial) && debug_view == 0 && !show_displacement;
         if spatial_on {
