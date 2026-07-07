@@ -153,6 +153,11 @@ struct Args {
     #[argh(option, default = "20.0")]
     radius: f32,
 
+    /// soak: sway/yaw the camera for N seconds, then snap back to the start
+    /// pose and hold — churns reservoir history with motion + disocclusion
+    #[argh(option, default = "0.0")]
+    orbit: f32,
+
     /// lamps-scene power law: `pilot` (4 floods + 60 pilots) or `equal`
     /// (64 identical lamps — the receiver-locality exam where global picking
     /// is uninformative and RIS must find the lamps overhead)
@@ -178,6 +183,8 @@ fn main() {
     });
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     app.insert_resource(DlssProjectId(uuid!("d5580e3b-691b-4fef-8dcd-58c0ae6df08e")));
+    app.insert_resource(OrbitSoak { secs: args.orbit, start: None });
+    app.add_systems(Update, orbit_soak);
     app.add_timeout_exit(args.timeout, 10.0)
         .add_screenshot(KeyCode::F12)
         .insert_resource(SceneArgs {
@@ -1332,4 +1339,46 @@ impl ExamAppExt for App {
             },
         )
     }
+}
+
+/// Motion soak: sway + yaw around the spawn pose, snap back exactly at `secs`.
+#[derive(Resource)]
+struct OrbitSoak {
+    secs: f32,
+    start: Option<Transform>,
+}
+
+fn orbit_soak(
+    time: Res<Time>,
+    mut orbit: ResMut<OrbitSoak>,
+    mut cams: Query<&mut Transform, With<SolariCamera>>,
+) {
+    if orbit.secs <= 0.0 {
+        return;
+    }
+    let Ok(mut tf) = cams.single_mut() else {
+        return;
+    };
+    if orbit.start.is_none() {
+        orbit.start = Some(*tf);
+    }
+    let start = orbit.start.unwrap();
+    let t = time.elapsed_secs();
+    if t >= orbit.secs + 1.0 {
+        *tf = start;
+        return;
+    }
+    // Settle phase: near-final pose while motion-contaminated history heals
+    // (m-cap frames), then the exact pose forces one clean accumulation restart.
+    if t >= orbit.secs {
+        *tf = start;
+        tf.translation += start.rotation * DVec3::new(1.0e-4, 0.0, 0.0);
+        return;
+    }
+    let sway = (t * 0.9).sin() as f64 * 1.0;
+    let bob = (t * 1.3).sin() as f64 * 0.25;
+    *tf = start;
+    let offset = start.rotation * DVec3::new(sway, bob, 0.0);
+    tf.translation += offset;
+    tf.rotate_y(((t * 0.55).sin() * 0.15) as f64);
 }
