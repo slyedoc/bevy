@@ -134,8 +134,8 @@ struct SurfaceGbuf {
     pad_b: u32,
 }
 
-// Rung 4a: canonical ReSTIR GI sample — the first-bounce reconnection vertex plus
-// the suffix radiance through it. 48 B (16-byte-size law for raw-VK↔wgpu structs).
+// Canonical ReSTIR GI sample: the first-bounce reconnection vertex + the suffix
+// radiance through it. Size must stay a 16-byte multiple (raw-VK vs wgpu layout).
 struct GiSample {
     pos_x: f32,      // x_s (bounce-1 offset ray origin)
     pos_y: f32,
@@ -148,12 +148,11 @@ struct GiSample {
     a0_r: f32,       // exact primary BSDF weight f·cos/pdf (incl. its RR share)
     a0_g: f32,
     a0_b: f32,
-    m: f32,          // sample count (canonical = 1; grows at 4a.2 temporal merge)
+    m: f32,          // sample count (1 until temporal merge grows it)
 }
 
-// The ONE SurfaceGbuf decode shared by the spatial pass and raygen (producer/
-// consumer single-source law). `f_ab` stays zero — F_AB lives in `brdf` and
-// sampling is brdf-free; callers fill it.
+// SurfaceGbuf decode shared by the spatial pass and raygen. `f_ab` stays zero —
+// F_AB lives in `brdf`; callers fill it.
 struct Surf {
     pos: vec3<f32>,
     view_z: f32,

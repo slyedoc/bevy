@@ -161,8 +161,8 @@ fn chit_opaque(
     let nee_off = (flags & 1u) != 0u;
     let restir_mode = (flags & 2u) != 0u;
     let spatial_on = restir_mode && (flags & 8u) != 0u;
-    // ReSTIR GI (rung 4a, flag bit 5): raygen shades GI from the stored canonical
-    // sample and needs this surface's shading inputs in the SurfaceGbuf.
+    // ReSTIR GI (flag bit 5): raygen reshades GI from the stored sample and
+    // needs this surface's shading inputs in the SurfaceGbuf.
     let gi_mode = (flags & 32u) != 0u;
     let is_primary = payload.gbuffer_pixel != NO_GBUFFER;
 
@@ -224,7 +224,7 @@ fn chit_opaque(
                     if lc.brdf_rays_can_hit {
                         w_mis = power_heuristic(lc.pdf_solid, brdf_pdf(wo, lc.wi, world_normal, ray_hit.material, F_ab));
                     }
-                    let f = w_mis * lc.radiance * evaluate_brdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
+                    let f = w_mis * lc.radiance * saturate(dot(world_normal, lc.wi)) * evaluate_brdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
                     let phat = pick_luminance(f);
                     let w = phat * lc.inverse_pdf;
                     if w <= 0.0 {
@@ -270,7 +270,7 @@ fn chit_opaque(
                                     if plc.brdf_rays_can_hit {
                                         w_mis = power_heuristic(plc.pdf_solid, brdf_pdf(wo, plc.wi, world_normal, ray_hit.material, F_ab));
                                     }
-                                    let f = w_mis * plc.radiance * evaluate_brdf(wo, plc.wi, world_normal, ray_hit.material, F_ab);
+                                    let f = w_mis * plc.radiance * saturate(dot(world_normal, plc.wi)) * evaluate_brdf(wo, plc.wi, world_normal, ray_hit.material, F_ab);
                                     let phat = pick_luminance(f);
                                     let w = phat * prev.w * prev_m;
                                     w_sum += w;
@@ -310,7 +310,7 @@ fn chit_opaque(
                     let pdf_of_bounce = brdf_pdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
                     w_mis = power_heuristic(lc.pdf_solid, pdf_of_bounce);
                 }
-                let f = w_mis * lc.radiance * evaluate_brdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
+                let f = w_mis * lc.radiance * saturate(dot(world_normal, lc.wi)) * evaluate_brdf(wo, lc.wi, world_normal, ray_hit.material, F_ab);
                 let phat = pick_luminance(f);
                 let w = phat * lc.inverse_pdf;
                 if w <= 0.0 {
@@ -327,17 +327,11 @@ fn chit_opaque(
             }
             res_m = f32(ris_m);
         }
-        // Visibility rays — one shared traceRay site. Iterations 0..dir_rays are
-        // the deterministic directional lights (restir mode: the sun is shaded per
-        // light at every vertex, never through a reservoir — a one-slot reservoir
-        // arbitrating sun-vs-lamp patchworks the screen; brdf_rays_can_hit is false
-        // for directionals so no MIS weight applies); the FINAL iteration is the
-        // emissive reservoir winner. Historical note: this used to be a single-site
-        // HARD RULE — two live call sites black-screened/hung. Root cause was the
-        // naga fork emitting traceRay via a shared per-payload helper fn (a shape
-        // no other toolchain produces; NVIDIA miscompiled the two-call case). Fixed
-        // 2026-07-07: traceRay now emits OpTraceRayKHR inline per call site, and
-        // multi-site chits are safe again. The unified loop stays because it's good.
+        // Visibility rays, one shared loop: iterations 0..dir_rays are the
+        // deterministic directional lights (the sun never enters a reservoir — a
+        // one-slot reservoir arbitrating sun-vs-lamp patchworks the screen;
+        // brdf_rays_can_hit is false for directionals so no MIS weight applies);
+        // the final iteration is the emissive reservoir winner.
         var dir_rays = 0u;
         if restir_mode {
             dir_rays = directional_light_count();
@@ -354,7 +348,8 @@ fn chit_opaque(
                 if dlc.inverse_pdf <= 0.0 {
                     continue;
                 }
-                f_vis = dlc.radiance * evaluate_brdf(wo, dlc.wi, world_normal, ray_hit.material, F_ab)
+                f_vis = dlc.radiance * saturate(dot(world_normal, dlc.wi))
+                    * evaluate_brdf(wo, dlc.wi, world_normal, ray_hit.material, F_ab)
                     * dlc.inverse_pdf;
                 // Directional sample: world_position = (unit direction, w=0).
                 vis_target = dresolved.world_position;

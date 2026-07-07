@@ -53,7 +53,7 @@ const BH_CAPTURE_RADIUS: f32 = 0.5;
 // Primary-surface shading inputs (chit-written in spatial/GI modes) — the GI
 // reshade reads them at path end.
 @group(1) @binding(10) var<storage, read_write> surfaces: array<SurfaceGbuf>;
-// ReSTIR GI canonical samples (rung 4a): 2 slots/pixel, interleaved by parity.
+// ReSTIR GI canonical samples: 2 slots/pixel, interleaved by frame parity.
 @group(1) @binding(12) var<storage, read_write> gi_samples: array<GiSample>;
 // Sentinel pixel index: this bounce writes no guide/reservoir (every non-primary bounce).
 const NO_GBUFFER: u32 = 0xffffffffu;
@@ -325,13 +325,12 @@ fn raygen(
         // pdf of the BRDF sample that produced this segment (0 on the primary ray),
         // threaded into the hit shader so it can MIS-weight its emissive vs NEE.
         var p_bounce = 0.0;
-        // GI split (rung 4a): radiance ≡ di0 + a0·gi_L, where a0 is the primary
-        // BSDF weight and gi_L the suffix radiance — the ReSTIR GI sample's value.
+        // GI split: radiance ≡ di0 + a0·gi_L (a0 = primary BSDF weight,
+        // gi_L = suffix radiance with a0 divided out).
         var di0 = vec3<f32>(0.0);
         var a0 = vec3<f32>(0.0);
         var gi_L = vec3<f32>(0.0);
         var gi_throughput = vec3<f32>(0.0);
-        // Canonical GI sample capture: the bounce-1 hit (reconnection vertex).
         var gi_xs = vec3<f32>(0.0);
         var gi_ns_oct = 0u;
         var gi_pdf1 = 0.0;
@@ -489,13 +488,13 @@ fn raygen(
             }
         }
 
-        // Rung-4a estimator overrides, all built on the di0/GI split.
+        // Estimator overrides, all built on the di0/GI split.
         let eflags = bitcast<u32>(camera.atmo.w);
         var gi_out = a0 * gi_L;
-        // ReSTIR GI (bit 5): persist the canonical sample, then shade GI from the
-        // STORE — exact stored a0 (round-trip gate) or, with bit 6, the SurfaceGbuf
-        // BRDF reconstruction (the path reuse will live on). Dead samples (sky or
-        // delta suffix) keep the live a0·gi_L.
+        // ReSTIR GI (flag bit 5): store this pixel's canonical sample, then shade
+        // GI from the store — the exact stored a0, or (bit 6) f·cos·L/pdf
+        // re-evaluated from the surface G-buffer. Dead samples (sky/delta, pdf=0)
+        // keep the live a0·gi_L.
         if (eflags & 32u) != 0u {
             let slot = pixel_index * 2u + (camera.frame.x & 1u);
             gi_samples[slot] = GiSample(
@@ -512,10 +511,9 @@ fn raygen(
                     let dist = length(to_s);
                     if dist > 1.0e-6 {
                         let wi = to_s / dist;
-                        // evaluate_brdf already folds NdotL — no extra cos here
-                        // (an extra ⟨cos⟩ shows as a ~0.67 uniform deficit).
                         let f = evaluate_brdf(surf.wo, wi, surf.ns, surf.mat, surf.f_ab);
-                        gi_out = f * vec3<f32>(stored.l_r, stored.l_g, stored.l_b) / stored.pdf;
+                        gi_out = f * max(dot(surf.ns, wi), 0.0)
+                            * vec3<f32>(stored.l_r, stored.l_g, stored.l_b) / stored.pdf;
                     }
                 } else {
                     gi_out = vec3<f32>(stored.a0_r, stored.a0_g, stored.a0_b)
@@ -524,8 +522,8 @@ fn raygen(
             }
             radiance = di0 + gi_out;
         }
-        // GI-only estimator (flag bit 4): the complement of di_only — suffix
-        // energy only. di_only + gi_only must sum to the full image (the 4a.0 gate).
+        // GI-only estimator (flag bit 4): the complement of di_only —
+        // di_only + gi_only must sum to the full image.
         if (eflags & 16u) != 0u {
             radiance = gi_out;
         }

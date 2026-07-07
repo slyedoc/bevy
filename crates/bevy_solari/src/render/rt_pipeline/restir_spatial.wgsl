@@ -72,7 +72,7 @@ fn eval_target(surf: Surf, resolved: ResolvedLightSample) -> TargetEval {
     if lc.brdf_rays_can_hit {
         w_mis = power_heuristic(lc.pdf_solid, brdf_pdf(surf.wo, lc.wi, surf.ns, surf.mat, surf.f_ab));
     }
-    let f = w_mis * lc.radiance * evaluate_brdf(surf.wo, lc.wi, surf.ns, surf.mat, surf.f_ab);
+    let f = w_mis * lc.radiance * saturate(dot(surf.ns, lc.wi)) * evaluate_brdf(surf.wo, lc.wi, surf.ns, surf.mat, surf.f_ab);
     return TargetEval(f, pick_luminance(f), resolved.world_position);
 }
 

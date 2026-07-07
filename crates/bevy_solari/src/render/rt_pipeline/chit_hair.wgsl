@@ -101,7 +101,7 @@ fn chit_hair(
                             nee_mis = power_heuristic(1.0 / lc.inverse_pdf, pdf_b);
                         }
                         let direct = evaluate_brdf(wo, lc.wi, world_normal, material, F_ab);
-                        emitted += nee_mis * lc.radiance * lc.inverse_pdf * direct;
+                        emitted += nee_mis * lc.radiance * lc.inverse_pdf * direct * saturate(dot(world_normal, lc.wi));
                     }
                 }
             }
