@@ -298,6 +298,9 @@ pub struct SolariReference {
     /// instead of the stored exact `a0` — the reconnection-shift shading path
     /// temporal/spatial reuse will rely on (gate: accumulated unbiasedness).
     pub gi_recon: bool,
+    /// With `restir_gi`: temporally merge last frame's reprojected GI reservoir
+    /// (surface depth/normal validated, capped by [`Self::restir_m_cap`]).
+    pub gi_temporal: bool,
     /// When false, render fresh frames instead of averaging (estimator levers stay
     /// active). With the rung-0 dump this captures a SINGLE warmed restir frame —
     /// the per-frame variance metric temporal reuse actually improves.
@@ -330,6 +333,7 @@ impl Default for SolariReference {
             gi_only: false,
             restir_gi: false,
             gi_recon: false,
+            gi_temporal: false,
             accumulate: true,
             spatial: false,
             spatial_taps: 5,

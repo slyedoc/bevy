@@ -22,6 +22,22 @@ fn luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
+// A GI sample's unweighted contribution at `surf`: f·cos·L toward x_s.
+fn gi_shade(surf: Surf, s: GiSample) -> vec3<f32> {
+    let to_s = vec3<f32>(s.pos_x, s.pos_y, s.pos_z) - surf.pos;
+    let dist = length(to_s);
+    if dist < 1.0e-6 {
+        return vec3<f32>(0.0);
+    }
+    let wi = to_s / dist;
+    return evaluate_brdf(surf.wo, wi, surf.ns, surf.mat, surf.f_ab)
+        * max(dot(surf.ns, wi), 0.0) * vec3<f32>(s.l_r, s.l_g, s.l_b);
+}
+
+fn gi_phat(surf: Surf, s: GiSample) -> f32 {
+    return luminance(gi_shade(surf, s));
+}
+
 // Hard path-length cap; Russian roulette terminates almost every path far sooner.
 const MAX_BOUNCES: u32 = 32u;
 // Stand-in fog: per-unit-length extinction applied over each ray segment.
@@ -335,6 +351,7 @@ fn raygen(
         var gi_ns_oct = 0u;
         var gi_pdf1 = 0.0;
         var gi_hit = false;
+        var gi_e1 = vec3<f32>(0.0);
 
         for (var bounce = 0u; bounce < MAX_BOUNCES; bounce += 1u) {
             // Black-hole geodesic (stand-in): bend the ray toward the mass and
@@ -350,6 +367,7 @@ fn raygen(
             }
 
             payload.emitted = vec3<f32>(0.0);
+            payload.emissive_mis = vec3<f32>(0.0);
             payload.attenuation = vec3<f32>(0.0);
             payload.next_origin = origin;
             payload.next_direction = direction;
@@ -443,6 +461,7 @@ fn raygen(
                 gi_hit = payload.hit_cluster != 0xffffffffu;
                 gi_xs = payload.next_origin;
                 gi_ns_oct = payload.hit_normal_oct;
+                gi_e1 = payload.emissive_mis;
             }
             if payload.bounce == 0u {
                 break;
@@ -496,28 +515,69 @@ fn raygen(
         // re-evaluated from the surface G-buffer. Dead samples (sky/delta, pdf=0)
         // keep the live a0·gi_L.
         if (eflags & 32u) != 0u {
-            let slot = pixel_index * 2u + (camera.frame.x & 1u);
-            gi_samples[slot] = GiSample(
+            let surf_raw = surfaces[pixel_index];
+            var surf = unpack_surface(surf_raw);
+            surf.f_ab = F_AB(surf.mat.perceptual_roughness, max(dot(surf.ns, surf.wo), 1.0e-4));
+            // Bounce-1 emission is this pixel's DI-by-MIS partner — its weight is
+            // tied to this sampling event, so it shades per-frame, never reused.
+            let l_reuse = gi_L - gi_e1;
+            let canon_ok = gi_hit && gi_pdf1 > 0.0 && gi_pdf1 < 1.0e30;
+            var sel = GiSample(
                 gi_xs.x, gi_xs.y, gi_xs.z, gi_ns_oct,
-                gi_L.x, gi_L.y, gi_L.z, select(0.0, gi_pdf1, gi_hit),
-                a0.x, a0.y, a0.z, 1.0,
+                l_reuse.x, l_reuse.y, l_reuse.z,
+                select(0.0, 1.0 / max(gi_pdf1, 1.0e-9), canon_ok),
+                a0.x, a0.y, a0.z,
+                select(0.0, 1.0, canon_ok),
+                surf_raw.normal_oct, surf_raw.view_z, 0u, 0u,
             );
-            let stored = gi_samples[slot];
-            if stored.pdf > 0.0 {
-                if (eflags & 64u) != 0u {
-                    var surf = unpack_surface(surfaces[pixel_index]);
-                    surf.f_ab = F_AB(surf.mat.perceptual_roughness, max(dot(surf.ns, surf.wo), 1.0e-4));
-                    let to_s = vec3<f32>(stored.pos_x, stored.pos_y, stored.pos_z) - surf.pos;
-                    let dist = length(to_s);
-                    if dist > 1.0e-6 {
-                        let wi = to_s / dist;
-                        let f = evaluate_brdf(surf.wo, wi, surf.ns, surf.mat, surf.f_ab);
-                        gi_out = f * max(dot(surf.ns, wi), 0.0)
-                            * vec3<f32>(stored.l_r, stored.l_g, stored.l_b) / stored.pdf;
+            let cur_slot = pixel_index * 2u + (camera.frame.x & 1u);
+            let has_surface = primary_cluster != 0xffffffffu;
+            if (eflags & 128u) != 0u && has_surface {
+                // Temporal merge with last frame's slot (prev parity), validated by
+                // the generating surface's depth/normal; p̂ re-evaluated here.
+                var sel_phat = gi_phat(surf, sel);
+                var w_sum = sel_phat * sel.w * sel.m;
+                var m_total = sel.m;
+                let clip = camera.prev_clip_from_world * vec4<f32>(surf.pos, 1.0);
+                if clip.w > 1.0e-4 {
+                    let uv = (clip.xy / clip.w) * vec2<f32>(0.5, -0.5) + 0.5;
+                    if all(uv >= vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) {
+                        let pp = vec2<u32>(uv * camera.dims.xy);
+                        let hist =
+                            gi_samples[(pp.y * u32(camera.dims.x) + pp.x) * 2u + ((camera.frame.x + 1u) & 1u)];
+                        let hn = octahedral_decode_signed(unpack2x16snorm(hist.surf_normal_oct));
+                        let depth_ok = abs(hist.surf_view_z - surf_raw.view_z) < 0.1 * surf_raw.view_z;
+                        if hist.m > 0.0 && depth_ok && dot(hn, surf.ns) > 0.9 {
+                            let m_h = min(hist.m, camera.dims.z);
+                            let ph = gi_phat(surf, hist);
+                            let wh = ph * hist.w * m_h;
+                            w_sum += wh;
+                            m_total += m_h;
+                            if wh > 0.0 && rand_f(&rng) * w_sum < wh {
+                                sel = hist;
+                                sel_phat = ph;
+                            }
+                        }
                     }
-                } else {
-                    gi_out = vec3<f32>(stored.a0_r, stored.a0_g, stored.a0_b)
-                        * vec3<f32>(stored.l_r, stored.l_g, stored.l_b);
+                }
+                sel.m = m_total;
+                sel.w = 0.0;
+                if sel_phat > 0.0 && m_total > 0.0 {
+                    sel.w = w_sum / (m_total * sel_phat);
+                }
+                gi_samples[cur_slot] = sel;
+                gi_out = a0 * gi_e1 + gi_shade(surf, sel) * sel.w;
+            } else {
+                gi_samples[cur_slot] = sel;
+                let stored = gi_samples[cur_slot];
+                if stored.m > 0.0 {
+                    if (eflags & 64u) != 0u {
+                        gi_out = a0 * gi_e1 + gi_shade(surf, stored) * stored.w;
+                    } else {
+                        gi_out = a0 * gi_e1
+                            + vec3<f32>(stored.a0_r, stored.a0_g, stored.a0_b)
+                            * vec3<f32>(stored.l_r, stored.l_g, stored.l_b);
+                    }
                 }
             }
             radiance = di0 + gi_out;

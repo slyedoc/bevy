@@ -15,6 +15,9 @@ struct RtPayload {
     // resets it before each trace and sums across bounces.
     anyhit_count: u32,
     emitted: vec3<f32>,        // radiance contributed at this vertex (sky at miss)
+    // The mis-weighted emission part of `emitted` (zero from miss/glass; raygen
+    // clears it per bounce). At bounce 1 this is the pixel's DI-by-MIS term.
+    emissive_mis: vec3<f32>,
     attenuation: vec3<f32>,    // throughput multiplier for the next segment
     next_origin: vec3<f32>,
     next_direction: vec3<f32>,

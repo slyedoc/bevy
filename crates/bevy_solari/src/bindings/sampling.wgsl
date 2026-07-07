@@ -141,14 +141,18 @@ struct GiSample {
     pos_y: f32,
     pos_z: f32,
     normal_oct: u32, // n_s, snorm-oct
-    l_r: f32,        // L_gi: suffix radiance, primary BSDF weight divided out
+    l_r: f32,        // reusable suffix radiance (bounce-1 emission excluded)
     l_g: f32,
     l_b: f32,
-    pdf: f32,        // solid-angle pdf of ω₁ at generation; 0 = dead sample
+    w: f32,          // unbiased contribution weight (1/pdf when canonical)
     a0_r: f32,       // exact primary BSDF weight f·cos/pdf (incl. its RR share)
     a0_g: f32,
     a0_b: f32,
-    m: f32,          // sample count (1 until temporal merge grows it)
+    m: f32,          // sample count; 0 = dead sample
+    surf_normal_oct: u32, // the GENERATING surface, for temporal validation
+    surf_view_z: f32,
+    pad_a: u32,
+    pad_b: u32,
 }
 
 // SurfaceGbuf decode shared by the spatial pass and raygen. `f_ab` stays zero —

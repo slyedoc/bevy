@@ -715,9 +715,8 @@ pub fn prepare_rt_output(
             .map(|b| b.raw_handle())
             .expect("rt_restir_light_samples buffer must be Vulkan-backed");
         let light_samples: bevy_render::render_resource::Buffer = light_samples.into();
-        // GI canonical samples (rung 4a): 2 slots × 48 B per pixel, zero-cleared
-        // (pdf=0 = dead sample).
-        let gi_samples_size = pixels as u64 * 96;
+        // GI reservoirs: 2 slots × 64 B per pixel, zero-cleared (m=0 = dead).
+        let gi_samples_size = pixels as u64 * 128;
         let gi_samples = allocator.create_buffer(
             &render_device,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
@@ -1267,8 +1266,9 @@ pub(crate) fn rt_pipeline(
     let mut accum_spf = 0u32;
     // Estimator flags (also packed into `atmo.w` below): bit 0 = NEE off,
     // bit 1 = ReSTIR DI, bit 2 = DI only, bit 3 = spatial pass, bit 4 = GI only,
-    // bit 5 = ReSTIR GI (rung 4a), bit 6 = GI shade reconstructed from the
-    // surface G-buffer (vs the stored exact a0), bits 8..15 = RIS M.
+    // bit 5 = ReSTIR GI, bit 6 = GI shade reconstructed from the surface
+    // G-buffer (vs the stored exact a0), bit 7 = GI temporal reuse,
+    // bits 8..15 = RIS M.
     let estimator_flags = reference.is_some_and(|r| r.nee_off) as u32
         | (reference.is_some_and(|r| r.restir) as u32) << 1
         | (reference.is_some_and(|r| r.di_only) as u32) << 2
@@ -1276,6 +1276,7 @@ pub(crate) fn rt_pipeline(
         | (reference.is_some_and(|r| r.gi_only) as u32) << 4
         | (reference.is_some_and(|r| r.restir_gi) as u32) << 5
         | (reference.is_some_and(|r| r.restir_gi && r.gi_recon) as u32) << 6
+        | (reference.is_some_and(|r| r.restir_gi && r.gi_temporal) as u32) << 7
         | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8);
     if let Some(reference) = reference {
         // The spatial pass compiles lazily; until its pipeline is ready its DI is

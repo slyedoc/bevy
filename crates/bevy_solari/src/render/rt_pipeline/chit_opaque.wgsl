@@ -184,6 +184,7 @@ fn chit_opaque(
         mis_weight = power_heuristic(payload.p_bounce, p_light);
     }
     var emitted = mis_weight * ray_hit.material.emissive;
+    payload.emissive_mis = emitted;
 
     // Direct lighting via RIS (rung 2): stream M light candidates through a
     // one-slot weighted reservoir — each weighted w = p̂/p, where the target
