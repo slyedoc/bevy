@@ -364,6 +364,17 @@ fn set_view_cull_mask(mask: u32) {
     view_cull_mask = mask;
 }
 
+// Per-view floating-origin delta (`origin_now − origin_prev`), seeded by entries
+// that consume `previous_frame_world_position` (the opaque chit). The tess
+// branches synthesize a STATIC previous position from the current one, which
+// must land in the PREVIOUS frame's origin like the mesh path's
+// `previous_frame_transforms` product — current + this delta gets it there.
+var<private> reproj_origin_delta: vec3<f32> = vec3<f32>(0.0);
+
+fn set_reproj_origin_delta(delta: vec3<f32>) {
+    reproj_origin_delta = delta;
+}
+
 fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
     let ray = RayDesc(ray_flag, view_cull_mask, ray_t_min, ray_t_max, ray_origin, ray_direction);
     var rq: ray_query;
@@ -994,7 +1005,8 @@ fn resolve_triangle_data_full_mat_fetch(
             // position == current (motion = camera-only), which is exact for static
             // displaced geometry (floors, planet terrain). MOVING tessellated surfaces
             // would ghost and need the real per-instance previous transform — TODO.
-            hit.previous_frame_world_position = hit.world_position;
+            // + delta: previous positions are in the PREVIOUS frame's origin.
+            hit.previous_frame_world_position = hit.world_position + reproj_origin_delta;
             hit.material.perceptual_roughness = max(hit.material.perceptual_roughness, TESS_ROUGHNESS_FLOOR);
             hit.material.roughness = hit.material.perceptual_roughness * hit.material.perceptual_roughness;
             return hit;
@@ -1018,7 +1030,8 @@ fn resolve_triangle_data_full_mat_fetch(
         );
         // Same tess motion fix as the smooth branch: static previous position
         // (motion = camera-only) instead of the unreliable per-instance lookup.
-        hit.previous_frame_world_position = hit.world_position;
+        // + delta: previous positions are in the PREVIOUS frame's origin.
+        hit.previous_frame_world_position = hit.world_position + reproj_origin_delta;
         hit.material.perceptual_roughness = max(hit.material.perceptual_roughness, TESS_ROUGHNESS_FLOOR);
         hit.material.roughness = hit.material.perceptual_roughness * hit.material.perceptual_roughness;
         return hit;

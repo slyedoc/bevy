@@ -14,7 +14,7 @@ enable primitive_index;
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::pbr::{rand_f, rand_u}
 #import bevy_solari::sampling::{generate_random_light_sample, generate_random_emissive_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, random_emissive_light_pdf_flux, resolve_emissive_for_restir, resolve_light_sample, emissive_light_count, directional_light_count, power_heuristic, pick_luminance, LightSample, Reservoir, SurfaceGbuf, StoredLight, pack_stored_light, ResolvedLightSample, NULL_LIGHT_ID}
-#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, load_material_bindless, sample_texture_lod, TEXTURE_MAP_NONE, light_sources, active_light_list}
+#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, load_material_bindless, sample_texture_lod, TEXTURE_MAP_NONE, light_sources, active_light_list, set_reproj_origin_delta}
 #import bevy_render::utils::{octahedral_encode, octahedral_decode_signed}
 
 var<incoming_ray_payload> payload: RtPayload;
@@ -103,6 +103,9 @@ fn chit_opaque(
     @builtin(hit_triangle_vertex_positions) hit_positions: array<vec3<f32>, 3>,
 ) {
     var rng = payload.rng;
+    // Tess hits synthesize their previous position from the current one; seed
+    // the delta so it lands in the previous frame's origin like the mesh path.
+    set_reproj_origin_delta(camera.origin_delta.xyz);
     // Geometry-debug views (cluster / triangle color): record this hit's global
     // cluster id + cluster-local triangle so raygen can hash them to a flat color on
     // the primary hit. Cheap; ignored unless `camera.frame.z` selects those views.
@@ -245,8 +248,13 @@ fn chit_opaque(
                 // re-evaluate its sample's p̂ HERE, and merge — the history counts
                 // as prev.m candidates at the cost of one resolve, no rays.
                 if is_primary {
-                    let prev_clip = camera.prev_clip_from_world
-                        * vec4<f32>(ray_hit.previous_frame_world_position, 1.0);
+                    // previous_frame_world_position comes from last frame's
+                    // camera-relative transform (PREV origin); the rebased prev
+                    // matrix expects CURRENT-origin input — convert, or statics
+                    // reproject off by the camera delta (history slides).
+                    let prev_pos =
+                        ray_hit.previous_frame_world_position - camera.origin_delta.xyz;
+                    let prev_clip = camera.prev_clip_from_world * vec4<f32>(prev_pos, 1.0);
                     if prev_clip.w > 1.0e-4 {
                         let prev_uv = (prev_clip.xy / prev_clip.w) * vec2<f32>(0.5, -0.5) + 0.5;
                         if all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv < vec2<f32>(1.0)) {
@@ -475,10 +483,13 @@ fn chit_opaque(
             gbuffer_specular[px] = vec4<f32>(specular, 0.0);
             // Screen-space motion vector: current vs previous UNJITTERED clip position,
             // UV space with y flipped. previous_frame_world_position handles moving
-            // instances (parent/skin), the matrices handle the camera. Guard last
+            // instances (parent/skin), the matrices handle the camera. It's in the
+            // PREVIOUS frame's origin (last frame's camera-relative transform); the
+            // rebased prev matrix expects CURRENT-origin input — convert, or static
+            // MVs are off by the camera delta and RR's history smears. Guard last
             // frame's divide too; zero motion if the surface was at the eye then.
-            let prev_clip =
-                camera.prev_clip_from_world * vec4<f32>(ray_hit.previous_frame_world_position, 1.0);
+            let prev_clip = camera.prev_clip_from_world
+                * vec4<f32>(ray_hit.previous_frame_world_position - camera.origin_delta.xyz, 1.0);
             var motion = vec2<f32>(0.0);
             if prev_clip.w > 1.0e-4 {
                 let cur_uv = (cur_clip.xy / cur_clip.w) * vec2<f32>(0.5, -0.5);
