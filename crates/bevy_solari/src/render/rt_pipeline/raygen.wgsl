@@ -571,24 +571,7 @@ fn raygen(
                 if clip.w > 1.0e-4 {
                     let uv = (clip.xy / clip.w) * vec2<f32>(0.5, -0.5) + 0.5;
                     if all(uv >= vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) {
-                        // Stochastic bilinear history pick (flag bit 19, the
-                        // RR/production path): nearest-neighbor quantization of
-                        // a translating reprojection is a zoomed lattice — a
-                        // visible moiré grid warping with camera distance.
-                        // Randomizing over the 2×2 footprint by its bilinear
-                        // weights turns that into white noise. The reference
-                        // keeps the certified nearest fetch.
-                        let decorrelate = (eflags & 524288u) != 0u;
-                        var pp = vec2<u32>(uv * camera.dims.xy);
-                        if decorrelate {
-                            let pf = uv * camera.dims.xy - 0.5;
-                            let base = floor(pf);
-                            let fr = pf - base;
-                            let jit = base
-                                + vec2<f32>(select(0.0, 1.0, rand_f(&rng) < fr.x),
-                                            select(0.0, 1.0, rand_f(&rng) < fr.y));
-                            pp = vec2<u32>(clamp(jit, vec2<f32>(0.0), camera.dims.xy - 1.0));
-                        }
+                        let pp = vec2<u32>(uv * camera.dims.xy);
                         var hist =
                             gi_samples[(pp.y * u32(camera.dims.x) + pp.x) * 2u + ((camera.frame.x + 1u) & 1u)];
                         // World_rel is camera-origin: last frame's stored x_s is
@@ -601,57 +584,13 @@ fn raygen(
                         let depth_ok = abs(hist.surf_view_z - surf_raw.view_z) < 0.1 * surf_raw.view_z;
                         if hist.m > 0.0 && depth_ok && dot(hn, surf.ns) > 0.9 {
                             let m_h = min(hist.m, camera.dims.z);
-                            if !decorrelate {
-                                // Reference path: exact self-fetch statically —
-                                // the certified merge, no Jacobian needed.
-                                let ph = gi_phat(surf, hist);
-                                let wh = ph * hist.w * m_h;
-                                w_sum += wh;
-                                m_total += m_h;
-                                if wh > 0.0 && rand_f(&rng) * w_sum < wh {
-                                    sel = hist;
-                                    sel_phat = ph;
-                                }
-                            } else if hist.w <= 0.0 {
-                                // Dead history still dilutes W (domain-split
-                                // law); its garbage x_s must not be jac-judged.
-                                m_total += m_h;
-                            } else {
-                                // Reconnection Jacobian, exactly like the
-                                // spatial pass: the (possibly jitter-fetched)
-                                // history was generated at pp's surface — its W
-                                // lives in THAT solid-angle measure. For an x_s
-                                // hovering cm above the surface the ratio
-                                // explodes between pixels (bright orb
-                                // fireflies) — rescale W, reject the
-                                // pathological band (stream dropped, m uncounted
-                                // — the spatial pass's acceptance semantics).
-                                let nb_raw = surfaces[pp.y * u32(camera.dims.x) + pp.x];
-                                let nb_pos =
-                                    vec3<f32>(nb_raw.pos_x, nb_raw.pos_y, nb_raw.pos_z);
-                                let xs = vec3<f32>(hist.pos_x, hist.pos_y, hist.pos_z);
-                                let n_s =
-                                    octahedral_decode_signed(unpack2x16snorm(hist.normal_oct));
-                                let to_me = surf.pos - xs;
-                                let to_nb = nb_pos - xs;
-                                let d2_me = dot(to_me, to_me);
-                                let d2_nb = dot(to_nb, to_nb);
-                                let cos_me =
-                                    abs(dot(n_s, to_me)) * inverseSqrt(max(d2_me, 1.0e-8));
-                                let cos_nb =
-                                    abs(dot(n_s, to_nb)) * inverseSqrt(max(d2_nb, 1.0e-8));
-                                let jac = (cos_me / max(cos_nb, 1.0e-4))
-                                    * (d2_nb / max(d2_me, 1.0e-8));
-                                if d2_me > 1.0e-8 && d2_nb > 1.0e-8 && jac >= 0.1 && jac <= 10.0 {
-                                    let ph = gi_phat(surf, hist);
-                                    let wh = ph * hist.w * jac * m_h;
-                                    w_sum += wh;
-                                    m_total += m_h;
-                                    if wh > 0.0 && rand_f(&rng) * w_sum < wh {
-                                        sel = hist;
-                                        sel_phat = ph;
-                                    }
-                                }
+                            let ph = gi_phat(surf, hist);
+                            let wh = ph * hist.w * m_h;
+                            w_sum += wh;
+                            m_total += m_h;
+                            if wh > 0.0 && rand_f(&rng) * w_sum < wh {
+                                sel = hist;
+                                sel_phat = ph;
                             }
                         }
                     }
