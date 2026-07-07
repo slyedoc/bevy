@@ -93,6 +93,8 @@ fn evaluate_and_sample_brdf(
     return EvaluateAndSampleBrdfResult(wi, throughput, pdf, diffuse_selected);
 }
 
+// CONVENTION: returns f·NdotL — the receiver cosine is FOLDED IN (light-side
+// cosθ/d² lives in `calculate_resolved_light_contribution`). Never re-multiply cos.
 fn evaluate_brdf(
     wo: vec3<f32>,
     wi: vec3<f32>,
