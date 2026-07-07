@@ -626,7 +626,19 @@ fn raygen(
                                 // fireflies) — rescale W, reject the
                                 // pathological band (stream dropped, m uncounted
                                 // — the spatial pass's acceptance semantics).
+                                //
+                                // pp's CURRENT surface stands in for the
+                                // generating one — valid only while it still
+                                // matches the record's stored depth/normal. At
+                                // edges under motion pp just changed owners
+                                // (disocclusion) and the stand-in is a different
+                                // surface: the mis-measured Jacobian sprays
+                                // white fizz along silhouettes. Drop instead.
                                 let nb_raw = surfaces[pp.y * u32(camera.dims.x) + pp.x];
+                                let nb_n = octahedral_decode_signed(
+                                    unpack2x16snorm(nb_raw.normal_oct));
+                                let nb_ok = abs(nb_raw.view_z - hist.surf_view_z)
+                                    < 0.1 * hist.surf_view_z && dot(nb_n, hn) > 0.9;
                                 let nb_pos =
                                     vec3<f32>(nb_raw.pos_x, nb_raw.pos_y, nb_raw.pos_z);
                                 let xs = vec3<f32>(hist.pos_x, hist.pos_y, hist.pos_z);
@@ -642,7 +654,8 @@ fn raygen(
                                     abs(dot(n_s, to_nb)) * inverseSqrt(max(d2_nb, 1.0e-8));
                                 let jac = (cos_me / max(cos_nb, 1.0e-4))
                                     * (d2_nb / max(d2_me, 1.0e-8));
-                                if d2_me > 1.0e-8 && d2_nb > 1.0e-8 && jac >= 0.1 && jac <= 10.0 {
+                                if nb_ok && d2_me > 1.0e-8 && d2_nb > 1.0e-8
+                                    && jac >= 0.1 && jac <= 10.0 {
                                     let ph = gi_phat(surf, hist);
                                     let wh = ph * hist.w * jac * m_h;
                                     w_sum += wh;
