@@ -380,6 +380,11 @@ pub struct SolariRestir {
     pub spatial_radius: f32,
     /// GI reconnection reservoirs (temporal + spatial). Off = ReSTIR DI only.
     pub gi: bool,
+    /// Max GI luminance per frame, in DISPLAY-referred units (post-exposure,
+    /// where ~1.0 is a well-exposed white) — reservoir spikes above it are
+    /// scaled down luminance-preserving. 0 = off. The reference path never
+    /// clamps (policy); this is the realtime firefly filter.
+    pub firefly_clamp: f32,
 }
 
 impl Default for SolariRestir {
@@ -390,6 +395,7 @@ impl Default for SolariRestir {
             spatial_taps: 3,
             spatial_radius: 20.0,
             gi: true,
+            firefly_clamp: 25.0,
         }
     }
 }

@@ -29,7 +29,7 @@ struct SpatialParams {
     taps: u32,        // neighbor count (≤ MAX_TAPS)
     radius: f32,      // disk radius, pixels
     blend_w: f32,     // raygen's accumulation weight this frame (1 = no accum)
-    pad_b: f32,
+    firefly_clamp: f32, // max GI luminance per frame (physical; 0 = off)
     unbiased: u32,    // 0 = naive M-sum, 1 = Z-count
     pad_a: u32,       // debug paint
     di_on: u32,
@@ -413,6 +413,14 @@ fn gi_spatial(px: u32, gid: vec2<u32>) {
         output[px] = vec4<f32>(mine, dbg_ref, own.m, 4.0);
         return;
     }
-    let gi = gi_shade(surf, sel) * big_w * params.blend_w;
-    output[px] = vec4<f32>(output[px].rgb + gi, output[px].a);
+    var gi = gi_shade(surf, sel) * big_w;
+    // Realtime firefly filter (reference passes 0 = off): scale reservoir
+    // spikes down luminance-preserving before they reach the frame.
+    if params.firefly_clamp > 0.0 {
+        let lum = pick_luminance(gi);
+        if lum > params.firefly_clamp {
+            gi *= params.firefly_clamp / lum;
+        }
+    }
+    output[px] = vec4<f32>(output[px].rgb + gi * params.blend_w, output[px].a);
 }

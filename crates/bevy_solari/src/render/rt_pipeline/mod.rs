@@ -439,7 +439,7 @@ pub struct RestirSpatialParams {
     pub taps: u32,
     pub radius: f32,
     pub blend_w: f32,
-    pub pad_b: f32,
+    pub firefly_clamp: f32,
     pub unbiased: u32,
     pub pad_a: u32,
     pub di_on: u32,
@@ -1555,12 +1555,14 @@ pub(crate) fn rt_pipeline(
                 ]
             })
         },
-        // Viewport pixels (restir temporal reprojection) + history M-cap.
+        // Viewport pixels (restir temporal reprojection) + history M-cap +
+        // GI firefly clamp (PHYSICAL radiance; 0 = off — the reference never
+        // clamps, so it always passes 0).
         dims: [
             viewport.x as f32,
             viewport.y as f32,
             restir_rt.map_or_else(|| reference.map_or(20.0, |r| r.restir_m_cap), |rt| rt.m_cap),
-            0.0,
+            restir_rt.map_or(0.0, |rt| rt.firefly_clamp / camera.exposure.max(1.0e-9)),
         ],
         world_from_view: world_from_view.to_cols_array(),
         window_arc: window_arc.to_array(),
@@ -1717,7 +1719,7 @@ pub(crate) fn rt_pipeline(
                     taps: taps.min(8),
                     radius,
                     blend_w,
-                    pad_b: 0.0,
+                    firefly_clamp: camera_inputs.dims[3],
                     unbiased: unbiased as u32,
                     pad_a: dbg as u32,
                     di_on: di_spatial as u32,

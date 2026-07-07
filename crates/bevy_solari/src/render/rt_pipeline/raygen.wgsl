@@ -631,6 +631,15 @@ fn raygen(
                     }
                 }
             }
+            // Realtime firefly filter (dims.w; the reference passes 0 = off):
+            // scale GI spikes down luminance-preserving. The pass-owned spatial
+            // shade applies the same threshold on its own add.
+            if camera.dims.w > 0.0 {
+                let gi_lum = luminance(gi_out);
+                if gi_lum > camera.dims.w {
+                    gi_out *= camera.dims.w / gi_lum;
+                }
+            }
             radiance = di0 + gi_out;
             dead_draw = select(1.0, 0.0, canon_ok);
         }
