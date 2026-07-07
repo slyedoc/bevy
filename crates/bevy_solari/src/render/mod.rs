@@ -60,6 +60,8 @@ impl Plugin for SolarRenderPlugin {
             .add_plugins(ExtractComponentPlugin::<SolariCamera>::default())
             .add_plugins(ExtractComponentPlugin::<SolariReference>::default())
             .register_type::<SolariReference>()
+            .add_plugins(ExtractComponentPlugin::<SolariRestir>::default())
+            .register_type::<SolariRestir>()
             .init_resource::<rt_pipeline::SolariFreezeDiff>()
             .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariFreezeDiff>::default())
             // Solari does its own light sampling and never reads the clustered-forward
@@ -350,6 +352,40 @@ impl Default for SolariReference {
             spatial_unbiased: false,
             spatial_debug: false,
             gi_dead_view: false,
+        }
+    }
+}
+
+/// Production ReSTIR on a [`SolariCamera`]: per-frame (no accumulation) DI
+/// reservoirs with temporal + spatial reuse, and GI reconnection reservoirs
+/// with temporal + spatial reuse — the certified full stack (restir_roadmap
+/// rungs 3–4a), feeding DLSS Ray Reconstruction as the denoiser. Ignored while
+/// a [`SolariReference`] is on the camera (the exam harness wins).
+#[derive(Component, Reflect, Clone, ExtractComponent)]
+#[reflect(Component, Default, Clone)]
+pub struct SolariRestir {
+    /// Initial light candidates per pixel streamed through the DI reservoir.
+    pub ris_candidates: u32,
+    /// Temporal history cap, ×`ris_candidates` — history counts for at most
+    /// this many frames' worth of candidates.
+    pub m_cap: f32,
+    /// Spatial neighbor taps per pixel (≤8). DI equal-time sweet spot is 2–3;
+    /// GI keeps earning through 8 (equal-time tables in restir_roadmap).
+    pub spatial_taps: u32,
+    /// Spatial neighbor disk radius, pixels.
+    pub spatial_radius: f32,
+    /// GI reconnection reservoirs (temporal + spatial). Off = ReSTIR DI only.
+    pub gi: bool,
+}
+
+impl Default for SolariRestir {
+    fn default() -> Self {
+        Self {
+            ris_candidates: 4,
+            m_cap: 20.0,
+            spatial_taps: 3,
+            spatial_radius: 20.0,
+            gi: true,
         }
     }
 }

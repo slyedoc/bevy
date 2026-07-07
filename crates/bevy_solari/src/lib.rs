@@ -200,6 +200,7 @@ pub mod prelude {
         lights::SolariUniformLights,
         render::SolariCamera,
         render::SolariReference,
+        render::SolariRestir,
         transform::{NoGpuGlobalTransformReadback, SolariGpuFrame, TransformStatic},
         SolariInitPlugin, SolariPlugin,
     };

@@ -53,7 +53,7 @@ use crate::render::atmosphere::{
     AtmosphereSky, SolariAtmosphereGpu, SolariAtmosphereView, SolariAtmosphereVolumesGpu,
 };
 use crate::render::view_cull::SolariEnvironmentMap;
-use crate::render::{CameraReframe, SolariCamera, SolariReference};
+use crate::render::{CameraReframe, SolariCamera, SolariReference, SolariRestir};
 use crate::resource_manager::SolariResourceManager;
 use crate::transform::{TransformGraph, TransformPropagate};
 use bevy_render::extract_resource::ExtractResource;
@@ -1025,7 +1025,7 @@ pub(crate) fn rt_pipeline(
         Option<&SolariDlssJitter>,
         Option<&CameraReframe>,
         Option<&RtCameraSlot>,
-        Option<&SolariReference>,
+        (Option<&SolariReference>, Option<&SolariRestir>),
         Option<&RtAccumulation>,
         Option<&RtFrozen>,
         Option<&SolariCylindricalWindow>,
@@ -1100,11 +1100,14 @@ pub(crate) fn rt_pipeline(
         dlss_jitter,
         reframe,
         camera_slot,
-        reference,
+        (reference, restir_rt),
         accumulation,
         frozen,
         cyl_window,
     ) = view.into_inner();
+    // Production ReSTIR ([`SolariRestir`]) drives the estimator only when the
+    // exam harness ([`SolariReference`]) isn't on the camera.
+    let restir_rt = restir_rt.filter(|_| reference.is_none());
 
     // Environment cube the miss shader samples (same priority as the megakernel):
     // the baked atmosphere cube if this view has one, else the view's skybox image,
@@ -1330,18 +1333,28 @@ pub(crate) fn rt_pipeline(
     // bits 8..15 = RIS M, bit 16 = GI spatial (the pass owns the GI shade),
     // bit 17 = dead-canonical rate paint, bit 18 = spatial debug (raygen
     // stashes its would-be GI shade for the pass's ratio paint).
-    let estimator_flags = reference.is_some_and(|r| r.nee_off) as u32
-        | (reference.is_some_and(|r| r.restir) as u32) << 1
-        | (reference.is_some_and(|r| r.di_only) as u32) << 2
-        | (reference.is_some_and(|r| r.restir && r.spatial) as u32) << 3
-        | (reference.is_some_and(|r| r.gi_only) as u32) << 4
-        | (reference.is_some_and(|r| r.restir_gi) as u32) << 5
-        | (reference.is_some_and(|r| r.restir_gi && r.gi_recon) as u32) << 6
-        | (reference.is_some_and(|r| r.restir_gi && r.gi_temporal) as u32) << 7
-        | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8)
-        | (reference.is_some_and(|r| r.restir_gi && r.gi_spatial) as u32) << 16
-        | (reference.is_some_and(|r| r.restir_gi && r.gi_dead_view) as u32) << 17
-        | (reference.is_some_and(|r| r.spatial_debug) as u32) << 18;
+    let estimator_flags = if let Some(rt) = restir_rt {
+        // Production per-frame stack: ReSTIR DI (temporal + spatial) and,
+        // when `gi` is on, GI reconnection reservoirs (temporal + spatial,
+        // the pass owns the GI shade). DLSS RR is the denoiser downstream.
+        1 << 1
+            | 1 << 3
+            | ((rt.gi as u32) * (1 << 5 | 1 << 7 | 1 << 16))
+            | (rt.ris_candidates.min(255) << 8)
+    } else {
+        reference.is_some_and(|r| r.nee_off) as u32
+            | (reference.is_some_and(|r| r.restir) as u32) << 1
+            | (reference.is_some_and(|r| r.di_only) as u32) << 2
+            | (reference.is_some_and(|r| r.restir && r.spatial) as u32) << 3
+            | (reference.is_some_and(|r| r.gi_only) as u32) << 4
+            | (reference.is_some_and(|r| r.restir_gi) as u32) << 5
+            | (reference.is_some_and(|r| r.restir_gi && r.gi_recon) as u32) << 6
+            | (reference.is_some_and(|r| r.restir_gi && r.gi_temporal) as u32) << 7
+            | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8)
+            | (reference.is_some_and(|r| r.restir_gi && r.gi_spatial) as u32) << 16
+            | (reference.is_some_and(|r| r.restir_gi && r.gi_dead_view) as u32) << 17
+            | (reference.is_some_and(|r| r.spatial_debug) as u32) << 18
+    };
     if let Some(reference) = reference {
         // Hold accumulation until EVERY solari pipeline is compiled (the one
         // readiness gate — a warmup frame with any column/pass missing bakes
@@ -1506,7 +1519,7 @@ pub(crate) fn rt_pipeline(
         dims: [
             viewport.x as f32,
             viewport.y as f32,
-            reference.map_or(20.0, |r| r.restir_m_cap),
+            restir_rt.map_or_else(|| reference.map_or(20.0, |r| r.restir_m_cap), |rt| rt.m_cap),
             0.0,
         ],
         world_from_view: world_from_view.to_cols_array(),
@@ -1628,8 +1641,10 @@ pub(crate) fn rt_pipeline(
     // into the accumulated output — the same blend weight the raygen used this
     // frame, so accumulation composes without a history buffer.
     if let Some(rs) = restir_spatial.as_deref_mut() {
-        let di_spatial = reference.is_some_and(|r| r.restir && r.spatial);
-        let gi_spatial = reference.is_some_and(|r| r.restir_gi && r.gi_spatial);
+        let di_spatial =
+            restir_rt.is_some() || reference.is_some_and(|r| r.restir && r.spatial);
+        let gi_spatial = restir_rt.is_some_and(|rt| rt.gi)
+            || reference.is_some_and(|r| r.restir_gi && r.gi_spatial);
         let spatial_on = (di_spatial || gi_spatial) && debug_view == 0 && !show_displacement;
         if spatial_on {
             // Lazy queue: the resolve statically reads the scene-columns group
@@ -1660,18 +1675,24 @@ pub(crate) fn rt_pipeline(
                 } else {
                     1.0
                 };
-                let r = reference.unwrap();
+                let (taps, radius, unbiased, dbg) = match (restir_rt, reference) {
+                    (Some(rt), _) => (rt.spatial_taps, rt.spatial_radius, false, false),
+                    (None, Some(r)) => {
+                        (r.spatial_taps, r.spatial_radius, r.spatial_unbiased, r.spatial_debug)
+                    }
+                    (None, None) => unreachable!("spatial_on requires one of them"),
+                };
                 let params = RestirSpatialParams {
                     width: viewport.x,
                     height: viewport.y,
                     parity: camera_inputs.frame[0] & 1,
                     frame: camera_inputs.frame[0],
-                    taps: r.spatial_taps.min(8),
-                    radius: r.spatial_radius,
+                    taps: taps.min(8),
+                    radius,
                     blend_w,
                     pad_b: 0.0,
-                    unbiased: r.spatial_unbiased as u32,
-                    pad_a: r.spatial_debug as u32,
+                    unbiased: unbiased as u32,
+                    pad_a: dbg as u32,
                     di_on: di_spatial as u32,
                     gi_on: gi_spatial as u32,
                 };

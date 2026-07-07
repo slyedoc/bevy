@@ -165,6 +165,13 @@ struct Args {
     /// is uninformative and RIS must find the lamps overhead)
     #[argh(option, default = "String::from(\"pilot\")")]
     lamp_law: String,
+
+    /// production path: SolariRestir (full per-frame ReSTIR stack) + DLSS RR
+    /// instead of the reference accumulator — the estimator flags above are
+    /// ignored; --taps/--radius apply. Probe expects will FAIL (per-frame
+    /// noise); this is the visual/perf smoke test, not an exam
+    #[argh(switch)]
+    production: bool,
 }
 
 /// Uniform sky radiance (cd/m²) for the furnace scene.
@@ -187,6 +194,11 @@ fn main() {
     app.insert_resource(DlssProjectId(uuid!("d5580e3b-691b-4fef-8dcd-58c0ae6df08e")));
     app.insert_resource(OrbitSoak { secs: args.orbit, start: None });
     app.add_systems(Update, orbit_soak);
+    if args.production {
+        app.add_systems(Update, apply_production);
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        app.insert_resource(SolariDlssMode::Dlaa);
+    }
     app.add_timeout_exit(args.timeout, 10.0)
         .add_screenshot(KeyCode::F12)
         .insert_resource(SceneArgs {
@@ -1055,6 +1067,22 @@ fn setup_yard(
         Transform::from_translation(DVec3::new(2.0, 7.0, 20.0))
             .looking_at(DVec3::new(-1.0, 0.0, 0.0), Vec3::Y),
     ));
+}
+
+/// `--production`: swap the reference accumulator for the per-frame ReSTIR
+/// stack the moment a scene camera appears (DLSS RR denoises downstream).
+fn apply_production(
+    mut commands: Commands,
+    cameras: Query<Entity, Added<SolariReference>>,
+    args: Res<SceneArgs>,
+) {
+    for entity in &cameras {
+        commands.entity(entity).remove::<SolariReference>().insert(SolariRestir {
+            spatial_taps: args.taps,
+            spatial_radius: args.radius,
+            ..default()
+        });
+    }
 }
 
 /// F = freeze reference snapshot, V = toggle |current-frozen| diff view, P = dump PFM,
