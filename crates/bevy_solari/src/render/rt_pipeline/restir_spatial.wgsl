@@ -260,33 +260,32 @@ fn di_spatial(px: u32, gid: vec2<u32>) {
     output[px] = vec4<f32>(output[px].rgb + di, output[px].a);
 }
 
-// Spatial GI reuse: merge neighbors' reservoirs at this surface. A transplanted
-// sample changes solid-angle measure — the reconnection Jacobian
-// (cosθ_me/cosθ_nb)·(d_nb²/d_me²) rescales its W; extreme reconnections are
-// rejected rather than clamped (firefly control). One visibility ray, winner only.
+// Spatial GI reuse: merge neighbors' reservoirs at this surface. Streams are
+// accepted only if geometry-compatible, Jacobian-sane, AND their sample is
+// visible from here (one ray per candidate — an occluded stream must not count,
+// or its dead M darkens shadow boundaries). `unbiased` = balance-heuristic MIS
+// over the surviving generating streams (per-pixel BSDF pdfs, so 1/M is not a
+// balance heuristic for GI); 0 = naive M-sum over the survivors.
 fn gi_spatial(px: u32, gid: vec2<u32>) {
     let own = gi_samples[px * 2u + params.parity];
     if own.m <= 0.0 || own.surf_view_z <= 0.0 {
         return;
     }
     let surf = load_surf(px);
+    let my_origin = offset_ray_origin(surf.pos, surf.ng);
     var rng = (px + params.frame * 5782582u) * 0x9e3779b1u + 0x1b873593u;
 
-    var src_px: array<u32, 9>;
-    var src_m: array<f32, 9>;
-    var src_n = 1u;
-    src_px[0] = px;
-    src_m[0] = own.m;
-
-    var sel = own;
-    var sel_phat = 0.0;
-    var w_sum = 0.0;
-    var m_total = own.m;
+    // Survivor streams: candidate + its W in MY measure + its M.
+    var s_px: array<u32, 9>;
+    var s_m: array<f32, 9>;
+    var s_w: array<f32, 9>;
+    var s_n = 0u;
     if own.w > 0.0 {
-        sel_phat = gi_phat(surf, own);
-        w_sum = sel_phat * own.w * own.m;
+        s_px[0] = px;
+        s_m[0] = own.m;
+        s_w[0] = own.w;
+        s_n = 1u;
     }
-
     let taps = min(params.taps, MAX_TAPS);
     for (var t = 0u; t < taps; t += 1u) {
         let ang = rand_f(&rng) * 6.2831853;
@@ -309,61 +308,91 @@ fn gi_spatial(px: u32, gid: vec2<u32>) {
         if !depth_ok || dot(nn, surf.ns) < 0.9 {
             continue;
         }
-        let xs = vec3<f32>(ns.pos_x, ns.pos_y, ns.pos_z);
+        let xj = vec3<f32>(ns.pos_x, ns.pos_y, ns.pos_z);
         let n_s = octahedral_decode_signed(unpack2x16snorm(ns.normal_oct));
-        let nsurf = surfaces[npx];
-        let to_me = surf.pos - xs;
-        let to_nb = vec3<f32>(nsurf.pos_x, nsurf.pos_y, nsurf.pos_z) - xs;
+        let jsurf_raw = surfaces[npx];
+        let to_me = surf.pos - xj;
+        let to_j = vec3<f32>(jsurf_raw.pos_x, jsurf_raw.pos_y, jsurf_raw.pos_z) - xj;
         let d2_me = dot(to_me, to_me);
-        let d2_nb = dot(to_nb, to_nb);
-        if d2_me < 1.0e-8 || d2_nb < 1.0e-8 {
+        let d2_j = dot(to_j, to_j);
+        if d2_me < 1.0e-8 || d2_j < 1.0e-8 {
             continue;
         }
         let cos_me = abs(dot(n_s, to_me)) * inverseSqrt(d2_me);
-        let cos_nb = abs(dot(n_s, to_nb)) * inverseSqrt(d2_nb);
-        let jac = (cos_me / max(cos_nb, 1.0e-4)) * (d2_nb / max(d2_me, 1.0e-8));
+        let cos_j = abs(dot(n_s, to_j)) * inverseSqrt(d2_j);
+        let jac = (cos_me / max(cos_j, 1.0e-4)) * (d2_j / max(d2_me, 1.0e-8));
         if jac < 0.1 || jac > 10.0 {
             continue;
         }
-        let ph = gi_phat(surf, ns);
-        let w = ph * ns.w * jac * ns.m;
+        if spatial_visibility(my_origin, vec4<f32>(xj, 1.0)) <= 0.0 {
+            continue;
+        }
+        s_px[s_n] = npx;
+        s_m[s_n] = ns.m;
+        s_w[s_n] = ns.w * jac;
+        s_n += 1u;
+    }
+    if s_n == 0u {
+        return;
+    }
+
+    var w_sum = 0.0;
+    var sel = own;
+    var sel_phat = 0.0;
+    var m_total = 0.0;
+    for (var j = 0u; j < s_n; j += 1u) {
+        m_total += s_m[j];
+        let cand = gi_samples[s_px[j] * 2u + params.parity];
+        let ph_me = gi_phat(surf, cand);
+        if ph_me <= 0.0 {
+            continue;
+        }
+        var w = 0.0;
+        if params.unbiased == 1u {
+            // Balance-heuristic MIS: p̂ proxies at each stream's surface, in a
+            // common area measure at x_s (× cosθ/d²).
+            let xj = vec3<f32>(cand.pos_x, cand.pos_y, cand.pos_z);
+            let n_s = octahedral_decode_signed(unpack2x16snorm(cand.normal_oct));
+            var num = 0.0;
+            var denom = 0.0;
+            for (var k = 0u; k < s_n; k += 1u) {
+                let ksurf = load_surf(s_px[k]);
+                let to_k = ksurf.pos - xj;
+                let d2_k = dot(to_k, to_k);
+                if d2_k < 1.0e-8 {
+                    continue;
+                }
+                let conv = abs(dot(n_s, to_k)) * inverseSqrt(d2_k) / d2_k;
+                let pk = gi_phat(ksurf, cand) * conv * s_m[k];
+                denom += pk;
+                if k == j {
+                    num = pk;
+                }
+            }
+            if num <= 0.0 || denom <= 0.0 {
+                continue;
+            }
+            w = (num / denom) * ph_me * s_w[j];
+        } else {
+            w = ph_me * s_w[j] * s_m[j];
+        }
         w_sum += w;
-        m_total += ns.m;
-        src_px[src_n] = npx;
-        src_m[src_n] = ns.m;
-        src_n += 1u;
         if w > 0.0 && rand_f(&rng) * w_sum < w {
-            sel = ns;
-            sel_phat = ph;
+            sel = cand;
+            sel_phat = ph_me;
         }
     }
 
     if sel_phat <= 0.0 || w_sum <= 0.0 {
         return;
     }
-    let origin = offset_ray_origin(surf.pos, surf.ng);
-    let visible = spatial_visibility(
-        origin, vec4<f32>(sel.pos_x, sel.pos_y, sel.pos_z, 1.0));
-    if visible <= 0.0 {
-        return;
-    }
-    // Z-count denominator: count a contributor's M only if the winner lies in
-    // its domain (p̂ > 0 at ITS surface). Geometric only — no extra rays.
-    var m_denom = m_total;
+    // Survivors are pre-validated visible; MIS weights partition unity so the
+    // naive 1/M division drops out in unbiased mode.
+    var denom_final = m_total * sel_phat;
     if params.unbiased == 1u {
-        var z = 0.0;
-        for (var c = 0u; c < src_n; c += 1u) {
-            if src_px[c] == px {
-                if sel_phat > 0.0 {
-                    z += src_m[c];
-                }
-            } else if gi_phat(load_surf(src_px[c]), sel) > 0.0 {
-                z += src_m[c];
-            }
-        }
-        m_denom = max(z, 1.0e-4);
+        denom_final = sel_phat;
     }
-    let big_w = w_sum / max(m_denom * sel_phat, 1.0e-12);
+    let big_w = w_sum / max(denom_final, 1.0e-12);
     let gi = gi_shade(surf, sel) * big_w * params.exposure * params.blend_w;
     output[px] = vec4<f32>(output[px].rgb + gi, output[px].a);
 }

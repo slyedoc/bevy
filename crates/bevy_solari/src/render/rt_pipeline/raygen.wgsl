@@ -321,11 +321,12 @@ fn raygen(
             // camera sits at the eye with axes aligned to the screen, so a screen-
             // space direction IS a view-space direction.
             let uv = pixel / vec2<f32>(dims.xy);
-            let theta = (uv.x - 0.5) * camera.window_arc.x;
+            // .w slots offset the view rect (OS window) from the monitor center
+            let theta = camera.window_arc.w + (uv.x - 0.5) * camera.window_arc.x;
             let r = camera.window_arc.y;
             let p_screen = vec3<f32>(
                 r * sin(theta),
-                (0.5 - uv.y) * camera.window_arc.z,
+                camera.window_eye.w + (0.5 - uv.y) * camera.window_arc.z,
                 r * (1.0 - cos(theta)), // concave: edges bow toward the viewer
             );
             let d_view = p_screen - camera.window_eye.xyz;

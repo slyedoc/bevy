@@ -795,13 +795,16 @@ pub fn extract_rt_camera_slot(
 /// (slightly inflated) off-axis frustum.
 #[derive(Component, Clone, Copy)]
 pub struct SolariCylindricalWindow {
-    /// Total horizontal arc angle, radians (arc_length / radius)
+    /// Horizontal arc angle subtended by the view rect, radians (arc_length / radius)
     pub arc_angle: f32,
     /// Curvature radius, meters (1000R = 1.0)
     pub radius: f32,
-    /// Screen height, meters
+    /// View-rect height, meters
     pub height: f32,
-    /// Viewer eye in screen space (center origin, +X right, +Y up, +Z toward viewer)
+    /// View-rect center offset from the monitor center (an OS window's offset):
+    /// `.x` = arc-length meters along the cylinder, `.y` = vertical meters
+    pub center: Vec2,
+    /// Viewer eye in screen space (monitor-center origin, +X right, +Y up, +Z toward viewer)
     pub eye: Vec3,
 }
 
@@ -1370,10 +1373,11 @@ pub(crate) fn rt_pipeline(
     }
 
     // Cylindrical-window raygen params (zeros = mode off, planar unproject).
+    // `.w` slots carry the view-rect center: arc angle offset + vertical meters.
     let window_arc = cyl_window.map_or(Vec4::ZERO, |w| {
-        Vec4::new(w.arc_angle, w.radius, w.height, 0.0)
+        Vec4::new(w.arc_angle, w.radius, w.height, w.center.x / w.radius.max(1e-3))
     });
-    let window_eye = cyl_window.map_or(Vec4::ZERO, |w| w.eye.extend(0.0));
+    let window_eye = cyl_window.map_or(Vec4::ZERO, |w| w.eye.extend(w.center.y));
 
     let camera_inputs = RtCamera {
         inverse_view_proj: world_from_clip.to_cols_array(),
