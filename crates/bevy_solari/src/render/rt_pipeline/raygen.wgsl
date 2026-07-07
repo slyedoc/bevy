@@ -536,6 +536,14 @@ fn raygen(
                 select(0.0, 1.0, canon_ok),
                 surf_raw.normal_oct, surf_raw.view_z, 0u, 0u,
             );
+            // Domain split: a bounce-1 MISS (sky/env) or delta pdf has no
+            // reconnection vertex — that suffix shades live per-frame, and the
+            // draw still counts toward M (W averages over ALL draws).
+            var gi_env = vec3<f32>(0.0);
+            if !canon_ok {
+                gi_env = a0 * (gi_L - gi_e1);
+            }
+            sel.m = 1.0;
             let cur_slot = pixel_index * 2u + (camera.frame.x & 1u);
             let has_surface = primary_cluster != 0xffffffffu;
             if !has_surface {
@@ -544,11 +552,16 @@ fn raygen(
             // Spatial pass owns the reservoir shade (flag bit 16); raygen keeps
             // the per-pixel emission term and the dead-sample live fallback.
             let gi_pass_owns = (eflags & 65536u) != 0u;
+            gi_out = a0 * gi_e1 + gi_env;
             if (eflags & 128u) != 0u && has_surface {
                 // Temporal merge with last frame's slot (prev parity), validated by
                 // the generating surface's depth/normal; p̂ re-evaluated here.
-                var sel_phat = gi_phat(surf, sel);
-                var w_sum = sel_phat * sel.w * sel.m;
+                var sel_phat = 0.0;
+                var w_sum = 0.0;
+                if canon_ok {
+                    sel_phat = gi_phat(surf, sel);
+                    w_sum = sel_phat * sel.w * sel.m;
+                }
                 var m_total = sel.m;
                 let clip = camera.prev_clip_from_world * vec4<f32>(surf.pos, 1.0);
                 if clip.w > 1.0e-4 {
@@ -578,17 +591,16 @@ fn raygen(
                     sel.w = w_sum / (m_total * sel_phat);
                 }
                 gi_samples[cur_slot] = sel;
-                if m_total > 0.0 {
-                    gi_out = a0 * gi_e1;
-                    if !gi_pass_owns {
-                        gi_out += gi_shade(surf, sel) * sel.w;
-                    }
+                if !gi_pass_owns && sel.w > 0.0 {
+                    gi_out += gi_shade(surf, sel) * sel.w;
                 }
             } else {
+                if !canon_ok {
+                    sel.w = 0.0;
+                }
                 gi_samples[cur_slot] = sel;
                 let stored = gi_samples[cur_slot];
-                if stored.m > 0.0 {
-                    gi_out = a0 * gi_e1;
+                if stored.w > 0.0 {
                     if gi_pass_owns {
                     } else if (eflags & 64u) != 0u {
                         gi_out += gi_shade(surf, stored) * stored.w;
