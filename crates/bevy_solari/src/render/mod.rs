@@ -287,6 +287,9 @@ pub struct SolariReference {
     /// (emissive + one NEE/reservoir estimate, no bounces). The standard ReSTIR
     /// evaluation image — indirect noise otherwise buries the DI variance win.
     pub di_only: bool,
+    /// Indirect only (rung 4a): the complement of `di_only` — output `A₀·L_gi`,
+    /// the suffix energy past the primary vertex. di_only + gi_only = full image.
+    pub gi_only: bool,
     /// When false, render fresh frames instead of averaging (estimator levers stay
     /// active). With the rung-0 dump this captures a SINGLE warmed restir frame —
     /// the per-frame variance metric temporal reuse actually improves.
@@ -316,6 +319,7 @@ impl Default for SolariReference {
             restir: false,
             restir_m_cap: 20.0,
             di_only: false,
+            gi_only: false,
             accumulate: true,
             spatial: false,
             spatial_taps: 5,

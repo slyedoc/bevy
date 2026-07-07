@@ -1239,11 +1239,13 @@ pub(crate) fn rt_pipeline(
     let mut accum_n = 0u32;
     let mut accum_spf = 0u32;
     // Estimator flags (also packed into `atmo.w` below): bit 0 = NEE off,
-    // bit 1 = ReSTIR DI, bit 2 = DI only, bit 3 = spatial pass, bits 8..15 = RIS M.
+    // bit 1 = ReSTIR DI, bit 2 = DI only, bit 3 = spatial pass, bit 4 = GI only,
+    // bits 8..15 = RIS M.
     let estimator_flags = reference.is_some_and(|r| r.nee_off) as u32
         | (reference.is_some_and(|r| r.restir) as u32) << 1
         | (reference.is_some_and(|r| r.di_only) as u32) << 2
         | (reference.is_some_and(|r| r.restir && r.spatial) as u32) << 3
+        | (reference.is_some_and(|r| r.gi_only) as u32) << 4
         | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8);
     if let Some(reference) = reference {
         // The spatial pass compiles lazily; until its pipeline is ready its DI is

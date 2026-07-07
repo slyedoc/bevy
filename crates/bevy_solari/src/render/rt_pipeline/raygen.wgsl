@@ -319,6 +319,11 @@ fn raygen(
         // pdf of the BRDF sample that produced this segment (0 on the primary ray),
         // threaded into the hit shader so it can MIS-weight its emissive vs NEE.
         var p_bounce = 0.0;
+        // GI split (rung 4a): radiance ≡ di0 + a0·gi_L, where a0 is the primary
+        // BSDF weight and gi_L the suffix radiance — the ReSTIR GI sample's value.
+        var a0 = vec3<f32>(0.0);
+        var gi_L = vec3<f32>(0.0);
+        var gi_throughput = vec3<f32>(0.0);
 
         for (var bounce = 0u; bounce < MAX_BOUNCES; bounce += 1u) {
             // Black-hole geodesic (stand-in): bend the ray toward the mass and
@@ -417,10 +422,19 @@ fn raygen(
             }
 
             radiance += throughput * payload.emitted;
+            if bounce != 0u {
+                gi_L += gi_throughput * payload.emitted;
+            }
             if payload.bounce == 0u {
                 break;
             }
             throughput *= payload.attenuation;
+            if bounce == 0u {
+                a0 = payload.attenuation;
+                gi_throughput = vec3<f32>(1.0);
+            } else {
+                gi_throughput *= payload.attenuation;
+            }
             origin = payload.next_origin;
             direction = payload.next_direction;
             p_bounce = payload.p_bounce;
@@ -445,7 +459,19 @@ fn raygen(
                     break;
                 }
                 throughput /= p;
+                // Mirror the RR compensation into the split (a0 owns bounce 0's).
+                if bounce == 0u {
+                    a0 /= p;
+                } else {
+                    gi_throughput /= p;
+                }
             }
+        }
+
+        // GI-only estimator (flag bit 4): the complement of di_only — suffix
+        // energy only. di_only + gi_only must sum to the full image (the 4a.0 gate).
+        if (bitcast<u32>(camera.atmo.w) & 16u) != 0u {
+            radiance = a0 * gi_L;
         }
 
         // Atmosphere volumes: attenuate + in-scatter over the primary segment
