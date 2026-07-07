@@ -324,14 +324,17 @@ fn chit_opaque(
             }
             res_m = f32(ris_m);
         }
-        // Visibility rays — the chit's SINGLE traceRay call site. Iterations
-        // 0..dir_rays are the deterministic directional lights (restir mode: the
-        // sun is shaded per light at every vertex, never through a reservoir —
-        // a one-slot reservoir arbitrating sun-vs-lamp patchworks the screen;
-        // brdf_rays_can_hit is false for directionals so no MIS weight applies);
-        // the FINAL iteration is the emissive reservoir winner. Single-site is a
-        // hard rule: a second OpTraceRayKHR in this closest-hit miscompiles on
-        // current drivers (whole-scene black, or Xid 13 — bisected 2026-07-06).
+        // Visibility rays — one shared traceRay site. Iterations 0..dir_rays are
+        // the deterministic directional lights (restir mode: the sun is shaded per
+        // light at every vertex, never through a reservoir — a one-slot reservoir
+        // arbitrating sun-vs-lamp patchworks the screen; brdf_rays_can_hit is false
+        // for directionals so no MIS weight applies); the FINAL iteration is the
+        // emissive reservoir winner. Historical note: this used to be a single-site
+        // HARD RULE — two live call sites black-screened/hung. Root cause was the
+        // naga fork emitting traceRay via a shared per-payload helper fn (a shape
+        // no other toolchain produces; NVIDIA miscompiled the two-call case). Fixed
+        // 2026-07-07: traceRay now emits OpTraceRayKHR inline per call site, and
+        // multi-site chits are safe again. The unified loop stays because it's good.
         var dir_rays = 0u;
         if restir_mode {
             dir_rays = directional_light_count();
