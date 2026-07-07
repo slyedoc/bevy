@@ -56,6 +56,8 @@ const BINDING_SURFACE: u32 = 10;
 // ReSTIR winner resolved-light samples (2 slots × 48 B/pixel): chit-written, read
 // by the wgpu spatial pass so it can reshade without `physical_load`. Always bound.
 const BINDING_LIGHT_SAMPLES: u32 = 11;
+/// ReSTIR GI canonical samples (rung 4a): 2 interleaved 48-B slots per pixel.
+const BINDING_GI_SAMPLES: u32 = 12;
 
 /// Per-frame camera inputs the raygen shader reads — std140-compatible
 /// (mat4 + vec4). `inverse_view_proj` reconstructs a world-space ray per pixel;
@@ -471,7 +473,7 @@ impl RtPipeline {
         }
         // ReSTIR reservoirs: raygen clears the current slot, the chit merges + stores.
         // Surface G-buffer: the chit writes it for the spatial merge+shade pass.
-        for binding in [BINDING_RESERVOIRS, BINDING_SURFACE, BINDING_LIGHT_SAMPLES] {
+        for binding in [BINDING_RESERVOIRS, BINDING_SURFACE, BINDING_LIGHT_SAMPLES, BINDING_GI_SAMPLES] {
             bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(binding)
@@ -752,6 +754,8 @@ impl RtPipeline {
         surface: (vk::Buffer, u64),
         // ReSTIR winner light samples `(VkBuffer, size)` bound at BINDING_LIGHT_SAMPLES.
         light_samples: (vk::Buffer, u64),
+        // ReSTIR GI canonical samples `(VkBuffer, size)` bound at BINDING_GI_SAMPLES.
+        gi_samples: (vk::Buffer, u64),
         env_map_view: vk::ImageView,
         env_map_image: Option<vk::Image>,
     ) -> Option<RtViewBindings> {
@@ -759,7 +763,7 @@ impl RtPipeline {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(4 + gbuffers.len() as u32), // output + reservoirs + surface + light_samples + DLSS guides
+                .descriptor_count(5 + gbuffers.len() as u32), // output + reservoirs + surface + light_samples + gi_samples + DLSS guides
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(1), // camera (ringed)
@@ -849,6 +853,10 @@ impl RtPipeline {
             .buffer(light_samples.0)
             .offset(0)
             .range(light_samples.1)];
+        let gi_samples_info = [vk::DescriptorBufferInfo::default()
+            .buffer(gi_samples.0)
+            .offset(0)
+            .range(gi_samples.1)];
         // DLSS guide descriptors built outside `writes` so the per-binding infos
         // outlive `update_descriptor_sets` (empty when the feature is off).
         #[cfg(feature = "dlss")]
@@ -903,6 +911,11 @@ impl RtPipeline {
                 .dst_binding(BINDING_LIGHT_SAMPLES)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&light_samples_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_GI_SAMPLES)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&gi_samples_info),
         ];
         #[cfg(feature = "dlss")]
         {

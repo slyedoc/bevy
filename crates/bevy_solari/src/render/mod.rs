@@ -290,6 +290,14 @@ pub struct SolariReference {
     /// Indirect only (rung 4a): the complement of `di_only` — output `A₀·L_gi`,
     /// the suffix energy past the primary vertex. di_only + gi_only = full image.
     pub gi_only: bool,
+    /// ReSTIR GI (rung 4a.1): raygen stores the canonical GI sample
+    /// `{x_s, n_s, L_gi, pdf, a0}` per pixel and shades GI from the STORED sample
+    /// (buffer round-trip gate — must equal plain PT per-path).
+    pub restir_gi: bool,
+    /// With `restir_gi`: reshade `f(x_v,ω)·cos·L/pdf` from the surface G-buffer
+    /// instead of the stored exact `a0` — the reconnection-shift shading path
+    /// temporal/spatial reuse will rely on (gate: accumulated unbiasedness).
+    pub gi_recon: bool,
     /// When false, render fresh frames instead of averaging (estimator levers stay
     /// active). With the rung-0 dump this captures a SINGLE warmed restir frame —
     /// the per-frame variance metric temporal reuse actually improves.
@@ -320,6 +328,8 @@ impl Default for SolariReference {
             restir_m_cap: 20.0,
             di_only: false,
             gi_only: false,
+            restir_gi: false,
+            gi_recon: false,
             accumulate: true,
             spatial: false,
             spatial_taps: 5,

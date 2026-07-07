@@ -5,7 +5,8 @@ enable wgpu_ray_query;
 #import bevy_solari::pbr::D_GGX
 #import bevy_solari::pbr::{rand_f, rand_vec2f, rand_u, rand_range_u}
 #import bevy_render::maths::{PI_2, orthonormalize}
-#import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, active_light_list, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, resolve_ray_hit_full, offset_ray_origin, load_material_bindless, material_ids, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD, clusters, instance_cluster_ranges}
+#import bevy_render::utils::octahedral_decode_signed
+#import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, active_light_list, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, resolve_ray_hit_full, offset_ray_origin, load_material_bindless, material_ids, ResolvedRayHitFull, ResolvedMaterial, MIRROR_ROUGHNESS_THRESHOLD, clusters, instance_cluster_ranges}
 
 fn power_heuristic(f: f32, g: f32) -> f32 {
     return balance_heuristic(f * f, g * g);
@@ -131,6 +132,66 @@ struct SurfaceGbuf {
     wo_oct: u32,         // view dir (-ray_direction) — world_position is ABSOLUTE, so
                          // the pass can't reconstruct wo from position alone
     pad_b: u32,
+}
+
+// Rung 4a: canonical ReSTIR GI sample — the first-bounce reconnection vertex plus
+// the suffix radiance through it. 48 B (16-byte-size law for raw-VK↔wgpu structs).
+struct GiSample {
+    pos_x: f32,      // x_s (bounce-1 offset ray origin)
+    pos_y: f32,
+    pos_z: f32,
+    normal_oct: u32, // n_s, snorm-oct
+    l_r: f32,        // L_gi: suffix radiance, primary BSDF weight divided out
+    l_g: f32,
+    l_b: f32,
+    pdf: f32,        // solid-angle pdf of ω₁ at generation; 0 = dead sample
+    a0_r: f32,       // exact primary BSDF weight f·cos/pdf (incl. its RR share)
+    a0_g: f32,
+    a0_b: f32,
+    m: f32,          // sample count (canonical = 1; grows at 4a.2 temporal merge)
+}
+
+// The ONE SurfaceGbuf decode shared by the spatial pass and raygen (producer/
+// consumer single-source law). `f_ab` stays zero — F_AB lives in `brdf` and
+// sampling is brdf-free; callers fill it.
+struct Surf {
+    pos: vec3<f32>,
+    view_z: f32,
+    ns: vec3<f32>,
+    ng: vec3<f32>,
+    mat: ResolvedMaterial,
+    wo: vec3<f32>,
+    f_ab: vec2<f32>,
+}
+
+fn unpack_surface(s: SurfaceGbuf) -> Surf {
+    var out: Surf;
+    out.pos = vec3<f32>(s.pos_x, s.pos_y, s.pos_z);
+    out.view_z = s.view_z;
+    out.ns = octahedral_decode_signed(unpack2x16snorm(s.normal_oct));
+    out.ng = octahedral_decode_signed(unpack2x16snorm(s.geo_normal_oct));
+    let c_rg = unpack2x16float(s.color_rg);
+    let c_bm = unpack2x16float(s.color_b_metallic);
+    let r_pr = unpack2x16float(s.rough_prough);
+    let refl = unpack2x16float(s.reflectance);
+    var m: ResolvedMaterial;
+    m.base_color = vec3<f32>(c_rg, c_bm.x);
+    m.emissive = vec3<f32>(0.0);
+    m.reflectance = refl.x;
+    m.roughness = r_pr.x;
+    m.perceptual_roughness = r_pr.y;
+    m.metallic = c_bm.y;
+    m.specular_transmission = 0.0;
+    m.ior = 1.5;
+    m.dispersion = 0.0;
+    m.extinction = vec3<f32>(0.0);
+    m.nested_priority = 0u;
+    out.mat = m;
+    // wo is stored by the chit: world_position is absolute, so the consumer
+    // can't reconstruct the view dir as normalize(-pos).
+    out.wo = octahedral_decode_signed(unpack2x16snorm(s.wo_oct));
+    out.f_ab = vec2<f32>(0.0);
+    return out;
 }
 
 struct ResolvedLightSample {

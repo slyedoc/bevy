@@ -15,7 +15,7 @@
 //       count only the M that could have produced it (Bitterli Alg. 6).
 enable wgpu_ray_query;
 
-#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, StoredLight, ResolvedLightSample, unpack_stored_light, NULL_LIGHT_ID, calculate_resolved_light_contribution, power_heuristic, pick_luminance}
+#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, Surf, unpack_surface, StoredLight, ResolvedLightSample, unpack_stored_light, NULL_LIGHT_ID, calculate_resolved_light_contribution, power_heuristic, pick_luminance}
 #import bevy_solari::brdf::{evaluate_brdf, brdf_pdf, F_AB}
 #import bevy_solari::scene_bindings::{offset_ray_origin, ResolvedMaterial, tlas, RAY_T_MIN, RAY_T_MAX, RAY_NO_CULL}
 #import bevy_solari::pbr::rand_f
@@ -49,44 +49,9 @@ struct SpatialParams {
 const MAX_TAPS: u32 = 8u;
 
 // Unpacked shading state for one pixel's surface.
-struct Surf {
-    pos: vec3<f32>,
-    view_z: f32,
-    ns: vec3<f32>,
-    ng: vec3<f32>,
-    mat: ResolvedMaterial,
-    wo: vec3<f32>,
-    f_ab: vec2<f32>,
-}
-
 fn load_surf(px: u32) -> Surf {
-    let s = surfaces[px];
-    var out: Surf;
-    out.pos = vec3<f32>(s.pos_x, s.pos_y, s.pos_z);
-    out.view_z = s.view_z;
-    out.ns = octahedral_decode_signed(unpack2x16snorm(s.normal_oct));
-    out.ng = octahedral_decode_signed(unpack2x16snorm(s.geo_normal_oct));
-    let c_rg = unpack2x16float(s.color_rg);
-    let c_bm = unpack2x16float(s.color_b_metallic);
-    let r_pr = unpack2x16float(s.rough_prough);
-    let refl = unpack2x16float(s.reflectance);
-    var m: ResolvedMaterial;
-    m.base_color = vec3<f32>(c_rg, c_bm.x);
-    m.emissive = vec3<f32>(0.0);
-    m.reflectance = refl.x;
-    m.roughness = r_pr.x;
-    m.perceptual_roughness = r_pr.y;
-    m.metallic = c_bm.y;
-    m.specular_transmission = 0.0;
-    m.ior = 1.5;
-    m.dispersion = 0.0;
-    m.extinction = vec3<f32>(0.0);
-    m.nested_priority = 0u;
-    out.mat = m;
-    // View dir stored by the chit (world_position is absolute, not camera-relative,
-    // so it can't be reconstructed as normalize(-pos)).
-    out.wo = octahedral_decode_signed(unpack2x16snorm(s.wo_oct));
-    out.f_ab = F_AB(m.perceptual_roughness, max(dot(out.ns, out.wo), 1.0e-4));
+    var out = unpack_surface(surfaces[px]);
+    out.f_ab = F_AB(out.mat.perceptual_roughness, max(dot(out.ns, out.wo), 1.0e-4));
     return out;
 }
 

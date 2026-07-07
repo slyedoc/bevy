@@ -521,6 +521,12 @@ pub struct RtOutputBuffer {
     pub light_samples: bevy_render::render_resource::Buffer,
     pub light_samples_raw: vk::Buffer,
     pub light_samples_size: u64,
+    /// ReSTIR GI canonical samples (rung 4a): 2 slots/pixel × 48 B, slot-indexed
+    /// like `reservoirs`. Raygen-written at path end (the suffix radiance is only
+    /// known there), raygen-read for the store/recon shade gates.
+    pub gi_samples: bevy_render::render_resource::Buffer,
+    pub gi_samples_raw: vk::Buffer,
+    pub gi_samples_size: u64,
     /// DLSS ray-reconstruction guide G-buffers — normal+roughness, diffuse+depth,
     /// specular+hit-distance, and motion vectors — each `pixels` × `vec4<f32>`,
     /// allocated and reallocated alongside the color output. Written by the
@@ -709,12 +715,29 @@ pub fn prepare_rt_output(
             .map(|b| b.raw_handle())
             .expect("rt_restir_light_samples buffer must be Vulkan-backed");
         let light_samples: bevy_render::render_resource::Buffer = light_samples.into();
+        // GI canonical samples (rung 4a): 2 slots × 48 B per pixel, zero-cleared
+        // (pdf=0 = dead sample).
+        let gi_samples_size = pixels as u64 * 96;
+        let gi_samples = allocator.create_buffer(
+            &render_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            gi_samples_size,
+            MemoryLocation::GpuOnly,
+            "rt_restir_gi_samples",
+        );
+        // SAFETY: Vulkan-backed (Allocator only builds VkBuffers).
+        let gi_samples_raw = unsafe { gi_samples.as_hal::<VkApi>() }
+            .map(|b| b.raw_handle())
+            .expect("rt_restir_gi_samples buffer must be Vulkan-backed");
+        let gi_samples: bevy_render::render_resource::Buffer = gi_samples.into();
         let mut clear_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("rt_reservoirs_clear"),
         });
         clear_encoder.clear_buffer(&reservoirs, 0, None);
         clear_encoder.clear_buffer(&surface, 0, None);
         clear_encoder.clear_buffer(&light_samples, 0, None);
+        clear_encoder.clear_buffer(&gi_samples, 0, None);
         render_queue.submit([clear_encoder.finish()]);
         commands.entity(entity).insert(RtOutputBuffer {
             buffer: buffer.into(),
@@ -733,6 +756,9 @@ pub fn prepare_rt_output(
             light_samples,
             light_samples_raw,
             light_samples_size,
+            gi_samples,
+            gi_samples_raw,
+            gi_samples_size,
             #[cfg(feature = "dlss")]
             gbuffer,
         });
@@ -1168,6 +1194,7 @@ pub(crate) fn rt_pipeline(
                         (output.reservoirs_raw, output.reservoirs_size),
                         (output.surface_raw, output.surface_size),
                         (output.light_samples_raw, output.light_samples_size),
+                        (output.gi_samples_raw, output.gi_samples_size),
                         env_view,
                         environment_map_image,
                     ) {
@@ -1240,12 +1267,15 @@ pub(crate) fn rt_pipeline(
     let mut accum_spf = 0u32;
     // Estimator flags (also packed into `atmo.w` below): bit 0 = NEE off,
     // bit 1 = ReSTIR DI, bit 2 = DI only, bit 3 = spatial pass, bit 4 = GI only,
-    // bits 8..15 = RIS M.
+    // bit 5 = ReSTIR GI (rung 4a), bit 6 = GI shade reconstructed from the
+    // surface G-buffer (vs the stored exact a0), bits 8..15 = RIS M.
     let estimator_flags = reference.is_some_and(|r| r.nee_off) as u32
         | (reference.is_some_and(|r| r.restir) as u32) << 1
         | (reference.is_some_and(|r| r.di_only) as u32) << 2
         | (reference.is_some_and(|r| r.restir && r.spatial) as u32) << 3
         | (reference.is_some_and(|r| r.gi_only) as u32) << 4
+        | (reference.is_some_and(|r| r.restir_gi) as u32) << 5
+        | (reference.is_some_and(|r| r.restir_gi && r.gi_recon) as u32) << 6
         | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8);
     if let Some(reference) = reference {
         // The spatial pass compiles lazily; until its pipeline is ready its DI is

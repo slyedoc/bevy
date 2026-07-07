@@ -11,7 +11,8 @@ enable wgpu_ray_tracing_pipeline;
 // pipeline layout matches the wgpu-built scene bind group bound at trace time.
 #import bevy_solari::scene_bindings::{tlas, RAY_T_MIN, RAY_T_MAX}
 #import bevy_solari::rt_payload::{RtPayload, RtCamera}
-#import bevy_solari::sampling::Reservoir
+#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, GiSample, Surf, unpack_surface}
+#import bevy_solari::brdf::{evaluate_brdf, F_AB}
 #import bevy_solari::pbr::rand_f
 #import bevy_solari::atmosphere::{atmosphere_ray_sphere_near, atmosphere_ray_sphere_far, atmosphere_rayleigh_phase, atmosphere_mie_phase}
 #import bevy_render::utils::octahedral_decode_signed
@@ -49,6 +50,11 @@ const BH_CAPTURE_RADIUS: f32 = 0.5;
 // (see `Reservoir`). raygen clears this pixel's CURRENT slot; the opaque chit
 // fills it on a primary hit — sky/glass pixels then carry dead (M=0) history.
 @group(1) @binding(9) var<storage, read_write> reservoirs: array<Reservoir>;
+// Primary-surface shading inputs (chit-written in spatial/GI modes) — the GI
+// reshade reads them at path end.
+@group(1) @binding(10) var<storage, read_write> surfaces: array<SurfaceGbuf>;
+// ReSTIR GI canonical samples (rung 4a): 2 slots/pixel, interleaved by parity.
+@group(1) @binding(12) var<storage, read_write> gi_samples: array<GiSample>;
 // Sentinel pixel index: this bounce writes no guide/reservoir (every non-primary bounce).
 const NO_GBUFFER: u32 = 0xffffffffu;
 
@@ -321,9 +327,15 @@ fn raygen(
         var p_bounce = 0.0;
         // GI split (rung 4a): radiance ≡ di0 + a0·gi_L, where a0 is the primary
         // BSDF weight and gi_L the suffix radiance — the ReSTIR GI sample's value.
+        var di0 = vec3<f32>(0.0);
         var a0 = vec3<f32>(0.0);
         var gi_L = vec3<f32>(0.0);
         var gi_throughput = vec3<f32>(0.0);
+        // Canonical GI sample capture: the bounce-1 hit (reconnection vertex).
+        var gi_xs = vec3<f32>(0.0);
+        var gi_ns_oct = 0u;
+        var gi_pdf1 = 0.0;
+        var gi_hit = false;
 
         for (var bounce = 0u; bounce < MAX_BOUNCES; bounce += 1u) {
             // Black-hole geodesic (stand-in): bend the ray toward the mass and
@@ -422,8 +434,16 @@ fn raygen(
             }
 
             radiance += throughput * payload.emitted;
-            if bounce != 0u {
+            if bounce == 0u {
+                di0 = payload.emitted;
+            } else {
                 gi_L += gi_throughput * payload.emitted;
+            }
+            // Reconnection vertex: the bounce-1 hit (offset origin + its normal).
+            if bounce == 1u {
+                gi_hit = payload.hit_cluster != 0xffffffffu;
+                gi_xs = payload.next_origin;
+                gi_ns_oct = payload.hit_normal_oct;
             }
             if payload.bounce == 0u {
                 break;
@@ -432,6 +452,7 @@ fn raygen(
             if bounce == 0u {
                 a0 = payload.attenuation;
                 gi_throughput = vec3<f32>(1.0);
+                gi_pdf1 = payload.p_bounce;
             } else {
                 gi_throughput *= payload.attenuation;
             }
@@ -468,10 +489,45 @@ fn raygen(
             }
         }
 
+        // Rung-4a estimator overrides, all built on the di0/GI split.
+        let eflags = bitcast<u32>(camera.atmo.w);
+        var gi_out = a0 * gi_L;
+        // ReSTIR GI (bit 5): persist the canonical sample, then shade GI from the
+        // STORE — exact stored a0 (round-trip gate) or, with bit 6, the SurfaceGbuf
+        // BRDF reconstruction (the path reuse will live on). Dead samples (sky or
+        // delta suffix) keep the live a0·gi_L.
+        if (eflags & 32u) != 0u {
+            let slot = pixel_index * 2u + (camera.frame.x & 1u);
+            gi_samples[slot] = GiSample(
+                gi_xs.x, gi_xs.y, gi_xs.z, gi_ns_oct,
+                gi_L.x, gi_L.y, gi_L.z, select(0.0, gi_pdf1, gi_hit),
+                a0.x, a0.y, a0.z, 1.0,
+            );
+            let stored = gi_samples[slot];
+            if stored.pdf > 0.0 {
+                if (eflags & 64u) != 0u {
+                    var surf = unpack_surface(surfaces[pixel_index]);
+                    surf.f_ab = F_AB(surf.mat.perceptual_roughness, max(dot(surf.ns, surf.wo), 1.0e-4));
+                    let to_s = vec3<f32>(stored.pos_x, stored.pos_y, stored.pos_z) - surf.pos;
+                    let dist = length(to_s);
+                    if dist > 1.0e-6 {
+                        let wi = to_s / dist;
+                        // evaluate_brdf already folds NdotL — no extra cos here
+                        // (an extra ⟨cos⟩ shows as a ~0.67 uniform deficit).
+                        let f = evaluate_brdf(surf.wo, wi, surf.ns, surf.mat, surf.f_ab);
+                        gi_out = f * vec3<f32>(stored.l_r, stored.l_g, stored.l_b) / stored.pdf;
+                    }
+                } else {
+                    gi_out = vec3<f32>(stored.a0_r, stored.a0_g, stored.a0_b)
+                        * vec3<f32>(stored.l_r, stored.l_g, stored.l_b);
+                }
+            }
+            radiance = di0 + gi_out;
+        }
         // GI-only estimator (flag bit 4): the complement of di_only — suffix
         // energy only. di_only + gi_only must sum to the full image (the 4a.0 gate).
-        if (bitcast<u32>(camera.atmo.w) & 16u) != 0u {
-            radiance = a0 * gi_L;
+        if (eflags & 16u) != 0u {
+            radiance = gi_out;
         }
 
         // Atmosphere volumes: attenuate + in-scatter over the primary segment

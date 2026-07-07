@@ -106,6 +106,16 @@ struct Args {
     #[argh(switch)]
     gi_only: bool,
 
+    /// reSTIR GI (rung 4a.1): shade GI from the stored canonical sample —
+    /// the buffer round-trip gate (must equal plain PT per-path)
+    #[argh(switch)]
+    restir_gi: bool,
+
+    /// with --restir-gi: reshade f·cos·L/pdf from the surface G-buffer instead of
+    /// the stored exact a0 — the reconnection-shift shading path (gate: unbiased)
+    #[argh(switch)]
+    gi_recon: bool,
+
     /// disable accumulation: fresh frames each frame (restir history stays warm).
     /// With `--rung0`, the 5s dump captures ONE frame — per-frame variance metric
     #[argh(switch)]
@@ -166,6 +176,8 @@ fn main() {
             restir: args.restir,
             di_only: args.di_only,
             gi_only: args.gi_only,
+            restir_gi: args.restir_gi,
+            gi_recon: args.gi_recon,
             no_accum: args.no_accum,
             spatial: args.spatial,
             zcount: args.zcount,
@@ -234,6 +246,8 @@ struct SceneArgs {
     restir: bool,
     di_only: bool,
     gi_only: bool,
+    restir_gi: bool,
+    gi_recon: bool,
     no_accum: bool,
     spatial: bool,
     zcount: bool,
@@ -515,6 +529,8 @@ fn setup_furnace(
             restir: args.restir,
             di_only: args.di_only,
             gi_only: args.gi_only,
+            restir_gi: args.restir_gi,
+            gi_recon: args.gi_recon,
             accumulate: !args.no_accum,
             spatial: args.spatial,
             spatial_unbiased: args.zcount,
@@ -681,6 +697,8 @@ fn setup_room(
             restir: args.restir,
             di_only: args.di_only,
             gi_only: args.gi_only,
+            restir_gi: args.restir_gi,
+            gi_recon: args.gi_recon,
             accumulate: !args.no_accum,
             spatial: args.spatial,
             spatial_unbiased: args.zcount,
@@ -770,6 +788,8 @@ fn setup_lamps(
             restir: args.restir,
             di_only: args.di_only,
             gi_only: args.gi_only,
+            restir_gi: args.restir_gi,
+            gi_recon: args.gi_recon,
             accumulate: !args.no_accum,
             spatial: args.spatial,
             spatial_unbiased: args.zcount,
@@ -885,6 +905,8 @@ fn setup_cell(
             restir: args.restir,
             di_only: args.di_only,
             gi_only: args.gi_only,
+            restir_gi: args.restir_gi,
+            gi_recon: args.gi_recon,
             accumulate: !args.no_accum,
             spatial: args.spatial,
             spatial_unbiased: args.zcount,
@@ -972,6 +994,8 @@ fn setup_yard(
             restir: args.restir,
             di_only: args.di_only,
             gi_only: args.gi_only,
+            restir_gi: args.restir_gi,
+            gi_recon: args.gi_recon,
             accumulate: !args.no_accum,
             spatial: args.spatial,
             spatial_unbiased: args.zcount,
@@ -1221,15 +1245,17 @@ impl ExamAppExt for App {
         let secs = duration.or_else(|| std::env::var_os("CLAUDECODE").map(|_| agent_default));
         if let Some(secs) = secs {
             self.insert_resource(Timeout(Timer::from_seconds(secs, TimerMode::Once)))
-                .add_systems(
-                    Update,
-                    |time: Res<Time>, mut t: ResMut<Timeout>, mut exit: MessageWriter<AppExit>| {
-                        if t.0.tick(time.delta()).just_finished() {
-                            info!("timeout reached, exiting");
-                            exit.write(AppExit::Success);
-                        }
-                    },
-                );
+                .add_systems(Update, |time: Res<Time>, mut t: ResMut<Timeout>| {
+                    if t.0.tick(time.delta()).just_finished() {
+                        info!("timeout reached, exiting");
+                        // Hard exit: skip teardown (device-heavy shutdown otherwise
+                        // segfaults after success and taints the exam's exit code).
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                        let _ = std::io::stderr().flush();
+                        std::process::exit(0);
+                    }
+                });
         }
         self
     }

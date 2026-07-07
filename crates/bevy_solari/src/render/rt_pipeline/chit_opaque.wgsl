@@ -161,6 +161,9 @@ fn chit_opaque(
     let nee_off = (flags & 1u) != 0u;
     let restir_mode = (flags & 2u) != 0u;
     let spatial_on = restir_mode && (flags & 8u) != 0u;
+    // ReSTIR GI (rung 4a, flag bit 5): raygen shades GI from the stored canonical
+    // sample and needs this surface's shading inputs in the SurfaceGbuf.
+    let gi_mode = (flags & 32u) != 0u;
     let is_primary = payload.gbuffer_pixel != NO_GBUFFER;
 
     // Emissive contribution, MIS-weighted against NEE on all but the primary ray.
@@ -399,24 +402,27 @@ fn chit_opaque(
         // Persist the merged reservoir for next frame's temporal pass. Stored
         // regardless of the winner's visibility (no visibility reuse yet — zeroing
         // W on occlusion is the session-2 bias study, it darkens under merge).
-        if restir_mode && is_primary {
-            var store_w = 0.0;
-            if sel_phat > 0.0 && res_m > 0.0 {
-                store_w = w_sum / (res_m * sel_phat);
-            }
+        if (restir_mode || gi_mode) && is_primary {
             let view_z = -(camera.view_from_world * vec4<f32>(ray_hit.world_position, 1.0)).z;
-            reservoirs[payload.gbuffer_pixel * 2u + (camera.frame.x & 1u)] = Reservoir(
-                sel.light_id,
-                sel.seed,
-                res_m,
-                store_w,
-                pack2x16snorm(octahedral_encode(world_normal) * 2.0 - 1.0),
-                max(view_z, 1.0e-4),
-                0u,
-                0u,
-            );
-            // Surface attrs for the spatial pass's p̂ re-target + shade.
-            if spatial_on {
+            if restir_mode {
+                var store_w = 0.0;
+                if sel_phat > 0.0 && res_m > 0.0 {
+                    store_w = w_sum / (res_m * sel_phat);
+                }
+                reservoirs[payload.gbuffer_pixel * 2u + (camera.frame.x & 1u)] = Reservoir(
+                    sel.light_id,
+                    sel.seed,
+                    res_m,
+                    store_w,
+                    pack2x16snorm(octahedral_encode(world_normal) * 2.0 - 1.0),
+                    max(view_z, 1.0e-4),
+                    0u,
+                    0u,
+                );
+            }
+            // Surface attrs: the spatial pass's p̂ re-target + shade, and (gi_mode)
+            // raygen's GI reshade at path end.
+            if spatial_on || gi_mode {
                 surfaces[payload.gbuffer_pixel] = SurfaceGbuf(
                     ray_hit.world_position.x,
                     ray_hit.world_position.y,
@@ -431,6 +437,8 @@ fn chit_opaque(
                     pack2x16snorm(octahedral_encode(wo) * 2.0 - 1.0),
                     0u,
                 );
+            }
+            if spatial_on {
                 // Resolve the winner once here (chit has `physical_load`) and store it
                 // so the wgpu spatial pass can reshade neighbors without bindless loads.
                 let slot = payload.gbuffer_pixel * 2u + (camera.frame.x & 1u);
