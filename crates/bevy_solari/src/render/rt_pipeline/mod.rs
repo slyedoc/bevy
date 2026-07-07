@@ -1378,12 +1378,17 @@ pub(crate) fn rt_pipeline(
         // temporal always, spatial only when taps > 0 (at 0 the pass doesn't
         // run and the chit/raygen shade their own reservoirs directly). DLSS
         // RR is the denoiser downstream.
+        // Bit 19 = history decorrelation (stochastic-bilinear reprojection
+        // fetch + temporal reconnection Jacobian): whitens the moiré grid the
+        // quantized fetch shows under motion — for the RR path only, so the
+        // certified reference estimator stays untouched.
         let spatial = rt.spatial_taps > 0;
         1 << 1
             | (spatial as u32) << 3
             | ((rt.gi as u32) * (1 << 5 | 1 << 7))
             | ((rt.gi && spatial) as u32) << 16
             | (rt.ris_candidates.min(255) << 8)
+            | 1 << 19
     } else {
         reference.is_some_and(|r| r.nee_off) as u32
             | (reference.is_some_and(|r| r.restir) as u32) << 1
