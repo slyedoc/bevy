@@ -244,27 +244,32 @@ fn spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // Winner visibility from the target — also the own contributor's visibility.
+    let origin = offset_ray_origin(surf.pos, surf.ng);
+    let visible = spatial_visibility(origin, sel_pos);
+
     // Denominator: naive M-sum (biased dark where a contributor's domain can't
-    // produce the winner) or the Z-count of M that actually could.
+    // produce the winner) or the visibility-aware 1/Z — count a contributor's M
+    // only if the winner is in its unshadowed domain AND actually VISIBLE from it
+    // (the shadow-boundary fix; one shadow ray per contributor).
     var m_denom = m_total;
     if params.unbiased == 1u {
         var z = 0.0;
         for (var s = 0u; s < src_n; s += 1u) {
-            if src_px[s] == px {
-                z += src_m[s]; // own p̂(winner) > 0 by construction
-                continue;
+            var can_produce = visible > 0.0; // own: reuse the target's trace
+            if src_px[s] != px {
+                let ssurf = load_surf(src_px[s]);
+                can_produce = eval_target(ssurf, sel_ls).phat > 0.0
+                    && spatial_visibility(offset_ray_origin(ssurf.pos, ssurf.ng), sel_pos) > 0.0;
             }
-            let e = eval_target(load_surf(src_px[s]), sel_ls);
-            if e.phat > 0.0 {
+            if can_produce {
                 z += src_m[s];
             }
         }
-        m_denom = max(z, src_m[0]);
+        m_denom = max(z, 1.0e-4);
     }
 
     let big_w = w_sum / max(m_denom * sel_phat, 1.0e-12);
-    let origin = offset_ray_origin(surf.pos, surf.ng);
-    let visible = spatial_visibility(origin, sel_pos);
     // Debug: BLUE = winner occluded (all-blue floor = ray query broken);
     // GREEN = visible, DI would land. Numbers via the probe readback.
     if debug {
