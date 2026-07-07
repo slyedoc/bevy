@@ -30,6 +30,7 @@ struct RtCamera {
     world_from_view: mat4x4<f32>,
     window_arc: vec4<f32>,
     window_eye: vec4<f32>,
+    origin_delta: vec4<f32>,
 }
 
 struct CameraPassParams {
@@ -176,11 +177,13 @@ fn rt_camera() {
     // Without this, camera translation produces ~zero motion vectors on static geometry.
     // The CPU-supplied reframe (teleports / explicit frame handoffs) composes after it.
     var prev = clip_from_world;
+    var origin_delta = vec3<f32>(0.0);
     if prev_cam.valid == 1u {
         prev = prev_cam.clip_from_world;
         let dx = f32(origin_x - prev_cam.origin_x);
         let dy = f32(origin_y - prev_cam.origin_y);
         let dz = f32(origin_z - prev_cam.origin_z);
+        origin_delta = vec3<f32>(dx, dy, dz);
         let origin_shift = mat4x4<f32>(
             vec4<f32>(1.0, 0.0, 0.0, 0.0),
             vec4<f32>(0.0, 1.0, 0.0, 0.0),
@@ -192,6 +195,8 @@ fn rt_camera() {
             prev = prev * params.reframe_prev_from_current;
         }
     }
+    // Cross-frame reservoir positions (camera-origin space) rebase by this.
+    out_camera.origin_delta = vec4<f32>(origin_delta, 0.0);
     out_camera.prev_clip_from_world = prev;
     prev_cam.clip_from_world = clip_from_world;
     prev_cam.origin_x = origin_x;

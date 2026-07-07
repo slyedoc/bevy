@@ -1565,6 +1565,10 @@ pub(crate) fn rt_pipeline(
         world_from_view: world_from_view.to_cols_array(),
         window_arc: window_arc.to_array(),
         window_eye: window_eye.to_array(),
+        // CPU fallback path: no per-frame origin delta (the GPU camera pass
+        // computes it in f64) — cross-frame reservoir reuse is stale-by-one
+        // under motion there, matching the fallback's best-effort contract.
+        origin_delta: [0.0; 4],
     };
     // Fill this view's GPU camera buffer (bound at a constant dynamic offset 0). The
     // GPU-authoritative path derives the basis from `world[camera_slot]` in the

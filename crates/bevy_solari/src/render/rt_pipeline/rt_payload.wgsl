@@ -77,4 +77,5 @@ struct RtCamera {
     world_from_view: mat4x4<f32>, // camera basis: view→world ray dirs (cylindrical window)
     window_arc: vec4<f32>,        // .x = arc angle (rad); .y = radius m (0 = flat); .z = height m
     window_eye: vec4<f32>,        // .xyz = eye in screen space (center origin, +Z toward viewer)
+    origin_delta: vec4<f32>,      // .xyz = origin_now − origin_prev: cross-frame position rebase
 }

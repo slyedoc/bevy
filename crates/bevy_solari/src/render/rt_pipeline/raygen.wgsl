@@ -572,8 +572,14 @@ fn raygen(
                     let uv = (clip.xy / clip.w) * vec2<f32>(0.5, -0.5) + 0.5;
                     if all(uv >= vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) {
                         let pp = vec2<u32>(uv * camera.dims.xy);
-                        let hist =
+                        var hist =
                             gi_samples[(pp.y * u32(camera.dims.x) + pp.x) * 2u + ((camera.frame.x + 1u) & 1u)];
+                        // World_rel is camera-origin: last frame's stored x_s is
+                        // in last frame's origin. Rebase or the reconnection
+                        // point drifts every frame the camera moves (glitter).
+                        hist.pos_x -= camera.origin_delta.x;
+                        hist.pos_y -= camera.origin_delta.y;
+                        hist.pos_z -= camera.origin_delta.z;
                         let hn = octahedral_decode_signed(unpack2x16snorm(hist.surf_normal_oct));
                         let depth_ok = abs(hist.surf_view_z - surf_raw.view_z) < 0.1 * surf_raw.view_z;
                         if hist.m > 0.0 && depth_ok && dot(hn, surf.ns) > 0.9 {

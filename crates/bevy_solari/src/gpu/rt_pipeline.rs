@@ -109,6 +109,12 @@ pub struct RtCamera {
     /// `.xyz` = viewer eye in screen space (screen-center origin, +X right, +Y up,
     /// +Z toward viewer, meters) — matches the camera's local translation.
     pub window_eye: [f32; 4],
+    /// `.xyz` = this frame's floating-origin translation minus last frame's
+    /// (`origin_now − origin_prev`, f64-computed GPU-side). World_rel is
+    /// camera-origin, so cross-frame reservoir positions must be rebased by
+    /// this or they go stale every frame the camera moves (motion glitter).
+    /// Zero on frame 1 and on the CPU fallback path.
+    pub origin_delta: [f32; 4],
 }
 
 /// Bindless geometry buffer-device-addresses the closest-hit reads via

@@ -951,9 +951,11 @@ fn drain_null_count(resources: &mut Ptlas) {
                 if regular_writes > 0 {
                     // Incremental writes into regular partitions are silently
                     // driver-broken (the CPU-churn constraint, hit GPU-side) —
-                    // redo them via the safe full-rebuild path.
+                    // redo them via the safe full-rebuild path. Fires EVERY
+                    // frame the camera moves (camera-origin transforms churn
+                    // all statics), so debug-level, not per-frame info spam.
                     resources.pending_null_rebuild = true;
-                    tracing::info!(
+                    tracing::debug!(
                         "ptlas: {regular_writes} regular-partition write(s) in an incremental build — forcing a full restamp (driver constraint)"
                     );
                 }
