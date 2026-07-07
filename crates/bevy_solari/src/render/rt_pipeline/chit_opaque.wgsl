@@ -258,24 +258,11 @@ fn chit_opaque(
                     if prev_clip.w > 1.0e-4 {
                         let prev_uv = (prev_clip.xy / prev_clip.w) * vec2<f32>(0.5, -0.5) + 0.5;
                         if all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv < vec2<f32>(1.0)) {
-                            // Stochastic bilinear history pick (flag bit 19,
-                            // the RR/production path — see raygen's GI fetch):
-                            // nearest-neighbor reprojection under motion is a
-                            // zoomed lattice — a moiré grid; randomizing over
-                            // the 2×2 footprint whitens it. Reference keeps the
-                            // certified nearest fetch. (DI needs no Jacobian:
-                            // p̂ re-evaluates the full geometry at THIS surface,
-                            // the proven-unbiased spatial-reuse semantics.)
-                            var pp = vec2<u32>(prev_uv * camera.dims.xy);
-                            if (flags & 524288u) != 0u {
-                                let pf = prev_uv * camera.dims.xy - 0.5;
-                                let base = floor(pf);
-                                let fr = pf - base;
-                                let jit = base
-                                    + vec2<f32>(select(0.0, 1.0, rand_f(&rng) < fr.x),
-                                                select(0.0, 1.0, rand_f(&rng) < fr.y));
-                                pp = vec2<u32>(clamp(jit, vec2<f32>(0.0), camera.dims.xy - 1.0));
-                            }
+                            // DI keeps the nearest fetch: the stochastic pick is
+                            // re-landing one domain at a time (GI first — see
+                            // raygen) to pin the edge-fizz source before DI gets
+                            // its own jitter + fallback.
+                            let pp = vec2<u32>(prev_uv * camera.dims.xy);
                             let prev_slot = (pp.y * u32(camera.dims.x) + pp.x) * 2u
                                 + (1u - (camera.frame.x & 1u));
                             let prev = reservoirs[prev_slot];

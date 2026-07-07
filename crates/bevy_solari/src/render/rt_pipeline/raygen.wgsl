@@ -578,6 +578,13 @@ fn raygen(
                         // Randomizing over the 2×2 footprint by its bilinear
                         // weights turns that into white noise. The reference
                         // keeps the certified nearest fetch.
+                        //
+                        // The jittered pick is used only if its record VALIDATES
+                        // against this surface — else fall back to nearest.
+                        // Without the fallback, pixels along creases and
+                        // silhouettes (where the jitter straddles a validation
+                        // boundary) reject history ~half the frames and run
+                        // chronically cold — the white edge fizz.
                         let decorrelate = (eflags & 524288u) != 0u;
                         var pp = vec2<u32>(uv * camera.dims.xy);
                         if decorrelate {
@@ -587,7 +594,16 @@ fn raygen(
                             let jit = base
                                 + vec2<f32>(select(0.0, 1.0, rand_f(&rng) < fr.x),
                                             select(0.0, 1.0, rand_f(&rng) < fr.y));
-                            pp = vec2<u32>(clamp(jit, vec2<f32>(0.0), camera.dims.xy - 1.0));
+                            let pj = vec2<u32>(clamp(jit, vec2<f32>(0.0), camera.dims.xy - 1.0));
+                            let peek =
+                                gi_samples[(pj.y * u32(camera.dims.x) + pj.x) * 2u + ((camera.frame.x + 1u) & 1u)];
+                            let peek_n =
+                                octahedral_decode_signed(unpack2x16snorm(peek.surf_normal_oct));
+                            if peek.m > 0.0
+                                && abs(peek.surf_view_z - surf_raw.view_z) < 0.1 * surf_raw.view_z
+                                && dot(peek_n, surf.ns) > 0.9 {
+                                pp = pj;
+                            }
                         }
                         var hist =
                             gi_samples[(pp.y * u32(camera.dims.x) + pp.x) * 2u + ((camera.frame.x + 1u) & 1u)];
