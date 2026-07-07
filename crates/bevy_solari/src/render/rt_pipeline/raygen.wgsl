@@ -709,17 +709,9 @@ fn raygen(
             // scale GI spikes down luminance-preserving. The pass-owned spatial
             // shade applies the same threshold on its own add.
             if camera.dims.w > 0.0 {
-                var clamp_t = camera.dims.w;
-                // History confidence: a cold chain (disocclusion — moving
-                // silhouettes reject history every frame) is a raw 1-spp
-                // estimator whose spikes a warm chain would dilute by m —
-                // scale the clamp with reservoir age or edges fizz white.
-                if (eflags & 128u) != 0u {
-                    clamp_t *= clamp(sel.m / max(camera.dims.z, 1.0), 0.05, 1.0);
-                }
                 let gi_lum = luminance(gi_out);
-                if gi_lum > clamp_t {
-                    gi_out *= clamp_t / gi_lum;
+                if gi_lum > camera.dims.w {
+                    gi_out *= camera.dims.w / gi_lum;
                 }
             }
             radiance = di0 + gi_out;
