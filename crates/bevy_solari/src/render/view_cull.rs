@@ -60,16 +60,16 @@ pub fn render_layers_to_mask(layers: Option<&RenderLayers>) -> u32 {
 /// brightness (`0.0` ⇒ no skybox ⇒ a ray miss stays black).
 ///
 /// `environment_brightness` is the **raw cd/m²** (`Skybox::brightness`, not
-/// pre-exposed): the pathtracer accumulates raw radiance and applies the camera
-/// exposure once at the end, so the sky is exposed exactly like the rest of the
-/// scene.
+/// pre-exposed): the pathtracer accumulates raw radiance and the display blit
+/// applies the camera exposure at read, so the sky is exposed exactly like the
+/// rest of the scene.
 #[derive(Clone, Copy, ShaderType)]
 pub struct SolariViewUniform {
     pub cull_mask: UVec4,
     /// Linear-RGB background for a **primary**-ray miss when there's no skybox
-    /// (the camera's resolved `ClearColor`). Displayed as-is (the pathtracer
-    /// divides by exposure so the end-of-loop `× exposure` cancels), then
-    /// tonemapped — matching the raster framebuffer clear.
+    /// (the camera's resolved `ClearColor`), tonemapped — matching the raster
+    /// framebuffer clear. Stored raw; it picks up the blit's exposure like all
+    /// other radiance, so a non-black clear reads as physical luminance.
     pub clear_color: Vec3,
     pub environment_brightness: f32,
     /// `restir_debug` visualization mode (0 = none; see

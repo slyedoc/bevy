@@ -261,7 +261,8 @@ pub struct SolariCamera;
 /// Reference path-tracer mode: while the camera holds still, every frame's samples
 /// are averaged into the output buffer (progressive accumulation) — the ground-truth
 /// image every realtime technique is validated against. Any camera move, projection,
-/// exposure, or viewport change resets the accumulator. Assumes a static scene
+/// or viewport change resets the accumulator (exposure doesn't — the buffer holds
+/// physical radiance and the blit exposes at read). Assumes a static scene
 /// (movers keep re-rendering into the average as ghosting). Debug views and DLSS
 /// bypass accumulation — don't combine.
 #[derive(Component, Reflect, Clone, ExtractComponent)]

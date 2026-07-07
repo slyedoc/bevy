@@ -53,7 +53,8 @@ pub struct RtCameraPassParams {
     pub camera_slot: u32,
     /// World-buffer node high-water — bounds guard for `camera_slot`.
     pub node_count: u32,
-    /// `camera_position.w` — camera exposure (raygen scales final radiance by it).
+    /// `camera_position.w` — camera exposure (tooling only; the trace outputs
+    /// physical radiance and the blit applies exposure at read).
     pub exposure: f32,
     /// 1 = the camera slot is live + propagated this frame; 0 (cold start / slot not
     /// yet allocated) → the shader writes an identity basis instead of reading

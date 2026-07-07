@@ -3,8 +3,8 @@
 // barrier the in-chit path can't provide. Merges K disk-sampled neighbors
 // (depth/normal-validated), traces ONE ray-query visibility ray for the winner,
 // and adds the DI into the accumulated output with the SAME blend weight the
-// raygen used this frame (`output += blend_w · DI · exposure`) — accumulation
-// composes without a history buffer. Shade-only: reservoirs are NOT written
+// raygen used this frame (`output += blend_w · DI`, physical radiance) —
+// accumulation composes without a history buffer. Shade-only: reservoirs are NOT written
 // back, so the bias study isolates the spatial combiner (no feedback loop).
 //
 // Two combiners (`params.unbiased`):
@@ -29,7 +29,7 @@ struct SpatialParams {
     taps: u32,        // neighbor count (≤ MAX_TAPS)
     radius: f32,      // disk radius, pixels
     blend_w: f32,     // raygen's accumulation weight this frame (1 = no accum)
-    exposure: f32,
+    pad_b: f32,
     unbiased: u32,    // 0 = naive M-sum, 1 = Z-count
     pad_a: u32,       // debug paint
     di_on: u32,
@@ -255,7 +255,7 @@ fn di_spatial(px: u32, gid: vec2<u32>) {
     if visible <= 0.0 {
         return;
     }
-    let di = sel_f * big_w * visible * params.exposure * params.blend_w;
+    let di = sel_f * big_w * visible * params.blend_w;
     // Alpha carries the gizmo depth — leave it untouched.
     output[px] = vec4<f32>(output[px].rgb + di, output[px].a);
 }
@@ -393,6 +393,6 @@ fn gi_spatial(px: u32, gid: vec2<u32>) {
         denom_final = sel_phat;
     }
     let big_w = w_sum / max(denom_final, 1.0e-12);
-    let gi = gi_shade(surf, sel) * big_w * params.exposure * params.blend_w;
+    let gi = gi_shade(surf, sel) * big_w * params.blend_w;
     output[px] = vec4<f32>(output[px].rgb + gi, output[px].a);
 }

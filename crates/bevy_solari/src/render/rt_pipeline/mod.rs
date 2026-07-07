@@ -136,7 +136,7 @@ impl Default for SolariCostHeatmap {
 /// Debug view that shows each surface's displacement (height) map as grayscale — a validation
 /// for the displacement-map wiring BEFORE tessellation actually displaces geometry: confirms
 /// which map lands on which surface, the UV mapping, and the height sign. When `enabled`, the
-/// opaque closest-hit replaces shading with the sampled height (exposure-compensated) on surfaces
+/// opaque closest-hit replaces shading with the sampled height on surfaces
 /// that have a `displacement_texture`, and a dim grey elsewhere. Set it from the main world (e.g.
 /// on a keypress) — `bevy_solari::prelude::SolariShowDisplacement`.
 #[derive(Resource, Clone, Copy, Default, ExtractResource)]
@@ -437,7 +437,7 @@ pub struct RestirSpatialParams {
     pub taps: u32,
     pub radius: f32,
     pub blend_w: f32,
-    pub exposure: f32,
+    pub pad_b: f32,
     pub unbiased: u32,
     pub pad_a: u32,
     pub di_on: u32,
@@ -557,14 +557,14 @@ pub struct SolariDlssJitter {
 }
 
 /// Per-view reference-accumulation progress ([`SolariReference`]): samples averaged
-/// so far and the camera/exposure/viewport state they were taken under — any change
-/// resets `n` to 0 (the mean restarts). Written back each dispatch.
+/// so far and the camera/viewport state they were taken under — any change resets
+/// `n` to 0 (the mean restarts). Exposure is NOT part of the identity: the buffer
+/// holds physical radiance, so exposure changes recompose at the blit for free.
 #[derive(Component, Clone)]
 pub struct RtAccumulation {
     pub n: u32,
     camera: bevy_transform::components::GlobalTransform,
     clip_from_view: Mat4,
-    exposure: f32,
     pixels: u32,
     /// Estimator flag bits (nee_off/restir/RIS-M) — an estimator switch restarts
     /// the mean, otherwise a live A/B toggle averages two different estimators.
@@ -1347,7 +1347,6 @@ pub(crate) fn rt_pipeline(
             let same = accumulation.is_some_and(|a| {
                 a.camera == view.world_from_view
                     && a.clip_from_view == view.clip_from_view
-                    && a.exposure == camera.exposure
                     && a.pixels == output.pixels
                     && a.flags == estimator_flags
             });
@@ -1365,7 +1364,6 @@ pub(crate) fn rt_pipeline(
                 n: n_new,
                 camera: view.world_from_view,
                 clip_from_view: view.clip_from_view,
-                exposure: camera.exposure,
                 pixels: output.pixels,
                 flags: estimator_flags,
             });
@@ -1384,8 +1382,8 @@ pub(crate) fn rt_pipeline(
         view_from_world: view_from_world.to_cols_array(),
         clip_from_world: clip_from_world.to_cols_array(),
         prev_clip_from_world: prev_clip_from_world.to_cols_array(),
-        // .xyz = ray origin; .w = camera exposure (raygen scales final radiance by
-        // it, like the megakernel's `radiance *= view.exposure`).
+        // .xyz = ray origin; .w = camera exposure (carried for shader-side tooling;
+        // the trace no longer consumes it — radiance stays physical, the blit exposes).
         camera_position: Vec3::ZERO.extend(camera.exposure).to_array(),
         // .x = frame index (RNG seed); .y = SER material-hint bits =
         // ceil(log2(material_count)), the number of low bits of the SBT-record-index
@@ -1575,9 +1573,9 @@ pub(crate) fn rt_pipeline(
     ctx.add_command_buffer(trace_encoder.finish());
 
     // ReSTIR spatial merge+shade (rung 3): after the trace (all reservoirs +
-    // surfaces exist), before the blit. Adds `blend_w · DI · exposure` into the
-    // accumulated output — the same blend weight the raygen used this frame, so
-    // accumulation composes without a history buffer.
+    // surfaces exist), before the blit. Adds `blend_w · DI` (physical radiance)
+    // into the accumulated output — the same blend weight the raygen used this
+    // frame, so accumulation composes without a history buffer.
     if let Some(rs) = restir_spatial.as_deref_mut() {
         let di_spatial = reference.is_some_and(|r| r.restir && r.spatial);
         let gi_spatial = reference.is_some_and(|r| r.restir_gi && r.gi_spatial);
@@ -1620,7 +1618,7 @@ pub(crate) fn rt_pipeline(
                     taps: r.spatial_taps.min(8),
                     radius: r.spatial_radius,
                     blend_w,
-                    exposure: camera.exposure,
+                    pad_b: 0.0,
                     unbiased: r.spatial_unbiased as u32,
                     pad_a: r.spatial_debug as u32,
                     di_on: di_spatial as u32,
@@ -1665,16 +1663,21 @@ pub(crate) fn rt_pipeline(
     // normal wgpu compute pass on the shared ctx encoder → runs after the trace
     // buffer, so the view target stays wgpu-layout-tracked). The diff view
     // (rung-0 harness) rides here: |current − frozen| heatmap when enabled.
+    // Exposure applies HERE: the buffer holds physical radiance. Debug views
+    // paint raw non-radiance values → exposure 1.0 so they display verbatim.
     let frozen_valid = frozen.filter(|f| f.pixels == output.pixels);
     let diff_on = debug
         .freeze_diff
         .as_deref()
         .is_some_and(|fd| fd.diff && frozen_valid.is_some());
     let diff_scale = debug.freeze_diff.as_deref().map_or(4.0, |fd| fd.diff_scale);
+    let debug_paint =
+        debug_view != 0 || show_displacement || reference.is_some_and(|r| r.spatial_debug);
+    let blit_exposure = if debug_paint { 1.0 } else { camera.exposure };
     render_queue.write_buffer(
         &rt_blit.params,
         0,
-        bytemuck::bytes_of(&[diff_on as u32 as f32, diff_scale, 0.0, 0.0]),
+        bytemuck::bytes_of(&[diff_on as u32 as f32, diff_scale, blit_exposure, 0.0]),
     );
     let frozen_binding = frozen_valid.map_or(&output.buffer, |f| &f.buffer);
     let bind_group = render_device.create_bind_group(

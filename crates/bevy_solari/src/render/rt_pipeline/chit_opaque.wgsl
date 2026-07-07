@@ -130,15 +130,14 @@ fn chit_opaque(
     // Displacement debug view (`frame.w == 1`): replace shading with the surface's height map in
     // grayscale, validating the displacement wiring (which map → which surface, the UVs, the sign)
     // BEFORE tessellation actually moves geometry. Surfaces with no displacement map read dim grey
-    // for context. Terminate the path and divide by exposure so the raygen's `radiance *= exposure`
-    // cancels — the pixel shows the raw `[0,1]` height.
+    // for context. The blit passes exposure 1.0 for debug views, so the raw `[0,1]` height displays.
     if camera.frame.w == 1u {
         let dmat = load_material_bindless(ray_hit.material_id);
         var height = 0.02;
         if dmat.displacement_texture_id != TEXTURE_MAP_NONE {
             height = sample_texture_lod(dmat.displacement_texture_id, ray_hit.uv, 0.0).r;
         }
-        payload.emitted = vec3<f32>(height) / max(camera.camera_position.w, 1e-6);
+        payload.emitted = vec3<f32>(height);
         payload.bounce = 0u;
         payload.rng = rng;
         return;

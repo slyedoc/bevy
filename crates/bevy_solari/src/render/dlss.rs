@@ -359,7 +359,7 @@ pub fn prepare_solari_dlss(
 
     // Linear depth (no hardware depth) ⇒ no `InvertedDepth`. HDR (linear Rgba16Float
     // color). Low-resolution MVs (ours are at render resolution). NO auto-exposure:
-    // raygen already applies the camera exposure (`final_color *= exposure`), so the
+    // the blit applies the camera exposure before RR reads the view target, so the
     // color is pre-exposed and DLSS must stay exposure-neutral (assumes exposure 1.0).
     // With auto-exposure on top, a dark scene (e.g. a black/unbaked sky) makes DLSS
     // crank the gain and the lit meshes blow out.

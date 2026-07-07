@@ -619,19 +619,18 @@ fn raygen(
         }
 
         // Atmosphere volumes: attenuate + in-scatter over the primary segment
-        // (aerial perspective / limb / sky-through-shell). Per sample, before exposure.
+        // (aerial perspective / limb / sky-through-shell). Per sample.
         radiance = atmosphere_volumes_apply(radiance, cam_origin, cam_direction, primary_t);
         frame_sum += select(radiance, vec3<f32>(0.0), captured);
     } // sample loop
 
-    // Camera exposure (matches the megakernel's `radiance *= view.exposure`); the
-    // physical sky/light radiance is otherwise far too bright. `.w` of the camera
-    // position carries the exposure.
+    // The output buffer holds PHYSICAL radiance — the display blit applies the
+    // camera exposure at read, so accumulation/dumps/probes/debug paints stay
+    // in physical units and an exposure change never resets the mean.
     var final_color = frame_sum / f32(rounds);
-    final_color *= camera.camera_position.w;
 
     // Reference accumulation: fold this frame's average into the running mean held
-    // in the output buffer. Post-exposure (an exposure change resets CPU-side).
+    // in the output buffer.
     if reference && accum_n > 0.0 {
         let w = f32(ref_spf) / (accum_n + f32(ref_spf));
         final_color = mix(output[pixel_index].rgb, final_color, w);

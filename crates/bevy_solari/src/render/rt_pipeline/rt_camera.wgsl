@@ -51,7 +51,7 @@ struct CameraPassParams {
     window_eye: vec4<f32>,                      // passthrough → RtCamera.window_eye (eye in screen space)
     camera_slot: u32,                        // the SolariCamera's transform-table slot
     node_count: u32,                         // world-buffer node high-water (bounds guard)
-    exposure: f32,                           // → camera_position.w
+    exposure: f32,                           // → camera_position.w (tooling only; the trace stays physical)
     // 1 = the camera slot is allocated + propagated this frame; 0 (cold start /
     // slot not yet live) → write an identity basis so the first frame is a stable
     // camera-at-origin instead of reading undefined `world`.

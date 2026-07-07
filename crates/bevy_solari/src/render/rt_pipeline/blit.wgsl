@@ -7,7 +7,9 @@
 // Frozen reference snapshot (rung-0 diff harness). Bound to `rt_output` itself
 // when nothing is frozen; `params.x` gates the mode so that alias is never read.
 @group(0) @binding(2) var<storage, read> frozen: array<vec4<f32>>;
-// .x = mode (0 passthrough, 1 diff heatmap), .y = diff scale.
+// .x = mode (0 passthrough, 1 diff heatmap), .y = diff scale, .z = camera
+// exposure (the output buffer is physical radiance; 1.0 while a debug view
+// paints raw non-radiance values).
 @group(0) @binding(3) var<uniform> params: vec4<f32>;
 
 // Black -> blue -> green -> yellow -> red ramp for |diff| luminance.
@@ -29,9 +31,9 @@ fn blit(@builtin(global_invocation_id) gid: vec3<u32>) {
     // `.w` carries the primary-hit depth (gizmo-depth bridge), not alpha — force
     // alpha to 1.0 so it never tints the displayed image.
     let c = rt_output[index];
-    var rgb = c.rgb;
+    var rgb = c.rgb * params.z;
     if params.x == 1.0 {
-        let d = abs(c.rgb - frozen[index].rgb);
+        let d = abs(c.rgb - frozen[index].rgb) * params.z;
         let lum = dot(d, vec3<f32>(0.2126, 0.7152, 0.0722));
         rgb = diff_ramp(lum * params.y);
     }
