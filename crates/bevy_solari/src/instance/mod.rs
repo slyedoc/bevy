@@ -100,22 +100,22 @@ impl Plugin for InstancePlugin {
             .add_systems(
                 Render,
                 (
-                    prepare_material_slots.in_set(RenderSystems::Prepare),
+                    prepare_material_slots.in_set(RenderSystems::PrepareResources),
                     // Slot-aligned alpha-test flags the PTLAS fill derives
                     // instance opacity from (GPU-side).
                     prepare_material_traversal_flags
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .after(prepare_material_slots),
                     // Resolves `material_id` the `MaterialColumn` reads, so it
                     // must precede every column prepare.
                     resolve_instance_material_ids
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .after(prepare_material_slots)
                         .before(GpuColumnPrepareSet),
                     // Upload this frame's instance change journal for the GPU
                     // reconcile. Runs after the flush appended its records (flush is
                     // in ExtractSchedule, before Prepare).
-                    upload_rt_journal.in_set(RenderSystems::Prepare),
+                    upload_rt_journal.in_set(RenderSystems::PrepareResources),
                 ),
             )
             // The delta-clear records in the render graph after the scatters

@@ -439,9 +439,8 @@ pub fn prepare_light_resolve(
     resolve.params.write_buffer(&render_device, &render_queue);
 }
 
-/// `Render::PrepareBindGroups`: build the resolve bind group **once**. Every buffer
-/// it binds — `world`, the directional-light + transform-slot sparse columns — has
-/// a stable handle across growth, so once built it stays valid; no per-frame rebuild.
+/// `Render::PrepareBindGroups`: (re)build the resolve bind group. Rebuilt every
+/// frame — cheap, and immune to a bound buffer changing allocation strategy later.
 pub fn prepare_light_resolve_bind_group(
     mut resolve: ResMut<LightResolve>,
     resource_manager: Option<Res<SolariResourceManager>>,
@@ -451,9 +450,6 @@ pub fn prepare_light_resolve_bind_group(
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
-    if resolve.bind_group.is_some() {
-        return;
-    }
     let (Some(resource_manager), Some(directional), Some(transform_slot), Some(propagate), Some(params)) = (
         resource_manager,
         directional,
@@ -533,8 +529,8 @@ impl Plugin for SolariLightsPlugin {
             .add_systems(
                 Render,
                 (
-                    prepare_light_sources.in_set(RenderSystems::Prepare),
-                    prepare_light_resolve.in_set(RenderSystems::Prepare),
+                    prepare_light_sources.in_set(RenderSystems::PrepareResources),
+                    prepare_light_resolve.in_set(RenderSystems::PrepareResources),
                     prepare_light_resolve_bind_group.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )

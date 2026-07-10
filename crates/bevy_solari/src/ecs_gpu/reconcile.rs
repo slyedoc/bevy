@@ -152,18 +152,15 @@ pub fn prepare_rt_reconcile_bind_group(
     else {
         return;
     };
-    if reconcile.bind_group.is_some() {
-        return;
-    }
     let Some(params) = reconcile.params.binding() else {
         return;
     };
     // Bind the WHOLE sparse buffer (stable handle) per column, not the committed
-    // range: this bind group is built once and cached, and the columns grow (regen),
-    // so a committed-sized binding would freeze at the first size and the reconcile
-    // couldn't write slots past it. The reconcile is slot-indexed and never calls
-    // `arrayLength`, so the whole-range bind is safe (no `arrayLength` hang) and
-    // growth-proof — every slot `< high_water` is always in range.
+    // range: the columns grow (regen), so a committed-sized binding would freeze
+    // at the first size and the reconcile couldn't write slots past it. The
+    // reconcile is slot-indexed and never calls `arrayLength`, so the whole-range
+    // bind is safe (no `arrayLength` hang) and growth-proof — every slot
+    // `< high_water` is always in range.
     let layout = pipeline_cache.get_bind_group_layout(&reconcile.layout);
     reconcile.bind_group = Some(render_device.create_bind_group(
         "rt_reconcile",
@@ -243,7 +240,7 @@ impl Plugin for ReconcilePlugin {
                     // this reads for the dispatch bound + params. Without the order, a
                     // stale (0) count means the reconcile never dispatches.
                     prepare_rt_reconcile
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .after(crate::instance::upload_rt_journal),
                     prepare_rt_reconcile_bind_group.in_set(RenderSystems::PrepareBindGroups),
                 ),

@@ -1343,19 +1343,30 @@ fn try_compile_rt_wgsl(
     // The scene `textures`/`samplers` are unsized `binding_array`s in WGSL. wgpu's
     // own pipeline compile bakes a FIXED descriptor count into the SPIR-V (the
     // device doesn't enable `runtimeDescriptorArray`, so an `OpTypeRuntimeArray`
-    // descriptor variable is invalid). Mirror that: override @group(0) bindings
-    // 7 (textures) and 8 (samplers) to the layout's `MAX_TEXTURE_COUNT`. All other
-    // resources fall back to their own group/binding (`fake_missing_bindings`).
+    // descriptor variable is invalid). Mirror that for every unsized binding
+    // array the composed module actually contains — derived from the module, not
+    // hardcoded group/binding numbers, so a scene-binding renumber can't silently
+    // reintroduce the illegal runtime-array variable. The substituted count must
+    // match the descriptor set layout, which sizes all of them `MAX_TEXTURE_COUNT`.
     options.fake_missing_bindings = true;
-    for binding in [7u32, 8u32] {
-        options.binding_map.insert(
-            naga::ResourceBinding { group: 0, binding },
-            naga::back::spv::BindingInfo {
-                descriptor_set: 0,
-                binding,
-                binding_array_size: Some(crate::bindings::MAX_TEXTURE_COUNT.get()),
-            },
-        );
+    for (_, var) in module.global_variables.iter() {
+        let Some(ref binding) = var.binding else {
+            continue;
+        };
+        if let naga::TypeInner::BindingArray {
+            size: naga::ArraySize::Dynamic,
+            ..
+        } = module.types[var.ty].inner
+        {
+            options.binding_map.insert(
+                binding.clone(),
+                naga::back::spv::BindingInfo {
+                    descriptor_set: binding.group,
+                    binding: binding.binding,
+                    binding_array_size: Some(crate::bindings::MAX_TEXTURE_COUNT.get()),
+                },
+            );
+        }
     }
     naga::back::spv::write_vec(&module, &info, &options, None)
         .map_err(|e| format!("SPIR-V emit failed: {e:?}"))
@@ -1488,6 +1499,38 @@ fn alloc_mapped_buffer(
 mod tests {
     use super::try_compile_rt_wgsl;
 
+    /// Rejects what VUID-StandaloneSpirv-OpTypeRuntimeArray-04680 rejects: a
+    /// descriptor variable instantiating `OpTypeRuntimeArray` (a `UniformConstant`
+    /// pointer to a runtime array). Happens when an unsized `binding_array` misses
+    /// the fixed-size substitution in the SPIR-V binding map.
+    fn assert_no_runtime_descriptor_array(file: &str, spv: &[u32]) {
+        const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
+        const OP_TYPE_POINTER: u32 = 32;
+        const STORAGE_UNIFORM_CONSTANT: u32 = 0;
+        let mut runtime_arrays = std::collections::HashSet::new();
+        let mut i = 5; // skip the SPIR-V header
+        while i < spv.len() {
+            let (opcode, word_count) = (spv[i] & 0xffff, (spv[i] >> 16) as usize);
+            assert!(word_count > 0, "{file}: malformed SPIR-V");
+            match opcode {
+                OP_TYPE_RUNTIME_ARRAY => {
+                    runtime_arrays.insert(spv[i + 1]);
+                }
+                OP_TYPE_POINTER => {
+                    assert!(
+                        !(spv[i + 2] == STORAGE_UNIFORM_CONSTANT
+                            && runtime_arrays.contains(&spv[i + 3])),
+                        "{file}: UniformConstant pointer to OpTypeRuntimeArray — an \
+                         unsized binding_array escaped the fixed-size binding_map \
+                         substitution (VUID-StandaloneSpirv-OpTypeRuntimeArray-04680)"
+                    );
+                }
+                _ => {}
+            }
+            i += word_count;
+        }
+    }
+
     // Headless compose→validate→SPIR-V of every built-in RT shader — shader edits
     // fail here at `cargo test` time instead of as a runtime pipeline-build black
     // screen (an expensive lesson when each GPU repro needs a supervised run).
@@ -1530,8 +1573,9 @@ mod tests {
                 include_str!("../render/rt_pipeline/restir_spatial.wgsl"),
             ),
         ] {
-            if let Err(e) = try_compile_rt_wgsl(source, file, &[]) {
-                panic!("{file}: {e}");
+            match try_compile_rt_wgsl(source, file, &[]) {
+                Ok(spv) => assert_no_runtime_descriptor_array(file, &spv),
+                Err(e) => panic!("{file}: {e}"),
             }
         }
     }

@@ -7,6 +7,37 @@
 //! black-screen class (a producer's delta consumed while its consumer's
 //! pipeline is still compiling — dropped one-shot writes, statics collapsed
 //! at origin, black accumulations).
+//!
+//! # Readiness is three axes, and this gate only covers the first
+//!
+//! 1. **Pipelines compiled** — this registry.
+//! 2. **Bind groups built from buffers that exist** — schedule placement.
+//!    `RenderSystems::PrepareBindGroups` is a chained SUB-set *inside*
+//!    `Prepare`; a system added bare to `Prepare` has NO ordering against it,
+//!    so its bind-group builder can run first on some frames (per-run
+//!    nondeterminism). Rule: solari never adds a system bare to
+//!    `RenderSystems::Prepare` — buffer-writing prepares go in
+//!    `PrepareResources`, bind-group builders in `PrepareBindGroups`. Bind
+//!    groups are rebuilt every frame unless a buffer-identity signature is
+//!    checked (see `bindings/bind_groups.rs`) — "stable handle today" is not
+//!    a caching contract.
+//! 3. **The producer actually ran this frame** — a dispatch consuming another
+//!    pass's per-frame output (indirect args, freshly-scattered columns) must
+//!    verify that pass recorded (e.g. `TransformFrontier::ran`), not merely
+//!    that its own pipeline exists.
+//!
+//! # One-shot data must be retained until consumed, or fail loudly
+//!
+//! Any delta/queue/latch that is cleared each frame trusts its consumer to
+//! have run that frame. If the consumer has ANY bail path, that trust is a
+//! silent session-long loss (invisible instances, identity camera). Either:
+//! - **retain-until-consumed**: clear only after the consumer records
+//!   (`GpuColumn::pending`, `TransformPropagate::needs_full_rebuild`,
+//!   `TransformSubtract::dirty`, the reconcile journal's `mark_folded`), or
+//! - **re-arm a recovery latch** when consumption was missed
+//!   (`dispatch_transform_propagate`'s full-rebuild re-arm), or
+//! - **warn loudly** when dropping is the only option
+//!   (`prepare_column`'s no-column tripwire, `clas_arena`'s DROPPING warns).
 
 use bevy_ecs::{
     resource::Resource,

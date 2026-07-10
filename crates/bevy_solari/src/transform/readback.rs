@@ -307,6 +307,9 @@ pub fn dispatch_transform_readback(
     if readback.changed_count == 0 {
         return; // nothing moved → the reset-to-0 header already says count = 0.
     }
+    if !frontier.ran() {
+        return; // frontier pipelines still compiling — its indirect args are stale.
+    }
     let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.transform_readback) else {
         return;
     };

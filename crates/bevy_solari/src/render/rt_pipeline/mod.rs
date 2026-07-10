@@ -912,20 +912,49 @@ fn try_dispatch_rt_camera(
     output: &RtOutputBuffer,
     inputs: RtCameraGpuInputs,
 ) -> bool {
+    // `SOLARI_CAMERA_DEBUG=1`: log which camera path fills the buffer (GPU pass vs
+    // CPU fallback) and why — the fallback is silent by design, which makes a
+    // wrong-basis frame indistinguishable from a right one in logs.
+    fn camera_debug() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SOLARI_CAMERA_DEBUG").as_deref() == Ok("1"))
+    }
     let (Some(pipelines), Some(resources), Some(propagate), Some(slot)) =
         (pipelines, resources, propagate, camera_slot)
     else {
+        if camera_debug() {
+            bevy_log::info!(
+                "rt_camera: CPU fallback (pipelines={} resources={} propagate={} slot={:?})",
+                pipelines.is_some(),
+                resources.is_some(),
+                propagate.is_some(),
+                camera_slot.map(|s| s.0),
+            );
+        }
         return false; // cold start (slot extracted a frame after the camera spawns).
     };
     let node_count = propagate.node_count();
     // Slot not yet propagated → CPU fallback (correct for a root camera; a transient
     // first-frame-or-two for a childed one, before its slot lands).
     if slot.0 >= node_count {
+        if camera_debug() {
+            bevy_log::info!("rt_camera: CPU fallback (slot {} >= node_count {node_count})", slot.0);
+        }
         return false;
     }
     let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.rt_camera) else {
+        if camera_debug() {
+            bevy_log::info!("rt_camera: CPU fallback (pipeline compiling)");
+        }
         return false; // still compiling (or failed — the cache logs a compile error).
     };
+    if camera_debug() {
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 300 == 0 {
+            bevy_log::info!("rt_camera: GPU pass (slot {} node_count {node_count})", slot.0);
+        }
+    }
 
     let mut params = UniformBuffer::from(RtCameraPassParams {
         clip_from_view: inputs.clip_from_view,

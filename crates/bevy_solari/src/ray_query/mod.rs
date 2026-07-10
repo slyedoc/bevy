@@ -370,7 +370,7 @@ impl Plugin for RayQueryPlugin {
             .add_systems(
                 Render,
                 (
-                    prepare_ray_query.in_set(RenderSystems::Prepare),
+                    prepare_ray_query.in_set(RenderSystems::PrepareResources),
                     prepare_ray_query_bind_group.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )

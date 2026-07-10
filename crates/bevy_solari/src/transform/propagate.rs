@@ -412,9 +412,12 @@ pub fn dispatch_transform_propagate(
                     let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(groups);
                     pass.dispatch_workgroups(gx, gy, gz);
                     walked = true;
-                } else if let Some(frontier) = frontier.as_ref() {
+                } else if let Some(frontier) = frontier.as_ref().filter(|f| f.ran()) {
                     // Changed path: the dispatch size is GPU-side (seeds + expanded
-                    // descendants) — consume the frontier's indirect args.
+                    // descendants) — consume the frontier's indirect args. Gated on
+                    // the frontier having actually recorded this frame: its args are
+                    // stale/zero otherwise, and dispatching from them would count as
+                    // "walked" while touching none of the changed nodes.
                     pass.dispatch_workgroups_indirect(
                         frontier.indirect_buffer(),
                         CONSUMER_ARGS_OFFSET,
@@ -431,5 +434,19 @@ pub fn dispatch_transform_propagate(
     // already taken, and is re-recorded on the next growth.)
     if walked {
         propagate.needs_full_rebuild = false;
+    } else if propagate.dispatch_count > 0 && !propagate.needs_full_rebuild {
+        // Changed-path seeds existed but nothing walked them (the frontier chain or
+        // the walk itself couldn't record this frame). The seeds' delta records are
+        // consumed by the column scatter this frame — retrying the changed path
+        // next frame would walk nothing, silently freezing those nodes at a zero
+        // world (invisible instances, identity camera) for the whole session.
+        // Re-arm the full-rebuild latch instead: one O(n) walk recovers every node
+        // once everything lands — cold-start-priced, and only fires cold-start.
+        propagate.needs_full_rebuild = true;
+        bevy_log::info!(
+            "transform: {} changed-path seeds unwalked (frontier ran: {}) — full walk re-armed",
+            propagate.dispatch_count,
+            frontier.as_ref().is_some_and(|f| f.ran()),
+        );
     }
 }

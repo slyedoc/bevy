@@ -5888,7 +5888,8 @@ wgpu-types       = { path = "/mnt/code/f/wgpu/wgpu-types" }
 wgpu-naga-bridge = { path = "/mnt/code/f/wgpu/wgpu-naga-bridge" }
 naga             = { path = "/mnt/code/f/wgpu/naga" }
 # naga_oil matches naga's TypeInner exhaustively; the fork adds the SER
-# `HitObject` arm so it compiles against the naga RT/SER fork above.
-naga_oil         = { git = "https://github.com/slyedoc/naga_oil.git", branch = "solari-ser" }
+# `HitObject` arm (and now cooperative vectors) so it compiles against the
+# naga RT/SER fork above.
+naga_oil         = { path = "/mnt/code/f/naga_oil" }
 ash              = { git = "https://github.com/ash-rs/ash.git", branch = "master" }
 gpu-allocator    = { git = "https://github.com/slyedoc/gpu-allocator.git", branch = "ash-push-rename" }

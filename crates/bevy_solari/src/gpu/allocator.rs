@@ -53,7 +53,7 @@ use bevy_ecs::{
 };
 use bevy_render::render_resource::Buffer;
 use bevy_render::renderer::{
-    raw_vulkan_init::AdditionalVulkanFeatures, RenderDevice,
+    raw_vulkan_init::AdditionalVulkanFeatures, RenderDevice, RenderQueue,
 };
 use core::ops::{Deref, Range};
 use std::sync::{Arc, Mutex};
@@ -145,22 +145,17 @@ struct AllocatorInner {
     device: ash::Device,
     physical_device: vk::PhysicalDevice,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
-    /// Raw queue handle — same family + index as wgpu's queue
-    /// (family 0, index 0; see `wgpu-hal/src/vulkan/adapter.rs::
-    /// open_with_callback` → `let family_index = 0`). Vulkan
-    /// guarantees identity for matching pairs, so sparse-bind
-    /// submissions interleave with wgpu's regular work in submission
-    /// order. All desktop GPUs expose `SPARSE_BINDING_BIT` on their
-    /// graphics queue.
-    ///
-    /// Wrapped in a `Mutex` because Vulkan requires external sync
-    /// of `VkQueue` — bevy systems may call `SparseBuffer::commit`
-    /// in parallel from the task pool. NOTE: this does NOT sync
-    /// with wgpu's own queue submissions (wgpu's queue mutex is
-    /// internal). For V1 we rely on the render schedule serializing
-    /// wgpu submits and our sparse binds via system ordering; a
-    /// proper fix would route everything through wgpu's queue.
-    queue: Mutex<vk::Queue>,
+    /// wgpu's queue. Sparse binds go through `Queue::as_hal_locked`,
+    /// which holds wgpu's submission-serializing lock around the raw
+    /// `vkQueueBindSparse` — the ONLY way to satisfy Vulkan's external-
+    /// synchronization requirement on `VkQueue` against wgpu's own
+    /// `vkQueueSubmit`/`vkQueuePresentKHR` on other threads. Commits run
+    /// on Compute Task Pool threads while the render thread submits;
+    /// an unshared lock here is an intermittent Xid 32 (corrupted
+    /// pushbuffer) device-loss, worst during startup's commit storm.
+    /// All desktop GPUs expose `SPARSE_BINDING_BIT` on their graphics
+    /// queue, so binding on wgpu's queue is always legal.
+    queue: RenderQueue,
     /// (min, max) VA over every sparse reservation — the "plausible device
     /// address" span for debug validation (`SOLARI_PTLAS_VALIDATE`).
     sparse_va_span: Mutex<(u64, u64)>,
@@ -170,7 +165,7 @@ impl Allocator {
     /// Pull raw Vulkan handles from `render_device` and cache physical-
     /// device memory properties for type-index lookup. Returns `None`
     /// if the device is not Vulkan-backed.
-    pub fn try_new(render_device: &RenderDevice) -> Option<Self> {
+    pub fn try_new(render_device: &RenderDevice, render_queue: &RenderQueue) -> Option<Self> {
         // SAFETY: as_hal yields the raw Vulkan device while the wgpu
         // Device is alive; we clone the ash handles (Arc-internally)
         // so the cloned values outlive the guard.
@@ -189,17 +184,13 @@ impl Allocator {
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-        // SAFETY: queue family 0 / queue 0 is the device queue wgpu
-        // itself binds; identity is guaranteed by Vulkan.
-        let queue = unsafe { device.get_device_queue(0, 0) };
-
         Some(Self {
             inner: Arc::new(AllocatorInner {
                 instance,
                 device,
                 physical_device,
                 memory_properties,
-                queue: Mutex::new(queue),
+                queue: render_queue.clone(),
                 sparse_va_span: Mutex::new((u64::MAX, 0)),
             }),
         })
@@ -743,9 +734,10 @@ impl SparseBuffer {
 
         // SAFETY: queue + fence + bind_infos all valid; binds[] points
         // at memory we just allocated; resource ranges fit inside the
-        // sparse buffer's virtual size. Queue lock held across
-        // submission + wait — Vulkan requires `VkQueue` to be
-        // externally synchronized.
+        // sparse buffer's virtual size. `as_hal_locked` holds wgpu's
+        // submission lock across the bind + wait — Vulkan requires
+        // `VkQueue` to be externally synchronized, INCLUDING against
+        // wgpu's own submits/presents on other threads.
         // The actual page bind + blocking fence wait — the part that
         // only runs when new pages are committed (growth / streaming).
         // Steady state skips this entirely (binds.is_empty() above).
@@ -755,25 +747,23 @@ impl SparseBuffer {
             pages = binds.iter().map(|b| b.size / page_size).sum::<u64>(),
         )
         .entered();
-        let queue = self
-            .allocator
-            .inner
-            .queue
-            .lock()
-            .expect("SparseBuffer.commit: queue mutex poisoned");
         unsafe {
-            device
-                .queue_bind_sparse(*queue, &bind_infos, fence)
-                .expect("SparseBuffer.commit: vkQueueBindSparse failed");
-            if let Err(err) = device.wait_for_fences(&[fence], true, u64::MAX) {
-                // Device lost: name the last AS pass the GPU reached before
-                // dying (per-pass checkpoints), then die as before.
-                crate::gpu::extension::report_queue_checkpoints(*queue);
-                panic!("SparseBuffer.commit: vkWaitForFences failed: {err:?}");
-            }
-            device.destroy_fence(fence, None);
+            self.allocator.inner.queue.as_hal_locked::<VkApi, _>(|queue| {
+                let queue = queue
+                    .expect("SparseBuffer.commit: wgpu queue is not Vulkan-backed")
+                    .as_raw();
+                device
+                    .queue_bind_sparse(queue, &bind_infos, fence)
+                    .expect("SparseBuffer.commit: vkQueueBindSparse failed");
+                if let Err(err) = device.wait_for_fences(&[fence], true, u64::MAX) {
+                    // Device lost: name the last AS pass the GPU reached before
+                    // dying (per-pass checkpoints), then die as before.
+                    crate::gpu::extension::report_queue_checkpoints(queue);
+                    panic!("SparseBuffer.commit: vkWaitForFences failed: {err:?}");
+                }
+                device.destroy_fence(fence, None);
+            });
         }
-        drop(queue);
     }
 
     fn allocate_chunk(&self, size: u64) -> vk::DeviceMemory {
@@ -847,6 +837,7 @@ fn bit_set(bits: &mut [u8], i: usize) {
 pub fn init_allocator(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
     additional: Res<AdditionalVulkanFeatures>,
 ) {
     if !additional.has::<ClusterAccelerationStructureFeature>() {
@@ -859,7 +850,7 @@ pub fn init_allocator(
         );
         return;
     }
-    let Some(memory) = Allocator::try_new(&render_device) else {
+    let Some(memory) = Allocator::try_new(&render_device, &render_queue) else {
         bevy_log::warn_once!(
             "bevy_solari disabled: raw-VK allocator init failed despite the cluster-AS feature \
              being present. All solari passes no-op."

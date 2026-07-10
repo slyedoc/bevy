@@ -158,7 +158,7 @@ impl Plugin for SolariTransformPlugin {
                         prepare_transform_readback,
                     )
                         .chain()
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .after(GpuColumnPrepareSet),
                     (
                         prepare_transform_frontier_bind_group,

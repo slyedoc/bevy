@@ -288,7 +288,7 @@ impl Plugin for SolariPickingPlugin {
             .add_systems(
                 Render,
                 prepare_picking_rays
-                    .in_set(RenderSystems::Prepare)
+                    .in_set(RenderSystems::PrepareResources)
                     .before(prepare_ray_query),
             )
             .add_systems(

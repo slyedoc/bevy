@@ -382,7 +382,7 @@ impl<C: GpuColumnDesc> Plugin for GpuColumnPlugin<C> {
                 Render,
                 (
                     prepare_column::<C>
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .in_set(GpuColumnPrepareSet),
                     prepare_column_bind_group::<C>.in_set(RenderSystems::PrepareBindGroups),
                 ),
@@ -417,13 +417,13 @@ fn init_column<C: GpuColumnDesc>(
     let Some(allocator) = allocator else {
         return;
     };
-    let make_sparse = || {
+    let make_sparse = |label: &'static str| {
         allocator.create_sparse_buffer(
             &render_device,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             BufferUsages::STORAGE | BufferUsages::COPY_DST,
             COLUMN_VIRTUAL_BYTES,
-            C::LABEL,
+            label,
         )
     };
     let (layout, entry_point, previous) = if C::KEEP_PREVIOUS {
@@ -441,7 +441,13 @@ fn init_column<C: GpuColumnDesc>(
                 ),
             ),
             "scatter_with_history",
-            Some(make_sparse()),
+            // Distinct label: the Aftermath VA-map triage resolves faulting
+            // addresses by buffer label, and two buffers both named `C::LABEL`
+            // make the current/previous pair ambiguous. One leak per history
+            // column at startup, bounded by the column count.
+            Some(make_sparse(Box::leak(
+                format!("{}.previous", C::LABEL).into_boxed_str(),
+            ))),
         )
     } else {
         (
@@ -479,7 +485,7 @@ fn init_column<C: GpuColumnDesc>(
     params.set_label(Some(C::LABEL));
 
     commands.insert_resource(GpuColumn::<C> {
-        buffer: make_sparse(),
+        buffer: make_sparse(C::LABEL),
         previous,
         capacity_slots: 0,
         delta,
@@ -506,7 +512,23 @@ fn prepare_column<C: GpuColumnDesc>(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
-    let (Some(column), Some(table)) = (column.as_deref_mut(), table) else {
+    let Some(table) = table else {
+        return;
+    };
+    let Some(column) = column.as_deref_mut() else {
+        // Tripwire: the table's delta is cleared unconditionally at Cleanup on
+        // the assumption this system moved it into the column's retained
+        // `pending`. With no column resource to receive it, the records are
+        // about to be dropped on the floor — a silent one-shot loss (the
+        // frontier-seed-loss class). Say so instead of rendering wrong forever.
+        let dropped = C::delta_records(&table).len();
+        if dropped > 0 {
+            bevy_log::warn_once!(
+                "GpuColumn<{}>: {dropped} delta word(s) with no column resource to \
+                 receive them — cleared unconsumed at Cleanup (column init skipped?)",
+                C::LABEL,
+            );
+        }
         return;
     };
     let high_water = table.high_water().max(1);

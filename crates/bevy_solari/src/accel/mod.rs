@@ -102,12 +102,12 @@ impl Plugin for AccelPlugin {
             .add_systems(
                 Render,
                 (
-                    prepare_blas_sharing.in_set(RenderSystems::Prepare),
+                    prepare_blas_sharing.in_set(RenderSystems::PrepareResources),
                     prepare_selector_params
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .after(prepare_blas_sharing),
                     prepare_ptlas_params
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .after(prepare_selector_params)
                         // The tess slot reservation reads `TessClassify::blas_ready`, which
                         // `run_tess_classify` latches — order after it so the reservation
@@ -117,11 +117,11 @@ impl Plugin for AccelPlugin {
                     prepare_selector_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     prepare_blas_sharing_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     prepare_ptlas_fill_bind_group.in_set(RenderSystems::PrepareBindGroups),
-                    deform::prepare_deform.in_set(RenderSystems::Prepare),
+                    deform::prepare_deform.in_set(RenderSystems::PrepareResources),
                     deform::prepare_deform_bind_group.in_set(RenderSystems::PrepareBindGroups),
-                    animated_blas::prepare_animated_blas.in_set(RenderSystems::Prepare),
+                    animated_blas::prepare_animated_blas.in_set(RenderSystems::PrepareResources),
                     animated_blas::prepare_animated_blas_params
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .after(animated_blas::prepare_animated_blas),
                     animated_blas::prepare_animated_blas_bind_group
                         .in_set(RenderSystems::PrepareBindGroups),

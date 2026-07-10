@@ -74,8 +74,9 @@ pub fn upscaling(
     };
 
     let Some(pipeline) = pipeline_cache.get_render_pipeline(upscaling_target.0) else {
-        // we need to do some work on the swapchain to avoid pink screen uninit on macos
-        #[cfg(target_os = "macos")]
+        // While the upscaling pipeline is still compiling, touch the swapchain
+        // anyway: an untouched surface texture is presented in an undefined
+        // layout (a Vulkan validation error, pink uninit on macos).
         ctx.command_encoder().begin_render_pass(&pass_descriptor);
         return;
     };

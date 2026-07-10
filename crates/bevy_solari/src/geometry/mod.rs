@@ -135,9 +135,9 @@ impl Plugin for GeometryPlugin {
                         .in_set(RenderSystems::PrepareAssets)
                         .after(upload_pending_templates),
                     tess_classify::run_tess_classify
-                        .in_set(RenderSystems::Prepare),
+                        .in_set(RenderSystems::PrepareResources),
                     tess_displace::prepare_tess_ptlas_write
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .after(tess_classify::run_tess_classify),
                     tess_displace::prepare_tess_ptlas_write_bind_group
                         .in_set(RenderSystems::PrepareBindGroups),

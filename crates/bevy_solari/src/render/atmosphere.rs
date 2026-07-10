@@ -617,9 +617,8 @@ pub fn prepare_atmosphere_sky(
     });
 }
 
-/// `Render::PrepareBindGroups`: build the bake bind group **once** — the uniform
-/// buffer never reallocates after its first write and the sky cube is allocated
-/// once, so the group stays valid for the resource lifetimes.
+/// `Render::PrepareBindGroups`: (re)build the bake bind group. Rebuilt every
+/// frame — cheap, and immune to a bound resource changing allocation later.
 pub fn prepare_atmosphere_bind_group(
     mut pipeline: ResMut<AtmospherePipeline>,
     resource_manager: Option<Res<SolariResourceManager>>,
@@ -628,9 +627,6 @@ pub fn prepare_atmosphere_bind_group(
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
-    if pipeline.bind_group.is_some() {
-        return;
-    }
     let (Some(resource_manager), Some(sky), Some(uniform)) =
         (resource_manager, sky, gpu.uniform.binding())
     else {

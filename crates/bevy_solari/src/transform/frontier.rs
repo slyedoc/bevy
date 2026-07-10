@@ -41,6 +41,13 @@ use super::graph::{
 };
 
 const WORKGROUP_SIZE: u32 = 64;
+
+/// `SOLARI_XFORM_DEBUG=1`: trace the changed-path seed/walk decisions — the
+/// silent-bail points where cold-start seed loss hides.
+pub(crate) fn xform_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SOLARI_XFORM_DEBUG").as_deref() == Ok("1"))
+}
 /// Max expansion depth (hierarchy levels below a moved node). Must match
 /// `transform_frontier.wgsl`; deeper descendants go stale (mirror of the walk's
 /// `MAX_DEPTH = 64` guard — realistic scenes are ≤ 8 deep).
@@ -96,6 +103,11 @@ pub struct TransformFrontier {
     capacity_slots: u32,
     frame_id: u32,
     seed_count: u32,
+    /// Whether the seed/expand/finalize chain actually recorded this frame. The
+    /// walk's changed path must NOT dispatch from the indirect args otherwise —
+    /// they're stale (or zero), and the seeds' delta records are consumed by the
+    /// column scatter this frame, so a silent skip loses those nodes for good.
+    ran: bool,
     /// seed/expand (dummy in the indirect slot).
     bind_group_walk: Option<BindGroup>,
     /// finalize (the real indirect-args buffer).
@@ -121,6 +133,13 @@ impl TransformFrontier {
     #[inline]
     pub fn seed_count(&self) -> u32 {
         self.seed_count
+    }
+
+    /// Whether the frontier chain recorded this frame — the indirect args are
+    /// fresh iff true. See the field docs.
+    #[inline]
+    pub fn ran(&self) -> bool {
+        self.ran
     }
 }
 
@@ -174,6 +193,7 @@ pub fn init_transform_frontier(mut commands: Commands, render_device: Res<Render
         capacity_slots: 1,
         frame_id: 0,
         seed_count: 0,
+        ran: false,
         bind_group_walk: None,
         bind_group_finalize: None,
     });
@@ -222,6 +242,7 @@ pub fn prepare_transform_frontier(
     let extra: &[u32] = seeds.as_ref().map(|s| s.0.as_slice()).unwrap_or(&[]);
     let changed_count = local_t.pending();
     frontier.seed_count = changed_count + extra.len() as u32;
+    frontier.ran = false;
     frontier.frame_id = frontier.frame_id.wrapping_add(1).max(1);
     if frontier.seed_count == 0 {
         return; // consumers key off seed_count — nothing to reset or upload.
@@ -314,14 +335,15 @@ pub fn prepare_transform_frontier_bind_group(
 /// indirect expand per level, then a final finalize that publishes the consumer
 /// count + indirect args.
 pub fn dispatch_transform_frontier(
-    frontier: Option<Res<TransformFrontier>>,
+    frontier: Option<ResMut<TransformFrontier>>,
     pipelines: Res<SolariPipelines>,
     pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
-    let Some(frontier) = frontier else {
+    let Some(mut frontier) = frontier else {
         return;
     };
+    let frontier = &mut *frontier;
     if frontier.seed_count == 0 {
         return;
     }
@@ -330,8 +352,22 @@ pub fn dispatch_transform_frontier(
         pipeline_cache.get_compute_pipeline(pipelines.transform_frontier_expand),
         pipeline_cache.get_compute_pipeline(pipelines.transform_frontier_finalize),
     ) else {
+        if xform_debug() {
+            bevy_log::info!(
+                "frontier: bail, pipelines cold (seed_count {})",
+                frontier.seed_count
+            );
+        }
         return;
     };
+    if xform_debug() && (frontier.bind_group_walk.is_none() || frontier.bind_group_finalize.is_none()) {
+        bevy_log::info!(
+            "frontier: bail, bind groups missing (seed_count {}, params {:?}, extra_seeds buffer {:?})",
+            frontier.seed_count,
+            frontier.params.binding().is_some(),
+            frontier.extra_seeds.buffer().map(|b| b.size()),
+        );
+    }
     let (Some(walk_group), Some(finalize_group)) = (
         frontier.bind_group_walk.as_ref(),
         frontier.bind_group_finalize.as_ref(),
@@ -367,4 +403,6 @@ pub fn dispatch_transform_frontier(
     pass.dispatch_workgroups(1, 1, 1);
 
     d.end(&mut pass);
+    drop(pass);
+    frontier.ran = true;
 }

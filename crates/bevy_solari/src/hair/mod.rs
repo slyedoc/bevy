@@ -380,17 +380,17 @@ impl Plugin for HairPlugin {
             .add_systems(
                 Render,
                 (
-                    manager::prepare_hair_geometry.in_set(RenderSystems::Prepare),
+                    manager::prepare_hair_geometry.in_set(RenderSystems::PrepareResources),
                     // Assigns the PTLAS hair base + count; must run before the
                     // PTLAS sizes its instance space.
                     prepare_hair_instances
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .after(manager::prepare_hair_geometry)
                         // Needs each branch material's stable slot for `material_id`.
                         .after(crate::material::prepare_material_slots)
                         .before(crate::accel::ptlas::prepare_ptlas_params),
                     ptlas_hair::prepare_hair_ptlas_write
-                        .in_set(RenderSystems::Prepare)
+                        .in_set(RenderSystems::PrepareResources)
                         .after(prepare_hair_instances),
                     ptlas_hair::prepare_hair_ptlas_write_bind_group
                         .in_set(RenderSystems::PrepareBindGroups),

@@ -139,8 +139,8 @@ pub fn prepare_transform_subtract(
     subtract.params.write_buffer(&render_device, &render_queue);
 }
 
-/// `Render::PrepareBindGroups`: build the subtract bind group **once** — both world buffers
-/// have stable sparse handles across growth, so it stays valid.
+/// `Render::PrepareBindGroups`: (re)build the subtract bind group. Rebuilt every
+/// frame — cheap, and immune to a bound buffer changing allocation strategy later.
 pub fn prepare_transform_subtract_bind_group(
     mut subtract: Option<ResMut<TransformSubtract>>,
     resource_manager: Option<Res<SolariResourceManager>>,
@@ -153,9 +153,6 @@ pub fn prepare_transform_subtract_bind_group(
     else {
         return;
     };
-    if subtract.bind_group.is_some() {
-        return;
-    }
     let Some(params) = subtract.params.binding() else {
         return;
     };

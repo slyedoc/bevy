@@ -105,10 +105,10 @@ pub fn prepare_transform_gather(
     gather.params.write_buffer(&render_device, &render_queue);
 }
 
-/// `Render::PrepareBindGroups`: build the gather bind group **once**. Every buffer
-/// it binds — `world`, the `TransformColumn` (current + previous) and
-/// `NodeSlotColumn` sparse stores — has a stable handle across growth, so once
-/// built it stays valid; no per-frame rebuild needed.
+/// `Render::PrepareBindGroups`: (re)build the gather bind group. Rebuilt every
+/// frame — cheap (one small group), and immune to any bound buffer changing its
+/// allocation strategy later (a cached group over a swapped buffer is a silent
+/// session-long stale read; see the frontier seed-loss postmortem).
 pub fn prepare_transform_gather_bind_group(
     mut gather: Option<ResMut<TransformGather>>,
     resource_manager: Option<Res<SolariResourceManager>>,
@@ -123,9 +123,6 @@ pub fn prepare_transform_gather_bind_group(
     else {
         return;
     };
-    if gather.bind_group.is_some() {
-        return;
-    }
     let Some(params) = gather.params.binding() else {
         return;
     };

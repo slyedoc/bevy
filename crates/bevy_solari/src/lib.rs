@@ -287,7 +287,7 @@ impl Plugin for SolariPlugin {
             .add_systems(Render, gpu::retire::reap_retired.in_set(RenderSystems::Cleanup))
             .add_systems(
                 Render,
-                ecs_gpu::log_pipeline_wait.in_set(RenderSystems::Prepare),
+                ecs_gpu::log_pipeline_wait.in_set(RenderSystems::PrepareResources),
             )
             .add_systems(
                 RenderStartup,
