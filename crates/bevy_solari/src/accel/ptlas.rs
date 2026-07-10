@@ -172,13 +172,8 @@ pub struct PtlasFillParamsGpu {
     pub cpu_count: u32,
     pub force_all: u32,
     /// 1 → OMM-consult validation mode (drop FORCE_NO_OPAQUE so micromaps drive).
-    /// Set from `SOLARI_OMM_CONSULT` when the extension is available.
+    /// Set from `SOLARI_OMM_CONSULT` (default on).
     pub omm_consult: u32,
-    /// 1 → force the OMM to 2-state at traversal (collapse "unknown" micro-tris to
-    /// opaque/transparent via the bake's lean), so NO micro-triangle ever invokes
-    /// the any-hit. Trades a sub-micro-triangle-precise cutout edge for zero any-hit.
-    /// Set from `SOLARI_OMM_2STATE` when the extension is available.
-    pub omm_force_2_state: u32,
     /// This build's seed-epoch stamp (≥1) — `fill_seed` marks its slots,
     /// `fill_incremental` skips them (one WRITE per instance per build).
     pub epoch: u32,
@@ -761,20 +756,6 @@ pub fn prepare_ptlas_params(
                 std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::debug!("ptlas: omm_consult={on}");
-            }
-            on
-        },
-        // Force the micromap to 2-state at traversal (no any-hit on the unknown
-        // edge band). OFF by default: forcing 2-state on a 4-state-FORMAT micromap
-        // mis-resolves the cutout (the whole leaf collapses to transparent). The
-        // correct zero-any-hit path is a NATIVE 2-state bake (OC1_2_State) in the
-        // importer, not this runtime flag. Opt in with SOLARI_OMM_2STATE=1.
-        omm_force_2_state: {
-            let on = (std::env::var("SOLARI_OMM_2STATE").as_deref() == Ok("1")) as u32;
-            static LOGGED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::debug!("ptlas: omm_force_2_state={on}");
             }
             on
         },

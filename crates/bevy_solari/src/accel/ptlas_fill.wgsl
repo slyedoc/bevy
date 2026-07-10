@@ -62,17 +62,9 @@ struct PtlasFillParams {
     /// render holes-solid under it; the per-geometry `has_omm` column is the
     /// correct, always-on replacement.
     omm_consult: u32,
-    /// 1 → OR `FORCE_OPACITY_MICROMAP_2_STATE` into OMM instances so "unknown"
-    /// micro-triangles collapse to opaque/transparent and the any-hit never runs.
-    omm_force_2_state: u32,
     /// This build's seed-epoch stamp (≥1, bumped per build) — see `seed_epoch`.
     epoch: u32,
 }
-
-/// `VK_GEOMETRY_INSTANCE_FORCE_OPACITY_MICROMAP_2_STATE_EXT` — treat the OMM as
-/// 2-state at traversal (unknown → opaque/transparent), so no micro-triangle
-/// invokes the any-hit shader.
-const FORCE_OPACITY_MICROMAP_2_STATE: u32 = 0x10u;
 
 /// The NV global-partition sentinel
 /// (`VK_PARTITIONED_ACCELERATION_STRUCTURE_PARTITION_INDEX_GLOBAL_NV`).
@@ -152,14 +144,10 @@ fn resolve_partition(slot: u32) -> u32 {
 fn derived_vk_flags(slot: u32) -> u32 {
     // Validation mode: clear FORCE_NO_OPAQUE so an attached OMM is consulted. The
     // OMM then drives per-micro-triangle: pure opaque/transparent commit/skip in
-    // hardware, "unknown" still invokes the any-hit. (Confirmed consulted via the
-    // FORCE_OPACITY_MICROMAP_2_STATE diagnostic.)
+    // hardware, "unknown" still invokes the any-hit. Zero-any-hit cutouts come
+    // from a native 2-state bake (OC1_2_State) in the importer, not a runtime
+    // instance flag — forcing 2-state on a 4-state bake mis-resolves the cutout.
     if params.omm_consult == 1u {
-        // Force 2-state so even the "unknown" edge micro-tris commit/skip in
-        // hardware — the any-hit never runs (slightly quantized cutout edge).
-        if params.omm_force_2_state == 1u {
-            return FORCE_OPACITY_MICROMAP_2_STATE;
-        }
         return 0u;
     }
     return material_vk_flags(material_traversal_flags[instance_material_ids[slot]]);
