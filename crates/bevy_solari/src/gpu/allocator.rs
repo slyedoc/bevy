@@ -202,6 +202,25 @@ impl Allocator {
         *self.inner.sparse_va_span.lock().unwrap()
     }
 
+    /// Drain the queue before a raw `vkFree*`/`vkDestroy*`. wgpu defers its own
+    /// destruction behind fence waits, but raw destroys in `Drop` run immediately
+    /// — at teardown the last frame's submissions can still reference the object
+    /// (VUID-vkFreeMemory-memory-00677 et al.). `vkQueueWaitIdle` under wgpu's
+    /// submission lock is externally-synced and near-free when already idle.
+    /// Call from every raw-destroying `Drop` (see `SparseBuffer`, `MeshOmm`,
+    /// `RtViewBindings`, `RtPipeline`).
+    pub fn quiesce_before_raw_destroy(&self) {
+        // SAFETY: the callback holds the submission lock (external sync on the
+        // queue); the device handle is alive (self keeps it so).
+        unsafe {
+            self.inner.queue.as_hal_locked::<VkApi, _>(|queue| {
+                if let Some(queue) = queue {
+                    let _ = self.inner.device.queue_wait_idle(queue.as_raw());
+                }
+            });
+        }
+    }
+
     /// Pin `buffer`: take ownership and capture its address as [`StableAddr`].
     /// The wrapper must outlive every GPU consumer of the address — in
     /// practice, live in an init-created resource for the app's lifetime.
@@ -796,6 +815,9 @@ impl SparseBuffer {
 
 impl Drop for SparseBuffer {
     fn drop(&mut self) {
+        // In-flight submissions may still reference this buffer's memory
+        // (teardown drops mid-last-frame); drain before freeing.
+        self.allocator.quiesce_before_raw_destroy();
         let device = &self.allocator.inner.device;
         // `wgpu_buffer` (and the `bevy_buffer` clone of the same handle)
         // drop via their own Drop after this method returns — the last

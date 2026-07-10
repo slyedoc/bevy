@@ -1168,10 +1168,12 @@ impl RtViewBindings {
 
 impl Drop for RtViewBindings {
     fn drop(&mut self) {
-        // SAFETY: the pool + camera buffer were created for this view and are
-        // unused at teardown (the dispatch drains the GPU before rebuilding, and
-        // the render world is otherwise idle at shutdown). Destroying the pool
-        // frees its descriptor set.
+        // In-flight traces may still reference the set/pool; drain first (near-
+        // free when the rebuild path already drained).
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: the pool + camera buffer were created for this view; the queue
+        // is drained and the device alive (keepalive). Destroying the pool frees
+        // its descriptor set.
         unsafe {
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
@@ -1185,10 +1187,12 @@ impl Drop for RtViewBindings {
 
 impl Drop for RtPipeline {
     fn drop(&mut self) {
-        // SAFETY: all handles were created by this resource and are unused at
-        // teardown (render world shutting down). The set-1 layout outlives the
-        // per-view pools/sets allocated from it (destroying a layout with live
-        // sets is legal), and those sets are dropped with their RtViewBindings.
+        // In-flight traces may still reference the pipeline/SBT; drain first.
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: all handles were created by this resource; the queue is
+        // drained and the device alive (keepalive). The set-1 layout outlives
+        // the per-view pools/sets allocated from it (destroying a layout with
+        // live sets is legal), and those sets drop with their RtViewBindings.
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device

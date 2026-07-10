@@ -94,17 +94,49 @@ pub struct ClasMeshEntry {
 /// references `backing` (via `opacity_micromap_array`) at traversal time and the
 /// per-triangle `index` at build time, so both buffers must outlive the CLAS.
 //
-// TODO(omm): `micromap` (a `VkMicromapEXT` handle) is never destroyed — it leaks
-// on mesh eviction. Acceptable while meshes live for the app lifetime (the arena
-// has no eviction yet, see module docs); add `vkDestroyMicromapEXT` alongside
-// CLAS eviction.
-#[derive(Debug)]
+// TODO(omm): once the arena gets EVICTION, dropping a `MeshOmm` while its CLAS
+// is still traversable must go through a deferred retire (the CLAS references
+// the micromap at traversal time) — the `Drop` below is only teardown-correct
+// today because meshes live for the app lifetime.
 pub struct MeshOmm {
     pub micromap: vk::MicromapEXT,
     /// Micro-map array storage (referenced by `opacity_micromap_array`).
     pub backing: wgpu::Buffer,
     /// Per-triangle OMM index buffer (referenced by `opacity_micromap_index_buffer`).
     pub index: wgpu::Buffer,
+    /// Extension fn table for [`Drop`]'s `vkDestroyMicromapEXT`. The `backing`/
+    /// `index` wgpu buffers pin the `VkDevice` through this struct's Drop
+    /// (fields drop after the impl runs), so the destroy never races device
+    /// teardown — the SparseBuffer keepalive pattern.
+    omm_fns: ash::ext::opacity_micromap::Device,
+    /// For [`Allocator::quiesce_before_raw_destroy`] in [`Drop`].
+    allocator: Allocator,
+}
+
+impl core::fmt::Debug for MeshOmm {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MeshOmm")
+            .field("micromap", &self.micromap)
+            .field("backing", &self.backing)
+            .field("index", &self.index)
+            .finish_non_exhaustive() // omm_fns: fn table, no Debug
+    }
+}
+
+impl Drop for MeshOmm {
+    fn drop(&mut self) {
+        // In-flight traversal/builds may still reference the micromap; drain first.
+        self.allocator.quiesce_before_raw_destroy();
+        // SAFETY: the micromap was created on this device, the queue is drained,
+        // and the device is alive — see the `omm_fns` field docs.
+        unsafe {
+            (self.omm_fns.fp().destroy_micromap_ext)(
+                self.omm_fns.device(),
+                self.micromap,
+                core::ptr::null(),
+            );
+        }
+    }
 }
 
 /// All buffers + handle for one mesh's opacity micro-map, produced by
@@ -114,6 +146,8 @@ pub struct MeshOmm {
 /// the caller for [`GpuRetire`] and keeps the parts the CLAS references.
 struct MicromapBuild {
     micromap: vk::MicromapEXT,
+    omm_fns: ash::ext::opacity_micromap::Device,
+    allocator: Allocator,
     backing: wgpu::Buffer,
     backing_addr: vk::DeviceAddress,
     index: wgpu::Buffer,
@@ -136,6 +170,8 @@ impl MicromapBuild {
                 micromap: self.micromap,
                 backing: self.backing,
                 index: self.index,
+                omm_fns: self.omm_fns,
+                allocator: self.allocator,
             },
             (self._array_input, self._descs_input, self._scratch),
         )
@@ -365,6 +401,8 @@ impl ClasArena {
 
         MicromapBuild {
             micromap,
+            omm_fns: omm_fns.clone(),
+            allocator: allocator.clone(),
             backing,
             backing_addr,
             index,
