@@ -750,18 +750,17 @@ pub fn prepare_ptlas_params(
         cpu_count,
         force_all: full_rebuild as u32,
         epoch,
-        // DEBUG: default ON whenever OMM is available so the micromap drives
-        // traversal (drops FORCE_NO_OPAQUE). SOLARI_OMM_CONSULT=0 forces it off.
-        // (Holes on non-OMM cutouts render solid under it — the per-geometry has_omm
+        // DEBUG: default ON so the micromap drives traversal (drops
+        // FORCE_NO_OPAQUE); SOLARI_OMM_CONSULT=0 forces it off. (Holes on
+        // non-OMM cutouts render solid under it — the per-geometry has_omm
         // column is the correct always-on fix.)
         omm_consult: {
-            let avail = crate::gpu::extension::opacity_micromap_available();
             let off = std::env::var("SOLARI_OMM_CONSULT").as_deref() == Ok("0");
-            let on = (avail && !off) as u32;
+            let on = !off as u32;
             static LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::debug!("ptlas: omm_consult={on} (omm_available={avail})");
+                tracing::debug!("ptlas: omm_consult={on}");
             }
             on
         },
@@ -771,12 +770,11 @@ pub fn prepare_ptlas_params(
         // correct zero-any-hit path is a NATIVE 2-state bake (OC1_2_State) in the
         // importer, not this runtime flag. Opt in with SOLARI_OMM_2STATE=1.
         omm_force_2_state: {
-            let avail = crate::gpu::extension::opacity_micromap_available();
             let on = (std::env::var("SOLARI_OMM_2STATE").as_deref() == Ok("1")) as u32;
             static LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::debug!("ptlas: omm_force_2_state={on} (omm_available={avail})");
+                tracing::debug!("ptlas: omm_force_2_state={on}");
             }
             on
         },

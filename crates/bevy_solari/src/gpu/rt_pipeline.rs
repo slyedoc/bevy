@@ -543,13 +543,9 @@ impl RtPipeline {
         // Opt into opacity micromaps. Unlike ray queries (which honor OMM straight
         // from the AS), a ray-tracing *pipeline* ignores opacity micromaps entirely
         // unless created with this flag — the driver invokes the any-hit shader on
-        // every micro-triangle as if no OMM were present. Gate on the extension so
-        // pipeline creation stays valid where OMM is unsupported.
-        let pipeline_flags = if crate::gpu::extension::opacity_micromap_available() {
-            vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT
-        } else {
-            vk::PipelineCreateFlags::empty()
-        };
+        // every micro-triangle as if no OMM were present. OMM is a required
+        // extension (solari disables without it), so the flag is unconditional.
+        let pipeline_flags = vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT;
         let mut pipeline_info = vk::RayTracingPipelineCreateInfoKHR::default()
             .flags(pipeline_flags)
             .stages(&stages)

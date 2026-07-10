@@ -104,11 +104,10 @@ pub fn init_blas_rebuild(
 /// build's OMM opt-in in `clas_arena`. Use for BOTH the stride-sizing query and
 /// the actual build so they agree.
 pub(crate) fn blas_build_flags() -> vk::BuildAccelerationStructureFlagsKHR {
-    let mut flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
-    if crate::gpu::extension::opacity_micromap_available() {
-        flags |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_OPACITY_MICROMAP_UPDATE_EXT;
-    }
-    flags
+    // OMM is a required extension (solari disables without it), so the opt-in
+    // is unconditional.
+    vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+        | vk::BuildAccelerationStructureFlagsKHR::ALLOW_OPACITY_MICROMAP_UPDATE_EXT
 }
 
 pub(crate) fn query_blas_size(

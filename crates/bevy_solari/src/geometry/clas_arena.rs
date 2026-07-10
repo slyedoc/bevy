@@ -271,10 +271,7 @@ impl ClasArena {
         fns: &ClusterExtensionFns,
         omm: &OmmUploadData,
     ) -> MicromapBuild {
-        let omm_fns = fns
-            .opacity_micromap
-            .as_ref()
-            .expect("clas_arena.create_micromap: opacity-micromap extension not enabled");
+        let omm_fns = &fns.opacity_micromap;
 
         // Build-input buffers need `MICROMAP_BUILD_INPUT_READ_ONLY_EXT` (wgpu
         // can't express it → allocator path); `write_buffer` stages the upload

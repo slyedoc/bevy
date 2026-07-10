@@ -862,13 +862,19 @@ pub fn init_allocator(
     render_queue: Res<RenderQueue>,
     additional: Res<AdditionalVulkanFeatures>,
 ) {
-    if !additional.has::<ClusterAccelerationStructureFeature>() {
+    if !additional.has::<ClusterAccelerationStructureFeature>()
+        || !additional.has::<crate::gpu::extension::OpacityMicromapFeature>()
+    {
         // Solari is silently disabled if we just return with no allocator — every
         // downstream `Option<Res<Allocator>>` init then no-ops, with no signal as to
         // why. Say it once so a "nothing renders" report has an obvious first answer.
+        // Opacity micromaps are required alongside cluster AS: every driver with
+        // the NV cluster extensions has VK_EXT_opacity_micromap, and requiring it
+        // keeps a no-OMM fallback out of every build/attach path.
         bevy_log::warn_once!(
             "bevy_solari disabled: the GPU/driver lacks the cluster acceleration-structure \
-             feature (VK_NV_cluster_acceleration_structure et al.). All solari passes no-op."
+             feature (VK_NV_cluster_acceleration_structure et al.) or VK_EXT_opacity_micromap. \
+             All solari passes no-op."
         );
         return;
     }

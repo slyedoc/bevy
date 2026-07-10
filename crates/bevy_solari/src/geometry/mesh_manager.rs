@@ -3,7 +3,6 @@ use super::asset::{
     OmmDesc, OmmUsage, PackedVertex,
 };
 use super::indices::{ClusterIndex, GroupIndex, NodeIndex};
-use crate::gpu::extension::opacity_micromap_available;
 use crate::gpu::allocator::Allocator;
 use crate::gpu::persistent_buffer::PersistentGpuBuffer;
 use alloc::sync::Arc;
@@ -463,9 +462,9 @@ impl ClusterMeshManager {
         };
 
         self.cluster_mesh_slices.insert(asset_id, slices);
-        // Thread the baked OMM through to the CLAS build, but only if the device
-        // can actually consume it — otherwise alpha cutouts fall back to any-hit.
-        let omm = (opacity_micromap_available() && mesh.has_opacity_micromap()).then(|| {
+        // Thread the baked OMM through to the CLAS build (the extension is
+        // required — solari is disabled entirely on devices without it).
+        let omm = mesh.has_opacity_micromap().then(|| {
             OmmUploadData {
                 array_data: Arc::clone(&mesh.omm_array_data),
                 descs: Arc::clone(&mesh.omm_descs),

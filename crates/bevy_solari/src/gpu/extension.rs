@@ -112,23 +112,15 @@ pub fn shader_clock_available() -> bool {
 }
 
 /// Marker registered when `VK_EXT_opacity_micromap` is enabled. Alpha-cutout
-/// meshes carry a baked opacity micro-map (see [`ClusterMesh`]); with this
-/// extension the RT cores resolve known opaque/transparent micro-regions in
-/// hardware, skipping the `ahit_alpha` any-hit invocation. Absent → the OMM
-/// build/attach is skipped and alpha cutouts fall back to pure any-hit.
+/// meshes carry a baked opacity micro-map (see [`ClusterMesh`]); the RT cores
+/// resolve known opaque/transparent micro-regions in hardware, skipping the
+/// `ahit_alpha` any-hit invocation. REQUIRED: every driver exposing the NV
+/// cluster-AS extensions (solari's hard floor) also exposes this, so its
+/// absence disables solari entirely (see `init_allocator`) instead of carrying
+/// a permanent no-OMM fallback through every build/attach path.
 ///
 /// [`ClusterMesh`]: crate::geometry::ClusterMesh
 pub struct OpacityMicromapFeature;
-
-/// `true` once `VK_EXT_opacity_micromap` has been enabled on the device. Read by
-/// the micromap build / CLAS-attach paths to decide whether to wire OMM at all.
-static OPACITY_MICROMAP_AVAILABLE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Whether `VK_EXT_opacity_micromap` was enabled at device creation.
-pub fn opacity_micromap_available() -> bool {
-    OPACITY_MICROMAP_AVAILABLE.load(core::sync::atomic::Ordering::Relaxed)
-}
 
 /// Register the cluster-AS + partitioned-AS Vulkan device-creation
 /// callback. Called by `SolariInitPlugin::build` — apps using
@@ -348,15 +340,14 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
             if supports(ext::opacity_micromap::NAME) {
                 args.extensions.push(ext::opacity_micromap::NAME);
                 additional.insert::<OpacityMicromapFeature>();
-                OPACITY_MICROMAP_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
                 let features = Box::leak(Box::new(
                     vk::PhysicalDeviceOpacityMicromapFeaturesEXT::default().micromap(true),
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
             } else {
                 tracing::warn!(
-                    "VK_EXT_opacity_micromap NOT exposed by this device — alpha cutouts fall back to \
-                     pure any-hit (no OMM acceleration)."
+                    "VK_EXT_opacity_micromap NOT exposed by this device — it is required \
+                     (every cluster-AS-capable driver has it), so solari will be disabled."
                 );
             }
 
@@ -404,10 +395,11 @@ pub struct ClusterExtensionFns {
     pub acceleration_structure: khr::acceleration_structure::Device,
     /// Per-device function table for `VK_EXT_opacity_micromap`
     /// (`vkGetMicromapBuildSizesEXT` / `vkCreateMicromapEXT` /
-    /// `vkCmdBuildMicromapsEXT`). `None` if the extension wasn't enabled
-    /// at device creation. Used to build the per-mesh opacity micro-map
-    /// the NV cluster CLAS references (see `geometry::clas_arena`).
-    pub opacity_micromap: Option<ext::opacity_micromap::Device>,
+    /// `vkCmdBuildMicromapsEXT`). The extension is REQUIRED (solari disables
+    /// entirely without it — see [`OpacityMicromapFeature`]), so the table is
+    /// always loaded. Used to build the per-mesh opacity micro-map the NV
+    /// cluster CLAS references (see `geometry::clas_arena`).
+    pub opacity_micromap: ext::opacity_micromap::Device,
 }
 
 impl ClusterExtensionFns {
@@ -427,7 +419,6 @@ impl ClusterExtensionFns {
     pub fn load(render_device: &RenderDevice, additional: &AdditionalVulkanFeatures) -> Self {
         let has_cluster = additional.has::<ClusterAccelerationStructureFeature>();
         let has_partitioned = additional.has::<PartitionedAccelerationStructureFeature>();
-        let has_opacity_micromap = additional.has::<OpacityMicromapFeature>();
 
         // SAFETY: as_hal yields the raw Vulkan device only while the
         // wgpu Device is alive; we only read function pointers and
@@ -459,8 +450,10 @@ impl ClusterExtensionFns {
                 nv::partitioned_acceleration_structure::Device::load(raw_instance, raw_device)
             }),
             acceleration_structure,
-            opacity_micromap: has_opacity_micromap
-                .then(|| ext::opacity_micromap::Device::load(raw_instance, raw_device)),
+            // Required extension (solari is disabled when it's absent, so this
+            // table is never called on a device without it — loading fn pointers
+            // is safe either way).
+            opacity_micromap: ext::opacity_micromap::Device::load(raw_instance, raw_device),
         }
     }
 }
@@ -800,18 +793,14 @@ pub unsafe fn cmd_micromap_barrier(
 ///
 /// # Safety
 ///
-/// Caller must uphold every Vulkan rule of `vkCmdBuildMicromapsEXT` and ensure
-/// `fns.opacity_micromap` is `Some`.
+/// Caller must uphold every Vulkan rule of `vkCmdBuildMicromapsEXT`.
 pub unsafe fn cmd_build_micromaps(
     encoder: &mut wgpu::CommandEncoder,
     fns: &ClusterExtensionFns,
     build_info: &vk::MicromapBuildInfoEXT<'_>,
 ) {
     let _span = tracing::info_span!("vk.build_micromaps").entered();
-    let omm = fns
-        .opacity_micromap
-        .as_ref()
-        .expect("cmd_build_micromaps: opacity-micromap extension not enabled");
+    let omm = &fns.opacity_micromap;
     unsafe {
         encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
             let hal_encoder =
