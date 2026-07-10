@@ -105,7 +105,11 @@ impl Plugin for SolariTransformPlugin {
             // Reliable first-sight for every node: queue it when its slot is assigned, so the `local`
             // upload never depends on the extract catching a cross-world change edge.
             .add_observer(enqueue_node_first_sight)
-            // TODO: handle few few transforms locally, not sending to gpu, might not need anymore
+            // CPU `GlobalTransform` for the consumers the GPU table doesn't serve:
+            // solari apps disable `TransformPlugin`, but UI layout still needs
+            // `Node` trees propagated on the CPU, and parentless entities
+            // (cameras, lights) need their `GlobalTransform` synced for CPU
+            // readers (picking, controllers) without waiting on the readback.
             .add_systems(
                 PostUpdate,
                 (

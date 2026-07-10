@@ -800,13 +800,6 @@ pub fn prepare_ptlas_params(
             capacity,
             PTLAS_PARTITION_COUNT,
         );
-        tracing::info!(
-            "ptlas: AS size {} MiB, scratch {} MiB (capacity {}, {} partitions)",
-            sizes_info.acceleration_structure_size >> 20,
-            sizes_info.build_scratch_size >> 20,
-            capacity,
-            PTLAS_PARTITION_COUNT,
-        );
         for i in 0..2 {
             resources.tlas[i] = None; // Drop old handle first (frees the VkAS).
             // SAFETY: as_hal yields the raw VkBuffer while the SparseBuffer
