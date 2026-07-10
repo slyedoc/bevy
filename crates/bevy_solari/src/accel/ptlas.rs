@@ -171,9 +171,6 @@ pub struct PtlasFillParamsGpu {
     pub active_count: u32,
     pub cpu_count: u32,
     pub force_all: u32,
-    /// 1 → OMM-consult validation mode (drop FORCE_NO_OPAQUE so micromaps drive).
-    /// Set from `SOLARI_OMM_CONSULT` (default on).
-    pub omm_consult: u32,
     /// This build's seed-epoch stamp (≥1) — `fill_seed` marks its slots,
     /// `fill_incremental` skips them (one WRITE per instance per build).
     pub epoch: u32,
@@ -745,20 +742,6 @@ pub fn prepare_ptlas_params(
         cpu_count,
         force_all: full_rebuild as u32,
         epoch,
-        // DEBUG: default ON so the micromap drives traversal (drops
-        // FORCE_NO_OPAQUE); SOLARI_OMM_CONSULT=0 forces it off. (Holes on
-        // non-OMM cutouts render solid under it — the per-geometry has_omm
-        // column is the correct always-on fix.)
-        omm_consult: {
-            let off = std::env::var("SOLARI_OMM_CONSULT").as_deref() == Ok("0");
-            let on = !off as u32;
-            static LOGGED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::debug!("ptlas: omm_consult={on}");
-            }
-            on
-        },
     };
     resources
         .fill_params
@@ -1044,6 +1027,7 @@ pub fn prepare_ptlas_fill_bind_group(
             ptlas.seed_epoch.buffer().as_entire_binding(),
             partition_hints.buffer().as_entire_binding(),
             sharing.geometry_built_level.as_entire_binding(),
+            sharing.geometry_flags.as_entire_binding(),
         )),
     );
     ptlas.bind_group = Some(group);

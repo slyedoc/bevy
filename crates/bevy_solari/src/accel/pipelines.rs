@@ -95,6 +95,7 @@ pub fn ptlas_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_sized(false, None),           // 18 seed_epoch
                 storage_buffer_read_only_sized(false, None), // 19 partition_hints
                 storage_buffer_read_only_sized(false, None), // 20 geometry_built_level (BLAS content truth)
+                storage_buffer_read_only_sized(false, None), // 21 geometry_flags (bit 0 = has baked OMM)
             ),
         ),
     )

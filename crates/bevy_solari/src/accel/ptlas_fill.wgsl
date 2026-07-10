@@ -56,12 +56,6 @@ struct PtlasFillParams {
     /// 1 → write every active instance (full rebuild); 0 → only
     /// instances of geometries rebuilt this frame.
     force_all: u32,
-    /// 1 → drop `FORCE_NO_OPAQUE` from every instance so an attached opacity
-    /// micro-map drives traversal (any-hit only on unknown micro-regions). Global
-    /// VALIDATION toggle (SOLARI_OMM_CONSULT) — alpha cutouts WITHOUT a baked OMM
-    /// render holes-solid under it; the per-geometry `has_omm` column is the
-    /// correct, always-on replacement.
-    omm_consult: u32,
     /// This build's seed-epoch stamp (≥1, bumped per build) — see `seed_epoch`.
     epoch: u32,
 }
@@ -140,16 +134,18 @@ fn resolve_partition(slot: u32) -> u32 {
 }
 
 /// The `instance_flags` an instance's record should carry, derived from its
-/// material — not stored per instance anywhere on the CPU.
+/// geometry + material — not stored per instance anywhere on the CPU.
 fn derived_vk_flags(slot: u32) -> u32 {
-    // Validation mode: clear FORCE_NO_OPAQUE so an attached OMM is consulted. The
-    // OMM then drives per-micro-triangle: pure opaque/transparent commit/skip in
-    // hardware, "unknown" still invokes the any-hit. Zero-any-hit cutouts come
-    // from a native 2-state bake (OC1_2_State) in the importer, not a runtime
-    // instance flag — forcing 2-state on a 4-state bake mis-resolves the cutout.
-    if params.omm_consult == 1u {
+    // A geometry whose CLASes carry a baked opacity micromap: the micromap
+    // drives traversal per micro-triangle (opaque/transparent commit/skip in
+    // hardware, any-hit only on "unknown" regions; a 2-state bake has none).
+    // Forcing `FORCE_NO_OPAQUE` here would invoke the any-hit on every hit and
+    // waste the micromap.
+    if (geometry_flags[instance_geometry_ids[slot]] & GEOMETRY_FLAG_HAS_OMM) != 0u {
         return 0u;
     }
+    // No micromap: an alpha-tested material needs the any-hit on every hit
+    // (`FORCE_NO_OPAQUE`), else its cutouts render solid.
     return material_vk_flags(material_traversal_flags[instance_material_ids[slot]]);
 }
 
@@ -336,6 +332,10 @@ fn finalize() {
 // written now would bake a hollow zero-extent leaf into the TLAS. Count it into
 // the heal word so rebuild-until-clean restamps once the content lands.
 @group(1) @binding(20) var<storage, read> geometry_built_level: array<u32>;
+/// geometry → flag bits; see `BlasSharing::geometry_flags`.
+@group(1) @binding(21) var<storage, read> geometry_flags: array<u32>;
+/// The geometry's CLASes were built with a baked opacity micromap attached.
+const GEOMETRY_FLAG_HAS_OMM: u32 = 1u;
 const BUILT_NO_LEVEL: u32 = 0xFFFFFFFFu;
 
 // slot-indexed: the epoch `fill_seed` last wrote this slot's record in.

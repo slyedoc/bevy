@@ -121,6 +121,12 @@ pub struct BlasSharing {
     /// gets committed and baked into the TLAS as a zero-extent leaf — the
     /// intermittent missing-static-scene startup race.
     pub clas_ready: Buffer,
+    /// geometry → flag bits (bit 0 = has baked OMM): set once the geometry's
+    /// CLASes were built with an opacity micromap attached (CPU-written at
+    /// CLAS upload, next to `clas_ready`). The PTLAS fill reads it per instance:
+    /// an OMM'd geometry lets the micromap drive traversal, while an alpha-tested
+    /// material without one keeps `FORCE_NO_OPAQUE` (shader alpha test).
+    pub geometry_flags: Buffer,
     /// dirty entry i → geometry id.
     pub dirty_gid: Buffer,
     /// dirty build count (atomic alloc). The selector guards its
@@ -236,6 +242,7 @@ pub fn init_blas_sharing(
     let geometry_dirty = storage_buf(&render_device, "blas_sharing.geometry_dirty", cap * 4);
     let geometry_desc = storage_buf(&render_device, "blas_sharing.geometry_desc", cap * 16);
     let clas_ready = storage_buf(&render_device, "blas_sharing.clas_ready", cap * 4);
+    let geometry_flags = storage_buf(&render_device, "blas_sharing.geometry_flags", cap * 4);
     let dirty_gid = storage_buf(&render_device, "blas_sharing.dirty_gid", cap * 4);
     let dirty_build_count = storage_buf(&render_device, "blas_sharing.dirty_count", 4);
     let build_desc = storage_buf(&render_device, "blas_sharing.build_desc", cap * 2 * 16);
@@ -261,6 +268,7 @@ pub fn init_blas_sharing(
         geometry_dirty,
         geometry_desc,
         clas_ready,
+        geometry_flags,
         dirty_gid,
         dirty_build_count,
         build_count,

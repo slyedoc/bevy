@@ -967,6 +967,16 @@ pub fn upload_pending_clas(
             (sharing.as_ref(), cluster_meshes.geometry_id_of(entry.asset_id))
         {
             render_queue.write_buffer(&sharing.clas_ready, gid as u64 * 4, &1u32.to_le_bytes());
+            // The CLASes above were built with an OMM attached: tell the PTLAS
+            // fill so this geometry's instances let the micromap drive traversal
+            // (cutouts WITHOUT one keep the forced any-hit).
+            if entry.omm.is_some() {
+                render_queue.write_buffer(
+                    &sharing.geometry_flags,
+                    gid as u64 * 4,
+                    &1u32.to_le_bytes(),
+                );
+            }
         }
     }
 }
