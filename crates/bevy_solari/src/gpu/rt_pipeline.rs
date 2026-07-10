@@ -257,6 +257,15 @@ pub struct RtPipeline {
 
     /// Shader modules retained for the pipeline's lifetime (destroyed on drop).
     modules: Vec<vk::ShaderModule>,
+
+    /// Keeps the `VkDevice` alive until this drops. The cloned `ash::Device`
+    /// above is a bare handle + fn table with NO ownership: at app teardown the
+    /// render world drops resources in arbitrary order, and if wgpu destroys the
+    /// device first, [`Drop`]'s raw destroys segfault against a dead device (the
+    /// old exam harnesses hard-`process::exit`ed to dodge exactly this). The
+    /// allocator transitively holds wgpu's queue → device, so holding it pins
+    /// the device across our Drop.
+    _device_keepalive: Allocator,
 }
 
 // SAFETY: all fields are plain Vulkan handles owned by this resource; the only
@@ -297,6 +306,10 @@ pub struct RtViewBindings {
     /// skybox that finishes loading (or is swapped) changes the view, and the
     /// baked-once set would otherwise sample the stale cube forever.
     env_map_view: vk::ImageView,
+    /// Keeps the `VkDevice` alive until this drops — see the twin field on
+    /// [`RtPipeline`]; without it, teardown drop order decides whether [`Drop`]'s
+    /// raw destroys run against a dead device.
+    _device_keepalive: Allocator,
 }
 
 // SAFETY: the host-visible geometry-address mapping is written only from the single
@@ -703,6 +716,7 @@ impl RtPipeline {
             record_capacity,
             material_classes: material_classes.to_vec(),
             modules,
+            _device_keepalive: allocator.clone(),
         };
         Some(out)
     }
@@ -963,6 +977,7 @@ impl RtPipeline {
             env_map_image,
             output_buffer,
             env_map_view,
+            _device_keepalive: allocator.clone(),
         })
     }
 

@@ -1336,17 +1336,15 @@ impl ExamAppExt for App {
         let secs = duration.or_else(|| std::env::var_os("CLAUDECODE").map(|_| agent_default));
         if let Some(secs) = secs {
             self.insert_resource(Timeout(Timer::from_seconds(secs, TimerMode::Once)))
-                .add_systems(Update, |time: Res<Time>, mut t: ResMut<Timeout>| {
-                    if t.0.tick(time.delta()).just_finished() {
-                        info!("timeout reached, exiting");
-                        // Hard exit: skip teardown (device-heavy shutdown otherwise
-                        // segfaults after success and taints the exam's exit code).
-                        use std::io::Write;
-                        let _ = std::io::stdout().flush();
-                        let _ = std::io::stderr().flush();
-                        std::process::exit(0);
-                    }
-                });
+                .add_systems(
+                    Update,
+                    |time: Res<Time>, mut t: ResMut<Timeout>, mut exit: MessageWriter<AppExit>| {
+                        if t.0.tick(time.delta()).just_finished() {
+                            info!("timeout reached, exiting");
+                            exit.write(AppExit::Success);
+                        }
+                    },
+                );
         }
         self
     }

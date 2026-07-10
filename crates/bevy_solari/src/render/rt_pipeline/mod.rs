@@ -1181,19 +1181,34 @@ pub(crate) fn rt_pipeline(
     // Environment cube the miss shader samples (same priority as the megakernel):
     // the baked atmosphere cube if this view has one, else the view's skybox image,
     // else the fallback cube. The atmosphere cube is a STORAGE image (GENERAL) the
-    // RT path never samples via wgpu, so we transition it ourselves; the skybox /
-    // fallback are wgpu-sampled (read-optimal already), so no transition.
-    let (environment_map_view, environment_map_image) =
+    // RT path never samples via wgpu, so we transition it ourselves. The skybox /
+    // fallback are wgpu-tracked — but the trace's sampled read is invisible to the
+    // tracker, so declare it below via `transition_resources`.
+    let (environment_map_view, environment_map_image, environment_map_texture) =
         match atmosphere_view.and(atmosphere_sky.as_ref()) {
-            Some(sky) => (&sky.cube_view, raw_image(&sky.texture)),
+            Some(sky) => (&sky.cube_view, raw_image(&sky.texture), None),
             None => {
-                let view = environment_map
+                let image = environment_map
                     .and_then(|env| env_images.texture_assets.get(&env.image))
-                    .map(|image| &image.texture_view)
-                    .unwrap_or(&env_images.fallback_image.cube.texture_view);
-                (view, None)
+                    .unwrap_or(&env_images.fallback_image.cube);
+                (&image.texture_view, None, Some(&image.texture))
             }
         };
+    // Make the untracked sampled read visible to wgpu: on the frames the skybox
+    // asset uploads, its tracked layout is TRANSFER_DST and no pass would
+    // otherwise transition it to read-only before the trace samples it
+    // (VUID-vkCmdDraw-None-09600). A no-op once the state already matches.
+    if let Some(texture) = environment_map_texture {
+        ctx.command_encoder().transition_resources(
+            core::iter::empty(),
+            core::iter::once(wgpu::TextureTransition {
+                // bevy `Texture` → the wrapped `wgpu::Texture`.
+                texture: &**texture,
+                selector: None,
+                state: wgpu::TextureUses::RESOURCE,
+            }),
+        );
+    }
     // Match the megakernel (view_cull.rs): the baked atmosphere cube is already
     // physical radiance (brightness 1.0); otherwise the skybox's raw cd/m²; else 0
     // (no sky ⇒ miss stays at the clear color). Brightness stays 0 while the skybox
