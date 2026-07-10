@@ -530,6 +530,32 @@ pub fn dispatch_animated_blas(
 
     let inst_scratch = align_addr(resources.instantiate_scratch.address, SCRATCH_ALIGN);
     let blas_scratch = align_addr(resources.blas_scratch.address, SCRATCH_ALIGN);
+
+    // The scratch commits are fixed-size, so validate the driver's reported
+    // scratch requirements against the committed pages BEFORE recording: a
+    // scratch overflow is a GPU write past committed sparse memory — a
+    // device-lost, not a validation error. Skipping the builds keeps last
+    // frame's animated BLASes (poses freeze) instead. The destination pools
+    // are not checked here: their sizing is workload-derived (per-cluster
+    // instantiate bound; per-BLAS stride from the single-AS size query), while
+    // these batch-input queries report a uniform worst case over the input
+    // maxima — far above any real workload.
+    let inst_scratch_needed =
+        (inst_scratch - resources.instantiate_scratch.address) + inst_sizes.build_scratch_size;
+    let blas_scratch_needed =
+        (blas_scratch - resources.blas_scratch.address) + bl_sizes.build_scratch_size;
+    if !resources.instantiate_scratch.is_committed(0..inst_scratch_needed)
+        || !resources.blas_scratch.is_committed(0..blas_scratch_needed)
+    {
+        bevy_log::error_once!(
+            "animated_blas: driver-required scratch exceeds committed capacity \
+             (instantiate {} B, blas {} B) — skipping animated builds",
+            inst_sizes.build_scratch_size,
+            bl_sizes.build_scratch_size,
+        );
+        return;
+    }
+
     let inst_args_addr = allocator.wgpu_buffer_device_address(&resources.instantiate_args).get();
     let inst_count_addr = allocator.wgpu_buffer_device_address(&resources.count).get();
     let inst_addrs_addr = allocator.wgpu_buffer_device_address(&resources.instantiated_clas_addrs).get();
@@ -627,8 +653,6 @@ pub fn dispatch_animated_blas(
         crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
     }
     ctx.add_command_buffer(encoder.finish());
-    let _ = inst_sizes;
-    let _ = bl_sizes;
 }
 
 fn align_addr(addr: u64, align: u64) -> u64 {
