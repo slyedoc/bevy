@@ -27,8 +27,6 @@ pub enum InspectorPanel {
     Entity(Entity),
     /// Shows a single resource.
     Resource(TypeId),
-    /// The world inspector (entities + resources).
-    World,
 }
 
 /// Enumerate `target`'s reflectable components and (re)build an editing section per component as
@@ -149,7 +147,6 @@ pub fn rebuild_panel(world: &mut World, panel: Entity) {
     match kind {
         InspectorPanel::Entity(target) => build_entity_inspector(world, target, panel),
         InspectorPanel::Resource(type_id) => build_resource_inspector(world, type_id, panel),
-        InspectorPanel::World => crate::world_panel::build_world_panel(world, panel),
     }
 }
 
