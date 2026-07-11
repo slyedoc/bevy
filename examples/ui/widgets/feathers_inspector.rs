@@ -1,6 +1,6 @@
 //! Reflection-driven property editing with Feathers widgets.
 //!
-//! Adds a turnkey [`WorldInspectorPlugin`]: press `` ` `` (backtick) to toggle an overlay listing
+//! Adds a turnkey [`WorldInspectorPlugin`]: press `F1` to toggle an overlay listing
 //! entities and resources in a collapsible tree — expand a row to edit its components/fields. Edits
 //! write straight back through reflection, so `Changed<T>` fires — watch the console.
 //!
@@ -72,7 +72,7 @@ fn main() {
             DefaultPlugins,
             FeathersPlugins,
             FeathersInspectorPlugins,
-            WorldInspectorPlugin::<With<Name>>::default().with_toggle_key(KeyCode::Backquote),
+            WorldInspectorPlugin::<With<Name>>::default().with_toggle_key(KeyCode::F1),
         ))
         .insert_resource(UiTheme(create_dark_theme()))
         .register_type::<DemoSettings>()
@@ -121,7 +121,7 @@ fn setup(mut commands: Commands) {
         },
     ));
 
-    info!("Press ` (backtick) to toggle the world inspector.");
+    info!("Press F1 to toggle the world inspector.");
 }
 
 /// Prints components/resources whenever an inspector edit mutates them.
