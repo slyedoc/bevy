@@ -1,24 +1,16 @@
 //! Reflection-driven property editing with Feathers widgets.
 //!
-//! Three panels: a **world inspector** listing named entities (click one to inspect it in the
-//! **detail** panel), and a **resource** inspector. Editing a slider, toggling a checkbox, switching
-//! an enum variant, or adding/removing list elements writes straight back through reflection, so
-//! `Changed<T>` fires — watch the console.
-
-use core::any::TypeId;
+//! Adds a turnkey [`WorldInspectorPlugin`]: press `` ` `` (backtick) to toggle an overlay listing
+//! entities and resources in a collapsible tree — expand a row to edit its components/fields. Edits
+//! write straight back through reflection, so `Changed<T>` fires — watch the console.
+//!
+//! The plugin is filtered with `With<Name>` here (only named entities); use
+//! `WorldInspectorPlugin::new()` for every entity, or any other query filter.
 
 use bevy::{
-    feathers::{
-        dark_theme::create_dark_theme,
-        theme::{ThemeBackgroundColor, UiTheme},
-        tokens, FeathersPlugins,
-    },
-    feathers_inspector::{
-        BuildResourceInspector, BuildWorldInspector, FeathersInspectorPlugins, Hidden,
-        InspectorDetailPanel, ReadOnly,
-    },
+    feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
+    feathers_inspector::{FeathersInspectorPlugins, Hidden, ReadOnly, WorldInspectorPlugin},
     prelude::*,
-    ui::px,
 };
 
 /// A demo component exercising the inspector's widgets.
@@ -76,7 +68,12 @@ struct DemoConfig {
 
 fn main() {
     App::new()
-        .add_plugins((DefaultPlugins, FeathersPlugins, FeathersInspectorPlugins))
+        .add_plugins((
+            DefaultPlugins,
+            FeathersPlugins,
+            FeathersInspectorPlugins,
+            WorldInspectorPlugin::<With<Name>>::default(),
+        ))
         .insert_resource(UiTheme(create_dark_theme()))
         .register_type::<DemoSettings>()
         .register_type::<NestedSettings>()
@@ -95,7 +92,6 @@ fn main() {
 fn setup(mut commands: Commands) {
     commands.spawn(Camera2d);
 
-    // Named entities the world inspector will list.
     commands.spawn((
         Name::new("Player"),
         DemoSettings {
@@ -125,35 +121,7 @@ fn setup(mut commands: Commands) {
         },
     ));
 
-    let world_panel = commands.spawn(panel(16.0, 200.0)).id();
-    let detail_panel = commands.spawn(panel(228.0, 360.0)).id();
-    let resource_panel = commands.spawn(panel(600.0, 360.0)).id();
-
-    // Where a selected entity's inspector is rendered.
-    commands.insert_resource(InspectorDetailPanel(detail_panel));
-
-    commands.queue(BuildWorldInspector { panel: world_panel });
-    commands.queue(BuildResourceInspector {
-        type_id: TypeId::of::<DemoConfig>(),
-        panel: resource_panel,
-    });
-}
-
-/// A themed inspector panel positioned absolutely.
-fn panel(left: f32, width: f32) -> impl Bundle {
-    (
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(left),
-            top: px(16),
-            width: px(width),
-            flex_direction: FlexDirection::Column,
-            row_gap: px(6),
-            padding: UiRect::all(px(10)),
-            ..default()
-        },
-        ThemeBackgroundColor(tokens::WINDOW_BG),
-    )
+    info!("Press ` (backtick) to toggle the world inspector.");
 }
 
 /// Prints components/resources whenever an inspector edit mutates them.

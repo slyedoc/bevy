@@ -43,11 +43,25 @@ pub fn build_entity_inspector(world: &mut World, target: Entity, panel: Entity) 
     let registry = world.resource::<AppTypeRegistry>().clone();
     let registry = registry.read();
 
-    let component_ids: Vec<ComponentId> = match world.get_entity(target) {
-        Ok(entity_ref) => entity_ref.archetype().components().to_vec(),
-        Err(_) => return,
-    };
+    let sections = entity_component_sections(world, &registry, target);
 
+    drop(registry);
+
+    if let Ok(panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.queue_spawn_related_scenes::<Children>(sections);
+    }
+}
+
+/// Build a titled section for each of an entity's reflectable components.
+pub(crate) fn entity_component_sections(
+    world: &World,
+    registry: &bevy_reflect::TypeRegistry,
+    entity: Entity,
+) -> Vec<Box<dyn Scene>> {
+    let component_ids: Vec<ComponentId> = match world.get_entity(entity) {
+        Ok(entity_ref) => entity_ref.archetype().components().to_vec(),
+        Err(_) => return Vec::new(),
+    };
     let mut sections: Vec<Box<dyn Scene>> = Vec::new();
     for component_id in component_ids {
         let Some(type_id) = world
@@ -63,22 +77,14 @@ pub fn build_entity_inspector(world: &mut World, target: Entity, panel: Entity) 
         let Some(reflect_component) = registration.data::<ReflectComponent>() else {
             continue;
         };
-        let Some(reflected) = reflect_component.reflect(world.entity(target)) else {
+        let Some(reflected) = reflect_component.reflect(world.entity(entity)) else {
             continue;
         };
         let name = registration.type_info().ty().short_path();
-        let root = InspectorRoot::Component {
-            entity: target,
-            type_id,
-        };
-        sections.push(section_for(&registry, root, name, reflected));
+        let root = InspectorRoot::Component { entity, type_id };
+        sections.push(section_for(registry, root, name, reflected));
     }
-
-    drop(registry);
-
-    if let Ok(panel_mut) = world.get_entity_mut(panel) {
-        panel_mut.queue_spawn_related_scenes::<Children>(sections);
-    }
+    sections
 }
 
 /// (Re)build a single-resource inspector as the sole child of `panel`.

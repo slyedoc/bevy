@@ -27,6 +27,7 @@ pub mod lists;
 pub mod recurse;
 pub mod sync;
 pub mod widget;
+pub mod world_inspector;
 pub mod world_panel;
 
 pub use attributes::{FieldCtx, Hidden, ReadOnly};
@@ -41,4 +42,5 @@ pub use recurse::{build_value, BuildCx};
 pub use widget::{
     DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins, ReflectInspectorWidget, SliderScalar,
 };
+pub use world_inspector::{WorldInspectorPlugin, WorldInspectorState};
 pub use world_panel::{build_world_panel, BuildWorldInspector, InspectorDetailPanel};
