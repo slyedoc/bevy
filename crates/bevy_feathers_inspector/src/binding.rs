@@ -1,10 +1,10 @@
-//! Root addressing and the generic writeback observer.
+//! Root addressing and the writeback observers.
 //!
 //! Every leaf widget spawned by the inspector carries an [`InspectorBinding`] that records how to
 //! get from the widget back to the data it edits: an [`InspectorRoot`] (which component, on which
 //! entity) plus a reflection [`ParsedPath`] from that root down to the edited field. When a widget
-//! emits a [`ValueChange<T>`], [`inspector_writeback`] resolves the binding and applies the new
-//! value through reflection, driving change detection on the target component.
+//! emits a [`ValueChange<T>`], a writeback observer resolves the binding and applies the new value
+//! through reflection, driving change detection on the target component.
 
 use core::any::TypeId;
 
@@ -12,6 +12,8 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_reflect::{GetPath, ParsedPath, PartialReflect};
 use bevy_ui_widgets::ValueChange;
+
+use crate::widget::SliderScalar;
 
 /// Identifies the reflected value that an inspector widget edits.
 #[derive(Clone)]
@@ -23,7 +25,11 @@ pub enum InspectorRoot {
         /// The component's registered type.
         type_id: TypeId,
     },
-    // `Resource { type_id }` is added in Phase 3.
+    /// A resource.
+    Resource {
+        /// The resource's registered type.
+        type_id: TypeId,
+    },
 }
 
 /// Placed on every leaf widget entity so its change observer can write back to the source data.
@@ -44,13 +50,9 @@ impl Default for InspectorBinding {
     }
 }
 
-/// Generic observer that writes a widget's new value back into the reflected source field.
-///
-/// One monomorphization is attached per leaf widget type (e.g. `inspector_writeback::<f32>` for a
-/// number input, `inspector_writeback::<bool>` for a checkbox). The actual reflection mutation is
-/// deferred into a command so it can take exclusive `&mut World` access.
-pub fn inspector_writeback<T: PartialReflect + Clone>(
-    event: On<ValueChange<T>>,
+/// Writeback observer for a `bool` field (from a checkbox's `ValueChange<bool>`).
+pub fn inspector_writeback_bool(
+    event: On<ValueChange<bool>>,
     bindings: Query<&InspectorBinding>,
     mut commands: Commands,
 ) {
@@ -61,18 +63,47 @@ pub fn inspector_writeback<T: PartialReflect + Clone>(
         return;
     };
     let path = binding.path.clone();
-    let value = event.value.clone();
+    let value = event.value;
     commands.queue(move |world: &mut World| {
-        apply_writeback(world, &root, &path, &value);
+        with_field_reflect_mut(world, &root, &path, |target| {
+            let _ = target.try_apply(value.as_partial_reflect());
+        });
     });
 }
 
-/// Resolve `root` to a mutable reflected reference and apply `value` at `path`.
-fn apply_writeback(
+/// Writeback observer for any numeric field edited by a slider (`ValueChange<f32>`).
+///
+/// The slider always emits `f32`; `T::from_slider_f32` converts it back to the field's real type
+/// (rounding for integers) so the reflected value keeps its original type.
+pub fn inspector_writeback_slider<T: SliderScalar>(
+    event: On<ValueChange<f32>>,
+    bindings: Query<&InspectorBinding>,
+    mut commands: Commands,
+) {
+    let Ok(binding) = bindings.get(event.source) else {
+        return;
+    };
+    let Some(root) = binding.root.clone() else {
+        return;
+    };
+    let path = binding.path.clone();
+    let value = T::from_slider_f32(event.value);
+    commands.queue(move |world: &mut World| {
+        with_field_reflect_mut(world, &root, &path, |target| {
+            let _ = target.try_apply(value.as_partial_reflect());
+        });
+    });
+}
+
+/// Resolve `root` + `path` to a mutable reflected reference and hand it to `f`.
+///
+/// Going through `Mut`'s `DerefMut` marks the component/resource changed, so `Changed<T>` fires.
+/// Shared by every writeback path (scalars, enum variant switches, list edits).
+pub(crate) fn with_field_reflect_mut(
     world: &mut World,
     root: &InspectorRoot,
     path: &ParsedPath,
-    value: &dyn PartialReflect,
+    f: impl FnOnce(&mut dyn PartialReflect),
 ) {
     // Clone the `Arc` so the read guard does not borrow `world`, leaving it free for `entity_mut`.
     let registry = world.resource::<AppTypeRegistry>().clone();
@@ -92,9 +123,33 @@ fn apply_writeback(
             let Some(mut reflected) = reflect_component.reflect_mut(entity_mut) else {
                 return;
             };
-            // `reflect_path_mut` goes through `Mut`'s `DerefMut`, so change detection fires.
             if let Ok(target) = reflected.reflect_path_mut(path) {
-                let _ = target.try_apply(value);
+                f(target);
+            }
+        }
+        InspectorRoot::Resource { type_id } => {
+            // Resources are stored on their own entity; reuse `ReflectComponent` against it.
+            let Some(registration) = registry.get(*type_id) else {
+                return;
+            };
+            let Some(reflect_component) = registration.data::<ReflectComponent>() else {
+                return;
+            };
+            let Some(resource_entity) = world
+                .components()
+                .get_id(*type_id)
+                .and_then(|id| world.resource_entities().get(id))
+            else {
+                return;
+            };
+            let Ok(entity_mut) = world.get_entity_mut(resource_entity) else {
+                return;
+            };
+            let Some(mut reflected) = reflect_component.reflect_mut(entity_mut) else {
+                return;
+            };
+            if let Ok(target) = reflected.reflect_path_mut(path) {
+                f(target);
             }
         }
     }

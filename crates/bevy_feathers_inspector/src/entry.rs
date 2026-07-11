@@ -1,11 +1,11 @@
 //! Top-level entry points that bridge the ECS `World` to the recursion engine.
 //!
-//! Phase 1 exposes [`build_entity_inspector`] (and the [`BuildEntityInspector`] command), which
-//! enumerates an entity's reflectable components and spawns an editing section per component as
-//! children of a target panel entity.
+//! [`build_entity_inspector`] enumerates an entity's reflectable components and spawns an editing
+//! section per component under a panel entity. The panel is marked with [`InspectorPanel`] so
+//! structural edits (enum variant switches, list add/remove) can [`rebuild_panel`] it.
 
 use bevy_ecs::component::ComponentId;
-use bevy_ecs::hierarchy::Children;
+use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_ecs::system::Command;
@@ -15,12 +15,25 @@ use bevy_ui::{px, Display, FlexDirection, Node};
 
 use bevy_feathers::display::label;
 
+use crate::attributes::FieldCtx;
 use crate::binding::InspectorRoot;
-use crate::recurse::build_value;
+use crate::recurse::{build_value, BuildCx};
 
-/// Enumerate `target`'s reflectable components and spawn an editing section per component as
-/// children of `panel`.
+/// Marks a panel entity built by the inspector, recording what it inspects so it can be rebuilt.
+#[derive(Component, Clone, Copy)]
+pub struct InspectorPanel {
+    /// The entity whose components are shown.
+    pub target: Entity,
+}
+
+/// Enumerate `target`'s reflectable components and (re)build an editing section per component as
+/// children of `panel`. Idempotent: existing panel children are cleared first.
 pub fn build_entity_inspector(world: &mut World, target: Entity, panel: Entity) {
+    clear_children(world, panel);
+    if let Ok(mut panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.insert(InspectorPanel { target });
+    }
+
     // Clone the `Arc` so the read guard does not borrow `world`.
     let registry = world.resource::<AppTypeRegistry>().clone();
     let registry = registry.read();
@@ -49,11 +62,14 @@ pub fn build_entity_inspector(world: &mut World, target: Entity, panel: Entity) 
             continue;
         };
         let name = registration.type_info().ty().short_path();
-        let root = InspectorRoot::Component {
-            entity: target,
-            type_id,
+        let cx = BuildCx {
+            registry: &registry,
+            root: InspectorRoot::Component {
+                entity: target,
+                type_id,
+            },
         };
-        let body = build_value(&registry, root, String::new(), reflected.as_partial_reflect());
+        let body = build_value(&cx, "", reflected.as_partial_reflect(), &FieldCtx::default());
         sections.push(Box::new(section(name, body)));
     }
 
@@ -61,6 +77,45 @@ pub fn build_entity_inspector(world: &mut World, target: Entity, panel: Entity) 
 
     if let Ok(panel_mut) = world.get_entity_mut(panel) {
         panel_mut.queue_spawn_related_scenes::<Children>(sections);
+    }
+}
+
+/// Rebuild a panel from the target it recorded in its [`InspectorPanel`].
+pub fn rebuild_panel(world: &mut World, panel: Entity) {
+    let Some(target) = world.get::<InspectorPanel>(panel).map(|p| p.target) else {
+        return;
+    };
+    build_entity_inspector(world, target, panel);
+}
+
+/// Walk up the hierarchy from `entity` to find the enclosing [`InspectorPanel`].
+pub fn find_ancestor_panel(
+    entity: Entity,
+    parents: &Query<&ChildOf>,
+    panels: &Query<&InspectorPanel>,
+) -> Option<Entity> {
+    let mut current = entity;
+    loop {
+        if panels.contains(current) {
+            return Some(current);
+        }
+        match parents.get(current) {
+            Ok(child_of) => current = child_of.parent(),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Despawn all children of `panel` (recursively).
+fn clear_children(world: &mut World, panel: Entity) {
+    let children: Vec<Entity> = world
+        .get::<Children>(panel)
+        .map(|c| c.iter().collect())
+        .unwrap_or_default();
+    for child in children {
+        if let Ok(entity_mut) = world.get_entity_mut(child) {
+            entity_mut.despawn();
+        }
     }
 }
 
