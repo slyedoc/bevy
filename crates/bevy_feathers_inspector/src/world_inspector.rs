@@ -146,6 +146,7 @@ impl<F: QueryFilter + Send + Sync + 'static> Plugin for WorldInspectorPlugin<F> 
 fn spawn_root(mut commands: Commands) {
     commands.spawn((
         WorldInspectorRoot,
+        bevy_ui_widgets::ScrollArea,
         Node {
             position_type: PositionType::Absolute,
             top: px(8),

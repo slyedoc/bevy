@@ -1,11 +1,12 @@
 //! Reusable camera CLI for solari examples and tools (part of the
 //! `bevy_solari_debug` feature).
 //!
-//! [`SolariCameraArgs`] is a [`clap::Args`] block: `--recipe` picks a named
-//! [`SolariRecipe`] setup, and the remaining levers modify it. Flatten it into
-//! any binary's arg struct and spawn what [`SolariCameraArgs::camera`] returns
-//! on the camera, and that binary speaks the same estimator dialect as
-//! `solari_furnace`:
+//! [`SolariCameraArgs`] is a [`clap::Args`] block with ONE identity lane:
+//! `--camera <RON>`, a complete [`SolariCamera`]. Every run prints its
+//! effective config as `solari_camera: <RON>` — copy it, tweak a lever, and
+//! feed it back. The session knobs (`--spp`, `--accum`) and `--debug-view`
+//! ride alongside because they are protocol/instrumentation, not estimator
+//! identity (see [`SolariCamera::name`]).
 //!
 //! ```ignore
 //! #[derive(clap::Parser)]
@@ -18,27 +19,25 @@
 //! ```
 
 use crate::render::rt_pipeline::SolariDebugView;
-use crate::render::{
-    DiEstimator, GiEstimator, ReferenceOutput, SolariCamera, SolariLighting, SolariRecipe,
-    SpatialReuse,
-};
+use crate::render::{SolariCamera, SolariLighting};
 
-/// The shared camera levers: a [`SolariRecipe`] plus modifiers. The default is
-/// the reference estimator rendering fresh frames (live feedback for
-/// interactive lever testing); `--accum` opts into progressive accumulation
-/// (the exam/convergence mode), and `--recipe default` selects the shipped
-/// realtime stack (`SolariLighting::default()`).
+/// The shared camera levers. Default is the reference estimator rendering
+/// fresh frames (live feedback for interactive testing); `--accum` opts into
+/// progressive accumulation (the exam/convergence mode); `--camera` selects
+/// any estimator configuration verbatim.
 #[derive(clap::Args, Clone, Debug)]
 pub struct SolariCameraArgs {
-    /// estimator recipe: reference | bsdf | restir-di | restir-di-spatial |
-    /// restir-gi | restir-gi-spatial | nrc | default (the shipped realtime
-    /// stack, `SolariLighting::default()`). The levers below modify it
-    #[arg(long, value_enum, default_value_t = SolariRecipe::Reference)]
-    pub recipe: SolariRecipe,
+    /// a complete SolariCamera as RON, e.g. '(mode: Realtime(()))' for the
+    /// shipped realtime stack or '(mode: Reference((di: Restir(()))))' for
+    /// ReSTIR DI on the reference frame. Struct fields may be omitted — their
+    /// canonical defaults apply. Every run prints its effective config as
+    /// `solari_camera:` — replay or tweak from that line. Default: the plain
+    /// reference accumulator
+    #[arg(long)]
+    pub camera: Option<String>,
 
-    /// reference: paths per pixel per frame (default is interactive-friendly;
-    /// exams typically pass 16+)
-    #[arg(long, default_value_t = 4)]
+    /// reference: paths per pixel per frame (exams typically pass 16+)
+    #[arg(long, default_value_t = 1)]
     pub spp: u32,
 
     /// reference: progressively accumulate frames into a converging mean (the
@@ -47,157 +46,43 @@ pub struct SolariCameraArgs {
     #[arg(long)]
     pub accum: bool,
 
-    /// direct illumination only (terminate at the primary vertex)
-    #[arg(long)]
-    pub di_only: bool,
-
-    /// indirect only (suffix energy past the primary vertex);
-    /// di_only + gi_only must sum to the full image
-    #[arg(long)]
-    pub gi_only: bool,
-
-    /// override RIS/initial candidates per pixel
-    #[arg(long)]
-    pub ris: Option<u32>,
-
-    /// override spatial neighbor taps (>0 enables spatial reuse on the
-    /// recipe's ReSTIR arms, 0 disables it)
-    #[arg(long)]
-    pub taps: Option<u32>,
-
-    /// override the spatial neighbor disk radius in pixels
-    #[arg(long)]
-    pub radius: Option<f32>,
-
-    /// visibility-aware 1/Z spatial combiner (research lever; costs one
-    /// shadow ray per contributor)
-    #[arg(long)]
-    pub zcount: bool,
-
-    /// override the temporal history cap (reservoir persistence in frames)
-    #[arg(long)]
-    pub mcap: Option<f32>,
-
-    /// default recipe: override the GI firefly clamp, display-referred luminance
-    /// (0 = off)
-    #[arg(long)]
-    pub clamp: Option<f32>,
-
-    /// reference recipes: force NRC GI termination ON
-    #[arg(long)]
-    pub nrc_gi: bool,
-
-    /// default recipe: disable GI reconnection reservoirs (ReSTIR DI only)
-    #[arg(long)]
-    pub no_gi: bool,
-
     /// debug view: `heatmap` (per-pixel cost), `any-hit`, `displacement`,
-    /// `cluster`, `triangles`, `normal-facing`, `nrc` (cache paint), `spatial`
-    /// (kill-stage paint on the recipe's spatial arms), `gi-dead`
-    /// (dead-canonical rate; needs a restir-gi recipe)
+    /// `cluster`, `triangles`, `normal-facing`, `nrc` (cache paint)
     #[arg(long, default_value = "")]
     pub debug_view: String,
 }
 
-/// Apply the spatial-reuse overrides to one ReSTIR arm's settings.
-fn override_spatial(
-    spatial: &mut Option<SpatialReuse>,
-    taps: Option<u32>,
-    radius: Option<f32>,
-    zcount: bool,
-    debug_paint: bool,
-) {
-    if let Some(taps) = taps {
-        if taps == 0 {
-            *spatial = None;
-            return;
-        }
-        spatial.get_or_insert_default().taps = taps;
-    }
-    if let Some(sp) = spatial {
-        if let Some(radius) = radius {
-            sp.radius = radius;
-        }
-        if zcount {
-            sp.unbiased_zcount = true;
-        }
-        if debug_paint {
-            sp.debug_paint = true;
-        }
-    }
+/// One-line RON for a [`SolariCamera`] — the `solari_camera:` wire format
+/// every tool prints at startup and `--camera` accepts back.
+pub fn camera_ron(camera: &SolariCamera) -> String {
+    ron::to_string(camera).unwrap_or_default()
 }
 
 impl SolariCameraArgs {
     /// The [`SolariCamera`] these levers select — spawn it on the camera
-    /// entity. The recipe is stamped out first, then the modifiers apply.
+    /// entity. `--camera <RON>` picks the estimator; the session knobs
+    /// (--spp/--accum) apply on top of reference modes, since the work budget
+    /// and accumulation policy belong to the session, not the identity.
     pub fn camera(&self) -> SolariCamera {
-        let mut mode = self.recipe.mode();
-        let spatial_paint = self.debug_view == "spatial";
-        match &mut mode {
-            SolariLighting::Realtime(rt) => {
-                if let Some(ris) = self.ris {
-                    rt.ris_candidates = ris.max(1);
-                }
-                if let Some(m_cap) = self.mcap {
-                    rt.m_cap = m_cap;
-                }
-                if let Some(clamp) = self.clamp {
-                    rt.firefly_clamp = clamp;
-                }
-                if self.no_gi {
-                    rt.gi = false;
-                }
-                if self.nrc_gi {
-                    rt.nrc_gi = true;
-                }
-                override_spatial(&mut rt.spatial, self.taps, self.radius, self.zcount, spatial_paint);
-            }
-            SolariLighting::Reference(r) => {
-                r.samples_per_frame = self.spp;
-                r.accumulate = self.accum;
-                if self.di_only {
-                    r.output = ReferenceOutput::DiOnly;
-                }
-                if self.gi_only {
-                    r.output = ReferenceOutput::GiOnly;
-                }
-                if self.nrc_gi {
-                    r.nrc_gi = true;
-                }
-                match &mut r.di {
-                    DiEstimator::BsdfOnly => {}
-                    DiEstimator::Nee { ris_candidates } => {
-                        if let Some(ris) = self.ris {
-                            *ris_candidates = ris.max(1);
-                        }
-                    }
-                    DiEstimator::Restir { ris_candidates, m_cap, spatial } => {
-                        if let Some(ris) = self.ris {
-                            *ris_candidates = ris.max(1);
-                        }
-                        if let Some(cap) = self.mcap {
-                            *m_cap = cap;
-                        }
-                        override_spatial(spatial, self.taps, self.radius, self.zcount, spatial_paint);
-                    }
-                }
-                if let GiEstimator::Restir { spatial, dead_view, .. } = &mut r.gi {
-                    override_spatial(spatial, self.taps, self.radius, self.zcount, spatial_paint);
-                    if self.debug_view == "gi-dead" {
-                        *dead_view = true;
-                    }
-                }
-            }
+        let mut camera: SolariCamera = match &self.camera {
+            Some(ron) => ron::from_str(ron)
+                .unwrap_or_else(|e| panic!("--camera: invalid SolariCamera RON: {e}")),
+            None => SolariCamera {
+                mode: SolariLighting::Reference(Default::default()),
+                debug: SolariDebugView::None,
+            },
+        };
+        if let SolariLighting::Reference(r) = &mut camera.mode {
+            r.samples_per_frame = self.spp;
+            r.accumulate = self.accum;
         }
-        SolariCamera {
-            mode,
-            debug: self.debug_view(),
+        if camera.debug == SolariDebugView::None {
+            camera.debug = self.debug_view();
         }
+        camera
     }
 
-    /// The [`SolariDebugView`] the `--debug-view` string selects. `spatial`
-    /// and `gi-dead` are estimator paints (flags inside the mode tree, set by
-    /// [`Self::camera`]), not views — they map to [`SolariDebugView::None`].
+    /// The [`SolariDebugView`] the `--debug-view` string selects.
     pub fn debug_view(&self) -> SolariDebugView {
         match self.debug_view.as_str() {
             "heatmap" | "cost" => SolariDebugView::cost_heatmap(),
@@ -209,5 +94,65 @@ impl SolariCameraArgs {
             "nrc" => SolariDebugView::NrcCache,
             _ => SolariDebugView::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::{DiEstimator, DiRestir, GiArm, GiEstimator, GiRestir, SolariReference, SpatialReuse};
+
+    /// The identity lane must round-trip: serialize any camera, read it back,
+    /// same estimator, same derived name.
+    #[test]
+    fn camera_ron_round_trips() {
+        let cameras = [
+            SolariCamera::default(),
+            SolariCamera {
+                mode: SolariLighting::Reference(SolariReference {
+                    di: DiEstimator::Restir(DiRestir {
+                        spatial: Some(SpatialReuse::default()),
+                        ..Default::default()
+                    }),
+                    gi: Some(GiArm {
+                        estimator: GiEstimator::Restir(GiRestir {
+                            spatial: Some(SpatialReuse::default()),
+                            ..Default::default()
+                        }),
+                        nrc: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                debug: SolariDebugView::None,
+            },
+        ];
+        for camera in cameras {
+            let ron = camera_ron(&camera);
+            let back: SolariCamera =
+                ron::from_str(&ron).unwrap_or_else(|e| panic!("{}: {e}\n{ron}", camera.name()));
+            assert_eq!(back.mode, camera.mode, "{ron}");
+            assert_eq!(back.name(), camera.name());
+        }
+    }
+
+    /// Terse RON: struct fields may be omitted (serde defaults), so the
+    /// realtime stack is just `(mode: Realtime(()))`.
+    #[test]
+    fn terse_ron_parses() {
+        let camera: SolariCamera = ron::from_str("(mode: Realtime(()))").unwrap();
+        assert_eq!(camera.mode, SolariLighting::default());
+        assert_eq!(camera.name(), "rt");
+        let camera: SolariCamera = ron::from_str("(mode: Reference(()))").unwrap();
+        assert_eq!(camera.name(), "ref");
+        let camera: SolariCamera =
+            ron::from_str("(mode: Reference((di: Restir(()), gi: Some((estimator: Restir(()))))))")
+                .unwrap();
+        assert_eq!(camera.name(), "ref-di4m1-gi");
+        let camera: SolariCamera = ron::from_str("(mode: Reference((gi: None)))").unwrap();
+        assert_eq!(camera.name(), "ref-nogi");
+        let camera: SolariCamera =
+            ron::from_str("(mode: Reference((jitter: false, gi: None)))").unwrap();
+        assert_eq!(camera.name(), "ref-nogi-nojit");
     }
 }

@@ -503,9 +503,13 @@ fn raygen(
 #ifdef SOLARI_SHADER_CLOCK
         rng = rng ^ clk0; // pins the start clock read before the loop (see above)
 #endif
-        // Sub-pixel jitter: DLSS's when realtime; uniform pixel-area AA when accumulating.
+        // Sub-pixel jitter: DLSS's when realtime; uniform pixel-area AA when
+        // accumulating. Estimator flag bit 21 disables the AA jitter (pixel
+        // CENTER every sample) so reservoir merges see identical surface
+        // points frame to frame — the target-mismatch isolation lever. It is
+        // also set when DLSS drives: RR must see the jitter it suggested.
         var jitter = camera.jitter.xy;
-        if reference {
+        if reference && (bitcast<u32>(camera.atmo.w) & (1u << 21u)) == 0u {
             jitter = vec2<f32>(rand_f(&rng), rand_f(&rng)) - 0.5;
         }
         let pixel = vec2<f32>(id.xy) + 0.5 + jitter;

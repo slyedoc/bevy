@@ -15,7 +15,7 @@ use bevy_reflect::tuple::DynamicTuple;
 use bevy_reflect::{ParsedPath, PartialReflect, TypeRegistry};
 use bevy_scene::prelude::*;
 use bevy_scene::Scene;
-use bevy_ui::{px, Display, FlexDirection, Node};
+use bevy_ui::{px, Display, FlexDirection, FlexWrap, Node};
 use bevy_ui_widgets::Activate;
 
 use bevy_feathers::controls::{ButtonVariant, FeathersButton, FeathersButtonProps};
@@ -95,7 +95,11 @@ pub fn build_enum(
         Node {
             display: Display::Flex,
             flex_direction: FlexDirection::Row,
+            // Many-variant enums must wrap inside the panel instead of
+            // running off the window.
+            flex_wrap: FlexWrap::Wrap,
             column_gap: px(4),
+            row_gap: px(4),
         }
         Children [ {buttons} ]
     }));
@@ -161,6 +165,10 @@ fn switch_enum_variant(
         build_default_variant(&registry, enum_type_id, variant_name)
     };
     let Some(dynamic) = dynamic else {
+        bevy_log::warn!(
+            "inspector: cannot switch to variant `{variant_name}` — a field type lacks \
+             ReflectDefault registration"
+        );
         return;
     };
     with_field_reflect_mut(world, root, path, |enum_field| {
@@ -206,7 +214,19 @@ fn build_default_variant(
 }
 
 /// Default-construct a value of `type_id` via its `ReflectDefault`, as a boxed partial reflect.
+///
+/// `Option<T>` is special-cased to `None`: `impl_reflect!` registers no
+/// `ReflectDefault` for it, but its default is `None` for any `T`.
 fn default_value(registry: &TypeRegistry, type_id: TypeId) -> Option<Box<dyn PartialReflect>> {
-    let default = registry.get(type_id)?.data::<ReflectDefault>()?.default();
-    Some(default.into_partial_reflect())
+    let registration = registry.get(type_id)?;
+    if let Some(default) = registration.data::<ReflectDefault>() {
+        return Some(default.default().into_partial_reflect());
+    }
+    let info = registration.type_info();
+    if info.as_enum().is_ok() && info.type_path_table().ident() == Some("Option") {
+        let mut none = DynamicEnum::new("None", DynamicVariant::Unit);
+        none.set_represented_type(Some(info));
+        return Some(Box::new(none));
+    }
+    None
 }

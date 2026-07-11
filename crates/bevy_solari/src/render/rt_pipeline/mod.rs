@@ -55,7 +55,7 @@ use crate::render::atmosphere::{
 };
 use crate::render::view_cull::SolariEnvironmentMap;
 use crate::render::{
-    CameraReframe, DiEstimator, GiEstimator, ReferenceOutput, SolariCamera, SolariReference,
+    CameraReframe, DiEstimator, GiEstimator, SolariCamera, SolariReference,
 };
 use crate::resource_manager::SolariResourceManager;
 use crate::transform::{TransformGraph, TransformPropagate};
@@ -113,6 +113,7 @@ pub(crate) struct RtEnvImages<'w> {
 /// main world (e.g. on a keypress, or via the debug UI's view dropdown).
 /// Switching variants resets the new variant's knobs to its defaults — the
 /// knobs live in the variant payload.
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Reflect, Clone, Copy, PartialEq, Default, Debug)]
 #[reflect(Default, Clone, PartialEq)]
 pub enum SolariDebugView {
@@ -1451,7 +1452,10 @@ pub(crate) fn rt_pipeline(
     // bits 8..15 = RIS M, bit 16 = GI spatial (the pass owns the GI shade),
     // bit 17 = dead-canonical rate paint, bit 18 = spatial debug (raygen
     // stashes its would-be GI shade for the pass's ratio paint), bit 20 =
-    // NRC GI termination (armed only past cache maturity).
+    // NRC GI termination (armed only past cache maturity), bit 21 = AA
+    // jitter off (pixel-center sampling — the reservoir-merge
+    // target-mismatch isolation lever; also set when DLSS drives, so RR
+    // always sees the jitter it suggested).
     let estimator_flags = if let Some(rt) = restir_rt {
         // Production per-frame stack: ReSTIR DI + GI reconnection reservoirs,
         // temporal always, spatial only when taps > 0 (at 0 the pass doesn't
@@ -1478,15 +1482,16 @@ pub(crate) fn rt_pipeline(
         // combinations structural: spatial only inside a ReSTIR arm, recon
         // only inside the GI ReSTIR arm).
         let r = reference.expect("SolariLighting is Realtime or Reference");
-        let (gi_recon, gi_temporal) = match &r.gi {
-            GiEstimator::Restir { recon, temporal, .. } => (*recon, *temporal),
-            GiEstimator::PathTraced => (false, false),
+        let (gi_recon, gi_temporal) = match r.gi.as_ref().map(|arm| &arm.estimator) {
+            Some(GiEstimator::Restir(gi)) => (gi.recon, gi.temporal),
+            _ => (false, false),
         };
         matches!(r.di, DiEstimator::BsdfOnly) as u32
             | (r.di_restir() as u32) << 1
-            | ((r.output == ReferenceOutput::DiOnly) as u32) << 2
+            // No GI arm = terminate at the primary vertex (bit 2).
+            | (r.gi.is_none() as u32) << 2
             | (r.di_spatial().is_some() as u32) << 3
-            | ((r.output == ReferenceOutput::GiOnly) as u32) << 4
+            | (r.gi.as_ref().is_some_and(|arm| arm.only) as u32) << 4
             | (r.gi_restir() as u32) << 5
             | (gi_recon as u32) << 6
             | (gi_temporal as u32) << 7
@@ -1494,10 +1499,14 @@ pub(crate) fn rt_pipeline(
             | (r.gi_spatial().is_some() as u32) << 16
             | (r.gi_dead_view() as u32) << 17
             | (r.spatial_debug_paint() as u32) << 18
-            | ((r.nrc_gi
+            | ((r.nrc_gi()
                 && debug.nrc_buffers.as_deref().is_some_and(|b| b.step > 300))
                 as u32)
                 << 20
+            // DLSS-RR must see the jitter it suggested: when RR drives, raygen
+            // keeps camera.jitter for every sample (accumulation still gets AA
+            // from the Halton sweep) instead of rolling its own.
+            | ((!r.jitter || dlss_jitter.is_some()) as u32) << 21
     };
     if let Some(reference) = reference {
         // Hold accumulation until EVERY solari pipeline is compiled (the one
@@ -1543,6 +1552,14 @@ pub(crate) fn rt_pipeline(
         let warmup = *settle_frames < 8 + history_frames;
         // `accumulate: false` = fresh frames (estimator levers stay live) — the
         // per-frame variance instrument; accum_spf 0 disables the raygen blend.
+        // Fresh frames still honor samples_per_frame (N samples averaged per
+        // frame, accum_n stays 0 so the shader full-replaces) — UNLESS DLSS
+        // is driving: spf > 0 switches raygen to its own AA jitter, and RR
+        // must see the jitter it was told about.
+        if debug_view == 0 && !show_displacement && !reference.accumulate && dlss_jitter.is_none()
+        {
+            accum_spf = reference.samples_per_frame.max(1);
+        }
         if debug_view == 0 && !show_displacement && reference.accumulate {
             accum_spf = reference.samples_per_frame.max(1);
             if warmup {
@@ -1674,7 +1691,10 @@ pub(crate) fn rt_pipeline(
         dims: [
             viewport.x as f32,
             viewport.y as f32,
-            restir_rt.map_or_else(|| reference.map_or(20.0, SolariReference::m_cap), |rt| rt.m_cap),
+            restir_rt.map_or_else(
+                || reference.expect("SolariLighting is Realtime or Reference").m_cap(),
+                |rt| rt.m_cap,
+            ),
             restir_rt.map_or(0.0, |rt| rt.firefly_clamp / camera.exposure.max(1.0e-9)),
         ],
         world_from_view: world_from_view.to_cols_array(),

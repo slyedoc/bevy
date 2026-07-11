@@ -26,18 +26,20 @@ pub struct SolariDebugPlugin;
 
 impl Plugin for SolariDebugPlugin {
     fn build(&self, app: &mut App) {
+        // The camera card's lever editing is the reflection-driven inspector;
+        // its widget registrations + external sync come from this plugin group.
+        if !app.is_plugin_added::<bevy_feathers_inspector::DefaultInspectorWidgetsPlugin>() {
+            app.add_plugins(bevy_feathers_inspector::FeathersInspectorPlugins);
+        }
         app.add_systems(
             Update,
             (
                 ui::spawn_render_debug_panels,
                 ui::update_render_debug_label,
-                // "view" dropdown (normal / time heatmap) + the cost-heatmap sliders.
+                // The per-camera debug card (stats + derived name + inspector).
                 ui::spawn_view_panels,
-                ui::update_view_label,
-                ui::update_recipe_label,
-                ui::sync_accumulate_checkbox,
+                ui::update_mode_label,
                 ui::update_stats_label,
-                ui::toggle_heatmap_controls,
             )
                 .run_if(debug_ui_enabled),
         );

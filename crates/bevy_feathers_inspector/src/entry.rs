@@ -25,6 +25,8 @@ use crate::recurse::{build_value, group_card, BuildCx};
 pub enum InspectorPanel {
     /// Shows all components of an entity.
     Entity(Entity),
+    /// Shows one component of an entity.
+    Component(Entity, TypeId),
     /// Shows a single resource.
     Resource(TypeId),
 }
@@ -83,6 +85,43 @@ pub(crate) fn entity_component_sections(
         sections.push(section_for(registry, root, name, reflected));
     }
     sections
+}
+
+/// (Re)build a single-component inspector as the sole child of `panel` —
+/// embed one component's editor in your own UI instead of the whole entity.
+pub fn build_component_inspector(world: &mut World, target: Entity, type_id: TypeId, panel: Entity) {
+    clear_children(world, panel);
+    if let Ok(mut panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.insert(InspectorPanel::Component(target, type_id));
+    }
+
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+
+    let Some(section) = component_section(world, &registry, target, type_id) else {
+        return;
+    };
+    drop(registry);
+
+    if let Ok(panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.queue_spawn_related_scenes::<Children>(vec![section]);
+    }
+}
+
+/// Build one component's titled section, or `None` if it isn't reflectable /
+/// present on `target`.
+pub(crate) fn component_section(
+    world: &World,
+    registry: &bevy_reflect::TypeRegistry,
+    target: Entity,
+    type_id: TypeId,
+) -> Option<Box<dyn Scene>> {
+    let registration = registry.get(type_id)?;
+    let reflect_component = registration.data::<ReflectComponent>()?;
+    let reflected = reflect_component.reflect(world.get_entity(target).ok()?)?;
+    let name = registration.type_info().ty().short_path();
+    let root = InspectorRoot::Component { entity: target, type_id };
+    Some(section_for(registry, root, name, reflected))
 }
 
 /// (Re)build a single-resource inspector as the sole child of `panel`.
@@ -146,6 +185,9 @@ pub fn rebuild_panel(world: &mut World, panel: Entity) {
     };
     match kind {
         InspectorPanel::Entity(target) => build_entity_inspector(world, target, panel),
+        InspectorPanel::Component(target, type_id) => {
+            build_component_inspector(world, target, type_id, panel);
+        }
         InspectorPanel::Resource(type_id) => build_resource_inspector(world, type_id, panel),
     }
 }
@@ -193,6 +235,23 @@ impl Command for BuildEntityInspector {
     type Out = ();
     fn apply(self, world: &mut World) {
         build_entity_inspector(world, self.target, self.panel);
+    }
+}
+
+/// Command form of [`build_component_inspector`].
+pub struct BuildComponentInspector {
+    /// The entity holding the component.
+    pub target: Entity,
+    /// The component type to inspect.
+    pub type_id: TypeId,
+    /// The panel entity the section is spawned under.
+    pub panel: Entity,
+}
+
+impl Command for BuildComponentInspector {
+    type Out = ();
+    fn apply(self, world: &mut World) {
+        build_component_inspector(world, self.target, self.type_id, self.panel);
     }
 }
 

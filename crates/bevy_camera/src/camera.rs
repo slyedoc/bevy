@@ -227,10 +227,10 @@ pub struct ComputedCameraValues {
 ///
 /// <https://en.wikipedia.org/wiki/Exposure_(photography)>
 #[derive(Component, Clone, Copy, Reflect)]
-#[reflect(opaque)]
 #[reflect(Component, Default, Clone)]
 pub struct Exposure {
     /// <https://en.wikipedia.org/wiki/Exposure_value#Tabulated_exposure_values>
+    #[reflect(@0.0..=20.0f32)]
     pub ev100: f32,
 }
 

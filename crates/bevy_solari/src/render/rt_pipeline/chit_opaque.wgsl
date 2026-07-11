@@ -419,8 +419,10 @@ fn chit_opaque(
             }
         }
         // Persist the merged reservoir for next frame's temporal pass. Stored
-        // regardless of the winner's visibility (no visibility reuse yet — zeroing
-        // W on occlusion is the session-2 bias study, it darkens under merge).
+        // regardless of the winner's visibility: killing chains conditioned on
+        // their own winner's shadow result biases the merge (visible-winner
+        // streams over-survive, overestimating penumbra) — the unbiased route
+        // is visibility in the re-target p̂, one extra ray per merge.
         if (restir_mode || gi_mode) && is_primary {
             let view_z = -(camera.view_from_world * vec4<f32>(ray_hit.world_position, 1.0)).z;
             if restir_mode {

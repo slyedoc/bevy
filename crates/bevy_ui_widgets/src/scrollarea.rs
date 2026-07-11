@@ -35,8 +35,13 @@ fn scrollarea_on_scroll(
         let can_scroll_x = node.overflow.x == OverflowAxis::Scroll;
         let can_scroll_y = node.overflow.y == OverflowAxis::Scroll;
 
+        // ScrollPosition is in PIXELS: line-unit wheel deltas must scale by
+        // the pixels-per-line ratio or a wheel tick moves the content 1px.
         let scroll_delta = scroll.to_lines(&scroll_conversion_ratio);
-        let scroll_delta = Vec2::new(scroll_delta.x, scroll_delta.y);
+        let scroll_delta = Vec2::new(
+            scroll_delta.x * *scroll_conversion_ratio,
+            scroll_delta.y * *scroll_conversion_ratio,
+        );
 
         let max_range = (content_size - visible_size).max(Vec2::ZERO);
 

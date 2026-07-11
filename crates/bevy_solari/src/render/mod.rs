@@ -12,7 +12,7 @@ mod reset;
 pub mod view_cull;
 
 use bevy_app::{App, Plugin, Update};
-use bevy_camera::{CameraMainTextureUsages, Hdr};
+use bevy_camera::{CameraMainTextureUsages, Exposure, Hdr};
 use bevy_light::cluster::ClusterConfig;
 use bevy_core_pipeline::{
     core_3d::{main_opaque_pass_3d, main_transparent_pass_3d},
@@ -57,9 +57,12 @@ impl Plugin for SolarRenderPlugin {
             .register_type::<SolariLighting>()
             .register_type::<SolariReference>()
             .register_type::<SolariRestir>()
-            .register_type::<ReferenceOutput>()
+            .register_type::<GiArm>()
             .register_type::<DiEstimator>()
+            .register_type::<DiNee>()
+            .register_type::<DiRestir>()
             .register_type::<GiEstimator>()
+            .register_type::<GiRestir>()
             .register_type::<SpatialReuse>()
             .init_resource::<rt_pipeline::SolariFreezeDiff>()
             .add_plugins(ExtractResourcePlugin::<rt_pipeline::SolariFreezeDiff>::default())
@@ -264,14 +267,16 @@ impl Plugin for SolarRenderPlugin {
 /// temporal history via [`CameraReset`]; changing [`debug`] deliberately does
 /// NOT — a debug paint pauses reference accumulation and it resumes untouched.
 ///
-/// Common setups are stamped out by [`SolariRecipe`] (see
-/// [`SolariCamera::from_recipe`]); tweak the resulting levers freely after.
+/// [`Self::name`] derives a compact truthful slug from the configuration —
+/// tools identify runs by it.
 ///
 /// [`mode`]: Self::mode
 /// [`debug`]: Self::debug
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bevy_solari_debug", serde(default))]
 #[derive(Component, Reflect, Clone, ExtractComponent)]
 #[reflect(Component, Default, Clone)]
-#[require(Hdr, CameraReset, CameraReframe)]
+#[require(Hdr, Exposure, CameraReset, CameraReframe)]
 pub struct SolariCamera {
     /// How this camera integrates light.
     pub mode: SolariLighting,
@@ -292,27 +297,99 @@ impl Default for SolariCamera {
 }
 
 impl SolariCamera {
-    /// A camera preconfigured by `recipe` (normal rendering, no debug paint).
-    pub fn from_recipe(recipe: SolariRecipe) -> Self {
-        Self {
-            mode: recipe.mode(),
-            debug: rt_pipeline::SolariDebugView::None,
+    /// The derived name: a compact slug computed FROM the configuration, so
+    /// it always tells the truth about what renders — grader rows, window
+    /// titles, and report labels all use it. Session knobs (samples per
+    /// frame, accumulation) and debug paints are not identity and don't
+    /// appear.
+    ///
+    /// `rt` = the shipped realtime default (deviations append: `rt-nogi`,
+    /// `rt-m5`); `ref` = the plain reference accumulator; estimator arms
+    /// append with their levers: `ref-di4m20s3-gis3` is ReSTIR DI (RIS 4,
+    /// m-cap 20, spatial 3 taps) + ReSTIR GI with a 3-tap spatial pass.
+    pub fn name(&self) -> String {
+        fn num(v: f32) -> String {
+            if v.fract() == 0.0 {
+                format!("{}", v as i64)
+            } else {
+                format!("{v}")
+            }
         }
-    }
-
-    /// Stamp `recipe`'s mode onto the camera, preserving the session knobs
-    /// (samples per frame, accumulation) when both sides are reference modes —
-    /// a recipe names an ESTIMATOR; the work budget and accumulation policy
-    /// belong to the session (see [`SolariRecipe::matches`]).
-    pub fn apply_recipe(&mut self, recipe: SolariRecipe) {
-        let mut mode = recipe.mode();
-        if let (SolariLighting::Reference(new), SolariLighting::Reference(old)) =
-            (&mut mode, &self.mode)
-        {
-            new.samples_per_frame = old.samples_per_frame;
-            new.accumulate = old.accumulate;
+        fn sp(spatial: &Option<SpatialReuse>) -> String {
+            spatial.as_ref().map_or(String::new(), |sp| format!("s{}", sp.taps))
         }
-        self.mode = mode;
+        match &self.mode {
+            SolariLighting::Realtime(rt) => {
+                // Deviations from the shipped default name themselves, so
+                // bare `rt` always means exactly `SolariRestir::default()`.
+                let d = SolariRestir::default();
+                let mut n = String::from("rt");
+                if rt.ris_candidates != d.ris_candidates {
+                    n.push_str(&format!("-ris{}", rt.ris_candidates));
+                }
+                if rt.m_cap != d.m_cap {
+                    n.push_str(&format!("-m{}", num(rt.m_cap)));
+                }
+                if let Some(spatial) = &rt.spatial {
+                    n.push_str(&format!("-s{}", spatial.taps));
+                }
+                if rt.gi != d.gi {
+                    n.push_str("-nogi");
+                }
+                if rt.nrc_gi != d.nrc_gi {
+                    n.push_str("-nonrc");
+                }
+                if rt.firefly_clamp != d.firefly_clamp {
+                    n.push_str(&format!("-clamp{}", num(rt.firefly_clamp)));
+                }
+                n
+            }
+            SolariLighting::Reference(r) => {
+                let mut n = String::from("ref");
+                match &r.di {
+                    DiEstimator::BsdfOnly => n.push_str("-bsdf"),
+                    // The default NEE arm is what bare "ref" means; deviations
+                    // (including plain NEE-1, the identity A/B) name themselves.
+                    DiEstimator::Nee(nee) if *nee == DiNee::default() => {}
+                    DiEstimator::Nee(nee) => {
+                        n.push_str(&format!("-nee{}", nee.ris_candidates));
+                    }
+                    DiEstimator::Restir(di) => {
+                        n.push_str(&format!(
+                            "-di{}m{}{}",
+                            di.ris_candidates,
+                            num(di.m_cap),
+                            sp(&di.spatial)
+                        ));
+                    }
+                }
+                match &r.gi {
+                    None => n.push_str("-nogi"),
+                    Some(arm) => {
+                        if arm.only {
+                            n.push_str("-gionly");
+                        }
+                        if let GiEstimator::Restir(gi) = &arm.estimator {
+                            n.push_str("-gi");
+                            if !gi.recon {
+                                n.push_str("norecon");
+                            }
+                            if !gi.temporal {
+                                n.push_str("notemporal");
+                            }
+                            n.push_str(&sp(&gi.spatial));
+                        }
+                        if arm.nrc {
+                            n.push_str("-nrc");
+                        }
+                    }
+                }
+                if !r.jitter {
+                    n.push_str("-nojit");
+                }
+                n
+            }
+        }
     }
 
     /// The reference settings, if this camera runs the reference integrator.
@@ -333,6 +410,7 @@ impl SolariCamera {
 }
 
 /// How a [`SolariCamera`] integrates light.
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Reflect, Clone, PartialEq, Debug)]
 #[reflect(Default, Clone, PartialEq)]
 pub enum SolariLighting {
@@ -349,134 +427,6 @@ impl Default for SolariLighting {
     }
 }
 
-/// Named estimator setups — one call stamps out a fully-configured
-/// [`SolariLighting`], so A/B sweeps and UIs can iterate [`Self::ALL`] instead
-/// of hand-assembling lever combinations. A recipe is a constructor, not
-/// stored state: tweak the resulting levers freely after.
-#[derive(Reflect, Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(feature = "bevy_solari_debug", derive(clap::ValueEnum))]
-pub enum SolariRecipe {
-    /// Reference NEE accumulator (plain next-event estimation, 1 candidate).
-    Reference,
-    /// Brute-force BSDF-only accumulator — the unbiasedness A/B against
-    /// [`Reference`](Self::Reference) (both MUST converge to the same image).
-    Bsdf,
-    /// ReSTIR DI: temporal reservoir reuse at the primary vertex, on the
-    /// reference accumulator.
-    RestirDi,
-    /// ReSTIR DI with the spatial merge+shade pass on top.
-    RestirDiSpatial,
-    /// ReSTIR DI + GI reconnection reservoirs (recon shading + temporal reuse).
-    RestirGi,
-    /// ReSTIR DI + GI with spatial reuse on both arms.
-    RestirGiSpatial,
-    /// Reference accumulator with NRC GI termination (biased by cache error —
-    /// grade by freeze-diff/RMSE against [`Reference`](Self::Reference)).
-    Nrc,
-    /// The stack exactly as shipped: [`SolariLighting::default()`] (per-frame
-    /// ReSTIR DI + GI with NRC termination, DLSS RR downstream). Deliberately
-    /// NOT a separate configuration — the default IS production, NRC and all.
-    Default,
-}
-
-impl SolariRecipe {
-    /// Every recipe, for UI dropdowns and benchmark sweeps.
-    pub const ALL: [SolariRecipe; 8] = [
-        SolariRecipe::Reference,
-        SolariRecipe::Bsdf,
-        SolariRecipe::RestirDi,
-        SolariRecipe::RestirDiSpatial,
-        SolariRecipe::RestirGi,
-        SolariRecipe::RestirGiSpatial,
-        SolariRecipe::Nrc,
-        SolariRecipe::Default,
-    ];
-
-    /// Short kebab-case name (matches the CLI `--recipe` values).
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Reference => "reference",
-            Self::Bsdf => "bsdf",
-            Self::RestirDi => "restir-di",
-            Self::RestirDiSpatial => "restir-di-spatial",
-            Self::RestirGi => "restir-gi",
-            Self::RestirGiSpatial => "restir-gi-spatial",
-            Self::Nrc => "nrc",
-            Self::Default => "default",
-        }
-    }
-
-    /// Whether `mode` runs this recipe's estimator. The session knobs
-    /// (samples per frame, accumulation) are ignored — they tune how fast the
-    /// estimator converges / whether frames average, not what it computes.
-    pub fn matches(&self, mode: &SolariLighting) -> bool {
-        let mut canonical = mode.clone();
-        if let SolariLighting::Reference(reference) = &mut canonical {
-            let defaults = SolariReference::default();
-            reference.samples_per_frame = defaults.samples_per_frame;
-            reference.accumulate = defaults.accumulate;
-        }
-        canonical == self.mode()
-    }
-
-    /// The fully-configured lighting mode this recipe names.
-    pub fn mode(&self) -> SolariLighting {
-        let di_restir = DiEstimator::Restir {
-            ris_candidates: 4,
-            m_cap: 20.0,
-            spatial: None,
-        };
-        match self {
-            Self::Reference => SolariLighting::Reference(SolariReference::default()),
-            Self::Bsdf => SolariLighting::Reference(SolariReference {
-                di: DiEstimator::BsdfOnly,
-                ..Default::default()
-            }),
-            Self::RestirDi => SolariLighting::Reference(SolariReference {
-                di: di_restir,
-                ..Default::default()
-            }),
-            Self::RestirDiSpatial => SolariLighting::Reference(SolariReference {
-                di: DiEstimator::Restir {
-                    ris_candidates: 4,
-                    m_cap: 20.0,
-                    spatial: Some(SpatialReuse::default()),
-                },
-                ..Default::default()
-            }),
-            Self::RestirGi => SolariLighting::Reference(SolariReference {
-                di: di_restir,
-                gi: GiEstimator::Restir {
-                    recon: true,
-                    temporal: true,
-                    spatial: None,
-                    dead_view: false,
-                },
-                ..Default::default()
-            }),
-            Self::RestirGiSpatial => SolariLighting::Reference(SolariReference {
-                di: DiEstimator::Restir {
-                    ris_candidates: 4,
-                    m_cap: 20.0,
-                    spatial: Some(SpatialReuse::default()),
-                },
-                gi: GiEstimator::Restir {
-                    recon: true,
-                    temporal: true,
-                    spatial: Some(SpatialReuse::default()),
-                    dead_view: false,
-                },
-                ..Default::default()
-            }),
-            Self::Nrc => SolariLighting::Reference(SolariReference {
-                nrc_gi: true,
-                ..Default::default()
-            }),
-            Self::Default => SolariLighting::default(),
-        }
-    }
-}
-
 /// Reference path-tracer mode: while the camera holds still, every frame's samples
 /// are averaged into the output buffer (progressive accumulation) — the ground-truth
 /// image every realtime technique is validated against. Any camera move, projection,
@@ -488,37 +438,44 @@ impl SolariRecipe {
 /// The estimator is a tree, so what composes is visible in the types: spatial
 /// reuse only exists inside a ReSTIR arm, reconnection shading only inside the
 /// GI ReSTIR arm. Selected via [`SolariLighting::Reference`].
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bevy_solari_debug", serde(default))]
 #[derive(Reflect, Clone, PartialEq, Debug)]
 #[reflect(Default, Clone, PartialEq)]
 pub struct SolariReference {
     /// Paths traced per pixel per frame (inner raygen loop). Raise to converge faster.
+    #[reflect(@1.0..=16.0f32)]
     pub samples_per_frame: u32,
     /// When false, render fresh frames instead of averaging (estimator levers stay
     /// active). With the rung-0 dump this captures a SINGLE warmed restir frame —
     /// the per-frame variance metric temporal reuse actually improves.
     pub accumulate: bool,
-    /// Which part of the transport to output (full, DI-only, GI-only).
-    pub output: ReferenceOutput,
     /// The direct-illumination estimator at each path vertex.
     pub di: DiEstimator,
-    /// The indirect (suffix) estimator past the primary vertex.
-    pub gi: GiEstimator,
-    /// NRC (zero/docs/nrc.md rung 2): terminate GI paths at bounce 2 into the
-    /// neural radiance cache (estimator flag bit 20). Composes with either
-    /// [`GiEstimator`]. Biased by cache error — graded by freeze-diff/RMSE
-    /// against the untouched reference.
-    pub nrc_gi: bool,
+    /// The indirect (suffix) transport past the primary vertex. `None`
+    /// terminates every path at the primary vertex — the standard ReSTIR
+    /// DI evaluation image (direct variance not buried in GI noise). The
+    /// GI-only display and NRC termination are properties OF the arm, so
+    /// they can't be configured without transport to act on.
+    pub gi: Option<GiArm>,
+    /// Sub-pixel AA jitter (uniform pixel-area). Off = every sample through
+    /// the pixel CENTER: the converged image is aliased, but temporal
+    /// reprojection lands on the exact same surface points every frame —
+    /// the isolation lever for jitter-induced target-function mismatch in
+    /// reservoir merges (grade no-jitter chains against a no-jitter NEE
+    /// exam; the truth stays jittered, so silhouettes carry aliasing error
+    /// in both).
+    pub jitter: bool,
 }
 
 impl Default for SolariReference {
     fn default() -> Self {
         Self {
-            samples_per_frame: 4,
-            accumulate: true,
-            output: ReferenceOutput::Full,
-            di: DiEstimator::Nee { ris_candidates: 1 },
-            gi: GiEstimator::PathTraced,
-            nrc_gi: false,
+            samples_per_frame: 1,
+            accumulate: false,
+            di: DiEstimator::Nee(DiNee::default()),
+            gi: Some(GiArm::default()),
+            jitter: true,
         }
     }
 }
@@ -526,50 +483,59 @@ impl Default for SolariReference {
 impl SolariReference {
     /// ReSTIR DI temporal reuse is on.
     pub fn di_restir(&self) -> bool {
-        matches!(self.di, DiEstimator::Restir { .. })
+        matches!(self.di, DiEstimator::Restir(_))
     }
 
     /// ReSTIR GI reconnection reservoirs are on.
     pub fn gi_restir(&self) -> bool {
-        matches!(self.gi, GiEstimator::Restir { .. })
+        matches!(&self.gi, Some(arm) if matches!(arm.estimator, GiEstimator::Restir(_)))
+    }
+
+    /// NRC GI termination is on (an arm property — no arm, no termination).
+    pub fn nrc_gi(&self) -> bool {
+        self.gi.as_ref().is_some_and(|arm| arm.nrc)
     }
 
     /// The DI spatial-reuse settings, when the ReSTIR DI spatial pass is on.
     pub fn di_spatial(&self) -> Option<&SpatialReuse> {
         match &self.di {
-            DiEstimator::Restir { spatial, .. } => spatial.as_ref(),
+            DiEstimator::Restir(di) => di.spatial.as_ref(),
             _ => None,
         }
     }
 
     /// The GI spatial-reuse settings, when the ReSTIR GI spatial pass is on.
     pub fn gi_spatial(&self) -> Option<&SpatialReuse> {
-        match &self.gi {
-            GiEstimator::Restir { spatial, .. } => spatial.as_ref(),
-            GiEstimator::PathTraced => None,
+        match self.gi.as_ref().map(|arm| &arm.estimator) {
+            Some(GiEstimator::Restir(gi)) => gi.spatial.as_ref(),
+            _ => None,
         }
     }
 
     /// RIS candidates per NEE sample (1 for the BSDF-only estimator).
     pub fn ris_candidates(&self) -> u32 {
-        match self.di {
+        match &self.di {
             DiEstimator::BsdfOnly => 1,
-            DiEstimator::Nee { ris_candidates }
-            | DiEstimator::Restir { ris_candidates, .. } => ris_candidates.max(1),
+            DiEstimator::Nee(DiNee { ris_candidates })
+            | DiEstimator::Restir(DiRestir { ris_candidates, .. }) => (*ris_candidates).max(1),
         }
     }
 
-    /// The temporal history cap (ReSTIR DI's, or the 20-frame default).
+    /// The temporal history cap: ReSTIR DI's, or [`DiRestir`]'s default when
+    /// the DI arm has no reservoir (the GI reservoirs still cap by it).
     pub fn m_cap(&self) -> f32 {
-        match self.di {
-            DiEstimator::Restir { m_cap, .. } => m_cap,
-            _ => 20.0,
+        match &self.di {
+            DiEstimator::Restir(DiRestir { m_cap, .. }) => *m_cap,
+            _ => DiRestir::default().m_cap,
         }
     }
 
     /// The GI dead-canonical-draw instrument paint is on.
     pub fn gi_dead_view(&self) -> bool {
-        matches!(self.gi, GiEstimator::Restir { dead_view: true, .. })
+        matches!(
+            self.gi.as_ref().map(|arm| &arm.estimator),
+            Some(GiEstimator::Restir(gi)) if gi.dead_view
+        )
     }
 
     /// Any spatial pass's kill-stage debug paint is on.
@@ -579,23 +545,27 @@ impl SolariReference {
     }
 }
 
-/// Which part of the transport a [`SolariReference`] camera outputs.
-#[derive(Reflect, Clone, Copy, PartialEq, Eq, Default, Debug)]
+/// The indirect (suffix) transport arm of a [`SolariReference`].
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bevy_solari_debug", serde(default))]
+#[derive(Reflect, Clone, PartialEq, Debug, Default)]
 #[reflect(Default, Clone, PartialEq)]
-pub enum ReferenceOutput {
-    /// The full image.
-    #[default]
-    Full,
-    /// Direct illumination only: terminate every path at the primary vertex
-    /// (emissive + one NEE/reservoir estimate, no bounces). The standard ReSTIR
-    /// evaluation image — indirect noise otherwise buries the DI variance win.
-    DiOnly,
-    /// Indirect only (rung 4a): the complement — output `A₀·L_gi`, the suffix
-    /// energy past the primary vertex. DiOnly + GiOnly = the full image.
-    GiOnly,
+pub struct GiArm {
+    /// How the suffix is estimated.
+    pub estimator: GiEstimator,
+    /// Display only this arm's bucket (`A₀·L_gi`, the suffix energy past the
+    /// primary vertex). The DI estimator still runs — it sets the MIS weights
+    /// this bucket is measured under. di-terminated + gi-only images sum to
+    /// the full image.
+    pub only: bool,
+    /// NRC (zero/docs/nrc.md rung 2): terminate this arm's paths at bounce 2
+    /// into the neural radiance cache (estimator flag bit 20). Biased by
+    /// cache error — graded by freeze-diff/RMSE against the untouched arm.
+    pub nrc: bool,
 }
 
 /// The direct-illumination estimator at each path vertex.
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Reflect, Clone, PartialEq, Debug)]
 #[reflect(Clone, PartialEq)]
 pub enum DiEstimator {
@@ -604,62 +574,125 @@ pub enum DiEstimator {
     BsdfOnly,
     /// Next-event estimation with RIS (rung 2): M light candidates stream
     /// through a one-slot reservoir, one shadow ray for the winner.
-    Nee {
-        /// RIS candidates per NEE sample. 1 = plain NEE (identical estimator);
-        /// raise for receiver-aware light selection (clamped to 255).
-        ris_candidates: u32,
-    },
+    Nee(DiNee),
     /// ReSTIR DI (rung 3): persist the primary vertex's reservoir per pixel and
     /// temporally merge last frame's (reprojected + geometry-validated). Emissive
     /// candidates then run at the primary vertex only; bounce vertices fall back
     /// to single-sample emissive NEE and directionals are shaded per light.
-    Restir {
-        /// Initial RIS candidates per pixel streamed through the reservoir.
-        ris_candidates: u32,
-        /// Temporal history cap, ×`ris_candidates` — history counts for at most
-        /// this many frames' worth of candidates (uncapped M = frozen shadows).
-        m_cap: f32,
-        /// Spatial reuse (rung 3 session 2): a post-trace compute pass merges
-        /// each pixel's reservoir with disk neighbors and owns the winner's
-        /// visibility + shade.
-        spatial: Option<SpatialReuse>,
-    },
+    Restir(DiRestir),
+}
+
+/// [`DiEstimator::Nee`] levers. The payload is a struct so switching to the
+/// variant (UI, RON) constructs the canonical defaults, not zeroes.
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bevy_solari_debug", serde(default))]
+#[derive(Reflect, Clone, PartialEq, Debug)]
+#[reflect(Default, Clone, PartialEq)]
+pub struct DiNee {
+    /// RIS candidates per NEE sample. 1 = plain NEE (identical estimator);
+    /// raise for receiver-aware light selection (clamped to 255).
+    #[reflect(@1.0..=255.0f32)]
+    pub ris_candidates: u32,
+}
+
+impl Default for DiNee {
+    fn default() -> Self {
+        Self { ris_candidates: 4 }
+    }
+}
+
+/// [`DiEstimator::Restir`] levers.
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bevy_solari_debug", serde(default))]
+#[derive(Reflect, Clone, PartialEq, Debug)]
+#[reflect(Default, Clone, PartialEq)]
+pub struct DiRestir {
+    /// Initial RIS candidates per pixel streamed through the reservoir.
+    #[reflect(@1.0..=255.0f32)]
+    pub ris_candidates: u32,
+    /// Temporal history cap, ×`ris_candidates` — history counts for at most
+    /// this many frames' worth of candidates (uncapped M = frozen shadows).
+    /// Default 1 — see [`SolariRestir::m_cap`]. History never aids accumulated
+    /// convergence either (correlation slows it, and under AA jitter the
+    /// merge's target-function mismatch biases it) — certify chains with
+    /// [`jitter`](SolariReference::jitter) off, reading the excess over a
+    /// no-jitter NEE control.
+    #[reflect(@1.0..=64.0f32)]
+    pub m_cap: f32,
+    /// Spatial reuse (rung 3 session 2): a post-trace compute pass merges
+    /// each pixel's reservoir with disk neighbors and owns the winner's
+    /// visibility + shade.
+    pub spatial: Option<SpatialReuse>,
+}
+
+impl Default for DiRestir {
+    fn default() -> Self {
+        Self {
+            ris_candidates: 4,
+            m_cap: 1.0,
+            spatial: None,
+        }
+    }
 }
 
 /// The indirect (suffix) estimator past the primary vertex.
-#[derive(Reflect, Clone, PartialEq, Debug)]
-#[reflect(Clone, PartialEq)]
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Reflect, Clone, PartialEq, Debug, Default)]
+#[reflect(Default, Clone, PartialEq)]
 pub enum GiEstimator {
     /// Plain path tracing of the suffix.
+    #[default]
     PathTraced,
     /// ReSTIR GI (rung 4a.1): raygen stores the canonical GI sample
     /// `{x_s, n_s, L_gi, pdf, a0}` per pixel and shades GI from the STORED
     /// sample.
-    Restir {
-        /// Reshade `f(x_v,ω)·cos·L/pdf` from the surface G-buffer instead of
-        /// the stored exact `a0` — the reconnection-shift shading path
-        /// temporal/spatial reuse relies on (gate: accumulated unbiasedness).
-        recon: bool,
-        /// Temporally merge last frame's reprojected GI reservoir (surface
-        /// depth/normal validated, capped by the DI arm's m_cap).
-        temporal: bool,
-        /// The spatial pass merges neighbors' GI reservoirs
-        /// (reconnection-Jacobian weighted, winner visibility) and owns the
-        /// GI shade.
-        spatial: Option<SpatialReuse>,
-        /// Instrument: paint 1 where the canonical GI draw is dead (bounce-1
-        /// miss or delta pdf) — the accumulated mean IS the dead-draw rate.
-        dead_view: bool,
-    },
+    Restir(GiRestir),
+}
+
+/// [`GiEstimator::Restir`] levers.
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bevy_solari_debug", serde(default))]
+#[derive(Reflect, Clone, PartialEq, Debug)]
+#[reflect(Default, Clone, PartialEq)]
+pub struct GiRestir {
+    /// Reshade `f(x_v,ω)·cos·L/pdf` from the surface G-buffer instead of
+    /// the stored exact `a0` — the reconnection-shift shading path
+    /// temporal/spatial reuse relies on (gate: accumulated unbiasedness).
+    pub recon: bool,
+    /// Temporally merge last frame's reprojected GI reservoir (surface
+    /// depth/normal validated, capped by the DI arm's m_cap).
+    pub temporal: bool,
+    /// The spatial pass merges neighbors' GI reservoirs
+    /// (reconnection-Jacobian weighted, winner visibility) and owns the
+    /// GI shade.
+    pub spatial: Option<SpatialReuse>,
+    /// Instrument: paint 1 where the canonical GI draw is dead (bounce-1
+    /// miss or delta pdf) — the accumulated mean IS the dead-draw rate.
+    pub dead_view: bool,
+}
+
+impl Default for GiRestir {
+    fn default() -> Self {
+        Self {
+            recon: true,
+            temporal: true,
+            spatial: None,
+            dead_view: false,
+        }
+    }
 }
 
 /// Spatial reservoir reuse settings, shared by the DI and GI ReSTIR arms.
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bevy_solari_debug", serde(default))]
 #[derive(Reflect, Clone, PartialEq, Debug)]
 #[reflect(Default, Clone, PartialEq)]
 pub struct SpatialReuse {
     /// Neighbor taps per pixel (≤8).
+    #[reflect(@1.0..=8.0f32)]
     pub taps: u32,
     /// Neighbor disk radius, pixels.
+    #[reflect(@1.0..=128.0f32)]
     pub radius: f32,
     /// false = naive M-sum combiner (BIASED — the visible-darkening study);
     /// true = Z-count (only M whose surface could produce the winner). Costs
@@ -687,13 +720,21 @@ impl Default for SpatialReuse {
 /// DLSS Ray Reconstruction as the denoiser.
 ///
 /// Selected via [`SolariLighting::Realtime`] (the default).
+#[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bevy_solari_debug", serde(default))]
 #[derive(Reflect, Clone, PartialEq, Debug)]
 #[reflect(Default, Clone, PartialEq)]
 pub struct SolariRestir {
     /// Initial light candidates per pixel streamed through the DI reservoir.
+    #[reflect(@1.0..=255.0f32)]
     pub ris_candidates: u32,
     /// Temporal history cap, ×`ris_candidates` — history counts for at most
-    /// this many frames' worth of candidates.
+    /// this many frames' worth of candidates. Default 1: DLSS-RR does the
+    /// temporal accumulation downstream, and reservoir history it can't see
+    /// is temporally-sticky error it preserves as detail — one frame's worth
+    /// keeps the merge while handing RR temporally-white input (grades best
+    /// on FLIP and flicker, static and motion, few- and many-light scenes).
+    #[reflect(@1.0..=64.0f32)]
     pub m_cap: f32,
     /// Spatial reuse. DEFAULT None — under DLSS RR, spatial reuse's disk-sized
     /// winner patches read as swimming pool-caustic light (correlated noise
@@ -707,6 +748,7 @@ pub struct SolariRestir {
     /// where ~1.0 is a well-exposed white) — reservoir spikes above it are
     /// scaled down luminance-preserving. 0 = off. The reference path never
     /// clamps (policy); this is the realtime firefly filter.
+    #[reflect(@0.0..=100.0f32)]
     pub firefly_clamp: f32,
     /// Terminate GI paths into the neural radiance cache (estimator flag
     /// bit 20) once the cache is mature (`NrcBuffers::step > 300`) — until
@@ -720,7 +762,7 @@ impl Default for SolariRestir {
     fn default() -> Self {
         Self {
             ris_candidates: 4,
-            m_cap: 20.0,
+            m_cap: 1.0,
             spatial: None,
             gi: true,
             firefly_clamp: 10.0,

@@ -9,7 +9,7 @@ use crate::bindings::RaytracingMesh3d;
 use crate::material::{StandardSolariMaterial, SolariMaterial3d};
 use bevy_asset::{AssetId, Assets, Handle};
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
-use bevy_camera::visibility::{InheritedVisibility, NoCpuCulling, Visibility};
+use bevy_camera::visibility::{InheritedVisibility, Visibility};
 use bevy_ecs::{
     component::Component,
     entity::Entity,
@@ -225,7 +225,7 @@ fn bake_and_swap(
     };
     commands
         .entity(entity)
-        .insert((RaytracingMesh3d(cluster), NoCpuCulling))
+        .insert(RaytracingMesh3d(cluster))
         // Drop the raster mesh AND the visibility components: a pure-RT mesh is
         // never frustum-culled (BVH does it) and Solari extracts it regardless of
         // `ViewVisibility`, so its `Visibility`/`InheritedVisibility` are unused —

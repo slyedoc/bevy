@@ -36,11 +36,14 @@ bevy_solari_debug = [
   "dep:clap",
   "dep:bevy_dev_tools",
   "dep:bevy_feathers",
+  "dep:bevy_feathers_inspector",
   "dep:bevy_input",
   "dep:bevy_input_focus",
   "dep:bevy_scene",
   "dep:bevy_text",
   "dep:bevy_ui_widgets",
+  "dep:serde",
+  "dep:ron",
 ]
 
 [dependencies]
@@ -98,6 +101,7 @@ bevy_transform = { path = "../bevy_transform", version = "0.20.0-dev", features 
 # in-engine debug-view dropdowns (Solari overlay + bevy render debug).
 bevy_dev_tools = { path = "../bevy_dev_tools", version = "0.20.0-dev", optional = true }
 bevy_feathers = { path = "../bevy_feathers", version = "0.20.0-dev", optional = true }
+bevy_feathers_inspector = { path = "../bevy_feathers_inspector", version = "0.20.0-dev", optional = true }
 bevy_input = { path = "../bevy_input", version = "0.20.0-dev", optional = true }
 bevy_input_focus = { path = "../bevy_input_focus", version = "0.20.0-dev", optional = true }
 bevy_scene = { path = "../bevy_scene", version = "0.20.0-dev", optional = true }
@@ -125,6 +129,9 @@ naga = { version = "29", features = ["wgsl-in", "spv-out"] }
 # raster prepass.
 dlss_wgpu = { version = "4.0.0" }
 serde_json = { version = "1.0.140", optional = true }
+# The camera config wire format (--camera RON round-trip, debug tooling).
+serde = { version = "1", features = ["derive"], optional = true }
+ron = { version = "0.12", optional = true }
 bytemuck = { version = "1" }
 # Harness dumps (`SolariFreezeDiff`): the accumulated output buffer is written
 # as OpenEXR for offline FLIP/RMSE grading.

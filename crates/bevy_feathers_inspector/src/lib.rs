@@ -34,8 +34,9 @@ pub use binding::{
     inspector_writeback_bool, inspector_writeback_slider, InspectorBinding, InspectorRoot,
 };
 pub use entry::{
-    build_entity_inspector, build_resource_inspector, find_ancestor_panel, rebuild_panel,
-    BuildEntityInspector, BuildResourceInspector, InspectorPanel,
+    build_component_inspector, build_entity_inspector, build_resource_inspector,
+    find_ancestor_panel, rebuild_panel, BuildComponentInspector, BuildEntityInspector,
+    BuildResourceInspector, InspectorPanel,
 };
 pub use recurse::{build_value, BuildCx};
 pub use widget::{

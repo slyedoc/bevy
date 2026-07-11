@@ -1,5 +1,4 @@
 use bevy_asset::{AssetId, Handle};
-use bevy_camera::visibility::NoCpuCulling;
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{component::Component, prelude::ReflectComponent, template::FromTemplate};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
@@ -29,7 +28,6 @@ use crate::material::SolariMaterial3d;
     SolariMaterial3d,
     Transform,
     GlobalTransform,
-    NoCpuCulling,
     SyncToRenderWorld,
 )]
 pub struct RaytracingMesh3d(pub Handle<ClusterMesh>);

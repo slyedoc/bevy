@@ -198,8 +198,9 @@ pub mod prelude {
         render::CameraReset,
         lights::SolariUniformLights,
         render::{
-            DiEstimator, GiEstimator, ReferenceOutput, SolariCamera, SolariLighting,
-            SolariRecipe, SolariReference, SolariRestir, SpatialReuse,
+            DiEstimator, DiNee, DiRestir, GiArm, GiEstimator, GiRestir,
+            SolariCamera, SolariLighting,
+            SolariReference, SolariRestir, SpatialReuse,
         },
         transform::{NoGpuGlobalTransformReadback, SolariGpuFrame, TransformStatic},
         SolariInitPlugin, SolariPlugin,
