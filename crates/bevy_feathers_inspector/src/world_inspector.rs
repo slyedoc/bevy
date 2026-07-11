@@ -86,15 +86,16 @@ enum DisclosureTarget {
     Resource(TypeId),
 }
 
-/// A toggleable world inspector, optionally filtered by query `F` (default: all entities).
+/// A world inspector, optionally filtered by query `F` (default: all entities).
 ///
-/// Configure with the builder methods:
+/// By default there is no toggle key — the panel is driven by [`WorldInspectorState::open`]. Call
+/// [`with_toggle_key`](Self::with_toggle_key) to bind a key that flips it:
 ///
 /// ```ignore
 /// // All entities, toggle with F12:
 /// WorldInspectorPlugin::new().with_toggle_key(KeyCode::F12)
-/// // Only named entities, no built-in toggle (drive `WorldInspectorState::open` yourself):
-/// WorldInspectorPlugin::<With<Name>>::default().without_toggle()
+/// // Only named entities, no toggle key (open it yourself via `WorldInspectorState::open`):
+/// WorldInspectorPlugin::<With<Name>>::default()
 /// ```
 pub struct WorldInspectorPlugin<F: QueryFilter = ()> {
     toggle_key: Option<KeyCode>,
@@ -104,29 +105,24 @@ pub struct WorldInspectorPlugin<F: QueryFilter = ()> {
 impl<F: QueryFilter> Default for WorldInspectorPlugin<F> {
     fn default() -> Self {
         Self {
-            toggle_key: Some(KeyCode::Backquote),
+            toggle_key: None,
             _filter: PhantomData,
         }
     }
 }
 
 impl WorldInspectorPlugin<()> {
-    /// A world inspector listing all entities (toggle: backtick).
+    /// A world inspector listing all entities (no toggle key by default).
     pub fn new() -> Self {
         Self::default()
     }
 }
 
 impl<F: QueryFilter> WorldInspectorPlugin<F> {
-    /// Set the key that toggles the panel.
+    /// Bind a key that toggles the panel. Without this, drive [`WorldInspectorState::open`]
+    /// yourself.
     pub fn with_toggle_key(mut self, key: KeyCode) -> Self {
         self.toggle_key = Some(key);
-        self
-    }
-
-    /// Disable the built-in toggle key; drive [`WorldInspectorState::open`] yourself.
-    pub fn without_toggle(mut self) -> Self {
-        self.toggle_key = None;
         self
     }
 }
