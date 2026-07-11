@@ -25,17 +25,20 @@ pub mod entry;
 pub mod enums;
 pub mod lists;
 pub mod recurse;
+pub mod sync;
 pub mod widget;
+pub mod world_panel;
 
 pub use attributes::{FieldCtx, Hidden, ReadOnly};
 pub use binding::{
     inspector_writeback_bool, inspector_writeback_slider, InspectorBinding, InspectorRoot,
 };
 pub use entry::{
-    build_entity_inspector, find_ancestor_panel, rebuild_panel, BuildEntityInspector,
-    InspectorPanel,
+    build_entity_inspector, build_resource_inspector, find_ancestor_panel, rebuild_panel,
+    BuildEntityInspector, BuildResourceInspector, InspectorPanel,
 };
 pub use recurse::{build_value, BuildCx};
 pub use widget::{
     DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins, ReflectInspectorWidget, SliderScalar,
 };
+pub use world_panel::{build_world_panel, BuildWorldInspector, InspectorDetailPanel};

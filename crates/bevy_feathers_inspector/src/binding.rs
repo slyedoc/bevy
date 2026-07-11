@@ -15,6 +15,65 @@ use bevy_ui_widgets::ValueChange;
 
 use crate::widget::SliderScalar;
 
+/// Resolve `root` + `path` to an immutable reflected reference and hand it to `f`.
+///
+/// Used by the external-sync systems to read the current source value back out.
+pub(crate) fn read_field<R>(
+    world: &World,
+    root: &InspectorRoot,
+    path: &ParsedPath,
+    f: impl FnOnce(&dyn PartialReflect) -> R,
+) -> Option<R> {
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+    let entity = match root {
+        InspectorRoot::Component { entity, .. } => *entity,
+        InspectorRoot::Resource { type_id } => world
+            .components()
+            .get_id(*type_id)
+            .and_then(|id| world.resource_entities().get(id))?,
+    };
+    let type_id = match root {
+        InspectorRoot::Component { type_id, .. } | InspectorRoot::Resource { type_id } => *type_id,
+    };
+    let reflect_component = registry.get(type_id)?.data::<ReflectComponent>()?;
+    let reflected = reflect_component.reflect(world.get_entity(entity).ok()?)?;
+    let target = reflected.reflect_path(path).ok()?;
+    Some(f(target))
+}
+
+/// Best-effort read of a reflected numeric value as `f32`.
+pub(crate) fn reflect_to_f32(value: &dyn PartialReflect) -> Option<f32> {
+    let reflect = value.try_as_reflect()?;
+    if let Some(v) = reflect.downcast_ref::<f32>() {
+        return Some(*v);
+    }
+    if let Some(v) = reflect.downcast_ref::<f64>() {
+        return Some(*v as f32);
+    }
+    if let Some(v) = reflect.downcast_ref::<i32>() {
+        return Some(*v as f32);
+    }
+    if let Some(v) = reflect.downcast_ref::<i64>() {
+        return Some(*v as f32);
+    }
+    if let Some(v) = reflect.downcast_ref::<u32>() {
+        return Some(*v as f32);
+    }
+    if let Some(v) = reflect.downcast_ref::<u64>() {
+        return Some(*v as f32);
+    }
+    if let Some(v) = reflect.downcast_ref::<usize>() {
+        return Some(*v as f32);
+    }
+    None
+}
+
+/// Best-effort read of a reflected `bool`.
+pub(crate) fn reflect_to_bool(value: &dyn PartialReflect) -> Option<bool> {
+    value.try_as_reflect()?.downcast_ref::<bool>().copied()
+}
+
 /// Identifies the reflected value that an inspector widget edits.
 #[derive(Clone)]
 pub enum InspectorRoot {

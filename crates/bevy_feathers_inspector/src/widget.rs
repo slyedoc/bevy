@@ -5,7 +5,7 @@
 //! mirrors `bevy-inspector-egui`'s `InspectorEguiImpl`, but instead of drawing egui it returns a
 //! boxed feathers [`Scene`] bound to the value.
 
-use bevy_app::{Plugin, PluginGroup, PluginGroupBuilder};
+use bevy_app::{Plugin, PluginGroup, PluginGroupBuilder, Update};
 use bevy_feathers::controls::{
     FeathersCheckbox, FeathersCheckboxProps, FeathersSlider, FeathersSliderProps,
 };
@@ -189,6 +189,9 @@ impl Plugin for DefaultInspectorWidgetsPlugin {
         register!(u64);
         register!(usize);
         register!(bool);
+
+        // Keep open widgets in sync when their source values change elsewhere.
+        app.add_systems(Update, crate::sync::sync_inspector_widgets);
     }
 }
 

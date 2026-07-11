@@ -4,11 +4,14 @@
 //! section per component under a panel entity. The panel is marked with [`InspectorPanel`] so
 //! structural edits (enum variant switches, list add/remove) can [`rebuild_panel`] it.
 
+use core::any::TypeId;
+
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_ecs::system::Command;
+use bevy_reflect::Reflect;
 use bevy_scene::prelude::*;
 use bevy_scene::Scene;
 use bevy_ui::{px, Display, FlexDirection, Node};
@@ -19,11 +22,16 @@ use crate::attributes::FieldCtx;
 use crate::binding::InspectorRoot;
 use crate::recurse::{build_value, BuildCx};
 
-/// Marks a panel entity built by the inspector, recording what it inspects so it can be rebuilt.
+/// Marks a panel entity built by the inspector, recording what it inspects so structural edits can
+/// [`rebuild_panel`] it.
 #[derive(Component, Clone, Copy)]
-pub struct InspectorPanel {
-    /// The entity whose components are shown.
-    pub target: Entity,
+pub enum InspectorPanel {
+    /// Shows all components of an entity.
+    Entity(Entity),
+    /// Shows a single resource.
+    Resource(TypeId),
+    /// The world inspector (entities + resources).
+    World,
 }
 
 /// Enumerate `target`'s reflectable components and (re)build an editing section per component as
@@ -31,7 +39,7 @@ pub struct InspectorPanel {
 pub fn build_entity_inspector(world: &mut World, target: Entity, panel: Entity) {
     clear_children(world, panel);
     if let Ok(mut panel_mut) = world.get_entity_mut(panel) {
-        panel_mut.insert(InspectorPanel { target });
+        panel_mut.insert(InspectorPanel::Entity(target));
     }
 
     // Clone the `Arc` so the read guard does not borrow `world`.
@@ -62,15 +70,11 @@ pub fn build_entity_inspector(world: &mut World, target: Entity, panel: Entity) 
             continue;
         };
         let name = registration.type_info().ty().short_path();
-        let cx = BuildCx {
-            registry: &registry,
-            root: InspectorRoot::Component {
-                entity: target,
-                type_id,
-            },
+        let root = InspectorRoot::Component {
+            entity: target,
+            type_id,
         };
-        let body = build_value(&cx, "", reflected.as_partial_reflect(), &FieldCtx::default());
-        sections.push(Box::new(section(name, body)));
+        sections.push(section_for(&registry, root, name, reflected));
     }
 
     drop(registry);
@@ -80,12 +84,70 @@ pub fn build_entity_inspector(world: &mut World, target: Entity, panel: Entity) 
     }
 }
 
-/// Rebuild a panel from the target it recorded in its [`InspectorPanel`].
-pub fn rebuild_panel(world: &mut World, panel: Entity) {
-    let Some(target) = world.get::<InspectorPanel>(panel).map(|p| p.target) else {
+/// (Re)build a single-resource inspector as the sole child of `panel`.
+pub fn build_resource_inspector(world: &mut World, type_id: TypeId, panel: Entity) {
+    clear_children(world, panel);
+    if let Ok(mut panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.insert(InspectorPanel::Resource(type_id));
+    }
+
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+
+    let Some(section) = resource_section(world, &registry, type_id) else {
         return;
     };
-    build_entity_inspector(world, target, panel);
+    drop(registry);
+
+    if let Ok(panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.queue_spawn_related_scenes::<Children>(vec![section]);
+    }
+}
+
+/// Build a titled section for a resource, or `None` if it isn't reflectable / present.
+pub(crate) fn resource_section(
+    world: &World,
+    registry: &bevy_reflect::TypeRegistry,
+    type_id: TypeId,
+) -> Option<Box<dyn Scene>> {
+    let registration = registry.get(type_id)?;
+    let reflect_component = registration.data::<ReflectComponent>()?;
+    let resource_entity = world
+        .components()
+        .get_id(type_id)
+        .and_then(|id| world.resource_entities().get(id))?;
+    let reflected = reflect_component.reflect(world.entity(resource_entity))?;
+    let name = registration.type_info().ty().short_path();
+    Some(section_for(
+        registry,
+        InspectorRoot::Resource { type_id },
+        name,
+        reflected,
+    ))
+}
+
+/// Build one titled section (a boxed scene) for a reflected value reachable from `root`.
+pub(crate) fn section_for(
+    registry: &bevy_reflect::TypeRegistry,
+    root: InspectorRoot,
+    name: &str,
+    reflected: &dyn Reflect,
+) -> Box<dyn Scene> {
+    let cx = BuildCx { registry, root };
+    let body = build_value(&cx, "", reflected.as_partial_reflect(), &FieldCtx::default());
+    Box::new(section(name, body))
+}
+
+/// Rebuild a panel according to what its [`InspectorPanel`] records.
+pub fn rebuild_panel(world: &mut World, panel: Entity) {
+    let Some(kind) = world.get::<InspectorPanel>(panel).copied() else {
+        return;
+    };
+    match kind {
+        InspectorPanel::Entity(target) => build_entity_inspector(world, target, panel),
+        InspectorPanel::Resource(type_id) => build_resource_inspector(world, type_id, panel),
+        InspectorPanel::World => crate::world_panel::build_world_panel(world, panel),
+    }
 }
 
 /// Walk up the hierarchy from `entity` to find the enclosing [`InspectorPanel`].
@@ -107,7 +169,7 @@ pub fn find_ancestor_panel(
 }
 
 /// Despawn all children of `panel` (recursively).
-fn clear_children(world: &mut World, panel: Entity) {
+pub(crate) fn clear_children(world: &mut World, panel: Entity) {
     let children: Vec<Entity> = world
         .get::<Children>(panel)
         .map(|c| c.iter().collect())
@@ -145,5 +207,20 @@ impl Command for BuildEntityInspector {
     type Out = ();
     fn apply(self, world: &mut World) {
         build_entity_inspector(world, self.target, self.panel);
+    }
+}
+
+/// Command form of [`build_resource_inspector`].
+pub struct BuildResourceInspector {
+    /// The resource type to inspect.
+    pub type_id: TypeId,
+    /// The panel entity the section is spawned under.
+    pub panel: Entity,
+}
+
+impl Command for BuildResourceInspector {
+    type Out = ();
+    fn apply(self, world: &mut World) {
+        build_resource_inspector(world, self.type_id, self.panel);
     }
 }
