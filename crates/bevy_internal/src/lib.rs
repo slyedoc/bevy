@@ -43,6 +43,8 @@ pub use bevy_diagnostic as diagnostic;
 pub use bevy_ecs as ecs;
 #[cfg(feature = "bevy_feathers")]
 pub use bevy_feathers as feathers;
+#[cfg(feature = "bevy_feathers_inspector")]
+pub use bevy_feathers_inspector as feathers_inspector;
 #[cfg(feature = "bevy_gilrs")]
 pub use bevy_gilrs as gilrs;
 #[cfg(feature = "bevy_gizmos")]
