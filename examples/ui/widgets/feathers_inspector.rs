@@ -72,7 +72,7 @@ fn main() {
             DefaultPlugins,
             FeathersPlugins,
             FeathersInspectorPlugins,
-            WorldInspectorPlugin::<With<Name>>::default(),
+            WorldInspectorPlugin::<With<Name>>::default().with_toggle_key(KeyCode::Backquote),
         ))
         .insert_resource(UiTheme(create_dark_theme()))
         .register_type::<DemoSettings>()

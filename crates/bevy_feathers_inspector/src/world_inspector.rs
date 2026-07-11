@@ -87,10 +87,17 @@ enum DisclosureTarget {
 }
 
 /// A toggleable world inspector, optionally filtered by query `F` (default: all entities).
+///
+/// Configure with the builder methods:
+///
+/// ```ignore
+/// // All entities, toggle with F12:
+/// WorldInspectorPlugin::new().with_toggle_key(KeyCode::F12)
+/// // Only named entities, no built-in toggle (drive `WorldInspectorState::open` yourself):
+/// WorldInspectorPlugin::<With<Name>>::default().without_toggle()
+/// ```
 pub struct WorldInspectorPlugin<F: QueryFilter = ()> {
-    /// Key that toggles the panel. `None` disables the built-in toggle (drive
-    /// [`WorldInspectorState::open`] yourself).
-    pub toggle_key: Option<KeyCode>,
+    toggle_key: Option<KeyCode>,
     _filter: PhantomData<fn() -> F>,
 }
 
@@ -104,9 +111,23 @@ impl<F: QueryFilter> Default for WorldInspectorPlugin<F> {
 }
 
 impl WorldInspectorPlugin<()> {
-    /// A world inspector listing all entities.
+    /// A world inspector listing all entities (toggle: backtick).
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl<F: QueryFilter> WorldInspectorPlugin<F> {
+    /// Set the key that toggles the panel.
+    pub fn with_toggle_key(mut self, key: KeyCode) -> Self {
+        self.toggle_key = Some(key);
+        self
+    }
+
+    /// Disable the built-in toggle key; drive [`WorldInspectorState::open`] yourself.
+    pub fn without_toggle(mut self) -> Self {
+        self.toggle_key = None;
+        self
     }
 }
 
