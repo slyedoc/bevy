@@ -24,7 +24,7 @@ use bevy_feathers::display::label;
 use crate::attributes::FieldCtx;
 use crate::binding::{with_field_reflect_mut, InspectorRoot};
 use crate::entry::{find_ancestor_panel, rebuild_panel, InspectorPanel};
-use crate::recurse::{build_value, column, field_row, parse_path, BuildCx};
+use crate::recurse::{column, field_entry, parse_path, BuildCx};
 
 /// Records how to switch an enum to a specific variant when its button is clicked.
 #[derive(Component, Clone)]
@@ -108,11 +108,10 @@ pub fn build_enum(
                 Some(name) => format!("{path}.{name}"),
                 None => format!("{path}.{i}"),
             };
-            let widget = build_value(cx, &sub_path, child, &FieldCtx::default());
             let label_text = field_name
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| i.to_string());
-            children.push(Box::new(field_row(&label_text, widget)));
+            children.push(field_entry(cx, &label_text, &sub_path, child, &FieldCtx::default()));
         }
     }
 

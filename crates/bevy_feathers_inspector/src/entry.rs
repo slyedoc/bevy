@@ -14,13 +14,10 @@ use bevy_ecs::system::Command;
 use bevy_reflect::Reflect;
 use bevy_scene::prelude::*;
 use bevy_scene::Scene;
-use bevy_ui::{px, Display, FlexDirection, Node};
-
-use bevy_feathers::display::label;
 
 use crate::attributes::FieldCtx;
 use crate::binding::InspectorRoot;
-use crate::recurse::{build_value, BuildCx};
+use crate::recurse::{build_value, group_card, BuildCx};
 
 /// Marks a panel entity built by the inspector, recording what it inspects so structural edits can
 /// [`rebuild_panel`] it.
@@ -135,7 +132,7 @@ pub(crate) fn section_for(
 ) -> Box<dyn Scene> {
     let cx = BuildCx { registry, root };
     let body = build_value(&cx, "", reflected.as_partial_reflect(), &FieldCtx::default());
-    Box::new(section(name, body))
+    Box::new(group_card(name, body))
 }
 
 /// Rebuild a panel according to what its [`InspectorPanel`] records.
@@ -178,20 +175,6 @@ pub(crate) fn clear_children(world: &mut World, panel: Entity) {
         if let Ok(entity_mut) = world.get_entity_mut(child) {
             entity_mut.despawn();
         }
-    }
-}
-
-/// A titled section wrapping one component's fields.
-fn section(title: &str, body: Box<dyn Scene>) -> impl Scene {
-    let children: Vec<Box<dyn Scene>> = vec![Box::new(label(title.to_string())), body];
-    bsn! {
-        Node {
-            display: Display::Flex,
-            flex_direction: FlexDirection::Column,
-            row_gap: px(4),
-            padding: px(6),
-        }
-        Children [ {children} ]
     }
 }
 

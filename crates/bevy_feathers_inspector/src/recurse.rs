@@ -2,9 +2,8 @@
 //!
 //! [`build_value`] is the inspector's analog of `bevy-inspector-egui`'s `ui_for_reflect`: given a
 //! reflected value it first checks for a registered per-type widget ([`ReflectInspectorWidget`]),
-//! and otherwise recurses structurally, emitting a labeled row per field. It threads a reflection
-//! path string (so each leaf knows how to address its field from the root) and a [`FieldCtx`] (the
-//! field's custom-attribute configuration).
+//! and otherwise recurses structurally. Scalar fields become a labeled row; compound fields
+//! (structs, enums, lists) become a titled feathers [`group`] "card".
 
 use bevy_ecs::hierarchy::Children;
 use bevy_reflect::structs::Struct;
@@ -12,8 +11,9 @@ use bevy_reflect::tuple_struct::TupleStruct;
 use bevy_reflect::{ParsedPath, PartialReflect, ReflectRef, TypeRegistry};
 use bevy_scene::prelude::*;
 use bevy_scene::Scene;
-use bevy_ui::{px, AlignItems, Display, FlexDirection, Node};
+use bevy_ui::{percent, px, AlignItems, Display, FlexDirection, Node};
 
+use bevy_feathers::containers::{group, group_body, group_header};
 use bevy_feathers::display::{label, label_dim};
 
 use crate::attributes::FieldCtx;
@@ -56,13 +56,17 @@ pub fn build_value(
         ReflectRef::Enum(enum_ref) => build_enum(cx, path, value, enum_ref),
         ReflectRef::List(list) => build_list(cx, path, list),
         ReflectRef::Array(array) => {
-            // Fixed-size arrays: rows per element, no add/remove.
             let rows = (0..array.len())
                 .filter_map(|i| {
                     let child = array.get(i)?;
                     let child_path = format!("{path}[{i}]");
-                    let widget = build_value(cx, &child_path, child, &FieldCtx::default());
-                    Some(Box::new(field_row(&i.to_string(), widget)) as Box<dyn Scene>)
+                    Some(field_entry(
+                        cx,
+                        &i.to_string(),
+                        &child_path,
+                        child,
+                        &FieldCtx::default(),
+                    ))
                 })
                 .collect();
             Box::new(column(rows))
@@ -71,7 +75,7 @@ pub fn build_value(
     }
 }
 
-/// Recurse into a named struct, one labeled row per field.
+/// Recurse into a named struct, one entry per field.
 fn build_struct(
     cx: &BuildCx,
     path: &str,
@@ -91,24 +95,68 @@ fn build_struct(
             }
             let child_field = field_info.map(FieldCtx::from_field).unwrap_or_default();
             let child_path = format!("{path}.{name}");
-            let widget = build_value(cx, &child_path, child, &child_field);
-            Some(Box::new(field_row(name, widget)) as Box<dyn Scene>)
+            Some(field_entry(cx, name, &child_path, child, &child_field))
         })
         .collect();
     Box::new(column(rows))
 }
 
-/// Recurse into a tuple struct, one row per positional field.
+/// Recurse into a tuple struct, one entry per positional field.
 fn build_tuple_struct(cx: &BuildCx, path: &str, tuple_struct: &dyn TupleStruct) -> Box<dyn Scene> {
     let rows: Vec<Box<dyn Scene>> = (0..tuple_struct.field_len())
         .filter_map(|i| {
             let child = tuple_struct.field(i)?;
             let child_path = format!("{path}.{i}");
-            let widget = build_value(cx, &child_path, child, &FieldCtx::default());
-            Some(Box::new(field_row(&i.to_string(), widget)) as Box<dyn Scene>)
+            Some(field_entry(
+                cx,
+                &i.to_string(),
+                &child_path,
+                child,
+                &FieldCtx::default(),
+            ))
         })
         .collect();
     Box::new(column(rows))
+}
+
+/// Render one field: a labeled row for scalars, or a titled `group` card for compound values.
+pub(crate) fn field_entry(
+    cx: &BuildCx,
+    name: &str,
+    path: &str,
+    child: &dyn PartialReflect,
+    field: &FieldCtx,
+) -> Box<dyn Scene> {
+    let compound = is_compound(cx, child, field);
+    let widget = build_value(cx, path, child, field);
+    if compound {
+        Box::new(group_card(name, widget))
+    } else {
+        Box::new(field_row(name, widget))
+    }
+}
+
+/// Whether `value` recurses into a nested structure (so it should get its own card).
+fn is_compound(cx: &BuildCx, value: &dyn PartialReflect, field: &FieldCtx) -> bool {
+    if field.read_only {
+        return false;
+    }
+    if let Some(type_id) = value.get_represented_type_info().map(|info| info.type_id())
+        && cx
+            .registry
+            .get_type_data::<ReflectInspectorWidget>(type_id)
+            .is_some()
+    {
+        return false;
+    }
+    matches!(
+        value.reflect_ref(),
+        ReflectRef::Struct(_)
+            | ReflectRef::TupleStruct(_)
+            | ReflectRef::Enum(_)
+            | ReflectRef::List(_)
+            | ReflectRef::Array(_)
+    )
 }
 
 /// Parse a reflection path string, treating the empty string as the identity (root) path.
@@ -120,33 +168,58 @@ pub fn parse_path(path: &str) -> ParsedPath {
     }
 }
 
-/// A labeled row: field name on the left, editing widget on the right.
-///
-/// The children are collected into one `Vec` (a `SceneList`) because a bare `Scene` embedded via
-/// `{}` in a `Children [ ... ]` slot must be a `SceneList`.
+/// A labeled row that fills its width: a fixed-width name cell, then the editing widget.
 pub fn field_row(name: &str, widget: Box<dyn Scene>) -> impl Scene {
-    let children: Vec<Box<dyn Scene>> = vec![Box::new(label(name.to_string())), widget];
+    let label_cell: Vec<Box<dyn Scene>> = vec![Box::new(label(name.to_string()))];
+    let widget_cell: Vec<Box<dyn Scene>> = vec![widget];
     bsn! {
         Node {
+            width: percent(100),
             display: Display::Flex,
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
             column_gap: px(8),
             min_height: px(26),
         }
-        Children [ {children} ]
+        Children [
+            (
+                Node { width: px(96), flex_shrink: 0.0 }
+                Children [ {label_cell} ]
+            ),
+            {widget_cell},
+        ]
     }
 }
 
-/// A vertical stack of rows.
+/// A full-width vertical stack of rows.
 pub fn column(rows: Vec<Box<dyn Scene>>) -> impl Scene {
     bsn! {
         Node {
+            width: percent(100),
             display: Display::Flex,
             flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Stretch,
             row_gap: px(2),
         }
         Children [ {rows} ]
+    }
+}
+
+/// A titled feathers `group` card wrapping a body scene, filling its width.
+pub(crate) fn group_card(title: &str, body: Box<dyn Scene>) -> impl Scene {
+    let header: Vec<Box<dyn Scene>> = vec![Box::new(label(title.to_string()))];
+    let content: Vec<Box<dyn Scene>> = vec![body];
+    bsn! {
+        :group
+        Node { width: percent(100) }
+        Children [
+            (:group_header Children [ {header} ]),
+            (
+                :group_body
+                Node { width: percent(100) }
+                Children [ {content} ]
+            ),
+        ]
     }
 }
 
