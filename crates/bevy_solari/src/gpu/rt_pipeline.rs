@@ -37,13 +37,9 @@ const BINDING_GEOMETRY: u32 = 4; // uniform: bindless geometry buffer-device-add
 // `#ifdef SOLARI_DLSS`, so the layout slots and the SPIR-V binding numbers stay in
 // lockstep (set 1 is hand-built, so naga emits these numbers verbatim — no wgpu
 // descriptor compaction). Contiguous after BINDING_GEOMETRY (no gaps).
-#[cfg(feature = "dlss")]
 const BINDING_GBUFFER_NORMAL: u32 = 5; // storage: normal.xyz + linear roughness (.w)
-#[cfg(feature = "dlss")]
 const BINDING_GBUFFER_DIFFUSE: u32 = 6; // storage: diffuse albedo.xyz + linear depth (.w)
-#[cfg(feature = "dlss")]
 const BINDING_GBUFFER_SPECULAR: u32 = 7; // storage: specular albedo.xyz + hit distance (.w)
-#[cfg(feature = "dlss")]
 const BINDING_GBUFFER_MOTION: u32 = 8; // storage: screen-space motion vector.xy (.zw unused)
 // ReSTIR DI reservoirs (rung 3): 2 interleaved 32-B slots per pixel, written by
 // raygen (current-slot clear) + the opaque closest-hit (merge/store). Always
@@ -58,6 +54,14 @@ const BINDING_SURFACE: u32 = 10;
 const BINDING_LIGHT_SAMPLES: u32 = 11;
 /// ReSTIR GI canonical samples (rung 4a): 2 interleaved 48-B slots per pixel.
 const BINDING_GI_SAMPLES: u32 = 12;
+// NRC (zero/docs/nrc.md): transposed f16 weight mirror + f16 biases (raygen
+// inline coopvec inference), the training-record ring (raygen writes one
+// record per rotating pixel subset each frame), and the per-view
+// termination-query ring (raygen appends, the infer pass consumes).
+const BINDING_NRC_WEIGHTS: u32 = 13;
+const BINDING_NRC_BIAS: u32 = 14;
+const BINDING_NRC_RECORDS: u32 = 15;
+const BINDING_NRC_QUERIES: u32 = 16;
 
 /// Per-frame camera inputs the raygen shader reads — std140-compatible
 /// (mat4 + vec4). `inverse_view_proj` reconstructs a world-space ray per pixel;
@@ -115,6 +119,15 @@ pub struct RtCamera {
     /// this or they go stale every frame the camera moves (motion glitter).
     /// Zero on frame 1 and on the CPU fallback path.
     pub origin_delta: [f32; 4],
+    /// NRC (zero/docs/nrc.md): `.x` = position-encoding scene scale in meters
+    /// (0 ⇒ NRC off: no record writes, debug view black); `.y` = spread-
+    /// termination threshold c; `.z` = inline coopvec inference (0 = deferred).
+    pub nrc: [f32; 4],
+    /// NRC world-snapped anchor offset (`.xyz`, GPU-computed from the camera's
+    /// absolute f64 position): camera-relative positions plus this are
+    /// anchor-relative, so the cache encoding survives camera translation.
+    /// Zero on the CPU fallback path (camera-anchored there).
+    pub nrc_anchor: [f32; 4],
 }
 
 /// Bindless geometry buffer-device-addresses the closest-hit reads via
@@ -439,7 +452,6 @@ impl RtPipeline {
         // --- Descriptor set layout (set 1: output + camera) --------------------
         // TLAS is NOT here — it comes from the scene bind group (set 0). raygen
         // writes the output buffer; raygen reads the camera.
-        #[cfg_attr(not(feature = "dlss"), allow(unused_mut))]
         let mut bindings = vec![
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_OUTPUT)
@@ -483,7 +495,6 @@ impl RtPipeline {
         // DLSS guide G-buffers: raygen clears the primary pixel (sky/miss default);
         // the closest-hit overwrites it on a primary hit. Layout slots must match the
         // WGSL `#ifdef SOLARI_DLSS` bindings 5/6/7 exactly.
-        #[cfg(feature = "dlss")]
         for binding in [
             BINDING_GBUFFER_NORMAL,
             BINDING_GBUFFER_DIFFUSE,
@@ -502,7 +513,7 @@ impl RtPipeline {
         }
         // ReSTIR reservoirs: raygen clears the current slot, the chit merges + stores.
         // Surface G-buffer: the chit writes it for the spatial merge+shade pass.
-        for binding in [BINDING_RESERVOIRS, BINDING_SURFACE, BINDING_LIGHT_SAMPLES, BINDING_GI_SAMPLES] {
+        for binding in [BINDING_RESERVOIRS, BINDING_SURFACE, BINDING_LIGHT_SAMPLES, BINDING_GI_SAMPLES, BINDING_NRC_WEIGHTS, BINDING_NRC_BIAS, BINDING_NRC_RECORDS, BINDING_NRC_QUERIES] {
             bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(binding)
@@ -782,6 +793,11 @@ impl RtPipeline {
         light_samples: (vk::Buffer, u64),
         // ReSTIR GI canonical samples `(VkBuffer, size)` bound at BINDING_GI_SAMPLES.
         gi_samples: (vk::Buffer, u64),
+        // NRC inference weights / biases / training records / screen (BINDING_NRC_*).
+        nrc_weights: (vk::Buffer, u64),
+        nrc_bias: (vk::Buffer, u64),
+        nrc_records: (vk::Buffer, u64),
+        nrc_queries: (vk::Buffer, u64),
         env_map_view: vk::ImageView,
         env_map_image: Option<vk::Image>,
     ) -> Option<RtViewBindings> {
@@ -789,7 +805,7 @@ impl RtPipeline {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(5 + gbuffers.len() as u32), // output + reservoirs + surface + light_samples + gi_samples + DLSS guides
+                .descriptor_count(9 + gbuffers.len() as u32), // + 4×NRC (weights/bias/records/queries)
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(1), // camera (ringed)
@@ -883,9 +899,24 @@ impl RtPipeline {
             .buffer(gi_samples.0)
             .offset(0)
             .range(gi_samples.1)];
+        let nrc_weights_info = [vk::DescriptorBufferInfo::default()
+            .buffer(nrc_weights.0)
+            .offset(0)
+            .range(nrc_weights.1)];
+        let nrc_bias_info = [vk::DescriptorBufferInfo::default()
+            .buffer(nrc_bias.0)
+            .offset(0)
+            .range(nrc_bias.1)];
+        let nrc_records_info = [vk::DescriptorBufferInfo::default()
+            .buffer(nrc_records.0)
+            .offset(0)
+            .range(nrc_records.1)];
+        let nrc_queries_info = [vk::DescriptorBufferInfo::default()
+            .buffer(nrc_queries.0)
+            .offset(0)
+            .range(nrc_queries.1)];
         // DLSS guide descriptors built outside `writes` so the per-binding infos
         // outlive `update_descriptor_sets` (empty when the feature is off).
-        #[cfg(feature = "dlss")]
         let gbuffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = gbuffers
             .iter()
             .map(|&(buf, size)| {
@@ -895,7 +926,6 @@ impl RtPipeline {
                     .range(size)]
             })
             .collect();
-        #[cfg_attr(not(feature = "dlss"), allow(unused_mut))]
         let mut writes = vec![
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
@@ -942,8 +972,27 @@ impl RtPipeline {
                 .dst_binding(BINDING_GI_SAMPLES)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&gi_samples_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_NRC_WEIGHTS)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&nrc_weights_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_NRC_BIAS)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&nrc_bias_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_NRC_RECORDS)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&nrc_records_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(BINDING_NRC_QUERIES)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&nrc_queries_info),
         ];
-        #[cfg(feature = "dlss")]
         {
             let gbuffer_bindings = [
                 BINDING_GBUFFER_NORMAL,
@@ -1222,6 +1271,10 @@ fn rt_capabilities() -> naga::valid::Capabilities {
         | naga::valid::Capabilities::FLOAT64
         // f16 pack/unpack builtins (planet erosion maps decode 4×f16 texels).
         | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+        // True f16 + cooperative vectors: NRC inline inference in raygen
+        // (zero/docs/nrc.md rung 1).
+        | naga::valid::Capabilities::SHADER_FLOAT16
+        | naga::valid::Capabilities::COOPERATIVE_VECTOR
 }
 
 /// Build a naga_oil composer pre-loaded with the built-in importable modules the RT
@@ -1334,7 +1387,6 @@ fn try_compile_rt_wgsl(
     )]
     .into_iter()
     .collect();
-    #[cfg(feature = "dlss")]
     shader_defs.insert("SOLARI_DLSS".to_string(), ShaderDefValue::Bool(true));
     // Compile in the `shader_clock()` reads only when the device enabled
     // `VK_KHR_shader_clock`; otherwise the cost-heatmap path compiles out.

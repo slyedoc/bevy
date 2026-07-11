@@ -780,6 +780,11 @@ futures-lite = "2.0.1"
 futures-timer = { version = "3", features = ["wasm-bindgen", "gloo-timers"] }
 crossbeam-channel = "0.5.0"
 argh = "0.1.12"
+clap = { version = "4", features = ["derive"] }
+# NRC gym (plain-wgpu headless; wgpu resolves to the fork via [patch])
+wgpu = { version = "29", default-features = false, features = ["wgsl", "vulkan"] }
+pollster = "0.4"
+half = "2"
 thiserror = "2.0"
 event-listener = "5.3.0"
 anyhow = "1"
@@ -1623,23 +1628,15 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
-name = "solari_furnace"
-path = "examples/3d/solari/furnace.rs"
+name = "solari_nrc_gym"
+path = "examples/3d/solari/nrc_gym.rs"
 doc-scrape-examples = true
-required-features = [
-    "bevy_solari",
-    "bevy_solari_debug",
-    "cluster_processor",
-    "free_camera",
-    "bevy_feathers",
-    "bevy_dev_tools",
-]
 
-[package.metadata.example.solari_furnace]
-name = "Solari (furnace exam harness)"
-description = "Furnace/closed-form validation scenes + probe readback for the reference path tracer — the ReSTIR curriculum's referee."
+[package.metadata.example.solari_nrc_gym]
+name = "Solari (NRC rung-0 gym)"
+description = "Headless trainer certifying the NRC MLP coopmat kernels vs a CPU reference (zero/docs/nrc.md)."
 category = "3D Rendering"
-wasm = false                                                                        # Raytracing is not supported on the web
+wasm = false                                                                        # cooperative matrix is native-only
 
 [[example]]
 name = "solari_split_screen"

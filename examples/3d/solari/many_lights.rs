@@ -8,17 +8,7 @@
 //! the corner.
 
 use bevy::{
-    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
-    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
-    diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin},
-    feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
-    image::{ImageAddressMode, ImageLoaderSettings},
-    mesh::VertexAttributeValues,
-    pbr::PbrPlugin,
-    post_process::bloom::Bloom,
-    prelude::*,
-    render::diagnostic::RenderDiagnosticsPlugin,
-    solari::prelude::*,
+    camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, dev_tools::{fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig}, render_debug::RenderDebugOverlayPlugin}, diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin}, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, image::{ImageAddressMode, ImageLoaderSettings}, mesh::VertexAttributeValues, pbr::PbrPlugin, post_process::bloom::Bloom, prelude::*, render::diagnostic::RenderDiagnosticsPlugin, solari::prelude::*,
 };
 use chacha20::ChaCha8Rng;
 use rand::{RngExt, SeedableRng};
@@ -44,7 +34,8 @@ fn main() {
                 ..default()
             })
             .disable::<TransformPlugin>()
-            .disable::<PbrPlugin>(),
+            .disable::<PbrPlugin>()
+            .disable::<RenderDebugOverlayPlugin>(),
         SolariPlugin,
         FeathersPlugins,
         FreeCameraPlugin,
@@ -95,7 +86,7 @@ fn setup_scene(
                 Quat::from_xyzw(-0.183938, 0.009093744, 0.0017017953, 0.9828943).to_precision(),
             ),
         Msaa::Off,
-        SolariCamera,
+        SolariCamera::default(),
         Bloom {
             intensity: 0.1,
             ..Bloom::NATURAL

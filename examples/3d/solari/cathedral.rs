@@ -244,7 +244,7 @@ fn setup_scene(
         Transform::from_xyz(0.0, 3.5, -6.0)
             .looking_at(Vec3::new(0.0, 4.0, -56.0).to_precision(), Vec3::Y),
         Msaa::Off,
-        SolariCamera,
+        SolariCamera::default(),
         // The atmosphere drives the sun's color/attenuation and the sky; there's
         // no `SolariGlobalFog`, so all the fog in this scene is the local volume.
         SolariAtmosphere::default(),

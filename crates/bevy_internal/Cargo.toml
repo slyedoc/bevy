@@ -97,7 +97,7 @@ dfg_lut = ["bevy_pbr?/dfg_lut", "ktx2", "bevy_image/zstd"]
 area_light_luts = ["bevy_pbr?/area_light_luts", "ktx2", "bevy_image/zstd"]
 
 # NVIDIA Deep Learning Super Sampling
-dlss = ["bevy_anti_alias/dlss", "bevy_solari?/dlss"]
+dlss = ["bevy_anti_alias/dlss"]
 
 # Forcibly disable DLSS so that `cargo build --all-features` works without the DLSS SDK being installed. Not meant for users.
 force_disable_dlss = [

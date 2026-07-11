@@ -145,7 +145,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
                 Quat::from_xyzw(-0.1466768, 0.013738206, 0.002037309, 0.989087).to_precision(),
             ),
         Msaa::Off,
-        SolariCamera,
+        SolariCamera::default(),
     ));
 
     commands.spawn((

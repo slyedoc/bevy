@@ -202,7 +202,7 @@ fn setup_scene(
         Transform::from_xyz(0.0, f64::from(AXIS_Y), f64::from(eyepiece_z + 0.030))
             .looking_at(Vec3::new(0.0, AXIS_Y, -10.0).to_precision(), Vec3::Y),
         Msaa::Off,
-        SolariCamera,
+        SolariCamera::default(),
         SolariAtmosphere::default(),
     ));
 }

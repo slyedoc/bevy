@@ -151,7 +151,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
                 ..default()
             },
             Msaa::Off,
-            SolariCamera,
+            SolariCamera::default(),
             RenderLayers::layer(RT_LAYER),
             CameraSlot {
                 pos: UVec2::new(0, 0),

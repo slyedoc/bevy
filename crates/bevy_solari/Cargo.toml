@@ -18,10 +18,6 @@ keywords = ["bevy"]
 # `grid_i64` if both are set.
 grid_i64 = []
 grid_i128 = []
-# Pulls bevy_anti_alias/dlss (for DlssInitPlugin's Vulkan extension
-# registration + DlssProjectId) plus dlss_wgpu, which the `restir` path drives
-# directly for prepass-free DLSS Ray Reconstruction.
-dlss = ["bevy_anti_alias/dlss", "dep:dlss_wgpu"]
 force_disable_dlss = ["bevy_anti_alias/force_disable_dlss"]
 # Enables baking `bevy_mesh::Mesh` into `ClusterMesh` via
 # `ClusterMesh::from_mesh`. Pulls in `meshopt` (C library) — offline
@@ -31,10 +27,13 @@ cluster_processor = ["dep:meshopt"]
 # so glTF scenes get real materials with `PbrPlugin` (and its glTF→StandardMaterial
 # handler) disabled. Threaded from bevy via `bevy_gltf = [..., "bevy_solari?/gltf"]`.
 gltf = ["dep:bevy_gltf", "dep:serde_json"]
-# Enables the in-engine debug-view dropdown (`SolariDebugPlugin`).
-# Pulls in bevy_feathers + the UI widget stack — examples / tools
-# only; runtime games typically don't want this.
+# Enables the in-engine debug-view dropdown (`SolariDebugPlugin`) and the
+# reusable camera CLI (`cli::SolariCameraArgs`, a flattenable `clap::Args`
+# block carrying the furnace estimator levers). Pulls in bevy_feathers +
+# the UI widget stack + clap — examples / tools only; runtime games
+# typically don't want this.
 bevy_solari_debug = [
+  "dep:clap",
   "dep:bevy_dev_tools",
   "dep:bevy_feathers",
   "dep:bevy_input",
@@ -46,7 +45,11 @@ bevy_solari_debug = [
 
 [dependencies]
 # bevy
-bevy_anti_alias = { path = "../bevy_anti_alias", version = "0.20.0-dev" }
+# DLSS is unconditional: this stack is NVIDIA-only (raw-VK NV cluster AS),
+# and recipe behavior under DLSS RR is what any meaningful test measures.
+# bevy_anti_alias/dlss supplies DlssInitPlugin's Vulkan extension registration
+# + DlssProjectId; dlss_wgpu is driven directly for prepass-free RR.
+bevy_anti_alias = { path = "../bevy_anti_alias", version = "0.20.0-dev", features = ["dlss"] }
 bevy_app = { path = "../bevy_app", version = "0.20.0-dev" }
 bevy_asset = { path = "../bevy_asset", version = "0.20.0-dev" }
 bevy_camera = { path = "../bevy_camera", version = "0.20.0-dev" }
@@ -110,6 +113,8 @@ bevy_log = { path = "../bevy_log", version = "0.20.0-dev" }
 # today, mirroring whatever bevy does for DLSS+DX12 when that lands).
 ash = { version = "0.38", features = ["provisional"] }
 wgpu = { version = "29.0.3", default-features = false }
+# Optional — only pulled in by `bevy_solari_debug` (`cli::SolariCameraArgs`).
+clap = { version = "4", features = ["derive"], optional = true }
 # Shader composition for the raw-VK RT-pipeline shaders: they `#import` solari's
 # scene-binding / BRDF / sampling modules, which need naga_oil's composer (raw
 # naga::parse_str can't resolve `#import`). Patched to the SER-aware fork.
@@ -117,10 +122,14 @@ naga_oil = { version = "0.22", default-features = false }
 naga = { version = "29", features = ["wgsl-in", "spv-out"] }
 # DLSS Ray Reconstruction for the `restir` path — used directly (not via
 # bevy_anti_alias's `Dlss` component) so the self-contained RT path needs no
-# raster prepass. Only pulled in by the `dlss` feature.
-dlss_wgpu = { version = "4.0.0", optional = true }
+# raster prepass.
+dlss_wgpu = { version = "4.0.0" }
 serde_json = { version = "1.0.140", optional = true }
 bytemuck = { version = "1" }
+# Harness dumps (`SolariFreezeDiff`): the accumulated output buffer is written
+# as OpenEXR for offline FLIP/RMSE grading.
+exr = "1.74"
+half = { version = "2" }
 derive_more = { version = "2", default-features = false, features = ["display", "from"] }
 lz4_flex = { version = "0.13", default-features = false, features = ["std", "frame"] }
 meshopt = { version = "0.6.2", optional = true }

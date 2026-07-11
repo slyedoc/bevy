@@ -1,10 +1,9 @@
-use bevy_ecs::{change_detection::DetectChanges, component::Component, query::With, system::{Commands, Query, Res}, world::Ref};
+use bevy_ecs::{change_detection::DetectChanges, component::Component, entity::EntityHashMap, query::With, system::{Commands, Local, Query}, world::Ref};
 use bevy_math::Mat4;
 use bevy_reflect::Reflect;
 use bevy_render::{Extract, sync_world::RenderEntity};
 
-use crate::render::view::SolariViewState;
-use crate::render::SolariCamera;
+use crate::render::{SolariCamera, SolariLighting};
 
 /// Per-frame "drop temporal history" flags on a solari camera's render entity.
 /// Reset-reason systems in extract set the bits; the main-world copy (required by
@@ -76,19 +75,26 @@ pub fn reset_render_on_request(
     }
 }
 
-/// Reset reason: [`SolariViewState`] changed (integrator or debug view
-/// switched) — accumulated history belongs to the previous mode, and the scene
-/// kept moving while the other mode rendered.
-pub fn reset_render_on_view_state_change(
-    state: Extract<Res<SolariViewState>>,
-    cameras: Extract<Query<RenderEntity, With<SolariCamera>>>,
+/// Reset reason: the camera's [`SolariCamera::mode`] changed (integrator
+/// switched, or the active variant's estimator levers moved) — accumulated
+/// history belongs to the previous estimator. Changes to the `debug` field
+/// deliberately don't reset (a debug paint pauses accumulation and it resumes
+/// untouched), so the component's change tick alone isn't enough — the mode is
+/// compared by value against last frame's.
+pub fn reset_render_on_mode_change(
+    cameras: Extract<Query<(RenderEntity, Ref<SolariCamera>)>>,
+    mut previous: Local<EntityHashMap<SolariLighting>>,
     mut commands: Commands,
 ) {
-    if !state.is_changed() {
-        return;
-    }
-    for e in &cameras {
-        commands.entity(e).insert(CameraReset::request());
+    for (e, camera) in &cameras {
+        if !camera.is_changed() {
+            continue;
+        }
+        let mode_changed = previous.get(&e).is_some_and(|old| *old != camera.mode);
+        previous.insert(e, camera.mode.clone());
+        if mode_changed {
+            commands.entity(e).insert(CameraReset::request());
+        }
     }
 }
 

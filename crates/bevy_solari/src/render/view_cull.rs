@@ -73,7 +73,7 @@ pub struct SolariViewUniform {
     pub clear_color: Vec3,
     pub environment_brightness: f32,
     /// `restir_debug` visualization mode (0 = none; see
-    /// [`SolariDebugView::restir_debug_mode`](crate::render::view::SolariDebugView)).
+    /// [`SolariDebugView`](crate::render::rt_pipeline::SolariDebugView)).
     pub debug_mode: u32,
     /// Thin-lens focal-plane distance, from the camera's `DepthOfField`.
     pub focus_distance: f32,

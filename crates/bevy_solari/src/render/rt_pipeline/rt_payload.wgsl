@@ -40,6 +40,9 @@ struct RtPayload {
     // Same view: the GEOMETRIC (winding/position) normal, so raygen can tell a
     // back-wound triangle (red) from a merely bad vertex normal (yellow).
     hit_geo_normal_oct: u32,
+    // NRC: packed surface material at the hit (r5g6b5 base color, metallic8,
+    // roughness8); 0xffffffff = no material (miss / non-opaque chit).
+    hit_material: u32,
     // Pixel index (row-major `y*width + x`) on the PRIMARY bounce, sentinel after.
     // The DLSS guides and the ReSTIR reservoir writes both key off it (chit-direct).
     gbuffer_pixel: u32,
@@ -78,4 +81,6 @@ struct RtCamera {
     window_arc: vec4<f32>,        // .x = arc angle (rad); .y = radius m (0 = flat); .z = height m
     window_eye: vec4<f32>,        // .xyz = eye in screen space (center origin, +Z toward viewer)
     origin_delta: vec4<f32>,      // .xyz = origin_now − origin_prev: cross-frame position rebase
+    nrc: vec4<f32>,               // .x = NRC scene scale m (0 = off); .y = spread c; .z = inline coopvec
+    nrc_anchor: vec4<f32>,        // .xyz = camera-relative → anchor-relative position offset
 }

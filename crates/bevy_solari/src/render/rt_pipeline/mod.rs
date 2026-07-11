@@ -6,7 +6,8 @@
 //! copies that buffer into the view's HDR storage texture — the same target the
 //! reference path tracer writes — so the rest of the frame is unchanged.
 //!
-//! Selected via [`SolariLighting::RtPipeline`](crate::render::view::SolariLighting).
+//! Runs for every [`SolariCamera`] view; the component's variant selects the
+//! integrator (realtime ReSTIR vs reference accumulation).
 #![allow(unsafe_code)]
 
 mod rt_camera;
@@ -53,10 +54,12 @@ use crate::render::atmosphere::{
     AtmosphereSky, SolariAtmosphereGpu, SolariAtmosphereView, SolariAtmosphereVolumesGpu,
 };
 use crate::render::view_cull::SolariEnvironmentMap;
-use crate::render::{CameraReframe, SolariCamera, SolariReference, SolariRestir};
+use crate::render::{
+    CameraReframe, DiEstimator, GiEstimator, ReferenceOutput, SolariCamera, SolariReference,
+};
 use crate::resource_manager::SolariResourceManager;
 use crate::transform::{TransformGraph, TransformPropagate};
-use bevy_render::extract_resource::ExtractResource;
+use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 
 /// `RenderStartup`: build the RT pipeline (raygen/miss/chit + SBT) if the
 /// `VK_KHR_ray_tracing_pipeline` feature is present and the raw-VK allocator
@@ -104,94 +107,80 @@ pub(crate) struct RtEnvImages<'w> {
     fallback_image: Res<'w, FallbackImage>,
 }
 
-/// Per-pixel cost-heatmap debug view (requires `VK_KHR_shader_clock`). When
-/// `enabled`, the raygen reads the shader clock around the trace and replaces the
-/// shaded color with a colormap of the per-pixel cost; `scale` maps clocks → `[0, 1]`
-/// for the colormap (tune per scene). Set it from the main world (e.g. on a
-/// keypress) — `bevy_solari::prelude::SolariCostHeatmap`. A no-op when the device
-/// lacks shader_clock (the raygen's clock reads compile out).
-#[derive(Resource, Clone, Copy, ExtractResource)]
-pub struct SolariCostHeatmap {
-    pub enabled: bool,
-    /// `log2(cycles)` that maps to the colormap midpoint (green) — slide it to the
-    /// scene's midrange cost. `-` / `=` shift it. Default 16 (≈ 65k cycles).
-    pub center: f32,
-    /// Contrast: colormap change per `log2(cycles)` stop around [`center`](Self::center).
-    /// Crank it up to push the slowest toward red and the fastest toward blue; `[` / `]`
-    /// halve / 1.5× it.
-    pub contrast: f32,
+/// The camera's active debug view (the [`SolariCamera::debug`] field, default
+/// [`None`](Self::None) = normal rendering), at most one view at a time. Each
+/// variant replaces the shaded image with an instrument paint; set it from the
+/// main world (e.g. on a keypress, or via the debug UI's view dropdown).
+/// Switching variants resets the new variant's knobs to its defaults — the
+/// knobs live in the variant payload.
+#[derive(Reflect, Clone, Copy, PartialEq, Default, Debug)]
+#[reflect(Default, Clone, PartialEq)]
+pub enum SolariDebugView {
+    /// Normal rendering.
+    #[default]
+    None,
+    /// Per-pixel cost heatmap (requires `VK_KHR_shader_clock`): the raygen reads
+    /// the shader clock around the trace and replaces the shaded color with a
+    /// colormap of the per-pixel cost. A no-op when the device lacks
+    /// shader_clock (the raygen's clock reads compile out).
+    CostHeatmap {
+        /// `log2(cycles)` that maps to the colormap midpoint (green) — slide it
+        /// to the scene's midrange cost.
+        center: f32,
+        /// Contrast: colormap change per `log2(cycles)` stop around `center`.
+        /// Crank it up to push the slowest toward red and the fastest toward blue.
+        contrast: f32,
+    },
+    /// Colormap of the per-pixel count of alpha any-hit shader invocations —
+    /// the OMM-effectiveness view. Cold (blue) = the hit resolved in hardware
+    /// with no any-hit (opacity-micromap opaque/transparent micro-regions, or
+    /// plain opaque geometry); hot (red) = many any-hit invocations (unknown
+    /// micro-regions, or alpha cutouts with no baked OMM). With OMM working,
+    /// foliage interiors go cold and only the silhouette edges stay warm.
+    /// Unlike the cost heatmap this needs no `shader_clock`.
+    AnyHitCount {
+        /// Count → colormap scale: `color = cost_heatmap(count * scale)`.
+        scale: f32,
+    },
+    /// Show each surface's displacement (height) map as grayscale — a validation
+    /// for the displacement-map wiring BEFORE tessellation actually displaces
+    /// geometry: confirms which map lands on which surface, the UV mapping, and
+    /// the height sign. The opaque closest-hit replaces shading with the sampled
+    /// height on surfaces that have a `displacement_texture`, and a dim grey
+    /// elsewhere.
+    Displacement,
+    /// Flat per-CLUSTER color (a hash of the global cluster id). Shows the
+    /// cluster decomposition directly — each cluster a distinct hue — so
+    /// tessellation density (CLAS count) is visible at a glance.
+    Clusters,
+    /// Flat per-TRIANGLE color (a hash of cluster id + primitive index). Each
+    /// (micro-)triangle gets a distinct hue, so view-dependent tessellation
+    /// LEVEL reads directly as triangle density.
+    Triangles,
+    /// Color each primary hit by whether its SHADING normal faces the camera —
+    /// blue toward the viewer, red away (inverted / back-wound), brightness =
+    /// facing magnitude so grazing reads dark. On watertight, correctly-wound
+    /// geometry everything is blue; red patches are the bug.
+    NormalFacing,
+    /// Paint the NRC cache prediction at the primary hit (inline coopvec MLP
+    /// inference per pixel). Shows only while [`SolariNrc::enabled`]
+    /// (`crate::nrc::SolariNrc`) — the paint queries the live cache weights.
+    NrcCache,
 }
 
-impl Default for SolariCostHeatmap {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            center: 16.0,
-            // ~0.15/stop spreads a ±3-stop range across the colormap.
-            contrast: 0.15,
-        }
+impl SolariDebugView {
+    /// [`CostHeatmap`](Self::CostHeatmap) with the default colormap mapping:
+    /// center 16 (≈ 65k cycles), contrast 0.15/stop (spreads a ±3-stop range
+    /// across the colormap).
+    pub fn cost_heatmap() -> Self {
+        Self::CostHeatmap { center: 16.0, contrast: 0.15 }
     }
-}
 
-/// Debug view that shows each surface's displacement (height) map as grayscale — a validation
-/// for the displacement-map wiring BEFORE tessellation actually displaces geometry: confirms
-/// which map lands on which surface, the UV mapping, and the height sign. When `enabled`, the
-/// opaque closest-hit replaces shading with the sampled height on surfaces
-/// that have a `displacement_texture`, and a dim grey elsewhere. Set it from the main world (e.g.
-/// on a keypress) — `bevy_solari::prelude::SolariShowDisplacement`.
-#[derive(Resource, Clone, Copy, Default, ExtractResource)]
-pub struct SolariShowDisplacement {
-    pub enabled: bool,
-}
-
-/// Debug view that colormaps the per-pixel count of alpha any-hit shader
-/// invocations — the OMM-effectiveness view. Cold (blue) = the hit resolved in
-/// hardware with no any-hit (opacity-micromap opaque/transparent micro-regions,
-/// or plain opaque geometry); hot (red) = many any-hit invocations (unknown
-/// micro-regions, or alpha cutouts with no baked OMM). With OMM working, foliage
-/// interiors go cold and only the silhouette edges stay warm. Unlike the cost
-/// heatmap this needs no `shader_clock`. Mutually exclusive with the other views.
-#[derive(Resource, Clone, Copy, ExtractResource)]
-pub struct SolariAnyHitHeatmap {
-    pub enabled: bool,
-    /// Count → colormap scale: `color = cost_heatmap(count * scale)`. Default 0.1
-    /// (≈10 any-hits saturates to red). Tune per scene.
-    pub scale: f32,
-}
-
-impl Default for SolariAnyHitHeatmap {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            scale: 0.1,
-        }
+    /// [`AnyHitCount`](Self::AnyHitCount) at the default scale 0.1 (≈10
+    /// any-hits saturates to red). Tune per scene.
+    pub fn any_hit_count() -> Self {
+        Self::AnyHitCount { scale: 0.1 }
     }
-}
-
-/// Debug view: flat per-CLUSTER color (a hash of the global cluster id). Shows the
-/// cluster decomposition directly — each cluster a distinct hue — so tessellation
-/// density (CLAS count) is visible at a glance. Mutually exclusive with the other views.
-#[derive(Resource, Clone, Copy, Default, ExtractResource)]
-pub struct SolariClusterView {
-    pub enabled: bool,
-}
-
-/// Debug view: flat per-TRIANGLE color (a hash of cluster id + primitive index). Each
-/// (micro-)triangle gets a distinct hue, so view-dependent tessellation LEVEL reads
-/// directly as triangle density. Mutually exclusive with the other views.
-#[derive(Resource, Clone, Copy, Default, ExtractResource)]
-pub struct SolariTriangleView {
-    pub enabled: bool,
-}
-
-/// Debug view: color each primary hit by whether its SHADING normal faces the
-/// camera — blue toward the viewer, red away (inverted / back-wound), brightness
-/// = facing magnitude so grazing reads dark. On watertight, correctly-wound
-/// geometry everything is blue; red patches are the bug. Mutually exclusive with
-/// the other views.
-#[derive(Resource, Clone, Copy, Default, ExtractResource)]
-pub struct SolariNormalFacing {
-    pub enabled: bool,
 }
 
 /// Debug/feature inputs bundled into one [`SystemParam`] to keep the dispatch under
@@ -199,13 +188,10 @@ pub struct SolariNormalFacing {
 #[derive(bevy_ecs::system::SystemParam)]
 pub(crate) struct RtDebug<'w> {
     additional: Res<'w, AdditionalVulkanFeatures>,
-    cost_heatmap: Option<Res<'w, SolariCostHeatmap>>,
-    anyhit_heatmap: Option<Res<'w, SolariAnyHitHeatmap>>,
-    show_displacement: Option<Res<'w, SolariShowDisplacement>>,
-    cluster_view: Option<Res<'w, SolariClusterView>>,
-    triangle_view: Option<Res<'w, SolariTriangleView>>,
-    normal_facing: Option<Res<'w, SolariNormalFacing>>,
     freeze_diff: Option<Res<'w, SolariFreezeDiff>>,
+    nrc: Option<Res<'w, crate::nrc::SolariNrc>>,
+    nrc_buffers: Option<ResMut<'w, crate::nrc::NrcBuffers>>,
+    nrc_pipelines: Option<Res<'w, crate::nrc::NrcPipelines>>,
 }
 
 /// Material routing inputs for the SBT, bundled into one [`SystemParam`] to keep
@@ -247,7 +233,7 @@ pub struct RtBlit {
 /// Rung-0 diff harness controls (main-world, extracted). Bump `freeze_epoch` to
 /// snapshot the current accumulated image; `diff` displays `|current − frozen|`
 /// as a heatmap through the blit; bump `dump_epoch` to write the accumulation
-/// buffer as a PFM into `target/tmp/` for offline RMSE/FLIP.
+/// buffer as an EXR into `target/tmp/` for offline RMSE/FLIP.
 #[derive(Resource, Clone, bevy_render::extract_resource::ExtractResource)]
 pub struct SolariFreezeDiff {
     pub freeze_epoch: u32,
@@ -274,7 +260,7 @@ pub struct RtFrozen {
 }
 
 /// `Render` (`Cleanup`): execute [`SolariFreezeDiff`] epoch bumps — snapshot the
-/// accumulated output into [`RtFrozen`] (freeze) and/or write it as a PFM into
+/// accumulated output into [`RtFrozen`] (freeze) and/or write it as an EXR into
 /// `target/tmp/` (dump; blocking readback — a manual harness op, hitch accepted).
 pub fn rt_freeze_ops(
     views: Query<(
@@ -347,26 +333,42 @@ pub fn rt_freeze_ops(
                 continue;
             }
             let (w, h) = (viewport.x as usize, viewport.y as usize);
-            // PFM: little-endian (scale -1.0), rows bottom-to-top, RGB f32.
-            let mut pfm = format!("PF\n{w} {h}\n-1.0\n").into_bytes();
-            {
-                let data = slice.get_mapped_range();
-                for y in (0..h).rev() {
-                    let row = &data[y * w * 16..(y + 1) * w * 16];
-                    for px in row.chunks_exact(16) {
-                        pfm.extend_from_slice(&px[0..12]); // rgb, drop depth-alpha
-                    }
-                }
-            }
-            staging.unmap();
             let _ = std::fs::create_dir_all("target/tmp");
-            let path = format!("target/tmp/solari-{w}x{h}-{spp}spp-{}.pfm", fd.dump_epoch);
-            match std::fs::write(&path, &pfm) {
+            let path = format!("target/tmp/solari-{w}x{h}-{spp}spp-{}.exr", fd.dump_epoch);
+            let result = {
+                let data = slice.get_mapped_range();
+                write_dump_exr(&path, w, h, &data)
+            };
+            staging.unmap();
+            match result {
                 Ok(()) => bevy_log::info!("solari dump: wrote {path} ({spp} spp)"),
                 Err(e) => bevy_log::warn!("solari dump: {e}"),
             }
         }
     }
+}
+
+/// Write the mapped RGBA32F output rows (top-down, 16 B/pixel, `.w` = packed
+/// depth-alpha) as an RGB OpenEXR. Uncompressed scanlines: downstream tools
+/// (FLIP's tinyexr reader) crash on compressed encodings.
+fn write_dump_exr(path: &str, w: usize, h: usize, data: &[u8]) -> Result<(), exr::error::Error> {
+    use exr::prelude::*;
+    let texel = |x: usize, y: usize, c: usize| -> f32 {
+        let i = (y * w + x) * 16 + c * 4;
+        f32::from_le_bytes(data[i..i + 4].try_into().unwrap())
+    };
+    let mut image = Image::from_channels(
+        (w, h),
+        SpecificChannels::rgb(|pos: Vec2<usize>| {
+            (
+                texel(pos.x(), pos.y(), 0),
+                texel(pos.x(), pos.y(), 1),
+                texel(pos.x(), pos.y(), 2),
+            )
+        }),
+    );
+    image.layer_data.encoding = Encoding::UNCOMPRESSED;
+    image.write().to_file(path)
 }
 
 /// `RenderStartup`: build the blit pipeline (independent of `SolariPipelines`).
@@ -553,6 +555,11 @@ pub struct RtOutputBuffer {
     pub reservoirs: bevy_render::render_resource::Buffer,
     pub reservoirs_raw: vk::Buffer,
     pub reservoirs_size: u64,
+    /// NRC termination-query ring (16-byte count header + one 48-byte slot
+    /// per pixel), appended by raygen, consumed by nrc_query_infer.
+    pub nrc_queries: bevy_render::render_resource::Buffer,
+    pub nrc_queries_raw: vk::Buffer,
+    pub nrc_queries_size: u64,
     /// ReSTIR primary-hit surface G-buffer (48 B/pixel) — chit-written when the
     /// spatial pass is on; read by `restir_spatial.wgsl` for p̂ re-target + shade.
     pub surface: bevy_render::render_resource::Buffer,
@@ -574,7 +581,6 @@ pub struct RtOutputBuffer {
     /// specular+hit-distance, and motion vectors — each `pixels` × `vec4<f32>`,
     /// allocated and reallocated alongside the color output. Written by the
     /// closest-hit (chit-direct), read by the resolve.
-    #[cfg(feature = "dlss")]
     pub gbuffer: [RtGbuffer; 4],
 }
 
@@ -616,15 +622,14 @@ pub struct RtAccumulation {
 /// One DLSS ray-reconstruction guide buffer: a `pixels` × `vec4<f32>` GPU storage
 /// buffer the closest-hit writes. Held with its raw `VkBuffer` (for the RT set-1
 /// descriptor) and the wgpu handle (for the resolve pass).
-#[cfg(feature = "dlss")]
 pub struct RtGbuffer {
     pub buffer: bevy_render::render_resource::Buffer,
     pub raw: vk::Buffer,
 }
 
-/// Byte size of `rt_camera.wgsl`'s `PrevCamera` (`mat4x4` + 3×`f64` previous origin +
-/// `u32`, std430-padded).
-const RT_PREV_CAMERA_SIZE: u64 = 96;
+/// Byte size of `rt_camera.wgsl`'s `PrevCamera` (`mat4x4` + 3×`f64` previous
+/// origin + 2×`u32` + 3×`f64` held NRC anchor, std430-padded).
+const RT_PREV_CAMERA_SIZE: u64 = 128;
 
 /// `Prepare`: (re)allocate the per-view RT output buffer to fit the viewport.
 pub fn prepare_rt_output(
@@ -661,7 +666,6 @@ pub fn prepare_rt_output(
             .expect("rt_output buffer must be Vulkan-backed");
         // DLSS guide G-buffers: same size + lifetime as the color output, reallocated
         // with it (the `pixels` early-out above covers a viewport resize).
-        #[cfg(feature = "dlss")]
         let gbuffer: [RtGbuffer; 4] = core::array::from_fn(|_| {
             let buffer = allocator.create_buffer(
                 &render_device,
@@ -773,6 +777,21 @@ pub fn prepare_rt_output(
             .map(|b| b.raw_handle())
             .expect("rt_restir_gi_samples buffer must be Vulkan-backed");
         let gi_samples: bevy_render::render_resource::Buffer = gi_samples.into();
+        // NRC termination-query ring: count header + one slot per pixel.
+        let nrc_queries_size = 16 + pixels as u64 * crate::nrc::NRC_QUERY_SIZE as u64;
+        let nrc_queries = allocator.create_buffer(
+            &render_device,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            nrc_queries_size,
+            MemoryLocation::GpuOnly,
+            "rt_nrc_queries",
+        );
+        // SAFETY: Vulkan-backed (Allocator only builds VkBuffers).
+        let nrc_queries_raw = unsafe { nrc_queries.as_hal::<VkApi>() }
+            .map(|b| b.raw_handle())
+            .expect("rt_nrc_queries buffer must be Vulkan-backed");
+        let nrc_queries: bevy_render::render_resource::Buffer = nrc_queries.into();
         let mut clear_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("rt_reservoirs_clear"),
         });
@@ -780,6 +799,7 @@ pub fn prepare_rt_output(
         clear_encoder.clear_buffer(&surface, 0, None);
         clear_encoder.clear_buffer(&light_samples, 0, None);
         clear_encoder.clear_buffer(&gi_samples, 0, None);
+        clear_encoder.clear_buffer(&nrc_queries, 0, None);
         render_queue.submit([clear_encoder.finish()]);
         commands.entity(entity).insert(RtOutputBuffer {
             buffer: buffer.into(),
@@ -792,6 +812,9 @@ pub fn prepare_rt_output(
             reservoirs,
             reservoirs_raw,
             reservoirs_size,
+            nrc_queries,
+            nrc_queries_raw,
+            nrc_queries_size,
             surface,
             surface_raw,
             surface_size,
@@ -801,7 +824,6 @@ pub fn prepare_rt_output(
             gi_samples,
             gi_samples_raw,
             gi_samples_size,
-            #[cfg(feature = "dlss")]
             gbuffer,
         });
     }
@@ -892,6 +914,8 @@ struct RtCameraGpuInputs {
     /// Cylindrical window params; see `RtCamera::window_arc`/`window_eye`.
     window_arc: Vec4,
     window_eye: Vec4,
+    /// NRC scene scale (`.x`, meters; 0 = off); see `RtCamera::nrc`.
+    nrc: Vec4,
     exposure: f32,
 }
 
@@ -969,6 +993,7 @@ fn try_dispatch_rt_camera(
         dims: inputs.dims,
         window_arc: inputs.window_arc,
         window_eye: inputs.window_eye,
+        nrc: inputs.nrc,
         camera_slot: slot.0,
         node_count,
         exposure: inputs.exposure,
@@ -1094,7 +1119,7 @@ pub(crate) fn rt_pipeline(
         Option<&SolariDlssJitter>,
         Option<&CameraReframe>,
         Option<&RtCameraSlot>,
-        (Option<&SolariReference>, Option<&SolariRestir>),
+        &SolariCamera,
         Option<&RtAccumulation>,
         Option<&RtFrozen>,
         Option<&SolariCylindricalWindow>,
@@ -1102,7 +1127,7 @@ pub(crate) fn rt_pipeline(
     rt: Option<Res<RtPipeline>>,
     rt_blit: Res<RtBlit>,
     allocator: Option<Res<Allocator>>,
-    debug: RtDebug,
+    mut debug: RtDebug,
     scene_bindings: Res<RaytracingSceneBindings>,
     scene_columns: Res<SceneColumns>,
     // Tupled into one system param (the system is at bevy's 16-param ceiling).
@@ -1169,14 +1194,14 @@ pub(crate) fn rt_pipeline(
         dlss_jitter,
         reframe,
         camera_slot,
-        (reference, restir_rt),
+        solari_camera,
         accumulation,
         frozen,
         cyl_window,
     ) = view.into_inner();
-    // Production ReSTIR ([`SolariRestir`]) drives the estimator only when the
-    // exam harness ([`SolariReference`]) isn't on the camera.
-    let restir_rt = restir_rt.filter(|_| reference.is_none());
+    // The camera's [`SolariCamera`] variant selects the integrator: production
+    // ReSTIR (realtime) or the exam harness (reference accumulation).
+    let (reference, restir_rt) = (solari_camera.reference(), solari_camera.restir());
 
     // Environment cube the miss shader samples (same priority as the megakernel):
     // the baked atmosphere cube if this view has one, else the view's skybox image,
@@ -1319,17 +1344,19 @@ pub(crate) fn rt_pipeline(
                             .wgpu_device()
                             .poll(wgpu::PollType::wait_indefinitely());
                     }
-                    // DLSS guide G-buffers (empty without the feature) — bound into
-                    // set 1 alongside the color output, same size, same lifetime.
-                    #[cfg(feature = "dlss")]
+                    // DLSS guide G-buffers — bound into set 1 alongside the
+                    // color output, same size, same lifetime.
                     let gbuffers = [
                         (output.gbuffer[0].raw, output.size),
                         (output.gbuffer[1].raw, output.size),
                         (output.gbuffer[2].raw, output.size),
                         (output.gbuffer[3].raw, output.size),
                     ];
-                    #[cfg(not(feature = "dlss"))]
-                    let gbuffers: [(vk::Buffer, u64); 0] = [];
+                    // NRC buffers are created in Prepare (needs the Allocator);
+                    // the static set-1 bindings bake their raw handles, so wait.
+                    let Some(nrc_bufs) = debug.nrc_buffers.as_deref() else {
+                        return;
+                    };
                     if let Some(built) = rt.create_view_bindings(
                         allocator,
                         output.raw,
@@ -1340,6 +1367,13 @@ pub(crate) fn rt_pipeline(
                         (output.surface_raw, output.surface_size),
                         (output.light_samples_raw, output.light_samples_size),
                         (output.gi_samples_raw, output.gi_samples_size),
+                        (nrc_bufs.weights_t_raw, nrc_bufs.weights_t_size),
+                        (nrc_bufs.bias16_raw, nrc_bufs.bias16_size),
+                        (
+                            nrc_bufs.records_raw,
+                            (crate::nrc::NRC_RECORD_CAP * crate::nrc::NRC_RECORD_SIZE) as u64,
+                        ),
+                        (output.nrc_queries_raw, output.nrc_queries_size),
                         env_view,
                         environment_map_image,
                     ) {
@@ -1387,22 +1421,22 @@ pub(crate) fn rt_pipeline(
     if let Some(reframe) = reframe.filter(|r| !r.is_identity()) {
         prev_clip_from_world *= reframe.prev_from_current;
     }
-    // Debug-view selector, hoisted so the reference accumulator can bypass itself
-    // while a debug view owns the pixel.
-    let debug_view = if debug.cost_heatmap.as_deref().is_some_and(|h| h.enabled) {
-        1u32
-    } else if debug.anyhit_heatmap.as_deref().is_some_and(|h| h.enabled) {
-        2u32
-    } else if debug.cluster_view.as_deref().is_some_and(|v| v.enabled) {
-        3u32
-    } else if debug.triangle_view.as_deref().is_some_and(|v| v.enabled) {
-        4u32
-    } else if debug.normal_facing.as_deref().is_some_and(|v| v.enabled) {
-        5u32
-    } else {
-        0u32
+    // Debug-view selector ([`SolariDebugView`] → the shader ABI: `frame.z` view
+    // id + `frame.w` displacement flag), hoisted so the reference accumulator
+    // can bypass itself while a debug view owns the pixel.
+    let active_view = solari_camera.debug;
+    let debug_view = match active_view {
+        SolariDebugView::CostHeatmap { .. } => 1u32,
+        SolariDebugView::AnyHitCount { .. } => 2u32,
+        SolariDebugView::Clusters => 3u32,
+        SolariDebugView::Triangles => 4u32,
+        SolariDebugView::NormalFacing => 5u32,
+        // The cache paint queries the live NRC weights — nothing to show
+        // unless the cache is running.
+        SolariDebugView::NrcCache if debug.nrc.as_deref().is_some_and(|n| n.enabled) => 6u32,
+        _ => 0u32,
     };
-    let show_displacement = debug.show_displacement.as_deref().is_some_and(|d| d.enabled);
+    let show_displacement = active_view == SolariDebugView::Displacement;
 
     // Reference accumulation ([`SolariReference`]): misc.z = samples already in the
     // mean, misc.w = samples this frame (0 ⇒ off). Any camera/exposure/viewport/debug
@@ -1416,7 +1450,8 @@ pub(crate) fn rt_pipeline(
     // G-buffer (vs the stored exact a0), bit 7 = GI temporal reuse,
     // bits 8..15 = RIS M, bit 16 = GI spatial (the pass owns the GI shade),
     // bit 17 = dead-canonical rate paint, bit 18 = spatial debug (raygen
-    // stashes its would-be GI shade for the pass's ratio paint).
+    // stashes its would-be GI shade for the pass's ratio paint), bit 20 =
+    // NRC GI termination (armed only past cache maturity).
     let estimator_flags = if let Some(rt) = restir_rt {
         // Production per-frame stack: ReSTIR DI + GI reconnection reservoirs,
         // temporal always, spatial only when taps > 0 (at 0 the pass doesn't
@@ -1426,26 +1461,43 @@ pub(crate) fn rt_pipeline(
         // fetch + temporal reconnection Jacobian): whitens the moiré grid the
         // quantized fetch shows under motion — for the RR path only, so the
         // certified reference estimator stays untouched.
-        let spatial = rt.spatial_taps > 0;
+        let spatial = rt.spatial.is_some();
+        // Bit 20 = NRC GI termination, armed only once the cache is mature
+        // (a cold cache's extrapolations would composite garbage into every
+        // frame; until then paths trace their full suffix).
+        let nrc_ready = debug.nrc_buffers.as_deref().is_some_and(|b| b.step > 300);
         1 << 1
             | (spatial as u32) << 3
             | ((rt.gi as u32) * (1 << 5 | 1 << 7))
             | ((rt.gi && spatial) as u32) << 16
             | (rt.ris_candidates.min(255) << 8)
             | 1 << 19
+            | ((rt.nrc_gi && nrc_ready) as u32) << 20
     } else {
-        reference.is_some_and(|r| r.nee_off) as u32
-            | (reference.is_some_and(|r| r.restir) as u32) << 1
-            | (reference.is_some_and(|r| r.di_only) as u32) << 2
-            | (reference.is_some_and(|r| r.restir && r.spatial) as u32) << 3
-            | (reference.is_some_and(|r| r.gi_only) as u32) << 4
-            | (reference.is_some_and(|r| r.restir_gi) as u32) << 5
-            | (reference.is_some_and(|r| r.restir_gi && r.gi_recon) as u32) << 6
-            | (reference.is_some_and(|r| r.restir_gi && r.gi_temporal) as u32) << 7
-            | (reference.map_or(0, |r| r.ris_candidates.min(255)) << 8)
-            | (reference.is_some_and(|r| r.restir_gi && r.gi_spatial) as u32) << 16
-            | (reference.is_some_and(|r| r.restir_gi && r.gi_dead_view) as u32) << 17
-            | (reference.is_some_and(|r| r.spatial_debug) as u32) << 18
+        // The reference estimator tree → the flag bits (the tree makes legal
+        // combinations structural: spatial only inside a ReSTIR arm, recon
+        // only inside the GI ReSTIR arm).
+        let r = reference.expect("SolariLighting is Realtime or Reference");
+        let (gi_recon, gi_temporal) = match &r.gi {
+            GiEstimator::Restir { recon, temporal, .. } => (*recon, *temporal),
+            GiEstimator::PathTraced => (false, false),
+        };
+        matches!(r.di, DiEstimator::BsdfOnly) as u32
+            | (r.di_restir() as u32) << 1
+            | ((r.output == ReferenceOutput::DiOnly) as u32) << 2
+            | (r.di_spatial().is_some() as u32) << 3
+            | ((r.output == ReferenceOutput::GiOnly) as u32) << 4
+            | (r.gi_restir() as u32) << 5
+            | (gi_recon as u32) << 6
+            | (gi_temporal as u32) << 7
+            | (r.ris_candidates().min(255) << 8)
+            | (r.gi_spatial().is_some() as u32) << 16
+            | (r.gi_dead_view() as u32) << 17
+            | (r.spatial_debug_paint() as u32) << 18
+            | ((r.nrc_gi
+                && debug.nrc_buffers.as_deref().is_some_and(|b| b.step > 300))
+                as u32)
+                << 20
     };
     if let Some(reference) = reference {
         // Hold accumulation until EVERY solari pipeline is compiled (the one
@@ -1458,8 +1510,8 @@ pub(crate) fn rt_pipeline(
         // exactly this). So also require the scene quiet — no pending journal
         // records or mesh uploads, PTLAS built — for a few consecutive frames
         // (build latency the CPU can't observe directly).
-        let spatial_pending = ((reference.restir && reference.spatial)
-            || (reference.restir_gi && reference.gi_spatial))
+        let spatial_pending = (reference.di_spatial().is_some()
+            || reference.gi_spatial().is_some())
             && !restir_spatial
                 .as_deref()
                 .and_then(|rs| rs.pipeline)
@@ -1483,8 +1535,8 @@ pub(crate) fn rt_pipeline(
         // history-maturity window lets the chain reach ITS stationary state
         // before n starts advancing — else the first m-cap frames shade ~0.4×
         // and bake a permanent deficit (the cell 0.92 "estimator bug", part 2).
-        let history_frames = if reference.restir || reference.restir_gi {
-            reference.restir_m_cap.ceil() as u32 + 4
+        let history_frames = if reference.di_restir() || reference.gi_restir() {
+            reference.m_cap().ceil() as u32 + 4
         } else {
             0
         };
@@ -1533,6 +1585,17 @@ pub(crate) fn rt_pipeline(
     });
     let window_eye = cyl_window.map_or(Vec4::ZERO, |w| w.eye.extend(w.center.y));
 
+    // NRC master gate → RtCamera.nrc.x (0 = record writes + debug view off);
+    // .z selects inline coopvec inference over the batched query path.
+    let nrc_vec = debug.nrc.as_deref().filter(|n| n.enabled).map_or(Vec4::ZERO, |n| {
+        Vec4::new(
+            n.scene_scale,
+            n.spread_c,
+            if n.inline_coopvec { 1.0 } else { 0.0 },
+            0.0,
+        )
+    });
+
     let camera_inputs = RtCamera {
         inverse_view_proj: world_from_clip.to_cols_array(),
         view_from_world: view_from_world.to_cols_array(),
@@ -1550,8 +1613,8 @@ pub(crate) fn rt_pipeline(
             // .z = debug view selector: 0 = normal, 1 = cost (clock) heatmap (needs
             // SOLARI_SHADER_CLOCK), 2 = any-hit-count heatmap (OMM effectiveness),
             // 3 = per-cluster color, 4 = per-triangle color, 5 = normal-facing
-            // (blue toward camera / red away). The view dropdown keeps these
-            // mutually exclusive.
+            // (blue toward camera / red away), 6 = NRC cache paint. One view at
+            // a time — `SolariDebugView` is a single enum.
             debug_view,
             // .w = displacement debug view (1 = on); the opaque chit shows each
             // surface's height map (grayscale) to validate the displacement wiring.
@@ -1567,12 +1630,10 @@ pub(crate) fn rt_pipeline(
             // .zw = cost-heatmap log2 center + contrast (read by the raygen colormap).
             // The any-hit heatmap reuses .z as its count→colormap scale (only one
             // debug view is active at a time, so the slot is unambiguous).
-            let hm = debug.cost_heatmap.as_deref();
-            let anyhit = debug.anyhit_heatmap.as_deref();
-            let (center, contrast) = if anyhit.is_some_and(|h| h.enabled) {
-                (anyhit.map_or(0.1, |h| h.scale), 0.0)
-            } else {
-                (hm.map_or(0.0, |h| h.center), hm.map_or(0.0, |h| h.contrast))
+            let (center, contrast) = match active_view {
+                SolariDebugView::CostHeatmap { center, contrast } => (center, contrast),
+                SolariDebugView::AnyHitCount { scale } => (scale, 0.0),
+                _ => (0.0, 0.0),
             };
             [j.x, j.y, center, contrast]
         },
@@ -1613,11 +1674,15 @@ pub(crate) fn rt_pipeline(
         dims: [
             viewport.x as f32,
             viewport.y as f32,
-            restir_rt.map_or_else(|| reference.map_or(20.0, |r| r.restir_m_cap), |rt| rt.m_cap),
+            restir_rt.map_or_else(|| reference.map_or(20.0, SolariReference::m_cap), |rt| rt.m_cap),
             restir_rt.map_or(0.0, |rt| rt.firefly_clamp / camera.exposure.max(1.0e-9)),
         ],
         world_from_view: world_from_view.to_cols_array(),
         window_arc: window_arc.to_array(),
+        nrc: nrc_vec.to_array(),
+        // GPU camera pass computes the world-snapped anchor from the absolute
+        // f64 origin; the CPU fallback stays camera-anchored.
+        nrc_anchor: [0.0; 4],
         window_eye: window_eye.to_array(),
         // CPU fallback path: no per-frame origin delta (the GPU camera pass
         // computes it in f64) — cross-frame reservoir reuse is stale-by-one
@@ -1659,6 +1724,7 @@ pub(crate) fn rt_pipeline(
                 dims: Vec4::from_array(camera_inputs.dims),
                 window_arc,
                 window_eye,
+                nrc: nrc_vec,
                 exposure: camera.exposure,
             }
         },
@@ -1697,6 +1763,13 @@ pub(crate) fn rt_pipeline(
     });
     if let Some(ga) = geo_addrs.as_ref() {
         view_bindings.set_geometry_addresses(ga);
+    }
+
+    // Reset the termination-query ring's counter on the ctx encoder BEFORE the
+    // trace (the pre-trace flush orders this write ahead of raygen's appends).
+    if debug.nrc.as_deref().is_some_and(|n| n.enabled) {
+        ctx.command_encoder()
+            .clear_buffer(&output.nrc_queries, 0, Some(16));
     }
 
     // The raw cmd_trace_rays must go in its OWN command buffer — wgpu-core
@@ -1739,10 +1812,10 @@ pub(crate) fn rt_pipeline(
     // into the accumulated output — the same blend weight the raygen used this
     // frame, so accumulation composes without a history buffer.
     if let Some(rs) = restir_spatial.as_deref_mut() {
-        let di_spatial = restir_rt.is_some_and(|rt| rt.spatial_taps > 0)
-            || reference.is_some_and(|r| r.restir && r.spatial);
-        let gi_spatial = restir_rt.is_some_and(|rt| rt.gi && rt.spatial_taps > 0)
-            || reference.is_some_and(|r| r.restir_gi && r.gi_spatial);
+        let di_spatial = restir_rt.is_some_and(|rt| rt.spatial.is_some())
+            || reference.is_some_and(|r| r.di_spatial().is_some());
+        let gi_spatial = restir_rt.is_some_and(|rt| rt.gi && rt.spatial.is_some())
+            || reference.is_some_and(|r| r.gi_spatial().is_some());
         let spatial_on = (di_spatial || gi_spatial) && debug_view == 0 && !show_displacement;
         if spatial_on {
             // Queued by `queue_restir_spatial_pipeline` (Prepare) as soon as the
@@ -1756,13 +1829,15 @@ pub(crate) fn rt_pipeline(
                 } else {
                     1.0
                 };
-                let (taps, radius, unbiased, dbg) = match (restir_rt, reference) {
-                    (Some(rt), _) => (rt.spatial_taps, rt.spatial_radius, false, false),
-                    (None, Some(r)) => {
-                        (r.spatial_taps, r.spatial_radius, r.spatial_unbiased, r.spatial_debug)
-                    }
-                    (None, None) => unreachable!("spatial_on requires one of them"),
-                };
+                // One parameter set feeds the pass (DI and GI arms share it);
+                // prefer the realtime settings, then the DI arm's, then the GI arm's.
+                let sp = restir_rt
+                    .and_then(|rt| rt.spatial.as_ref())
+                    .or_else(|| reference.and_then(SolariReference::di_spatial))
+                    .or_else(|| reference.and_then(SolariReference::gi_spatial))
+                    .expect("spatial_on requires a configured spatial arm");
+                let (taps, radius, unbiased, dbg) =
+                    (sp.taps, sp.radius, sp.unbiased_zcount, sp.debug_paint);
                 let params = RestirSpatialParams {
                     width: viewport.x,
                     height: viewport.y,
@@ -1812,6 +1887,75 @@ pub(crate) fn rt_pipeline(
         }
     }
 
+    // NRC termination-query inference + composite: batch-evaluate the MLP for
+    // every query raygen appended and add throughput × cache into the output
+    // buffer — before training so this frame's queries see this frame's
+    // weights. `scale` folds in the raygen accumulation blend (w / rounds), so
+    // the composite lands exactly as if the radiance had been added in-loop.
+    // Skipped in debug views (they paint over the output). Runs only when
+    // bit 20 is armed with ReSTIR GI (bit 5) OFF — with GI reservoirs the
+    // raygen terminates via the inline query instead (this deferred composite
+    // would land after the reservoir already stored its shade), so the ring
+    // stays empty. DLSS RR: the composite adds the cache tail to the output
+    // buffer only, not the RR diffuse/specular guides — acceptable, the
+    // guides are primary-surface attributes, not radiance.
+    if let (Some(nrc_bufs), Some(nrc_pipelines)) =
+        (debug.nrc_buffers.as_deref(), debug.nrc_pipelines.as_deref())
+    {
+        let nrc_batched =
+            estimator_flags & (1 << 20) != 0 && estimator_flags & (1 << 5) == 0;
+        if debug.nrc.as_deref().is_some_and(|n| n.enabled && !n.inline_coopvec)
+            && nrc_batched
+            && debug_view == 0
+            && !show_displacement
+        {
+            let rounds = accum_spf.max(1) as f32;
+            let blend = if accum_spf > 0 && accum_n > 0 {
+                accum_spf as f32 / (accum_n as f32 + accum_spf as f32)
+            } else {
+                1.0
+            };
+            let _ = crate::nrc::dispatch_nrc_query_infer(
+                ctx.command_encoder(),
+                nrc_bufs,
+                nrc_pipelines,
+                &pipeline_cache,
+                &render_device,
+                &render_queue,
+                &output.nrc_queries,
+                &output.buffer,
+                output.pixels as u32,
+                blend / rounds,
+                camera.exposure,
+            );
+        }
+    }
+
+    // NRC online training (zero/docs/nrc.md rung 1): this frame's raygen-written
+    // records → encode → fwd → loss → bwd → adam, all on the shared ctx encoder.
+    // The inference mirrors the NEXT frame's raygen reads update at the end —
+    // one frame of cache latency, invisible for a cache converging over dozens.
+    if let (Some(nrc_bufs), Some(nrc_pipelines)) =
+        (debug.nrc_buffers.as_deref_mut(), debug.nrc_pipelines.as_deref())
+    {
+        if let Some(nrc_cfg) = debug.nrc.as_deref() {
+            if nrc_cfg.enabled
+                && nrc_cfg.training
+                && (*frame_counter).is_multiple_of(nrc_cfg.train_interval.max(1))
+            {
+                let _ = crate::nrc::dispatch_training(
+                    ctx.command_encoder(),
+                    nrc_bufs,
+                    nrc_pipelines,
+                    &pipeline_cache,
+                    &render_device,
+                    &render_queue,
+                    nrc_cfg,
+                );
+            }
+        }
+    }
+
     // Blit the per-pixel output buffer into the view's HDR storage texture (a
     // normal wgpu compute pass on the shared ctx encoder → runs after the trace
     // buffer, so the view target stays wgpu-layout-tracked). The diff view
@@ -1826,7 +1970,7 @@ pub(crate) fn rt_pipeline(
     let diff_scale = debug.freeze_diff.as_deref().map_or(4.0, |fd| fd.diff_scale);
     let debug_paint = debug_view != 0
         || show_displacement
-        || reference.is_some_and(|r| r.spatial_debug || r.gi_dead_view);
+        || reference.is_some_and(|r| r.spatial_debug_paint() || r.gi_dead_view());
     let blit_exposure = if debug_paint { 1.0 } else { camera.exposure };
     render_queue.write_buffer(
         &rt_blit.params,

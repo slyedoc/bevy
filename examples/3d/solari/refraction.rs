@@ -221,7 +221,7 @@ fn setup_scene(
         Transform::from_xyz(0.0, 0.25, 0.55)
             .looking_at(Vec3::new(0.0, 0.15, 0.0).to_precision(), Vec3::Y),
         Msaa::Off,
-        SolariCamera,
+        SolariCamera::default(),
         // Depth of field: bevy's standard component. The pathtracer consumes
         // it as a true thin lens (real bokeh, converged in the accumulation);
         // the realtime path blurs in post from the RT depth. f/∞ = off.

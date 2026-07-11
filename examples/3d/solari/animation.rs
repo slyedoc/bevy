@@ -301,7 +301,7 @@ fn setup_camera_and_light(mut commands: Commands) {
         Exposure::OVERCAST,
         Bloom::NATURAL,
         Hdr,
-        SolariCamera,
+        SolariCamera::default(),
         SolariAtmosphere::default(),
         SolariGlobalFog {
             visibility: 1200.0,

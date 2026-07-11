@@ -40,6 +40,7 @@ pub mod bindings;
 pub mod ecs_gpu;
 pub mod geometry;
 pub mod gpu;
+pub mod nrc;
 pub mod pipelines;
 pub mod resource_manager;
 
@@ -51,6 +52,8 @@ pub mod ray_query;
 pub mod render;
 pub mod transform;
 
+#[cfg(feature = "bevy_solari_debug")]
+pub mod cli;
 #[cfg(feature = "bevy_solari_debug")]
 pub mod debug;
 #[cfg(feature = "cluster_processor")]
@@ -183,29 +186,31 @@ pub mod prelude {
         hair::{Hair, HairAsset, HairMaterial, HairStrand, SolariBranches},
         lights::SolariDirectionLight,
         material::{SolariMaterial3d, StandardSolariMaterial},
+        nrc::SolariNrc,
         ray_query::picking::SolariPickingPlugin,
         accel::ClusterSelectorSettings,
         instance::SolariPartition,
         render::atmosphere::{SolariAtmosphere, SolariAtmosphereVolume, SolariGlobalFog},
-        render::rt_pipeline::SolariAnyHitHeatmap,
-        render::rt_pipeline::SolariClusterView,
-        render::rt_pipeline::SolariCostHeatmap,
         render::rt_pipeline::SolariCylindricalWindow,
+        render::rt_pipeline::SolariDebugView,
         render::rt_pipeline::SolariFreezeDiff,
-        render::rt_pipeline::SolariNormalFacing,
-        render::rt_pipeline::SolariShowDisplacement,
-        render::rt_pipeline::SolariTriangleView,
         render::CameraReframe,
         render::CameraReset,
         lights::SolariUniformLights,
-        render::SolariCamera,
-        render::SolariReference,
-        render::SolariRestir,
+        render::{
+            DiEstimator, GiEstimator, ReferenceOutput, SolariCamera, SolariLighting,
+            SolariRecipe, SolariReference, SolariRestir, SpatialReuse,
+        },
         transform::{NoGpuGlobalTransformReadback, SolariGpuFrame, TransformStatic},
         SolariInitPlugin, SolariPlugin,
     };
 
-    #[cfg(feature = "dlss")]
+    #[cfg(feature = "bevy_solari_debug")]
+    pub use crate::cli::SolariCameraArgs;
+
+    #[cfg(feature = "bevy_solari_debug")]
+    pub use crate::debug::SolariDebugUi;
+
     pub use crate::render::dlss::SolariDlssMode;
 
     #[cfg(feature = "cluster_processor")]
@@ -325,7 +330,6 @@ impl Plugin for SolariPlugin {
         // Bring up the DLSS Ray Reconstruction SDK (no-op / graceful when the feature
         // is off or RR is unsupported). The per-view context + RR dispatch are wired
         // by `SolarRenderPlugin`; this just creates the shared `SolariDlssSdk`.
-        #[cfg(feature = "dlss")]
         render::dlss::init_dlss(app);
     }
 }
@@ -345,5 +349,10 @@ impl SolariPlugin {
             // absolute world translation in f64 and the subtract pass relativizes it
             // against the camera origin (see `transform/`).
             | WgpuFeatures::SHADER_F64
+            // NRC (zero/docs/nrc.md): f16 MLP weights, coopmat training passes,
+            // coopvec inline inference in raygen. NV-only by project decision.
+            | WgpuFeatures::SHADER_F16
+            | WgpuFeatures::EXPERIMENTAL_COOPERATIVE_MATRIX
+            | WgpuFeatures::EXPERIMENTAL_COOPERATIVE_VECTOR
     }
 }

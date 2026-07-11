@@ -353,7 +353,7 @@ fn setup_camera_and_light(mut commands: Commands) {
         Msaa::Off,
         Exposure::OVERCAST,
         Hdr,
-        SolariCamera,
+        SolariCamera::default(),
         SolariAtmosphere::default(),
     ));
 }

@@ -49,6 +49,8 @@ pub struct RtCameraPassParams {
     pub window_arc: Vec4,
     /// Passthrough → `RtCamera.window_eye` (`.xyz` eye in screen space).
     pub window_eye: Vec4,
+    /// Passthrough → `RtCamera.nrc` (`.x` scene scale m; 0 = off).
+    pub nrc: Vec4,
     /// The `SolariCamera`'s transform-table slot (`GpuSlot<TransformGraph>`).
     pub camera_slot: u32,
     /// World-buffer node high-water — bounds guard for `camera_slot`.

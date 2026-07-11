@@ -165,7 +165,7 @@ fn setup(
             ..default()
         },
         Msaa::Off,
-        SolariCamera,
+        SolariCamera::default(),
         FreeCamera {
             walk_speed: 100.0,
             run_speed: 2000.0,

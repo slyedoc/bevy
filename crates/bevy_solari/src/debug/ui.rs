@@ -140,25 +140,23 @@ pub fn update_render_debug_label(
     }
 }
 
-// --- "view" dropdown (normal / time heatmap / displacement) + heatmap sliders --
-// A bottom-left "view" dropdown selects normal rendering, the per-pixel cost
-// heatmap (`SolariCostHeatmap.enabled`), or the displacement-map debug view
-// (`SolariShowDisplacement.enabled`). In heatmap view the two sliders (center,
-// contrast) appear and the DLSS dropdown hides; otherwise it's the reverse.
+// --- "view" dropdown (SolariDebugView) + heatmap sliders ----------------------
+// A bottom-left "view" dropdown per camera sets that camera's `SolariDebugView`
+// component — normal rendering or one of the debug paints. In cost-heatmap view
+// the two sliders (center, contrast) appear and the DLSS dropdown hides;
+// otherwise it's the reverse.
 
 pub use view_panel::{
-    spawn_view_panels, toggle_heatmap_controls, update_stats_label, update_view_label,
-    ViewPanelRoot,
+    spawn_view_panels, sync_accumulate_checkbox, toggle_heatmap_controls, update_recipe_label,
+    update_stats_label, update_view_label, ViewPanelRoot,
 };
 
 mod view_panel {
     use super::*;
-    use crate::render::rt_pipeline::{
-        SolariAnyHitHeatmap, SolariClusterView, SolariCostHeatmap, SolariNormalFacing,
-        SolariShowDisplacement, SolariTriangleView,
-    };
-    use crate::render::SolariCamera;
-    use bevy_ecs::system::{Res, ResMut};
+    use crate::render::rt_pipeline::SolariDebugView;
+    use crate::render::{SolariCamera, SolariLighting, SolariRecipe};
+    use bevy_ecs::query::Has;
+    use bevy_ecs::system::Res;
     use bevy_feathers::controls::FeathersSlider;
     use bevy_feathers::theme::ThemeBackgroundColor;
     use bevy_feathers::tokens::WINDOW_BG;
@@ -167,15 +165,24 @@ mod view_panel {
     use bevy_feathers::tokens;
     use bevy_text::{FontSourceTemplate, FontWeight, LineBreak, TextFont, TextLayout};
     use bevy_ui::{Display, FlexDirection, UiRect};
+    use bevy_feathers::controls::FeathersCheckbox;
+    use bevy_ui::Checked;
     use bevy_ui_widgets::{slider_self_update, SliderPrecision, ValueChange};
 
     /// Marker on a camera that already has a view panel.
     #[derive(Component)]
     pub struct ViewPanelSpawned;
 
-    /// Marker on the view button caption.
-    #[derive(Component, Default, Clone)]
-    pub struct ViewLabel;
+    /// On the view button caption; bound to the camera whose
+    /// [`SolariDebugView`] it shows.
+    #[derive(Component, Clone, Copy)]
+    pub struct ViewLabel(pub Entity);
+
+    impl Default for ViewLabel {
+        fn default() -> Self {
+            ViewLabel(Entity::PLACEHOLDER)
+        }
+    }
 
     /// Marker on the view panel card root (the shared debug card — stats,
     /// view dropdown, heatmap sliders, and the DLSS dropdown all live in it).
@@ -190,38 +197,67 @@ mod view_panel {
     #[derive(Component, Default, Clone)]
     pub struct StatsRtLabel;
 
-    /// Marker on the container holding the heatmap sliders (shown only in heatmap view).
-    #[derive(Component, Default, Clone)]
-    pub struct HeatmapControls;
+    /// On the recipe button caption; bound to the camera whose
+    /// [`SolariCamera::mode`] it names.
+    #[derive(Component, Clone, Copy)]
+    pub struct RecipeLabel(pub Entity);
 
-    /// One view menu item: selects the active debug view by setting the view toggles (mutually
-    /// exclusive — `normal` clears all, every other item sets exactly one).
-    fn view_item(
-        heatmap_on: bool,
-        anyhit_on: bool,
-        displacement_on: bool,
-        cluster_on: bool,
-        triangle_on: bool,
-        facing_on: bool,
-        label: &'static str,
-    ) -> impl Scene {
+    impl Default for RecipeLabel {
+        fn default() -> Self {
+            RecipeLabel(Entity::PLACEHOLDER)
+        }
+    }
+
+    /// On the accumulate checkbox; bound to the camera whose reference mode it
+    /// toggles. [`sync_accumulate_checkbox`] owns the `Checked` marker and the
+    /// row's visibility (reference modes only).
+    #[derive(Component, Clone, Copy)]
+    pub struct AccumulateCheckbox(pub Entity);
+
+    impl Default for AccumulateCheckbox {
+        fn default() -> Self {
+            AccumulateCheckbox(Entity::PLACEHOLDER)
+        }
+    }
+
+    /// On the container holding the heatmap sliders (shown only in heatmap
+    /// view); bound to the camera whose [`SolariDebugView`] gates it.
+    #[derive(Component, Clone, Copy)]
+    pub struct HeatmapControls(pub Entity);
+
+    impl Default for HeatmapControls {
+        fn default() -> Self {
+            HeatmapControls(Entity::PLACEHOLDER)
+        }
+    }
+
+    /// One view menu item: activating it sets `camera`'s
+    /// [`SolariCamera::debug`] (a single enum, so views are mutually
+    /// exclusive by construction).
+    fn view_item(camera: Entity, view: SolariDebugView, label: &'static str) -> impl Scene {
         bsn! {
             @FeathersMenuItem {
                 @caption: bsn! { Text({label.to_string()}) ThemedText }
             }
-            on(move |_: On<Activate>,
-                     mut heatmap: ResMut<SolariCostHeatmap>,
-                     mut anyhit: ResMut<SolariAnyHitHeatmap>,
-                     mut displacement: ResMut<SolariShowDisplacement>,
-                     mut cluster: ResMut<SolariClusterView>,
-                     mut triangle: ResMut<SolariTriangleView>,
-                     mut facing: ResMut<SolariNormalFacing>| {
-                heatmap.enabled = heatmap_on;
-                anyhit.enabled = anyhit_on;
-                displacement.enabled = displacement_on;
-                cluster.enabled = cluster_on;
-                triangle.enabled = triangle_on;
-                facing.enabled = facing_on;
+            on(move |_: On<Activate>, mut cameras: Query<&mut SolariCamera>| {
+                if let Ok(mut solari) = cameras.get_mut(camera) {
+                    solari.debug = view;
+                }
+            })
+        }
+    }
+
+    /// One recipe menu item: activating it stamps the recipe's mode onto
+    /// `camera` (the debug view is untouched).
+    fn recipe_item(camera: Entity, recipe: SolariRecipe) -> impl Scene {
+        bsn! {
+            @FeathersMenuItem {
+                @caption: bsn! { Text({recipe.name().to_string()}) ThemedText }
+            }
+            on(move |_: On<Activate>, mut cameras: Query<&mut SolariCamera>| {
+                if let Ok(mut solari) = cameras.get_mut(camera) {
+                    solari.apply_recipe(recipe);
+                }
             })
         }
     }
@@ -279,19 +315,43 @@ mod view_panel {
                         Children [
                             (
                                 @FeathersMenuButton {
-                                    @caption: bsn! { Text("view: normal") ThemedText ViewLabel }
+                                    @caption: bsn! { Text("mode: custom") ThemedText RecipeLabel({camera}) }
                                 }
                             ),
                             (
                                 @FeathersMenuPopup
                                 Children [
-                                    view_item(false, false, false, false, false, false, "normal"),
-                                    view_item(true, false, false, false, false, false, "time heatmap"),
-                                    view_item(false, true, false, false, false, false, "any-hit count"),
-                                    view_item(false, false, true, false, false, false, "displacement"),
-                                    view_item(false, false, false, true, false, false, "clusters"),
-                                    view_item(false, false, false, false, true, false, "triangles"),
-                                    view_item(false, false, false, false, false, true, "normal facing"),
+                                    recipe_item(camera, SolariRecipe::Reference),
+                                    recipe_item(camera, SolariRecipe::Bsdf),
+                                    recipe_item(camera, SolariRecipe::RestirDi),
+                                    recipe_item(camera, SolariRecipe::RestirDiSpatial),
+                                    recipe_item(camera, SolariRecipe::RestirGi),
+                                    recipe_item(camera, SolariRecipe::RestirGiSpatial),
+                                    recipe_item(camera, SolariRecipe::Nrc),
+                                    recipe_item(camera, SolariRecipe::Default),
+                                ]
+                            )
+                        ]
+                    ),
+                    (
+                        @FeathersMenu
+                        Children [
+                            (
+                                @FeathersMenuButton {
+                                    @caption: bsn! { Text("view: normal") ThemedText ViewLabel({camera}) }
+                                }
+                            ),
+                            (
+                                @FeathersMenuPopup
+                                Children [
+                                    view_item(camera, SolariDebugView::None, "normal"),
+                                    view_item(camera, SolariDebugView::cost_heatmap(), "time heatmap"),
+                                    view_item(camera, SolariDebugView::any_hit_count(), "any-hit count"),
+                                    view_item(camera, SolariDebugView::Displacement, "displacement"),
+                                    view_item(camera, SolariDebugView::Clusters, "clusters"),
+                                    view_item(camera, SolariDebugView::Triangles, "triangles"),
+                                    view_item(camera, SolariDebugView::NormalFacing, "normal facing"),
+                                    view_item(camera, SolariDebugView::NrcCache, "nrc cache"),
                                 ]
                             )
                         ]
@@ -302,15 +362,19 @@ mod view_panel {
                             flex_direction: FlexDirection::Column,
                             row_gap: px(2),
                         }
-                        HeatmapControls
+                        HeatmapControls({camera})
                         Children [
                             (Text("center") ThemedText),
                             (
                                 @FeathersSlider { @min: 10.0, @max: 24.0, @value: 16.0 }
                                 SliderPrecision(1)
                                 on(slider_self_update)
-                                on(|c: On<ValueChange<f32>>, mut heatmap: ResMut<SolariCostHeatmap>| {
-                                    heatmap.center = c.value;
+                                on(move |c: On<ValueChange<f32>>, mut cameras: Query<&mut SolariCamera>| {
+                                    if let Ok(mut solari) = cameras.get_mut(camera)
+                                        && let SolariDebugView::CostHeatmap { center, .. } = &mut solari.debug
+                                    {
+                                        *center = c.value;
+                                    }
                                 })
                             ),
                             (Text("contrast") ThemedText),
@@ -318,45 +382,105 @@ mod view_panel {
                                 @FeathersSlider { @min: 0.0, @max: 1.0, @value: 0.15 }
                                 SliderPrecision(2)
                                 on(slider_self_update)
-                                on(|c: On<ValueChange<f32>>, mut heatmap: ResMut<SolariCostHeatmap>| {
-                                    heatmap.contrast = c.value;
+                                on(move |c: On<ValueChange<f32>>, mut cameras: Query<&mut SolariCamera>| {
+                                    if let Ok(mut solari) = cameras.get_mut(camera)
+                                        && let SolariDebugView::CostHeatmap { contrast, .. } = &mut solari.debug
+                                    {
+                                        *contrast = c.value;
+                                    }
                                 })
                             ),
                         ]
+                    ),
+                    (
+                        @FeathersCheckbox {
+                            @caption: bsn! { Text("accumulate") ThemedText }
+                        }
+                        AccumulateCheckbox({camera})
+                        on(move |change: On<ValueChange<bool>>, mut cameras: Query<&mut SolariCamera>| {
+                            if let Ok(mut solari) = cameras.get_mut(camera)
+                                && let SolariLighting::Reference(reference) = &mut solari.mode
+                            {
+                                reference.accumulate = change.value;
+                            }
+                        })
                     )
                 });
             commands.entity(camera).insert(ViewPanelSpawned);
         }
     }
 
-    /// Keep the view button caption in sync with the active view toggle.
+    /// Keep each view button caption in sync with its camera's debug view.
     pub fn update_view_label(
-        heatmap: Res<SolariCostHeatmap>,
-        anyhit: Res<SolariAnyHitHeatmap>,
-        displacement: Res<SolariShowDisplacement>,
-        cluster: Res<SolariClusterView>,
-        triangle: Res<SolariTriangleView>,
-        facing: Res<SolariNormalFacing>,
-        mut labels: Query<&mut Text, With<ViewLabel>>,
+        cameras: Query<&SolariCamera>,
+        mut labels: Query<(&mut Text, &ViewLabel)>,
     ) {
-        let want = if heatmap.enabled {
-            "view: time heatmap"
-        } else if anyhit.enabled {
-            "view: any-hit count"
-        } else if displacement.enabled {
-            "view: displacement"
-        } else if cluster.enabled {
-            "view: clusters"
-        } else if triangle.enabled {
-            "view: triangles"
-        } else if facing.enabled {
-            "view: normal facing"
-        } else {
-            "view: normal"
-        };
-        for mut text in &mut labels {
+        for (mut text, label) in &mut labels {
+            let Ok(camera) = cameras.get(label.0) else {
+                continue;
+            };
+            let want = match camera.debug {
+                SolariDebugView::None => "view: normal",
+                SolariDebugView::CostHeatmap { .. } => "view: time heatmap",
+                SolariDebugView::AnyHitCount { .. } => "view: any-hit count",
+                SolariDebugView::Displacement => "view: displacement",
+                SolariDebugView::Clusters => "view: clusters",
+                SolariDebugView::Triangles => "view: triangles",
+                SolariDebugView::NormalFacing => "view: normal facing",
+                SolariDebugView::NrcCache => "view: nrc cache",
+            };
             if text.0 != want {
                 text.0 = want.to_string();
+            }
+        }
+    }
+
+    /// Keep each recipe button caption in sync with its camera's mode:
+    /// the matching recipe's name, or "custom" once the levers are hand-tweaked.
+    pub fn update_recipe_label(
+        cameras: Query<&SolariCamera>,
+        mut labels: Query<(&mut Text, &RecipeLabel)>,
+    ) {
+        for (mut text, label) in &mut labels {
+            let Ok(camera) = cameras.get(label.0) else {
+                continue;
+            };
+            let name = SolariRecipe::ALL
+                .iter()
+                .find(|recipe| recipe.matches(&camera.mode))
+                .map_or("custom", SolariRecipe::name);
+            let want = format!("mode: {name}");
+            if text.0 != want {
+                text.0 = want;
+            }
+        }
+    }
+
+    /// Mirror each camera's reference-accumulation state onto its checkbox
+    /// (`Checked` marker + row visibility) — the camera is the single source
+    /// of truth, so CLI/recipe/code changes all reflect in the UI. The
+    /// checkbox's `ValueChange` observer writes the camera; this closes the loop.
+    pub fn sync_accumulate_checkbox(
+        cameras: Query<&SolariCamera>,
+        mut boxes: Query<(Entity, &mut Node, &AccumulateCheckbox, Has<Checked>)>,
+        mut commands: Commands,
+    ) {
+        for (entity, mut node, bound, checked) in &mut boxes {
+            let Ok(camera) = cameras.get(bound.0) else {
+                continue;
+            };
+            let reference = camera.reference();
+            let want_display = if reference.is_some() { Display::Flex } else { Display::None };
+            if node.display != want_display {
+                node.display = want_display;
+            }
+            let want_checked = reference.is_some_and(|r| r.accumulate);
+            if want_checked != checked {
+                if want_checked {
+                    commands.entity(entity).insert(Checked);
+                } else {
+                    commands.entity(entity).remove::<Checked>();
+                }
             }
         }
     }
@@ -390,17 +514,20 @@ mod view_panel {
         }
     }
 
-    /// Show the heatmap sliders only in heatmap view.
+    /// Show the heatmap sliders only while their camera is in cost-heatmap view.
     pub fn toggle_heatmap_controls(
-        heatmap: Res<SolariCostHeatmap>,
-        mut controls: Query<&mut Node, With<HeatmapControls>>,
+        cameras: Query<&SolariCamera>,
+        mut controls: Query<(&mut Node, &HeatmapControls)>,
     ) {
-        let want = if heatmap.enabled {
-            Display::Flex
-        } else {
-            Display::None
-        };
-        for mut node in &mut controls {
+        for (mut node, bound) in &mut controls {
+            let Ok(camera) = cameras.get(bound.0) else {
+                continue;
+            };
+            let want = if matches!(camera.debug, SolariDebugView::CostHeatmap { .. }) {
+                Display::Flex
+            } else {
+                Display::None
+            };
             if node.display != want {
                 node.display = want;
             }
@@ -412,14 +539,12 @@ mod view_panel {
 // Unlike the render-debug overlay (a per-camera component), the DLSS mode is a single
 // global resource, so every menu item just sets `SolariDlssMode`.
 
-#[cfg(feature = "dlss")]
 pub use dlss_dropdown::{spawn_dlss_panels, toggle_dlss_visibility, update_dlss_label};
 
-#[cfg(feature = "dlss")]
 mod dlss_dropdown {
     use super::*;
     use crate::render::dlss::SolariDlssMode;
-    use crate::render::rt_pipeline::SolariCostHeatmap;
+    use crate::render::rt_pipeline::SolariDebugView;
     use crate::render::SolariCamera;
     use bevy_ecs::system::{Res, ResMut};
     use bevy_ui::Display;
@@ -428,9 +553,16 @@ mod dlss_dropdown {
     #[derive(Component)]
     pub struct DlssPanelSpawned;
 
-    /// Marker on the DLSS dropdown row (inside the view card), hidden in heatmap view.
-    #[derive(Component, Default, Clone)]
-    pub struct DlssPanelRoot;
+    /// On the DLSS dropdown row (inside the view card), hidden in heatmap view;
+    /// bound to the camera whose [`SolariDebugView`] gates it.
+    #[derive(Component, Clone, Copy)]
+    pub struct DlssPanelRoot(pub Entity);
+
+    impl Default for DlssPanelRoot {
+        fn default() -> Self {
+            DlssPanelRoot(Entity::PLACEHOLDER)
+        }
+    }
 
     /// Marker on the DLSS button caption.
     #[derive(Component, Default, Clone)]
@@ -459,12 +591,13 @@ mod dlss_dropdown {
             if cameras.get(target.0).is_err() {
                 continue; // camera already has its dropdown (or isn't solari)
             }
+            let camera = target.0;
             commands
                 .entity(panel)
                 .queue_spawn_related_scenes::<Children>(bsn_list! {
                     (
                         Node {}
-                        DlssPanelRoot
+                        DlssPanelRoot({camera})
                         Children [
                             (
                                 @FeathersMenu
@@ -505,18 +638,21 @@ mod dlss_dropdown {
         }
     }
 
-    /// Hide the DLSS dropdown in heatmap view — DLSS would denoise the heatmap, and the
-    /// view panel's sliders take its place.
+    /// Hide the DLSS dropdown while its camera is in heatmap view — DLSS would
+    /// denoise the heatmap, and the view panel's sliders take its place.
     pub fn toggle_dlss_visibility(
-        heatmap: Res<SolariCostHeatmap>,
-        mut roots: Query<&mut Node, With<DlssPanelRoot>>,
+        cameras: Query<&SolariCamera>,
+        mut roots: Query<(&mut Node, &DlssPanelRoot)>,
     ) {
-        let want = if heatmap.enabled {
-            Display::None
-        } else {
-            Display::Flex
-        };
-        for mut node in &mut roots {
+        for (mut node, bound) in &mut roots {
+            let Ok(camera) = cameras.get(bound.0) else {
+                continue;
+            };
+            let want = if matches!(camera.debug, SolariDebugView::CostHeatmap { .. }) {
+                Display::None
+            } else {
+                Display::Flex
+            };
             if node.display != want {
                 node.display = want;
             }

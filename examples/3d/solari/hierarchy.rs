@@ -251,7 +251,7 @@ fn setup(
         },
         CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
-        SolariCamera,
+        SolariCamera::default(),
         FreeCamera {
             walk_speed: 20.0,
             run_speed: 2000.0,

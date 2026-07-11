@@ -31,6 +31,8 @@ struct RtCamera {
     window_arc: vec4<f32>,
     window_eye: vec4<f32>,
     origin_delta: vec4<f32>,
+    nrc: vec4<f32>,
+    nrc_anchor: vec4<f32>,
 }
 
 struct CameraPassParams {
@@ -50,6 +52,7 @@ struct CameraPassParams {
     dims: vec4<f32>,                         // passthrough → RtCamera.dims (viewport px + restir M-cap)
     window_arc: vec4<f32>,                      // passthrough → RtCamera.window_arc (arc, radius, height)
     window_eye: vec4<f32>,                      // passthrough → RtCamera.window_eye (eye in screen space)
+    nrc: vec4<f32>,                             // passthrough → RtCamera.nrc (scene scale)
     camera_slot: u32,                        // the SolariCamera's transform-table slot
     node_count: u32,                         // world-buffer node high-water (bounds guard)
     exposure: f32,                           // → camera_position.w (tooling only; the trace stays physical)
@@ -78,6 +81,12 @@ struct PrevCamera {
     origin_y: f64,
     origin_z: f64,
     valid: u32,
+    anchor_valid: u32,
+    // The held NRC anchor (absolute, f64): kept until the camera leaves its
+    // cell by a margin — a bare round() flips at every boundary crossing.
+    anchor_x: f64,
+    anchor_y: f64,
+    anchor_z: f64,
 }
 
 // The transform table's world buffer: `mat3x4<f32>` per node, stored as three
@@ -204,8 +213,50 @@ fn rt_camera() {
     prev_cam.origin_z = origin_z;
     prev_cam.valid = 1u;
 
+    // NRC world-snapped anchor: the position encoding centers on the camera's
+    // absolute position snapped to a scene_scale/2 grid, so translation
+    // doesn't re-encode every surface (the cache relearns only on the rare
+    // anchor hop). `.xyz` = f32(abs_origin − anchor) — bounded by the grid
+    // cell, so exact in f32; raygen adds it to camera-relative positions to
+    // make them anchor-relative. The cell index rounds in f32: beyond ~1e7
+    // cells from the world origin the anchor coarsens gracefully.
+    var nrc_anchor = vec3<f32>(0.0);
+    if params.nrc.x > 0.0 {
+        let grid = f64(params.nrc.x * 0.5);
+        var ax = f64(round(f32(origin_x / grid))) * grid;
+        var ay = f64(round(f32(origin_y / grid))) * grid;
+        var az = f64(round(f32(origin_z / grid))) * grid;
+        // Hysteresis: hold the previous anchor until the camera has left its
+        // cell by a quarter-grid margin. A bare round() re-anchors at every
+        // boundary crossing — hovering near one re-encodes the entire world
+        // each wiggle, and the cache whiplashes between disjoint domains
+        // (random tint per hop; TD blowout if hops come fast).
+        if prev_cam.anchor_valid == 1u {
+            let hx = abs(f32(origin_x - prev_cam.anchor_x));
+            let hy = abs(f32(origin_y - prev_cam.anchor_y));
+            let hz = abs(f32(origin_z - prev_cam.anchor_z));
+            let limit = 0.75 * f32(grid);
+            if hx < limit && hy < limit && hz < limit {
+                ax = prev_cam.anchor_x;
+                ay = prev_cam.anchor_y;
+                az = prev_cam.anchor_z;
+            }
+        }
+        prev_cam.anchor_x = ax;
+        prev_cam.anchor_y = ay;
+        prev_cam.anchor_z = az;
+        prev_cam.anchor_valid = 1u;
+        nrc_anchor = vec3<f32>(
+            f32(origin_x - ax),
+            f32(origin_y - ay),
+            f32(origin_z - az),
+        );
+    }
+    out_camera.nrc_anchor = vec4<f32>(nrc_anchor, 0.0);
+
     out_camera.world_from_view = world_from_view;
     out_camera.window_arc = params.window_arc;
+    out_camera.nrc = params.nrc;
     out_camera.window_eye = params.window_eye;
     out_camera.camera_position = vec4<f32>(origin, params.exposure);
     out_camera.frame = params.frame;

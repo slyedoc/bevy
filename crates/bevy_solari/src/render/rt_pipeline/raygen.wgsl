@@ -6,6 +6,8 @@
 // emitted radiance + attenuation + the next ray. v1 fidelity is stand-in (the
 // hit shaders don't yet resolve real geometry/materials); the structure is real.
 enable wgpu_ray_tracing_pipeline;
+enable f16;
+enable wgpu_cooperative_vector;
 
 // The scene TLAS lives in the shared scene bind group (set 0) — imported so the
 // pipeline layout matches the wgpu-built scene bind group bound at trace time.
@@ -56,6 +58,152 @@ const BH_CAPTURE_RADIUS: f32 = 0.5;
 @group(1) @binding(10) var<storage, read_write> surfaces: array<SurfaceGbuf>;
 // ReSTIR GI canonical samples: 2 slots/pixel, interleaved by frame parity.
 @group(1) @binding(12) var<storage, read_write> gi_samples: array<GiSample>;
+
+// NRC (zero/docs/nrc.md rung 1): inference mirrors + training records.
+// Struct layout MUST MATCH nrc/nrc_mlp.wgsl and nrc/mod.rs.
+struct NrcRecord {
+    pos_rough: vec4<f32>,
+    dir_normal_cs: vec4<f32>,
+    diff_target_r: vec4<f32>,
+    spec_target_g: vec4<f32>,
+    target_b_valid: vec4<f32>,
+}
+@group(1) @binding(13) var<storage, read> nrc_weights: array<f16>;
+@group(1) @binding(14) var<storage, read> nrc_bias: array<f16>;
+@group(1) @binding(15) var<storage, read_write> nrc_records: array<NrcRecord>;
+// Termination-query ring, sized to the viewport (one query per pixel per
+// frame — sample 0 only, so pixels are unique); the nrc_query_infer compute
+// pass batch-evaluates the MLP and composites into the output buffer after the
+// trace. Layout MUST MATCH nrc_mlp.wgsl and NRC_QUERY_SIZE in nrc/mod.rs.
+struct NrcQueryGpu {
+    // [pos_unit.xyz (f32 bits), packed material r5g6b5+m8+r8]
+    v0: vec4<u32>,
+    // [normal cyl (unorm2x16), -wo cyl (unorm2x16), throughput.rg (f16x2),
+    //  throughput.b (f16x2, y unused)]
+    v1: vec4<u32>,
+    // [pixel index, unused ×3]
+    v2: vec4<u32>,
+}
+struct NrcQueryBuf {
+    count: atomic<u32>,
+    // Training-slot allocator (scattered pixel selection claims record-ring
+    // slots through it); cleared with the count each frame.
+    train_count: atomic<u32>,
+    pad_b: u32,
+    pad_c: u32,
+    q: array<NrcQueryGpu>,
+}
+@group(1) @binding(16) var<storage, read_write> nrc_queries: NrcQueryBuf;
+
+const NRC_RECORD_CAP: u32 = 16384u;
+const NRC_WIDTH: u32 = 64u;
+
+fn nrc_pcg(v: u32) -> u32 {
+    let s = v * 747796405u + 2891336453u;
+    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+fn nrc_one_blob(x: f32, bin: u32) -> f32 {
+    let center = (f32(bin) + 0.5) / 4.0;
+    let d = x - center;
+    return exp(-d * d * 32.0);
+}
+
+// Wrap-aware one-blob for the cylindrical phi coordinate; MUST MATCH
+// nrc_mlp.wgsl::one_blob_wrap.
+fn nrc_one_blob_wrap(x: f32, bin: u32) -> f32 {
+    let center = (f32(bin) + 0.5) / 4.0;
+    var d = x - center;
+    d -= round(d);
+    return exp(-d * d * 32.0);
+}
+
+// Cylindrical equal-area mapping (phi wrapped, z); MUST MATCH
+// nrc_mlp.wgsl::cyl_encode.
+fn nrc_cyl(v: vec3<f32>) -> vec2<f32> {
+    return vec2<f32>(
+        atan2(v.x, v.z) / (2.0 * 3.14159265) + 0.5,
+        v.y * 0.5 + 0.5,
+    );
+}
+
+// Cache-query surface inputs unpacked from the payload's r5g6b5+m8+r8 material.
+struct NrcSurf {
+    diff_alb: vec3<f32>,
+    spec_alb: vec3<f32>,
+    rough: f32,
+}
+
+fn nrc_unpack_material(m: u32) -> NrcSurf {
+    let base_color = vec3<f32>(
+        f32((m >> 27u) & 0x1fu) / 31.0,
+        f32((m >> 21u) & 0x3fu) / 63.0,
+        f32((m >> 16u) & 0x1fu) / 31.0);
+    let metallic = f32((m >> 8u) & 0xffu) / 255.0;
+    var s: NrcSurf;
+    s.rough = f32(m & 0xffu) / 255.0;
+    s.diff_alb = base_color * (1.0 - metallic);
+    s.spec_alb = mix(vec3(0.04), base_color, metallic);
+    return s;
+}
+
+// Inline cache query (camera.nrc.z): the full MLP evaluated in-register via
+// coopvec against the transposed weight mirror adam maintains. The encode
+// layout MUST MATCH nrc_mlp.wgsl::nrc_encode_oct (62 features: 36 freq
+// position, 4×4 one-blob dir/normal octs, 4 roughness blob, 3+3 albedos).
+fn nrc_query(
+    pos_unit: vec3<f32>,
+    dir_cs: vec2<f32>,
+    nrm_cs: vec2<f32>,
+    roughness: f32,
+    diff_albedo: vec3<f32>,
+    spec_albedo: vec3<f32>,
+) -> vec3<f32> {
+    var v = coopVecSplat<coop_vec64<f16>>(0.0h);
+    var pos_v = pos_unit;
+    for (var d = 0u; d < 3u; d += 1u) {
+        for (var oct = 0u; oct < 6u; oct += 1u) {
+            let phase = pos_v[d] * 3.14159265 * f32(1u << oct);
+            v = coopVecInsert(v, d * 12u + oct * 2u, f16(sin(phase)));
+            v = coopVecInsert(v, d * 12u + oct * 2u + 1u, f16(cos(phase)));
+        }
+    }
+    let rough_in = 1.0 - exp(-roughness);
+    for (var b = 0u; b < 4u; b += 1u) {
+        v = coopVecInsert(v, 36u + b, f16(nrc_one_blob_wrap(dir_cs.x, b)));
+        v = coopVecInsert(v, 40u + b, f16(nrc_one_blob(dir_cs.y, b)));
+        v = coopVecInsert(v, 44u + b, f16(nrc_one_blob_wrap(nrm_cs.x, b)));
+        v = coopVecInsert(v, 48u + b, f16(nrc_one_blob(nrm_cs.y, b)));
+        v = coopVecInsert(v, 52u + b, f16(nrc_one_blob(rough_in, b)));
+    }
+    var diff_v = diff_albedo;
+    var spec_v = spec_albedo;
+    for (var c = 0u; c < 3u; c += 1u) {
+        v = coopVecInsert(v, 56u + c, f16(diff_v[c]));
+        v = coopVecInsert(v, 59u + c, f16(spec_v[c]));
+    }
+    let zero_vec = coopVecSplat<coop_vec64<f16>>(0.0h);
+    for (var l = 0u; l < 6u; l += 1u) {
+        v = coopVecMatMulAdd<coop_vec64<f16>>(
+            v, &nrc_weights, l * NRC_WIDTH * NRC_WIDTH, &nrc_bias, l * NRC_WIDTH);
+        if l < 5u {
+            v = coopVecMax(v, zero_vec);
+        }
+    }
+    // Clamp the prediction to the target range [0, 256]: a cold or bad
+    // cache must never inject a huge radiance into shading/bootstrap (it
+    // poisons the accumulated mean and the TD target). f16 can also emit
+    // inf — this catches it (clamp propagates NaN, so guard that too).
+    var out = vec3<f32>(
+        f32(coopVecExtract(v, 0u)),
+        f32(coopVecExtract(v, 1u)),
+        f32(coopVecExtract(v, 2u)),
+    );
+    out = select(out, vec3(0.0), out != out);
+    return clamp(out, vec3(0.0), vec3(256.0));
+}
+
 // Sentinel pixel index: this bounce writes no guide/reservoir (every non-primary bounce).
 const NO_GBUFFER: u32 = 0xffffffffu;
 
@@ -251,6 +399,49 @@ fn raygen(
 
     // This frame's sample average (numerator; /rounds after the loop).
     var frame_sum = vec3<f32>(0.0);
+
+    // NRC training paths (zero/docs/nrc.md): hash-scattered pixels record up
+    // to 4 path vertices each into the 16k record ring; targets are the
+    // path's own suffix radiance, propagated after the walk. Scattering beats
+    // a contiguous band: every training step sees the whole frame's light
+    // distribution instead of one redundant stripe. ~2× over-selection
+    // competes for the 4096 ring slots (first come) so every slot is claimed
+    // every frame — an unclaimed slot would train on a stale record.
+    let nrc_on = camera.nrc.x > 0.0;
+    // Estimator lever (flag bit 20): terminate GI at bounce 2 into the cache.
+    let nrc_gi_on =
+        nrc_on && (bitcast<u32>(camera.atmo.w) & (1u << 20u)) != 0u;
+    // Inline inference (camera.nrc.z): GI termination + debug view call
+    // nrc_query directly in raygen instead of the batched query path.
+    let nrc_inline_on = nrc_on && camera.nrc.z > 0.0;
+    // ReSTIR GI (flag bit 5) also routes cache termination through the INLINE
+    // query: the GI reservoir stores its sample (gi_L) at the end of the
+    // bounce loop, but the batched composite lands post-trace — AFTER the
+    // reservoir shade is stored — so a deferred cache tail would be missing
+    // from every stored (and temporally/spatially reused) sample. Inline, the
+    // tail lands in radiance/gi_L before the store.
+    let nrc_restir_gi = (bitcast<u32>(camera.atmo.w) & (1u << 5u)) != 0u;
+    let nrc_sel = max((dims.x * dims.y) / (NRC_RECORD_CAP / 2u), 1u);
+    var nrc_training = nrc_on
+        && nrc_pcg(pixel_index ^ (camera.frame.x * 0x9e3779b9u)) % nrc_sel == 0u;
+    var nrc_base = 0u;
+    if nrc_training {
+        let slot = atomicAdd(&nrc_queries.train_count, 1u);
+        if slot < NRC_RECORD_CAP / 4u {
+            nrc_base = slot * 4u;
+        } else {
+            nrc_training = false;
+        }
+    }
+    // 1-in-16 training paths trace their FULL suffix — no cache termination.
+    // Pure-bootstrap TD has no absolute anchor at depth: a self-consistent
+    // radiance field can inflate coherently (slow color drift to blowout);
+    // the unbiased fraction pins it to measurement (paper §5.4).
+    let nrc_unbiased = nrc_training
+        && (nrc_pcg(pixel_index ^ (camera.frame.x * 2891336453u)) & 15u) == 0u;
+    var nrc_mask = 0u;
+    var nrc_prefix_rad = array<vec3<f32>, 4>();
+    var nrc_atten = array<vec3<f32>, 4>();
     // Instrument: per-frame SUM of the would-be GI shades across samples (pad_b),
     // vs the last sample's (pad_a) — the pass's debug ratio paint reads both.
     var dbg_gi_lum_sum = 0.0;
@@ -263,6 +454,10 @@ fn raygen(
     var primary_primitive = 0u;
     var primary_normal_oct = 0u;
     var primary_geo_normal_oct = 0u;
+    // NRC debug view (frame.z == 6): the primary hit's packed material +
+    // position for the cache-prediction paint.
+    var nrc_dbg_material = 0xffffffffu;
+    var nrc_dbg_pos = vec3<f32>(0.0);
     // Primary-hit depth (reverse-Z NDC) for the gizmo-depth bridge, written into
     // the always-present output buffer's alpha so rasterized overlays (gizmos)
     // occlude against the ray-traced scene — with or without DLSS. -1 = miss/sky.
@@ -350,6 +545,14 @@ fn raygen(
         // pdf of the BRDF sample that produced this segment (0 on the primary ray),
         // threaded into the hit shader so it can MIS-weight its emissive vs NEE.
         var p_bounce = 0.0;
+        // NRC spread-based termination (paper §5.1): accumulate the ray's
+        // footprint spread; terminate into the cache once it exceeds a
+        // fraction of the primary vertex's — diffuse bounces spread fast
+        // (terminate early, cache error hidden by the blur), sharp specular
+        // slowly (run deeper, where cache error would show). Fewer, better-
+        // placed queries than a hard bounce cutoff.
+        var nrc_spread = 0.0;
+        var nrc_prev_pdf = 1.0;
         // GI split: radiance ≡ di0 + a0·gi_L (a0 = primary BSDF weight,
         // gi_L = suffix radiance with a0 divided out).
         var di0 = vec3<f32>(0.0);
@@ -387,6 +590,7 @@ fn raygen(
             // Sentinel so a primary miss (sky) reads as "no cluster" (the miss shader
             // doesn't write these); the closest-hit overwrites on a hit.
             payload.hit_cluster = 0xffffffffu;
+            payload.hit_material = 0xffffffffu;
             // Only the primary hit produces the visible guide / reservoir write;
             // later bounces pass the sentinel so their closest-hit skips both.
             payload.gbuffer_pixel = select(NO_GBUFFER, pixel_index, bounce == 0u);
@@ -423,6 +627,13 @@ fn raygen(
                 primary_primitive = payload.hit_primitive;
                 primary_normal_oct = payload.hit_normal_oct;
                 primary_geo_normal_oct = payload.hit_geo_normal_oct;
+                // NRC debug view: the paint queries the cache with the
+                // primary hit's material/position (same decode the training
+                // records use).
+                if camera.frame.z == 6u {
+                    nrc_dbg_material = payload.hit_material;
+                    nrc_dbg_pos = payload.next_origin;
+                }
             }
 
             // Capture the PRIMARY hit's depth on bounce 0. A miss leaves
@@ -459,6 +670,116 @@ fn raygen(
                 throughput *= exp(-FOG_DENSITY * seg);
             }
 
+            // NRC vertex capture (sample 0 only — one path per pixel): inputs
+            // straight into the ring, prefix radiance + incoming throughput in
+            // registers for the backward target pass after the walk.
+            if nrc_training && s == 0u && bounce < 4u
+                && payload.hit_cluster != 0xffffffffu
+                && payload.hit_material != 0xffffffffu {
+                let ms = nrc_unpack_material(payload.hit_material);
+                let nrm_cs = nrc_cyl(octahedral_decode_signed(
+                    unpack2x16snorm(payload.hit_normal_oct)));
+                let dir_cs = nrc_cyl(-direction);
+                var rec: NrcRecord;
+                // Anchor-relative position — the encode pass only scales + biases.
+                rec.pos_rough = vec4<f32>(
+                    payload.next_origin + camera.nrc_anchor.xyz, ms.rough);
+                rec.dir_normal_cs = vec4<f32>(dir_cs, nrm_cs);
+                rec.diff_target_r = vec4<f32>(ms.diff_alb, 0.0);
+                rec.spec_target_g = vec4<f32>(ms.spec_alb, 0.0);
+                // .y = valid (for the scatter, which runs before the
+                // backward target pass rewrites this), .z = pixel, .w = bounce.
+                rec.target_b_valid = vec4<f32>(0.0, 1.0, f32(pixel_index), f32(bounce));
+                nrc_records[nrc_base + bounce] = rec;
+                nrc_prefix_rad[bounce] = radiance;
+                nrc_atten[bounce] = throughput;
+                nrc_mask |= 1u << bounce;
+            }
+
+            // Grow the footprint spread by this segment (length / sqrt(pdf
+            // that sampled the ray into this vertex)). Squared → an area.
+            if bounce > 0u {
+                let seg = length(payload.next_origin - origin);
+                nrc_spread += seg / sqrt(max(nrc_prev_pdf, 1.0e-3));
+            }
+            let nrc_spread_area = nrc_spread * nrc_spread;
+            let nrc_prim_area = primary_t * primary_t;
+            // Terminate when the footprint has spread past c·(primary area),
+            // never before bounce 2, always by bounce 5 (bounds query cost →
+            // caps the ray-gen dispatch length, i.e. the CTX-switch watchdog).
+            let nrc_spread_hit = nrc_spread_area
+                > camera.nrc.y * max(nrc_prim_area, 1.0e-6);
+
+            // Cache GI termination: spread-gated, at SECONDARY vertices —
+            // this is the actual cache speedup. Default: append a query to
+            // the ring and end the path; the post-trace nrc_query_infer pass
+            // batch-evaluates the MLP and composites throughput × cache into
+            // this pixel. Training paths (and camera.nrc.z, and ReSTIR GI —
+            // see nrc_restir_gi) evaluate the MLP inline instead: the
+            // backward target pass reads the loop-final radiance, so the
+            // cache tail must land IN-LOOP for the targets to bootstrap
+            // through the termination (TD, bounded contraction — full
+            // measured suffixes diverge on the small-denominator
+            // relative-L2). Without ReSTIR GI that's ≤4096 inline evals/frame
+            // — the coherent batch carries the bulk.
+            let nrc_term = bounce >= 5u || (bounce >= 2u && nrc_spread_hit);
+            // Training paths terminate deeper (16× the spread threshold,
+            // bounces 3-7): their TD targets then carry more measured
+            // bounces before the cache bootstrap — the grounding that damps
+            // the cache-trains-on-itself oscillation.
+            let nrc_term_train = bounce >= 7u
+                || (bounce >= 3u && nrc_spread_area
+                    > 16.0 * camera.nrc.y * max(nrc_prim_area, 1.0e-6));
+            let nrc_train_path = nrc_training && s == 0u;
+            if nrc_gi_on
+                && !(nrc_unbiased && s == 0u)
+                && payload.hit_cluster != 0xffffffffu
+                && payload.hit_material != 0xffffffffu
+                && select(nrc_term, nrc_term_train, nrc_train_path) {
+                let pos_unit = clamp(
+                    (payload.next_origin + camera.nrc_anchor.xyz) / camera.nrc.x + 0.5,
+                    vec3(0.0), vec3(1.0));
+                if nrc_inline_on || nrc_train_path || nrc_restir_gi {
+                    let ms = nrc_unpack_material(payload.hit_material);
+                    let nrm_cs = nrc_cyl(octahedral_decode_signed(
+                        unpack2x16snorm(payload.hit_normal_oct)));
+                    let dir_cs = nrc_cyl(-direction);
+                    let cache = nrc_query(
+                        pos_unit, dir_cs, nrm_cs, ms.rough, ms.diff_alb, ms.spec_alb);
+                    let tail = cache
+                        * (ms.diff_alb + ms.spec_alb + vec3(1.0e-2))
+                        / max(camera.camera_position.w, 1.0e-9);
+                    radiance += throughput * tail;
+                    // Keep the radiance ≡ di0 + a0·gi_L split exact: cache
+                    // termination happens past bounce 1, where throughput =
+                    // a0·gi_throughput — so the GI reservoir's stored suffix
+                    // carries the tail too.
+                    gi_L += gi_throughput * tail;
+                    break;
+                } else if s == 0u {
+                    // One query per pixel per frame keeps the composite
+                    // race-free; a full ring keeps tracing (unbiased fallback).
+                    let slot = atomicAdd(&nrc_queries.count, 1u);
+                    if slot < dims.x * dims.y {
+                        var q: NrcQueryGpu;
+                        q.v0 = vec4<u32>(
+                            bitcast<u32>(pos_unit.x),
+                            bitcast<u32>(pos_unit.y),
+                            bitcast<u32>(pos_unit.z),
+                            payload.hit_material);
+                        q.v1 = vec4<u32>(
+                            pack2x16unorm(nrc_cyl(octahedral_decode_signed(
+                                unpack2x16snorm(payload.hit_normal_oct)))),
+                            pack2x16unorm(nrc_cyl(-direction)),
+                            pack2x16float(throughput.rg),
+                            pack2x16float(vec2<f32>(throughput.b, 0.0)));
+                        q.v2 = vec4<u32>(pixel_index, 0u, 0u, 0u);
+                        nrc_queries.q[slot] = q;
+                        break;
+                    }
+                }
+            }
+
             radiance += throughput * payload.emitted;
             if bounce == 0u {
                 di0 = payload.emitted;
@@ -486,6 +807,7 @@ fn raygen(
             origin = payload.next_origin;
             direction = payload.next_direction;
             p_bounce = payload.p_bounce;
+            nrc_prev_pdf = payload.p_bounce;
 
             // Never feed a degenerate (zero-length or non-finite) direction to the next
             // traceRay — the RT core hangs the GPU on a zero-length ray. A hit shader
@@ -744,6 +1066,43 @@ fn raygen(
         // Atmosphere volumes: attenuate + in-scatter over the primary segment
         // (aerial perspective / limb / sky-through-shell). Per sample.
         radiance = atmosphere_volumes_apply(radiance, cam_origin, cam_direction, primary_t);
+        // NRC backward target pass: suffix radiance leaving vertex k toward
+        // the camera path = (final − prefix_k) / throughput_into_k. RR keeps
+        // throughput O(1) so the division is tame; guards catch the tail.
+        if nrc_training && s == 0u {
+            // TD self-training (paper §5): target_k = emission_k +
+            // atten_k · cache(vertex_{k+1}). One real BSDF step, the tail is
+            // the cache bootstrapping itself (stop-gradient — `targets` is a
+            // constant to the backward kernels). No throughput DIVISION, so
+            // no small-denominator blowup. Everything in exposure-scaled
+            // physical radiance; the cache is factorized so multiply the next
+            // vertex's albedo back before adding, divide THIS vertex's out.
+            let E = camera.camera_position.w;
+            for (var k = 0u; k < 4u; k += 1u) {
+                let slot = nrc_base + k;
+                if (nrc_mask & (1u << k)) == 0u {
+                    nrc_records[slot].target_b_valid = vec4<f32>(0.0);
+                    continue;
+                }
+                let alb = nrc_records[slot].diff_target_r.xyz
+                    + nrc_records[slot].spec_target_g.xyz + vec3(1.0e-2);
+                // Measured path suffix leaving vertex k (radiance from k
+                // onward ÷ throughput into k). Clamp tames the
+                // small-denominator tail.
+                let tin = max(nrc_atten[k], vec3(3.0e-2));
+                var tgt = (radiance - nrc_prefix_rad[k]) / tin * E;
+                if any(tgt != tgt) {
+                    tgt = vec3(0.0);
+                }
+                tgt = clamp(tgt / alb, vec3(0.0), vec3(256.0));
+                nrc_records[slot].diff_target_r.w = tgt.r;
+                nrc_records[slot].spec_target_g.w = tgt.g;
+                // .z/.w keep the capture's pixel/bounce (record debugging).
+                nrc_records[slot].target_b_valid = vec4<f32>(
+                    tgt.b, 1.0, f32(pixel_index), f32(k));
+            }
+        }
+
         frame_sum += select(radiance, vec3<f32>(0.0), captured);
     } // sample loop
 
@@ -823,6 +1182,29 @@ fn raygen(
             final_color = vec3<f32>(1.0, 0.9, 0.15) * (0.15 + 0.85 * abs(sfacing));
         } else {
             final_color = vec3<f32>(0.1, 0.4, 1.0) * (0.15 + 0.85 * sfacing);
+        }
+    }
+
+    // NRC debug view (frame.z == 6): paint the cache prediction at the
+    // primary hit (exposure-scaled radiance — directly displayable since the
+    // blit uses exposure 1.0 for debug views). Inputs come from the payload's
+    // primary-hit capture — the same decode the training records use.
+    if camera.nrc.x > 0.0 {
+        if camera.frame.z == 6u && nrc_dbg_material != 0xffffffffu {
+            let ms = nrc_unpack_material(nrc_dbg_material);
+            let nrm_cs = nrc_cyl(octahedral_decode_signed(
+                unpack2x16snorm(primary_normal_oct)));
+            let pos_unit = clamp(
+                (nrc_dbg_pos + camera.nrc_anchor.xyz) / camera.nrc.x + 0.5,
+                vec3(0.0), vec3(1.0));
+            final_color = max(nrc_query(
+                pos_unit,
+                nrc_cyl(-cam_direction),
+                nrm_cs,
+                ms.rough,
+                ms.diff_alb,
+                ms.spec_alb,
+            ), vec3(0.0)) * (ms.diff_alb + ms.spec_alb + vec3(1.0e-2));
         }
     }
 

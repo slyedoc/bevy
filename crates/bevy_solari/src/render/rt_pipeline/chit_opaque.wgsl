@@ -124,6 +124,15 @@ fn chit_opaque(
     // normal (cross of the fetched world positions, NOT ray_hit.geometric_world_normal
     // which is sign-matched to the vertex normal). Same edge convention as the resolve.
     payload.hit_normal_oct = pack2x16snorm(octahedral_encode(ray_hit.world_normal) * 2.0 - 1.0);
+    // NRC record material: r5g6b5 base color + metallic8 + roughness8.
+    {
+        let bc = clamp(ray_hit.material.base_color, vec3(0.0), vec3(1.0));
+        payload.hit_material = (u32(bc.r * 31.0 + 0.5) << 27u)
+            | (u32(bc.g * 63.0 + 0.5) << 21u)
+            | (u32(bc.b * 31.0 + 0.5) << 16u)
+            | (u32(clamp(ray_hit.material.metallic, 0.0, 1.0) * 255.0 + 0.5) << 8u)
+            | u32(clamp(ray_hit.material.roughness, 0.0, 1.0) * 255.0 + 0.5);
+    }
     let wp0 = vec3<f32>(dot(transform[0].xyz, hit_positions[0]) + transform[0].w, dot(transform[1].xyz, hit_positions[0]) + transform[1].w, dot(transform[2].xyz, hit_positions[0]) + transform[2].w);
     let wp1 = vec3<f32>(dot(transform[0].xyz, hit_positions[1]) + transform[0].w, dot(transform[1].xyz, hit_positions[1]) + transform[1].w, dot(transform[2].xyz, hit_positions[1]) + transform[2].w);
     let wp2 = vec3<f32>(dot(transform[0].xyz, hit_positions[2]) + transform[0].w, dot(transform[1].xyz, hit_positions[2]) + transform[1].w, dot(transform[2].xyz, hit_positions[2]) + transform[2].w);
@@ -366,8 +375,11 @@ fn chit_opaque(
                 // Directional sample: world_position = (unit direction, w=0).
                 vis_target = dresolved.world_position;
             } else {
-                // Spatial pass owns the emissive winner's visibility + shade.
-                if spatial_on || sel_phat <= 0.0 {
+                // Spatial pass owns the PRIMARY vertex's emissive winner (it
+                // reshades from the per-pixel reservoir); bounce vertices have
+                // no pass-side stand-in — their NEE winner must shade here or
+                // the GI arm loses NEE's whole share of the MIS partition.
+                if (spatial_on && is_primary) || sel_phat <= 0.0 {
                     continue;
                 }
                 f_vis = sel_f * (w_sum / (res_m * sel_phat));
