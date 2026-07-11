@@ -409,6 +409,12 @@ bevy_settings = ["bevy_internal/bevy_settings"]
 # Feathers widget collection.
 experimental_bevy_feathers = ["bevy_internal/bevy_feathers", "bevy_ui_widgets"]
 
+# Reflection-driven property inspector built on Feathers.
+experimental_bevy_feathers_inspector = [
+  "bevy_internal/bevy_feathers_inspector",
+  "experimental_bevy_feathers",
+]
+
 # Enable passthrough loading for SPIR-V shaders (Only supported on Vulkan, shader capabilities and extensions must agree with the platform implementation)
 spirv_shader_passthrough = ["bevy_internal/spirv_shader_passthrough"]
 
@@ -5428,6 +5434,18 @@ required-features = ["experimental_bevy_feathers"]
 [package.metadata.example.feathers_gallery]
 name = "Feathers Widgets"
 description = "Gallery of Feathers Widgets"
+category = "UI (User Interface)"
+wasm = true
+
+[[example]]
+name = "feathers_inspector"
+path = "examples/ui/widgets/feathers_inspector.rs"
+doc-scrape-examples = true
+required-features = ["experimental_bevy_feathers_inspector"]
+
+[package.metadata.example.feathers_inspector]
+name = "Feathers Inspector"
+description = "Reflection-driven property editing with Feathers widgets"
 category = "UI (User Interface)"
 wasm = true
 
