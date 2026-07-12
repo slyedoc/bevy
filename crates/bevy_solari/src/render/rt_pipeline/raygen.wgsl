@@ -25,7 +25,8 @@ fn luminance(c: vec3<f32>) -> f32 {
 }
 
 
-// Hard path-length cap; Russian roulette terminates almost every path far sooner.
+// Hard path-length backstop; the configured cap (estimator bits 22..27)
+// arrives ≤ 32 and Russian roulette terminates almost every path far sooner.
 const MAX_BOUNCES: u32 = 32u;
 // Stand-in fog: per-unit-length extinction applied over each ray segment.
 const FOG_DENSITY: f32 = 0.0;
@@ -569,7 +570,19 @@ fn raygen(
         var gi_hit = false;
         var gi_e1 = vec3<f32>(0.0);
 
-        for (var bounce = 0u; bounce < MAX_BOUNCES; bounce += 1u) {
+        // Path-length cap: estimator bits 22..27 carry the max INDIRECT
+        // bounce count (bounce 0 is the primary trace), so `bounces: 1`
+        // is classic one-bounce RTGI. With NRC armed the capped vertex
+        // terminates INTO the cache (see nrc_term), and training paths are
+        // EXEMPT from the cap — render short, train long: the cache learns
+        // full transport while production pixels trace one bounce and
+        // composite the cache tail.
+        let bounce_cap = min((bitcast<u32>(camera.atmo.w) >> 22u) & 0x3fu, MAX_BOUNCES);
+        var sample_cap = bounce_cap;
+        if nrc_training && s == 0u {
+            sample_cap = MAX_BOUNCES;
+        }
+        for (var bounce = 0u; bounce < sample_cap + 1u; bounce += 1u) {
             // Black-hole geodesic (stand-in): bend the ray toward the mass and
             // terminate if it crosses the capture radius.
             if BH_STRENGTH > 0.0 {
@@ -726,7 +739,10 @@ fn raygen(
             // measured suffixes diverge on the small-denominator
             // relative-L2). Without ReSTIR GI that's ≤4096 inline evals/frame
             // — the coherent batch carries the bulk.
-            let nrc_term = bounce >= 5u || (bounce >= 2u && nrc_spread_hit);
+            // `bounce >= bounce_cap` folds the path-length cap in: the last
+            // allowed vertex queries the cache instead of dropping the tail.
+            let nrc_term = bounce >= 5u || (bounce >= 2u && nrc_spread_hit)
+                || bounce >= bounce_cap;
             // Training paths terminate deeper (16× the spread threshold,
             // bounces 3-7): their TD targets then carry more measured
             // bounces before the cache bootstrap — the grounding that damps

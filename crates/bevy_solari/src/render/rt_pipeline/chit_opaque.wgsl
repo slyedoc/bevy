@@ -118,7 +118,16 @@ fn chit_opaque(
         vec4<f32>(object_to_world[0].y, object_to_world[1].y, object_to_world[2].y, object_to_world[3].y),
         vec4<f32>(object_to_world[0].z, object_to_world[1].z, object_to_world[2].z, object_to_world[3].z),
     );
-    let ray_hit = resolve_triangle_data_full_mat_fetch(instance_id, sbt.material_id, transform, cluster_id, primitive_index, barycentrics, hit_positions);
+    var ray_hit = resolve_triangle_data_full_mat_fetch(instance_id, sbt.material_id, transform, cluster_id, primitive_index, barycentrics, hit_positions);
+    // Lighting-only debug view (estimator bit 28): shade every surface with a
+    // WHITE base color so the image is pure light transport — texture color
+    // can't hide estimator differences (the albedo-demodulated presentation
+    // GI papers use). Downstream consumers (NRC records, surface G-buffer,
+    // DLSS guides, reshades) all read the overridden material, so the whole
+    // pipeline sees the white world consistently.
+    if (bitcast<u32>(camera.atmo.w) & (1u << 28u)) != 0u {
+        ray_hit.material.base_color = vec3<f32>(1.0);
+    }
 
     // Normal-facing debug view: stash the pre-bend shading normal + the RAW winding
     // normal (cross of the fetched world positions, NOT ray_hit.geometric_world_normal

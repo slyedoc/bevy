@@ -536,10 +536,12 @@ struct GpuMaterial {
 impl Default for GpuMaterial {
     fn default() -> Self {
         Self {
-            normal_map_texture_id: 0,
-            base_color_texture_id: 0,
-            emissive_texture_id: 0,
-            metallic_roughness_texture_id: 0,
+            // No map, not pool slot 0 — a slot whose textures haven't loaded
+            // yet (or was freed) must not sample whatever lives at index 0.
+            normal_map_texture_id: TEXTURE_MAP_NONE,
+            base_color_texture_id: TEXTURE_MAP_NONE,
+            emissive_texture_id: TEXTURE_MAP_NONE,
+            metallic_roughness_texture_id: TEXTURE_MAP_NONE,
             base_color: Vec3::ZERO,
             perceptual_roughness: 0.0,
             emissive: Vec3::ZERO,

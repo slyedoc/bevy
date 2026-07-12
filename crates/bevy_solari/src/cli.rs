@@ -47,7 +47,8 @@ pub struct SolariCameraArgs {
     pub accum: bool,
 
     /// debug view: `heatmap` (per-pixel cost), `any-hit`, `displacement`,
-    /// `cluster`, `triangles`, `normal-facing`, `nrc` (cache paint)
+    /// `cluster`, `triangles`, `normal-facing`, `nrc` (cache paint), `white`
+    /// (lighting only — white base color, pure light transport)
     #[arg(long, default_value = "")]
     pub debug_view: String,
 }
@@ -92,6 +93,7 @@ impl SolariCameraArgs {
             "triangles" => SolariDebugView::Triangles,
             "normal-facing" => SolariDebugView::NormalFacing,
             "nrc" => SolariDebugView::NrcCache,
+            "white" | "lighting" => SolariDebugView::WhiteWorld,
             _ => SolariDebugView::None,
         }
     }
@@ -154,5 +156,15 @@ mod tests {
         let camera: SolariCamera =
             ron::from_str("(mode: Reference((jitter: false, gi: None)))").unwrap();
         assert_eq!(camera.name(), "ref-nogi-nojit");
+        let camera: SolariCamera =
+            ron::from_str("(mode: Reference((gi: Some((bounces: 1)))))").unwrap();
+        assert_eq!(camera.name(), "ref");
+        let camera: SolariCamera =
+            ron::from_str("(mode: Reference((gi: Some((bounces: 32)))))").unwrap();
+        assert_eq!(camera.name(), "ref-b32");
+        let camera: SolariCamera = ron::from_str("(mode: Realtime((bounces: 1)))").unwrap();
+        assert_eq!(camera.name(), "rt");
+        let camera: SolariCamera = ron::from_str("(mode: Realtime((bounces: 32)))").unwrap();
+        assert_eq!(camera.name(), "rt-b32");
     }
 }

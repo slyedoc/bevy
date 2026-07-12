@@ -1141,7 +1141,9 @@ fn resolve_triangle_data_core(
         let T = TBN[0];
         let B = TBN[1];
         let N = TBN[2];
-        let Nt = sample_texture_lod(material.normal_map_texture_id, uv, partial_lod + material.texel_lod_bias);
+        // Texels store the tangent-space normal remapped to [0,1] — decode
+        // before the TBN transform (a flat texel (0.5, 0.5, 1) is (0, 0, 1)).
+        let Nt = sample_texture_lod(material.normal_map_texture_id, uv, partial_lod + material.texel_lod_bias) * 2.0 - 1.0;
         world_normal = normalize(Nt.x * T + Nt.y * B + Nt.z * N);
     }
 

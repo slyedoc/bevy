@@ -339,6 +339,9 @@ impl SolariCamera {
                 if rt.nrc_gi != d.nrc_gi {
                     n.push_str("-nonrc");
                 }
+                if rt.bounces != d.bounces {
+                    n.push_str(&format!("-b{}", rt.bounces));
+                }
                 if rt.firefly_clamp != d.firefly_clamp {
                     n.push_str(&format!("-clamp{}", num(rt.firefly_clamp)));
                 }
@@ -381,6 +384,9 @@ impl SolariCamera {
                         }
                         if arm.nrc {
                             n.push_str("-nrc");
+                        }
+                        if arm.bounces != GiArm::default().bounces {
+                            n.push_str(&format!("-b{}", arm.bounces));
                         }
                     }
                 }
@@ -496,6 +502,12 @@ impl SolariReference {
         self.gi.as_ref().is_some_and(|arm| arm.nrc)
     }
 
+    /// Maximum indirect bounces (the GI arm's; without an arm paths already
+    /// terminate at the primary vertex, so the cap is moot).
+    pub fn bounces(&self) -> u32 {
+        self.gi.as_ref().map_or_else(|| GiArm::default().bounces, |arm| arm.bounces)
+    }
+
     /// The DI spatial-reuse settings, when the ReSTIR DI spatial pass is on.
     pub fn di_spatial(&self) -> Option<&SpatialReuse> {
         match &self.di {
@@ -548,7 +560,7 @@ impl SolariReference {
 /// The indirect (suffix) transport arm of a [`SolariReference`].
 #[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "bevy_solari_debug", serde(default))]
-#[derive(Reflect, Clone, PartialEq, Debug, Default)]
+#[derive(Reflect, Clone, PartialEq, Debug)]
 #[reflect(Default, Clone, PartialEq)]
 pub struct GiArm {
     /// How the suffix is estimated.
@@ -562,6 +574,24 @@ pub struct GiArm {
     /// into the neural radiance cache (estimator flag bit 20). Biased by
     /// cache error — graded by freeze-diff/RMSE against the untouched arm.
     pub nrc: bool,
+    /// Maximum indirect bounces (path segments past the primary hit).
+    /// Default 1, matching [`SolariRestir::bounces`] — each deeper traced
+    /// bounce adds little energy at spike variance. Truncation is biased by
+    /// the missing tail: converged truths and exams that want full transport
+    /// spell `bounces: 32` (Russian roulette then does the terminating).
+    #[reflect(@1.0..=32.0f32)]
+    pub bounces: u32,
+}
+
+impl Default for GiArm {
+    fn default() -> Self {
+        Self {
+            estimator: GiEstimator::default(),
+            only: false,
+            nrc: false,
+            bounces: 1,
+        }
+    }
 }
 
 /// The direct-illumination estimator at each path vertex.
@@ -756,6 +786,13 @@ pub struct SolariRestir {
     /// [`gi`](Self::gi), cache-terminated paths query the cache inline in
     /// raygen so the GI reservoirs store the full suffix energy.
     pub nrc_gi: bool,
+    /// Maximum indirect bounces. Default 1: each traced bounce past the first
+    /// adds little energy at enormous variance — blowout noise the denoiser
+    /// smears — while with [`nrc_gi`](Self::nrc_gi) the capped vertex
+    /// terminates into the cache, which carries the deep tail (training paths
+    /// are exempt from the cap, so the cache learns full transport).
+    #[reflect(@1.0..=32.0f32)]
+    pub bounces: u32,
 }
 
 impl Default for SolariRestir {
@@ -767,6 +804,7 @@ impl Default for SolariRestir {
             gi: true,
             firefly_clamp: 10.0,
             nrc_gi: true,
+            bounces: 1,
         }
     }
 }

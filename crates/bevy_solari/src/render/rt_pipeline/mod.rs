@@ -167,6 +167,12 @@ pub enum SolariDebugView {
     /// inference per pixel). Shows only while [`SolariNrc::enabled`]
     /// (`crate::nrc::SolariNrc`) — the paint queries the live cache weights.
     NrcCache,
+    /// Lighting only: every opaque surface shades with a WHITE base color, so
+    /// the image is pure light transport — the albedo-demodulated presentation
+    /// GI papers use for estimator comparison. Not a paint: it renders,
+    /// accumulates, and exams like a normal image (estimator flag bit 28,
+    /// which also restarts any running mean when toggled).
+    WhiteWorld,
 }
 
 impl SolariDebugView {
@@ -1455,7 +1461,9 @@ pub(crate) fn rt_pipeline(
     // NRC GI termination (armed only past cache maturity), bit 21 = AA
     // jitter off (pixel-center sampling — the reservoir-merge
     // target-mismatch isolation lever; also set when DLSS drives, so RR
-    // always sees the jitter it suggested).
+    // always sees the jitter it suggested), bits 22..27 = max indirect
+    // bounces (raygen's path-length cap; roulette terminates sooner at
+    // the default 32).
     let estimator_flags = if let Some(rt) = restir_rt {
         // Production per-frame stack: ReSTIR DI + GI reconnection reservoirs,
         // temporal always, spatial only when taps > 0 (at 0 the pass doesn't
@@ -1477,6 +1485,7 @@ pub(crate) fn rt_pipeline(
             | (rt.ris_candidates.min(255) << 8)
             | 1 << 19
             | ((rt.nrc_gi && nrc_ready) as u32) << 20
+            | rt.bounces.clamp(1, 32) << 22
     } else {
         // The reference estimator tree → the flag bits (the tree makes legal
         // combinations structural: spatial only inside a ReSTIR arm, recon
@@ -1507,7 +1516,13 @@ pub(crate) fn rt_pipeline(
             // keeps camera.jitter for every sample (accumulation still gets AA
             // from the Halton sweep) instead of rolling its own.
             | ((!r.jitter || dlss_jitter.is_some()) as u32) << 21
+            | r.bounces().clamp(1, 32) << 22
     };
+    // The lighting-only view rides the estimator flags (bit 28), not the
+    // frame.z paint id: it is a converging image — accumulation stays live,
+    // and the flags-keyed restart resets the mean when it toggles.
+    let estimator_flags =
+        estimator_flags | ((active_view == SolariDebugView::WhiteWorld) as u32) << 28;
     if let Some(reference) = reference {
         // Hold accumulation until EVERY solari pipeline is compiled (the one
         // readiness gate — a warmup frame with any column/pass missing bakes
@@ -1602,16 +1617,27 @@ pub(crate) fn rt_pipeline(
     });
     let window_eye = cyl_window.map_or(Vec4::ZERO, |w| w.eye.extend(w.center.y));
 
+    // The camera decides whether the cache runs at all: without an NRC
+    // consumer (rt `nrc_gi`, a reference nrc arm, or the cache debug paint),
+    // record writes, inference, and training all idle — an rt-nonrc camera
+    // pays zero NRC cost.
+    let wants_nrc = restir_rt.is_some_and(|rt| rt.nrc_gi)
+        || reference.is_some_and(|r| r.nrc_gi())
+        || active_view == SolariDebugView::NrcCache;
     // NRC master gate → RtCamera.nrc.x (0 = record writes + debug view off);
     // .z selects inline coopvec inference over the batched query path.
-    let nrc_vec = debug.nrc.as_deref().filter(|n| n.enabled).map_or(Vec4::ZERO, |n| {
-        Vec4::new(
-            n.scene_scale,
-            n.spread_c,
-            if n.inline_coopvec { 1.0 } else { 0.0 },
-            0.0,
-        )
-    });
+    let nrc_vec = debug
+        .nrc
+        .as_deref()
+        .filter(|n| n.enabled && wants_nrc)
+        .map_or(Vec4::ZERO, |n| {
+            Vec4::new(
+                n.scene_scale,
+                n.spread_c,
+                if n.inline_coopvec { 1.0 } else { 0.0 },
+                0.0,
+            )
+        });
 
     let camera_inputs = RtCamera {
         inverse_view_proj: world_from_clip.to_cols_array(),
@@ -1959,8 +1985,12 @@ pub(crate) fn rt_pipeline(
         (debug.nrc_buffers.as_deref_mut(), debug.nrc_pipelines.as_deref())
     {
         if let Some(nrc_cfg) = debug.nrc.as_deref() {
+            // `wants_nrc`: no consumer ⇒ no training — raygen wrote no fresh
+            // records this frame (nrc.x is zeroed), so a step would train on
+            // a stale ring while burning the full training cost.
             if nrc_cfg.enabled
                 && nrc_cfg.training
+                && wants_nrc
                 && (*frame_counter).is_multiple_of(nrc_cfg.train_interval.max(1))
             {
                 let _ = crate::nrc::dispatch_training(
