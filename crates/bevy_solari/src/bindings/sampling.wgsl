@@ -131,7 +131,10 @@ struct SurfaceGbuf {
     reflectance: u32,    // pack2x16float(reflectance, 0)
     wo_oct: u32,         // view dir (-ray_direction) — world_position is ABSOLUTE, so
                          // the pass can't reconstruct wo from position alone
-    pad_b: u32,
+    f_ab_packed: u32,    // pack2x16float(F_AB) — the chit's split-sum LUT read,
+                         // carried so consumers never re-sample the DFG LUT (a
+                         // textureSampleLevel in raygen's sample loop measured
+                         // ~5 ms/spp — the ReSTIR-GI store-path regression)
 }
 
 // Canonical ReSTIR GI sample: the first-bounce reconnection vertex + the suffix
@@ -155,8 +158,8 @@ struct GiSample {
     pad_b: u32,
 }
 
-// SurfaceGbuf decode shared by the spatial pass and raygen. `f_ab` stays zero —
-// F_AB lives in `brdf`; callers fill it.
+// SurfaceGbuf decode shared by the spatial pass and raygen. `f_ab` is the
+// chit's packed LUT read — decoded here, never re-sampled.
 struct Surf {
     pos: vec3<f32>,
     view_z: f32,
@@ -193,7 +196,7 @@ fn unpack_surface(s: SurfaceGbuf) -> Surf {
     // wo is stored by the chit: world_position is absolute, so the consumer
     // can't reconstruct the view dir as normalize(-pos).
     out.wo = octahedral_decode_signed(unpack2x16snorm(s.wo_oct));
-    out.f_ab = vec2<f32>(0.0);
+    out.f_ab = unpack2x16float(s.f_ab_packed);
     return out;
 }
 

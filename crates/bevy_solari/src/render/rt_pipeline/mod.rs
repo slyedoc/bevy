@@ -429,8 +429,10 @@ pub struct RestirSpatial {
     /// itself builds lazily.
     pub pipeline: Option<CachedComputePipelineId>,
     pub shader: bevy_asset::Handle<bevy_shader::Shader>,
-    /// 48-byte `SpatialParams` uniform (see `restir_spatial.wgsl`).
+    /// `SpatialParams` uniform (see `restir_spatial.wgsl`).
     pub params: bevy_render::render_resource::Buffer,
+    /// The GI-finalize dispatch's own `SpatialParams` (phase = 1).
+    pub params_finalize: bevy_render::render_resource::Buffer,
     /// group(1) binding(4): `scene_bindings` hard-codes `geometry_addresses` here and
     /// it rides in transitively via brdf. The spatial pass never dereferences it (no
     /// `physical_load`), but the binding must exist — a zeroed uniform satisfies it.
@@ -453,6 +455,12 @@ pub struct RestirSpatialParams {
     pub pad_a: u32,
     pub di_on: u32,
     pub gi_on: u32,
+    /// 1 = the GI-finalize dispatch (temporal merge + reservoir shade — the
+    /// work moved out of raygen's register-cliffed sample loop), 0 = spatial.
+    pub phase: u32,
+    pub pad_b: u32,
+    pub pad_c: u32,
+    pub pad_d: u32,
 }
 
 /// `RenderStartup`: build the spatial pass pipeline (scene group 0 + own group 1).
@@ -474,13 +482,22 @@ pub fn init_restir_spatial(
                 uniform_buffer_sized(false, None),           // 3: params
                 uniform_buffer_sized(false, None),           // 4: geometry_addresses (unused, transitive)
                 storage_buffer_read_only_sized(false, None), // 5: light_samples (chit-written)
-                storage_buffer_read_only_sized(false, None), // 6: gi_samples (raygen-written)
+                storage_buffer_sized(false, None),           // 6: gi_samples (rw: finalize merges + writes back)
+                uniform_buffer_sized(false, None),           // 7: RtCamera (reprojection + estimator flags)
             ),
         ),
     );
     let shader = load_embedded_asset!(asset_server.as_ref(), "restir_spatial.wgsl");
     let params = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("restir_spatial_params"),
+        size: size_of::<RestirSpatialParams>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    // The finalize dispatch runs the same pipeline in the same frame with its
+    // own parameter values — it needs its own uniform buffer.
+    let params_finalize = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("restir_gi_finalize_params"),
         size: size_of::<RestirSpatialParams>() as u64,
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -492,7 +509,9 @@ pub fn init_restir_spatial(
         mapped_at_creation: false,
     });
     let _ = &pipeline_cache; // pipeline queued by `queue_restir_spatial_pipeline`
-    commands.insert_resource(RestirSpatial { layout, pipeline: None, shader, params, geo_addr });
+    commands.insert_resource(RestirSpatial {
+        layout, pipeline: None, shader, params, params_finalize, geo_addr,
+    });
 }
 
 /// `Render::Prepare`: queue the spatial pipeline the moment the scene-columns
@@ -1862,8 +1881,16 @@ pub(crate) fn rt_pipeline(
             || reference.is_some_and(|r| r.di_spatial().is_some());
         let gi_spatial = restir_rt.is_some_and(|rt| rt.gi && rt.spatial.is_some())
             || reference.is_some_and(|r| r.gi_spatial().is_some());
+        // GI reservoir finalize (phase 1): whenever the GI ReSTIR arm is on
+        // (estimator bit 5), the temporal merge + reservoir shade run HERE —
+        // raygen only exports the canonical sample (its sample loop is past a
+        // register cliff; see raygen.wgsl's bit-5 comment). Must run before
+        // the spatial dispatch so neighbors read merged chains.
+        let gi_finalize = restir_rt.is_some_and(|rt| rt.gi)
+            || reference.is_some_and(SolariReference::gi_restir);
         let spatial_on = (di_spatial || gi_spatial) && debug_view == 0 && !show_displacement;
-        if spatial_on {
+        let finalize_on = gi_finalize && debug_view == 0 && !show_displacement;
+        if spatial_on || finalize_on {
             // Queued by `queue_restir_spatial_pipeline` (Prepare) as soon as the
             // scene-columns layout exists — compiled with the cold-start batch.
             if let Some(spatial_pipeline) = rs
@@ -1875,58 +1902,88 @@ pub(crate) fn rt_pipeline(
                 } else {
                     1.0
                 };
-                // One parameter set feeds the pass (DI and GI arms share it);
-                // prefer the realtime settings, then the DI arm's, then the GI arm's.
-                let sp = restir_rt
-                    .and_then(|rt| rt.spatial.as_ref())
-                    .or_else(|| reference.and_then(SolariReference::di_spatial))
-                    .or_else(|| reference.and_then(SolariReference::gi_spatial))
-                    .expect("spatial_on requires a configured spatial arm");
-                let (taps, radius, unbiased, dbg) =
-                    (sp.taps, sp.radius, sp.unbiased_zcount, sp.debug_paint);
-                let params = RestirSpatialParams {
+                let base = RestirSpatialParams {
                     width: viewport.x,
                     height: viewport.y,
                     parity: camera_inputs.frame[0] & 1,
                     frame: camera_inputs.frame[0],
-                    taps: taps.min(8),
-                    radius,
+                    taps: 0,
+                    radius: 0.0,
                     blend_w,
                     firefly_clamp: camera_inputs.dims[3],
-                    unbiased: unbiased as u32,
-                    pad_a: dbg as u32,
-                    di_on: di_spatial as u32,
-                    gi_on: gi_spatial as u32,
+                    unbiased: 0,
+                    pad_a: 0,
+                    di_on: 0,
+                    gi_on: 0,
+                    phase: 0,
+                    pad_b: 0,
+                    pad_c: 0,
+                    pad_d: 0,
                 };
-                render_queue.write_buffer(&rs.params, 0, bytemuck::bytes_of(&params));
                 render_queue.write_buffer(
                     &rs.geo_addr,
                     0,
                     bytemuck::bytes_of(&geo_addrs.unwrap_or(bytemuck::Zeroable::zeroed())),
                 );
-                let bind_group = render_device.create_bind_group(
-                    "restir_spatial_bind_group",
-                    &pipeline_cache.get_bind_group_layout(&rs.layout),
-                    &BindGroupEntries::sequential((
-                        output.reservoirs.as_entire_binding(),
-                        output.surface.as_entire_binding(),
-                        output.buffer.as_entire_binding(),
-                        rs.params.as_entire_binding(),
-                        rs.geo_addr.as_entire_binding(),
-                        output.light_samples.as_entire_binding(),
-                        output.gi_samples.as_entire_binding(),
-                    )),
-                );
-                let encoder = ctx.command_encoder();
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("restir_spatial"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(spatial_pipeline);
-                pass.set_bind_group(0, scene_bg, &[]);
-                pass.set_bind_group(1, &bind_group, &[]);
-                pass.set_bind_group(2, columns_bg, &[]);
-                pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
+                let layout = pipeline_cache.get_bind_group_layout(&rs.layout);
+                let mut dispatch = |params_buf: &bevy_render::render_resource::Buffer,
+                                    params: RestirSpatialParams,
+                                    label: &'static str| {
+                    render_queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+                    let bind_group = render_device.create_bind_group(
+                        label,
+                        &layout,
+                        &BindGroupEntries::sequential((
+                            output.reservoirs.as_entire_binding(),
+                            output.surface.as_entire_binding(),
+                            output.buffer.as_entire_binding(),
+                            params_buf.as_entire_binding(),
+                            rs.geo_addr.as_entire_binding(),
+                            output.light_samples.as_entire_binding(),
+                            output.gi_samples.as_entire_binding(),
+                            output.camera_buffer.as_entire_binding(),
+                        )),
+                    );
+                    let encoder = ctx.command_encoder();
+                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                        label: Some(label),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(spatial_pipeline);
+                    pass.set_bind_group(0, scene_bg, &[]);
+                    pass.set_bind_group(1, &bind_group, &[]);
+                    pass.set_bind_group(2, columns_bg, &[]);
+                    pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
+                };
+                if finalize_on {
+                    dispatch(
+                        &rs.params_finalize,
+                        RestirSpatialParams { phase: 1, ..base },
+                        "restir_gi_finalize",
+                    );
+                }
+                if spatial_on {
+                    // One parameter set feeds the pass (DI and GI arms share it);
+                    // prefer the realtime settings, then the DI arm's, then the GI arm's.
+                    let sp = restir_rt
+                        .and_then(|rt| rt.spatial.as_ref())
+                        .or_else(|| reference.and_then(SolariReference::di_spatial))
+                        .or_else(|| reference.and_then(SolariReference::gi_spatial))
+                        .expect("spatial_on requires a configured spatial arm");
+                    dispatch(
+                        &rs.params,
+                        RestirSpatialParams {
+                            taps: sp.taps.min(8),
+                            radius: sp.radius,
+                            unbiased: sp.unbiased_zcount as u32,
+                            pad_a: sp.debug_paint as u32,
+                            di_on: di_spatial as u32,
+                            gi_on: gi_spatial as u32,
+                            ..base
+                        },
+                        "restir_spatial",
+                    );
+                }
             } else {
                 bevy_log::warn_once!("restir_spatial: pipeline not ready — DI missing this frame");
             }

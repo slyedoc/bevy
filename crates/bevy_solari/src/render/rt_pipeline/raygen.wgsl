@@ -13,8 +13,7 @@ enable wgpu_cooperative_vector;
 // pipeline layout matches the wgpu-built scene bind group bound at trace time.
 #import bevy_solari::scene_bindings::{tlas, RAY_T_MIN, RAY_T_MAX}
 #import bevy_solari::rt_payload::{RtPayload, RtCamera}
-#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, GiSample, Surf, unpack_surface, pick_luminance}
-#import bevy_solari::brdf::{F_AB, gi_shade, gi_phat}
+#import bevy_solari::sampling::{Reservoir, SurfaceGbuf, GiSample, pick_luminance}
 #import bevy_solari::pbr::rand_f
 #import bevy_solari::atmosphere::{atmosphere_ray_sphere_near, atmosphere_ray_sphere_far, atmosphere_rayleigh_phase, atmosphere_mie_phase}
 #import bevy_render::utils::octahedral_decode_signed
@@ -220,19 +219,27 @@ fn clock_delta(start: u32, end: u32) -> u32 {
 
 // 10-stop "temperature" colormap (NVIDIA timer-instrumentation): deep blue (cheap) →
 // cyan → green → yellow → orange → red → magenta (expensive). Input clamped to [0, 1].
+// Branch-chain lookup, NOT an indexed array: a function-local array is
+// dynamically indexed → local memory, and its 120 B would sit in EVERY
+// thread's raygen frame in every config (the heatmap only paints when
+// frame.z == 1, but stack allocation is the shader's static maximum). At
+// raygen's register cliff, frame bytes are the scarcest resource on the
+// card — see the ReSTIR-GI bit-5 comment. Divergence is irrelevant here:
+// debug-view-only code.
+fn heat_stop(i: i32) -> vec3<f32> {
+    if i <= 0 { return vec3<f32>(0.0, 2.0, 91.0); }
+    if i == 1 { return vec3<f32>(0.0, 108.0, 251.0); }
+    if i == 2 { return vec3<f32>(0.0, 221.0, 221.0); }
+    if i == 3 { return vec3<f32>(51.0, 221.0, 0.0); }
+    if i == 4 { return vec3<f32>(255.0, 252.0, 0.0); }
+    if i == 5 { return vec3<f32>(255.0, 180.0, 0.0); }
+    if i == 6 { return vec3<f32>(255.0, 104.0, 0.0); }
+    if i == 7 { return vec3<f32>(226.0, 22.0, 0.0); }
+    if i == 8 { return vec3<f32>(191.0, 0.0, 83.0); }
+    return vec3<f32>(145.0, 0.0, 65.0);
+}
+
 fn cost_heatmap(t: f32) -> vec3<f32> {
-    var c = array<vec3<f32>, 10>(
-        vec3<f32>(0.0, 2.0, 91.0),
-        vec3<f32>(0.0, 108.0, 251.0),
-        vec3<f32>(0.0, 221.0, 221.0),
-        vec3<f32>(51.0, 221.0, 0.0),
-        vec3<f32>(255.0, 252.0, 0.0),
-        vec3<f32>(255.0, 180.0, 0.0),
-        vec3<f32>(255.0, 104.0, 0.0),
-        vec3<f32>(226.0, 22.0, 0.0),
-        vec3<f32>(191.0, 0.0, 83.0),
-        vec3<f32>(145.0, 0.0, 65.0),
-    );
     let s = clamp(t, 0.0, 1.0) * 10.0;
     let cur = min(i32(s), 9);
     let prv = max(cur - 1, 0);
@@ -242,7 +249,7 @@ fn cost_heatmap(t: f32) -> vec3<f32> {
     let wc = smoothstep(fc - blur, fc + blur, s) * (1.0 - smoothstep(fc + 1.0 - blur, fc + 1.0 + blur, s));
     let wp = 1.0 - smoothstep(fc - blur, fc + blur, s);
     let wn = smoothstep(fc + 1.0 - blur, fc + 1.0 + blur, s);
-    return clamp((wc * c[cur] + wp * c[prv] + wn * c[nxt]) / 255.0, vec3(0.0), vec3(1.0));
+    return clamp((wc * heat_stop(cur) + wp * heat_stop(prv) + wn * heat_stop(nxt)) / 255.0, vec3(0.0), vec3(1.0));
 }
 #endif
 
@@ -441,11 +448,12 @@ fn raygen(
     let nrc_unbiased = nrc_training
         && (nrc_pcg(pixel_index ^ (camera.frame.x * 2891336453u)) & 15u) == 0u;
     var nrc_mask = 0u;
-    var nrc_prefix_rad = array<vec3<f32>, 4>();
-    var nrc_atten = array<vec3<f32>, 4>();
-    // Instrument: per-frame SUM of the would-be GI shades across samples (pad_b),
-    // vs the last sample's (pad_a) — the pass's debug ratio paint reads both.
-    var dbg_gi_lum_sum = 0.0;
+    // Packed f16 (2×u32 per vec3): these arrays are dynamically indexed, so
+    // they live in local memory in EVERY config — at raygen's register cliff
+    // the footprint is what matters, and the NRC MLP consuming the values is
+    // fp16 anyway. 96 B/thread -> 64 B/thread.
+    var nrc_prefix_rad = array<vec2<u32>, 4>();
+    var nrc_atten = array<vec2<u32>, 4>();
     // Total alpha any-hit invocations across all primary/bounce traces this pixel
     // (the OMM-effectiveness heatmap). Shadow-ray any-hits use the shadow payload's
     // own counter and aren't summed here.
@@ -708,8 +716,10 @@ fn raygen(
                 // backward target pass rewrites this), .z = pixel, .w = bounce.
                 rec.target_b_valid = vec4<f32>(0.0, 1.0, f32(pixel_index), f32(bounce));
                 nrc_records[nrc_base + bounce] = rec;
-                nrc_prefix_rad[bounce] = radiance;
-                nrc_atten[bounce] = throughput;
+                nrc_prefix_rad[bounce] = vec2<u32>(
+                    pack2x16float(radiance.xy), pack2x16float(vec2<f32>(radiance.z, 0.0)));
+                nrc_atten[bounce] = vec2<u32>(
+                    pack2x16float(throughput.xy), pack2x16float(vec2<f32>(throughput.z, 0.0)));
                 nrc_mask |= 1u << bounce;
             }
 
@@ -867,202 +877,62 @@ fn raygen(
         // re-evaluated from the surface G-buffer. Dead samples (sky/delta, pdf=0)
         // keep the live a0·gi_L.
         if (eflags & 32u) != 0u {
-            let surf_raw = surfaces[pixel_index];
-            var surf = unpack_surface(surf_raw);
-            surf.f_ab = F_AB(surf.mat.perceptual_roughness, max(dot(surf.ns, surf.wo), 1.0e-4));
-            // Bounce-1 emission is this pixel's DI-by-MIS partner — its weight is
-            // tied to this sampling event, so it shades per-frame, never reused.
+            // ReSTIR GI, raygen side: EXPORT ONLY. This block once held the
+            // temporal merge + reservoir shade and cost ~90 ms/frame at
+            // 16 spp on room (138 ms vs 46 ms equal-time vs path-traced GI):
+            // raygen's live-across-trace state (accumulators, dynamically
+            // indexed NRC arrays, payload) leaves no register headroom, so a
+            // composite local (Surf/ResolvedMaterial/GiSample — even inside
+            // an inlined leaf helper) spills to local memory, and holding the
+            // merge state in scalars blows register allocation instead,
+            // slowing code that never touches it. Bisections: empty block
+            // 39 ms, `unpack_surface` alone ~110 ms, scalarized full merge
+            // ~120 ms. The merge + shade now run in `restir_spatial.wgsl`'s
+            // `gi_finalize` dispatch (fresh register file, chit-cheap);
+            // raygen writes the canonical sample from values ALREADY LIVE in
+            // registers and touches no other memory.
             let l_reuse = gi_L - gi_e1;
             let canon_ok = gi_hit && gi_pdf1 > 0.0 && gi_pdf1 < 1.0e30;
-            var sel = GiSample(
-                gi_xs.x, gi_xs.y, gi_xs.z, gi_ns_oct,
-                l_reuse.x, l_reuse.y, l_reuse.z,
-                select(0.0, 1.0 / max(gi_pdf1, 1.0e-9), canon_ok),
-                a0.x, a0.y, a0.z,
-                select(0.0, 1.0, canon_ok),
-                surf_raw.normal_oct, surf_raw.view_z, 0u, 0u,
-            );
-            // Domain split: a bounce-1 MISS (sky/env) or delta pdf has no
-            // reconnection vertex — that suffix shades live per-frame, and the
-            // draw still counts toward M (W averages over ALL draws).
-            var gi_env = vec3<f32>(0.0);
-            if !canon_ok {
-                gi_env = a0 * (gi_L - gi_e1);
-            }
-            sel.m = 1.0;
             let cur_slot = pixel_index * 2u + (camera.frame.x & 1u);
             let has_surface = primary_cluster != 0xffffffffu;
-            if !has_surface {
-                sel.surf_view_z = 0.0;
+            // Only the LAST sample's canonical survives to `gi_finalize`
+            // (each store overwrites the slot and nothing reads it mid-loop),
+            // so skip the export for samples 0..rounds-1 — at 16 spp that is
+            // 15/16 of this block's memory traffic.
+            if s + 1u == rounds {
+            gi_samples[cur_slot].pos_x = gi_xs.x;
+            gi_samples[cur_slot].pos_y = gi_xs.y;
+            gi_samples[cur_slot].pos_z = gi_xs.z;
+            gi_samples[cur_slot].normal_oct = gi_ns_oct;
+            gi_samples[cur_slot].l_r = l_reuse.x;
+            gi_samples[cur_slot].l_g = l_reuse.y;
+            gi_samples[cur_slot].l_b = l_reuse.z;
+            gi_samples[cur_slot].w = select(0.0, 1.0 / max(gi_pdf1, 1.0e-9), canon_ok);
+            gi_samples[cur_slot].a0_r = a0.x;
+            gi_samples[cur_slot].a0_g = a0.y;
+            gi_samples[cur_slot].a0_b = a0.z;
+            // The draw counts toward M even when dead (W averages ALL draws).
+            gi_samples[cur_slot].m = 1.0;
+            // Generating-surface fields: `gi_finalize` fills them from the
+            // chit's SurfaceGbuf; view_z carries only the has-surface
+            // sentinel here (0 = sky, next frame's validation rejects).
+            gi_samples[cur_slot].surf_normal_oct = 0u;
+            gi_samples[cur_slot].surf_view_z = select(0.0, 1.0, has_surface);
+            gi_samples[cur_slot].pad_a = 0u;
+            gi_samples[cur_slot].pad_b = 0u;
             }
-            // Spatial pass owns the reservoir shade (flag bit 16); raygen keeps
-            // the per-pixel emission term and the dead-sample live fallback.
-            let gi_pass_owns = (eflags & 65536u) != 0u;
+            // Raygen keeps the per-pixel terms reuse can't carry: bounce-1
+            // emission (this pixel's DI-by-MIS partner) and the dead-sample
+            // live fallback (bounce-1 MISS / delta pdf has no reconnection
+            // vertex — that suffix shades per-frame). The reservoir shade
+            // lands in the output buffer from `gi_finalize`.
+            var gi_env = vec3<f32>(0.0);
+            if !canon_ok {
+                gi_env = a0 * l_reuse;
+            }
             gi_out = a0 * gi_e1 + gi_env;
-            if (eflags & 128u) != 0u && has_surface {
-                // Temporal merge with last frame's slot (prev parity), validated by
-                // the generating surface's depth/normal; p̂ re-evaluated here.
-                var sel_phat = 0.0;
-                var w_sum = 0.0;
-                if canon_ok {
-                    sel_phat = gi_phat(surf, sel);
-                    w_sum = sel_phat * sel.w * sel.m;
-                }
-                var m_total = sel.m;
-                // The canonical arm, kept for the shade-side re-merge below.
-                let canon = sel;
-                let canon_phat = sel_phat;
-                let canon_w_arm = w_sum;
-                var shade_done = false;
-                let decorrelate = (eflags & 524288u) != 0u;
-                let clip = camera.prev_clip_from_world * vec4<f32>(surf.pos, 1.0);
-                if clip.w > 1.0e-4 {
-                    let uv = (clip.xy / clip.w) * vec2<f32>(0.5, -0.5) + 0.5;
-                    if all(uv >= vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) {
-                        // THE CHAIN always merges the NEAREST fetch with the
-                        // certified math — never a jittered pick, never a
-                        // Jacobian. A Jacobian-corrected neighbor WRITTEN BACK
-                        // compounds its stand-in approximation error through
-                        // the fixed point (multiplicative noise, Jensen-biased
-                        // bright): panning turns seams into growing white
-                        // blobs. Decorrelation lives in the SHADE arm below,
-                        // which never touches storage (the spatial pass's
-                        // proven shade-only semantics).
-                        let pp = vec2<u32>(uv * camera.dims.xy);
-                        var hist =
-                            gi_samples[(pp.y * u32(camera.dims.x) + pp.x) * 2u + ((camera.frame.x + 1u) & 1u)];
-                        // World_rel is camera-origin: last frame's stored x_s is
-                        // in last frame's origin. Rebase or the reconnection
-                        // point drifts every frame the camera moves (glitter).
-                        hist.pos_x -= camera.origin_delta.x;
-                        hist.pos_y -= camera.origin_delta.y;
-                        hist.pos_z -= camera.origin_delta.z;
-                        let hn = octahedral_decode_signed(unpack2x16snorm(hist.surf_normal_oct));
-                        let depth_ok = abs(hist.surf_view_z - surf_raw.view_z) < 0.1 * surf_raw.view_z;
-                        if hist.m > 0.0 && depth_ok && dot(hn, surf.ns) > 0.9 {
-                            let m_h = min(hist.m, camera.dims.z);
-                            let ph = gi_phat(surf, hist);
-                            let wh = ph * hist.w * m_h;
-                            w_sum += wh;
-                            m_total += m_h;
-                            if wh > 0.0 && rand_f(&rng) * w_sum < wh {
-                                sel = hist;
-                                sel_phat = ph;
-                            }
-                        }
-                        // Shade-side decorrelation (flag bit 19, RR/production):
-                        // nearest-neighbor reprojection under motion is a zoomed
-                        // lattice — a moiré grid warping with camera distance.
-                        // Re-merge canonical + a stochastic-bilinear history
-                        // pick (validated, Jacobian-transported) for THIS
-                        // frame's shade only. Rejected pick ⇒ fall through to
-                        // the chain shade (warm), never a cold pixel.
-                        if decorrelate && !gi_pass_owns {
-                            let pf = uv * camera.dims.xy - 0.5;
-                            let base = floor(pf);
-                            let fr = pf - base;
-                            let jit = base
-                                + vec2<f32>(select(0.0, 1.0, rand_f(&rng) < fr.x),
-                                            select(0.0, 1.0, rand_f(&rng) < fr.y));
-                            let pj = vec2<u32>(clamp(jit, vec2<f32>(0.0), camera.dims.xy - 1.0));
-                            var hj =
-                                gi_samples[(pj.y * u32(camera.dims.x) + pj.x) * 2u + ((camera.frame.x + 1u) & 1u)];
-                            hj.pos_x -= camera.origin_delta.x;
-                            hj.pos_y -= camera.origin_delta.y;
-                            hj.pos_z -= camera.origin_delta.z;
-                            let hjn = octahedral_decode_signed(unpack2x16snorm(hj.surf_normal_oct));
-                            let hj_depth_ok =
-                                abs(hj.surf_view_z - surf_raw.view_z) < 0.1 * surf_raw.view_z;
-                            if hj.m > 0.0 && hj_depth_ok && dot(hjn, surf.ns) > 0.9
-                                && hj.w > 0.0 {
-                                // pj's CURRENT surface stands in for the record's
-                                // generating one — trusted only while it matches
-                                // the record's stored depth/normal (an edge pixel
-                                // that changed owners mis-measures the Jacobian).
-                                let nb_raw = surfaces[pj.y * u32(camera.dims.x) + pj.x];
-                                let nb_n = octahedral_decode_signed(
-                                    unpack2x16snorm(nb_raw.normal_oct));
-                                let nb_ok = abs(nb_raw.view_z - hj.surf_view_z)
-                                    < 0.1 * hj.surf_view_z && dot(nb_n, hjn) > 0.9;
-                                let nb_pos =
-                                    vec3<f32>(nb_raw.pos_x, nb_raw.pos_y, nb_raw.pos_z);
-                                let xs = vec3<f32>(hj.pos_x, hj.pos_y, hj.pos_z);
-                                let n_s =
-                                    octahedral_decode_signed(unpack2x16snorm(hj.normal_oct));
-                                let to_me = surf.pos - xs;
-                                let to_nb = nb_pos - xs;
-                                let d2_me = dot(to_me, to_me);
-                                let d2_nb = dot(to_nb, to_nb);
-                                let cos_me =
-                                    abs(dot(n_s, to_me)) * inverseSqrt(max(d2_me, 1.0e-8));
-                                let cos_nb =
-                                    abs(dot(n_s, to_nb)) * inverseSqrt(max(d2_nb, 1.0e-8));
-                                let jac = (cos_me / max(cos_nb, 1.0e-4))
-                                    * (d2_nb / max(d2_me, 1.0e-8));
-                                if nb_ok && d2_me > 1.0e-8 && d2_nb > 1.0e-8
-                                    && jac >= 0.1 && jac <= 10.0 {
-                                    var sh_sel = canon;
-                                    var sh_phat = canon_phat;
-                                    var sh_wsum = canon_w_arm;
-                                    var sh_m = canon.m;
-                                    let m_hj = min(hj.m, camera.dims.z);
-                                    let ph_j = gi_phat(surf, hj);
-                                    let wh_j = ph_j * hj.w * jac * m_hj;
-                                    sh_wsum += wh_j;
-                                    sh_m += m_hj;
-                                    if wh_j > 0.0 && rand_f(&rng) * sh_wsum < wh_j {
-                                        sh_sel = hj;
-                                        sh_phat = ph_j;
-                                    }
-                                    if sh_phat > 0.0 && sh_m > 0.0 && sh_wsum > 0.0 {
-                                        let sh_w = sh_wsum / (sh_m * sh_phat);
-                                        gi_out += gi_shade(surf, sh_sel) * sh_w;
-                                        shade_done = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                sel.m = m_total;
-                sel.w = 0.0;
-                if sel_phat > 0.0 && m_total > 0.0 {
-                    sel.w = w_sum / (m_total * sel_phat);
-                }
-                // Spatial-debug instrument (flag bit 18): stash the shade raygen
-                // WOULD apply — the pass's ratio paint reads it (taps 0 ⇒ must be 1).
-                if gi_pass_owns && (eflags & 262144u) != 0u {
-                    var ref_lum = 0.0;
-                    if sel.w > 0.0 {
-                        ref_lum = pick_luminance(gi_shade(surf, sel) * sel.w);
-                    }
-                    dbg_gi_lum_sum += ref_lum;
-                    sel.pad_a = bitcast<u32>(ref_lum);
-                    sel.pad_b = bitcast<u32>(dbg_gi_lum_sum);
-                }
-                gi_samples[cur_slot] = sel;
-                if !gi_pass_owns && !shade_done && sel.w > 0.0 {
-                    gi_out += gi_shade(surf, sel) * sel.w;
-                }
-            } else {
-                if !canon_ok {
-                    sel.w = 0.0;
-                }
-                gi_samples[cur_slot] = sel;
-                let stored = gi_samples[cur_slot];
-                if stored.w > 0.0 {
-                    if gi_pass_owns {
-                    } else if (eflags & 64u) != 0u {
-                        gi_out += gi_shade(surf, stored) * stored.w;
-                    } else {
-                        gi_out += vec3<f32>(stored.a0_r, stored.a0_g, stored.a0_b)
-                            * vec3<f32>(stored.l_r, stored.l_g, stored.l_b);
-                    }
-                }
-            }
-            // Realtime firefly filter (dims.w; the reference passes 0 = off):
-            // scale GI spikes down luminance-preserving. The pass-owned spatial
-            // shade applies the same threshold on its own add.
+            // Realtime firefly filter (dims.w; the reference passes 0 = off)
+            // on the raygen-owned terms; `gi_finalize` clamps its own add.
             if camera.dims.w > 0.0 {
                 let gi_lum = luminance(gi_out);
                 if gi_lum > camera.dims.w {
@@ -1109,8 +979,12 @@ fn raygen(
                 // Measured path suffix leaving vertex k (radiance from k
                 // onward ÷ throughput into k). Clamp tames the
                 // small-denominator tail.
-                let tin = max(nrc_atten[k], vec3(3.0e-2));
-                var tgt = (radiance - nrc_prefix_rad[k]) / tin * E;
+                let a_p = nrc_atten[k];
+                let atten_k = vec3<f32>(unpack2x16float(a_p.x), unpack2x16float(a_p.y).x);
+                let r_p = nrc_prefix_rad[k];
+                let prefix_k = vec3<f32>(unpack2x16float(r_p.x), unpack2x16float(r_p.y).x);
+                let tin = max(atten_k, vec3(3.0e-2));
+                var tgt = (radiance - prefix_k) / tin * E;
                 if any(tgt != tgt) {
                     tgt = vec3(0.0);
                 }

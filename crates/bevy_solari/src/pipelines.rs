@@ -92,6 +92,10 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "transform/transform_gather.wgsl");
     embedded_asset!(app, "transform/transform_readback.wgsl");
     embedded_asset!(app, "render/rt_pipeline/rt_camera.wgsl");
+    // rt_payload.wgsl is composed into the raw-VK RT pipeline directly, but
+    // restir_spatial.wgsl (a wgpu compute pass) #imports its RtCamera struct —
+    // the wgpu pipeline cache resolves that only for registered libraries.
+    bevy_shader::load_shader_library!(app, "render/rt_pipeline/rt_payload.wgsl");
     embedded_asset!(app, "lights/light_resolve.wgsl");
     embedded_asset!(app, "render/atmosphere_bake.wgsl");
     embedded_asset!(app, "render/atmosphere_lut_bake.wgsl");

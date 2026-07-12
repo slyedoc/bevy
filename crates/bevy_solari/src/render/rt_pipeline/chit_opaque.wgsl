@@ -465,7 +465,9 @@ fn chit_opaque(
                     pack2x16float(vec2<f32>(ray_hit.material.roughness, ray_hit.material.perceptual_roughness)),
                     pack2x16float(vec2<f32>(ray_hit.material.reflectance, 0.0)),
                     pack2x16snorm(octahedral_encode(wo) * 2.0 - 1.0),
-                    0u,
+                    // f_ab rides along: raygen/spatial must never re-sample
+                    // the DFG LUT (see SurfaceGbuf.f_ab_packed).
+                    pack2x16float(F_ab),
                 );
             }
             if spatial_on {
