@@ -589,6 +589,12 @@ fn raygen(
         var sample_cap = bounce_cap;
         if nrc_training && s == 0u {
             sample_cap = MAX_BOUNCES;
+        } else if nrc_gi_on {
+            // Sharp-footprint chains (mirror/glossy prefixes: delta pdf ⇒
+            // the spread accumulator adds ~0) DEFER their cache query past
+            // the path cap (see nrc_term's spread gate) — give them rope to
+            // the bounce-5 hard stop. Diffuse chains still query at the cap.
+            sample_cap = max(bounce_cap, 5u);
         }
         for (var bounce = 0u; bounce < sample_cap + 1u; bounce += 1u) {
             // Black-hole geodesic (stand-in): bend the ray toward the mass and
@@ -750,9 +756,16 @@ fn raygen(
             // relative-L2). Without ReSTIR GI that's ≤4096 inline evals/frame
             // — the coherent batch carries the bulk.
             // `bounce >= bounce_cap` folds the path-length cap in: the last
-            // allowed vertex queries the cache instead of dropping the tail.
+            // allowed vertex queries the cache instead of dropping the tail —
+            // but ONLY once the footprint has spread (nrc_spread_hit). A
+            // mirror/glossy prefix has ~zero spread at the cap (delta pdf),
+            // and querying there paints the cache's blurry, under-trained,
+            // chromatic answer into a pinhole-sharp reflection (the colored
+            // metal-sphere artifact in every grayscale rt render). Sharp
+            // chains keep tracing REAL transport (sample_cap extends to 5
+            // when NRC is armed) and query where the footprint widens.
             let nrc_term = bounce >= 5u || (bounce >= 2u && nrc_spread_hit)
-                || bounce >= bounce_cap;
+                || (bounce >= bounce_cap && nrc_spread_hit);
             // Training paths terminate deeper (16× the spread threshold,
             // bounces 3-7): their TD targets then carry more measured
             // bounces before the cache bootstrap — the grounding that damps
