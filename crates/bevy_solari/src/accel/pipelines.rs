@@ -5,7 +5,7 @@
 //! co-located one-per-file. They're owned by
 //! [`SolariResourceManager`](crate::resource_manager::SolariResourceManager) (which
 //! calls these), and the matching pipeline ids by
-//! [`SolariPipelines`](crate::pipelines::SolariPipelines) — the meshlet split.
+//! [`SolariPipelines`](crate::pipelines::SolariPipelines).
 
 use bevy_render::{
     render_resource::{

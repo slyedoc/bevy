@@ -116,7 +116,7 @@ struct Reservoir {
 
 // Primary-hit surface attributes for the ReSTIR spatial pass (48 B/pixel): the
 // exact shading inputs `evaluate_brdf`/`brdf_pdf`/`F_AB` need, f16-packed
-// (≤~0.1% shade error vs the chit's textured resolve — far under the 1% gate).
+// (≤~0.1% shade error vs the chit's textured resolve).
 // Positions are camera-relative (trace space); `wo = -normalize(pos)`.
 struct SurfaceGbuf {
     pos_x: f32,
@@ -212,8 +212,7 @@ struct ResolvedLightSample {
 // `physical_load` — reshades from stored data alone. Two halves: the RESOLVED
 // LIGHT (for neighbors re-targeting this sample at THEIR surface) and the chit's
 // EXACT shaded f + p̂ (for the OWN pixel, so its shade can't drift from the chit's
-// live value — the G-buffer-reconstructed recompute darkens dim pixels ~6%).
-// Plain f32 so it matches the chit under the 1% gate.
+// live value). Plain f32 so the reshade matches the chit.
 struct StoredLight {
     px: f32, py: f32, pz: f32, pw: f32, // world_position (w = 1 area, 0 directional)
     nx: f32, ny: f32, nz: f32,          // world_normal

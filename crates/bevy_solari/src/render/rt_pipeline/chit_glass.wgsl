@@ -17,7 +17,7 @@ enable primitive_index;
 
 #import bevy_solari::rt_payload::{RtPayload, RtCamera}
 #import bevy_solari::brdf::sample_glass_bsdf
-#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin}
+#import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin, set_reproj_origin_delta}
 
 var<incoming_ray_payload> payload: RtPayload;
 // Driver-provided triangle barycentrics (the fixed-function intersection's u, v).
@@ -60,6 +60,9 @@ fn chit_glass(
     @builtin(hit_triangle_vertex_positions) hit_positions: array<vec3<f32>, 3>,
 ) {
     var rng = payload.rng;
+    // Tess hits synthesize their previous position from the current one; seed
+    // the delta so it lands in the previous frame's origin like the mesh path.
+    set_reproj_origin_delta(camera.origin_delta.xyz);
     let barycentrics = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
     // Row-form affine (m[r] = (basis_row_r, translation_r)) the resolve expects.
     let transform = mat3x4<f32>(
@@ -116,10 +119,12 @@ fn chit_glass(
             let f0 = pow((ray_hit.material.ior - 1.0) / (ray_hit.material.ior + 1.0), 2.0);
             gbuffer_specular[px] = vec4<f32>(f0, f0, f0, 0.0);
             // Screen-space motion of the glass surface (current vs previous unjittered
-            // clip), UV space y-flipped. Guard last frame's divide too; zero motion if
-            // the surface was at the eye then.
-            let prev_clip =
-                camera.prev_clip_from_world * vec4<f32>(ray_hit.previous_frame_world_position, 1.0);
+            // clip), UV space y-flipped. previous_frame_world_position is in the
+            // PREVIOUS frame's origin; the rebased prev matrix expects CURRENT-origin
+            // input — convert, or static MVs are off by the camera delta. Guard last
+            // frame's divide too; zero motion if the surface was at the eye then.
+            let prev_clip = camera.prev_clip_from_world
+                * vec4<f32>(ray_hit.previous_frame_world_position - camera.origin_delta.xyz, 1.0);
             var motion = vec2<f32>(0.0);
             if prev_clip.w > 1.0e-4 {
                 let cur_uv = (cur_clip.xy / cur_clip.w) * vec2<f32>(0.5, -0.5);

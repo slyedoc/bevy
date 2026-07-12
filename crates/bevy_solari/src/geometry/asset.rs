@@ -138,7 +138,7 @@ pub struct ClusterMesh {
     pub lod_levels: u32,
     /// Opacity micro-map array build data (`VkMicromapEXT` input), or empty
     /// when this mesh has no baked OMM. Baked offline from the material's
-    /// alpha texture — see the `solari-omm-cluster-path` plan.
+    /// alpha texture.
     pub omm_array_data: Arc<[u8]>,
     /// Per-OMM descriptors into `omm_array_data` (micromap triangle array).
     pub omm_descs: Arc<[OmmDesc]>,
@@ -274,8 +274,7 @@ impl ClusterMesh {
 
     /// Attach an offline-baked opacity micro-map. `per_tri_index` must be
     /// parallel to the mesh's triangles in the SAME order as [`Self::indices`]
-    /// (post-cluster), so cluster index ranges slice it directly. See the
-    /// `solari-omm-cluster-path` plan.
+    /// (post-cluster), so cluster index ranges slice it directly.
     pub fn set_opacity_micromap(
         &mut self,
         array_data: Vec<u8>,
@@ -299,11 +298,9 @@ impl ClusterMesh {
 /// exact 16 B: normal@0, tangent@4, uv@8). Position is NOT here — the closest-hit
 /// reads it straight from the acceleration structure via
 /// `@builtin(hit_triangle_vertex_positions)` (`VK_KHR_ray_tracing_position_fetch`),
-/// and the rare CPU/sampling path that resolves a non-hit triangle reads it from
-/// the separate `vertex_positions` SoA pool. Dropping the 12-byte position head
-/// (28→16 B) packs more vertices per cache line → higher L1 hit, and removes the
-/// position duplication between this pool and `vertex_positions`. Built at upload,
-/// parallel to `vertex_positions` (same global vertex index).
+/// and the rare sampling path that resolves a non-hit triangle reads it from the
+/// separate `vertex_positions` SoA pool. Built at upload, parallel to
+/// `vertex_positions` (same global vertex index).
 #[derive(Copy, Clone, Pod, Zeroable, Debug, Default)]
 #[repr(C)]
 pub struct PackedVertex {

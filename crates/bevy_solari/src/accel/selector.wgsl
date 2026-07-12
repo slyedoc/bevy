@@ -10,8 +10,7 @@
 //   emit group G iff G.error <= E_build ∧ (G is root ∨ parent(G).error > E_build)
 //        ∨ (G is finest ∧ G.error > E_build)        // leaf fallback
 //
-// This is the object-space analogue of the old per-instance
-// screen-space cut: the projection collapses to a constant (the band's
+// The screen-space projection collapses to a constant (the band's
 // budget), so there is no camera, transform, or sphere here. Monotone
 // `max_quadric_error` across the DAG (guaranteed by the bake) makes the
 // cut single-coverage — every surface region appears exactly once.

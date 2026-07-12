@@ -64,8 +64,7 @@ fn cluster_bvh_node_is_group_leaf(n: ClusterBvhNode) -> bool {
 
 // Per-instance world transforms — slot-indexed `mat3x4` affine
 // (column k = 4x4 row k), GPU-scattered from a CPU delta by
-// `cluster::gpu_instances`. Replaces the old full `array<Mesh>`
-// re-upload.
+// `cluster::gpu_instances`.
 @group(0) @binding(10) var<storage, read> cluster_instance_transforms: array<mat3x4<f32>>;
 @group(0) @binding(11) var<storage, read> cluster_instance_group_bases: array<u32>;
 

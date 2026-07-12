@@ -5,13 +5,13 @@
 //
 // This is NVIDIA "BLAS merging" (vk_lod_clusters) applied to a fully
 // resident engine: the BLAS count is bounded by the resident geometry
-// universe — scene-stable and view-INDEPENDENT — so it never blows up
-// the way the old (geometry, distance-band) bucket model did. Geometry
-// BLAS addresses are `pool_base + geometry_id * stride`, stable for the
-// geometry's life, so a static instance is a PTLAS no-op (incremental
-// PTLAS restored). A geometry only rebuilds when its chosen LOD level
-// changes (camera crossing a band for the *closest* instance), and only
-// the instances of rebuilt geometries get re-written to the PTLAS.
+// universe — scene-stable and view-independent, unlike a
+// (geometry, distance-band) bucketing whose count grows with the view.
+// Geometry BLAS addresses are `pool_base + geometry_id * stride`, stable
+// for the geometry's life, so a static instance is an incremental-PTLAS
+// no-op. A geometry only rebuilds when its chosen LOD level changes
+// (camera crossing a band for the *closest* instance), and only the
+// instances of rebuilt geometries get re-written to the PTLAS.
 //
 // Per-frame passes (one thread per active instance / per geometry):
 //   0. geom_reset   — desired_level[gid]=NO_LEVEL, dirty[gid]=0.
@@ -164,12 +164,12 @@ fn classify_level(slot: u32, root_group: u32) -> u32 {
     let focal_px = view_focal_px();
     let world_center = apply_affine(slot, root.traversal_sphere.xyz);
     let world_radius = root.traversal_sphere.w * scale;
-    // `cluster_instance_transforms` is the ORIGIN-RELATIVE world (`world_rel`,
-    // origin = the camera itself), so the camera sits at (0,0,0) in this
-    // space. Subtracting `view.world_position` (ABSOLUTE) mixed spaces: at
-    // 9e6 m from the origin every instance classified as ~9e6 m away →
-    // coarsest LOD band (foliage decimation), and camera motion spuriously
-    // crossed bands → shared-BLAS rebuild storms (movement hitches).
+    // `cluster_instance_transforms` is the ORIGIN-RELATIVE world (origin = the
+    // camera itself), so the camera sits at (0,0,0) in this space and distance
+    // is just the center's length. Subtracting `view.world_position` (ABSOLUTE)
+    // would mix spaces: far from the world origin every instance classifies as
+    // origin-distance away (coarsest band), and camera motion spuriously
+    // crosses bands (shared-BLAS rebuild storms).
     let center_dist = length(world_center);
     let surface_dist = max(params.near_distance, center_dist - world_radius);
     let denom = max(scale * focal_px, 1e-12);

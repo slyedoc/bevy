@@ -11,9 +11,8 @@ use crate::material::StandardSolariMaterial;
 /// per-material `GpuMaterial` entries without holding the main-world asset store
 /// across schedules.
 ///
-/// Per-entity extraction (transforms / `RaytracingMesh3d` handles) happens via
-/// [`crate::instance::extract_cluster_instances`], which drives `InstanceManager`
-/// directly — no need for a separate `extract_raytracing_scene` system.
+/// Per-entity extraction (transforms / `RaytracingMesh3d` handles) is
+/// change-driven through [`crate::instance::InstanceManager`].
 #[derive(Resource, Deref, Default)]
 pub struct SolariMaterialAssets(HashMap<AssetId<StandardSolariMaterial>, StandardSolariMaterial>);
 

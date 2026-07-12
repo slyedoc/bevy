@@ -1,15 +1,12 @@
 //! GPU instance reconcile pass — folds the CPU's absolute-state change journal
 //! ([`crate::instance::RtJournal`]) into the per-instance GPU columns. One thread
 //! per journal record writes **all** of a slot's columns from the single record,
-//! so a reused slot is re-initialized atomically (no partial/stale column — the
-//! aliasing fix). See `reconcile.wgsl`.
+//! so a reused slot is re-initialized atomically (no partial/stale column).
+//! See `reconcile.wgsl`.
 //!
 //! The pass is self-contained: it owns its bind-group layout, pipeline id, and
-//! params buffer, and dispatches in [`SolariClusterSystems::Scatter`] alongside the
-//! per-column scatter. The journal carries the same per-slot values the scatter
-//! derives from its deltas, so the two writes agree; making the reconcile the sole
-//! writer (and deleting the redundant scatter) is the authority-flip step, gated on
-//! GPU validation.
+//! params buffer. The reconcile is the sole writer of the bind-only instance
+//! columns (journal `UPSERT`/`REMOVE` is GPU-reconcile-authoritative).
 
 use bevy_app::{App, Plugin};
 use bevy_asset::{load_embedded_asset, AssetServer};
@@ -127,7 +124,7 @@ pub fn prepare_rt_reconcile(
 }
 
 /// `Render::PrepareBindGroups`: build the reconcile bind group. The journal ring and
-/// every column buffer are stable-address (sparse), so once built it stays valid.
+/// every column buffer are stable-address (sparse), so the group is always valid.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_rt_reconcile_bind_group(
     reconcile: Option<ResMut<RtReconcile>>,

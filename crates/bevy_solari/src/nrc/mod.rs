@@ -1,8 +1,9 @@
-//! Neural Radiance Cache — zero/docs/nrc.md.
+//! Neural Radiance Cache: a small MLP trained online to predict cached
+//! radiance at GI path terminations.
 //!
-//! Training transplants the gym-certified coopmat pipeline into the render
-//! graph (encode records → fwd → loss → bwd → adam, dispatched after the
-//! trace each frame); raygen writes one training record per rotating pixel
+//! Training runs on the render graph as a coopmat compute chain (encode
+//! records → fwd → loss → bwd → adam, dispatched after the trace each
+//! frame); raygen writes one training record per rotating pixel
 //! subset. GI paths terminate into the cache by appending queries that the
 //! `nrc_query_infer` pass batch-evaluates (coherent coopvec against the
 //! transposed f16 weight mirror adam maintains) and composites into the
@@ -39,6 +40,8 @@ pub const NRC_RECORD_SIZE: usize = 80;
 /// the viewport (one query per pixel per frame) plus a 16-byte count header.
 /// Must match `NrcQueryGpu`/`NrcQueryBuf` in raygen.wgsl and nrc_mlp.wgsl.
 pub const NRC_QUERY_SIZE: usize = 48;
+/// Bytes per record in the loss-readback staging buffer: 4 loss + 16 target.
+const LOSS_STAGING_BYTES_PER_RECORD: u64 = 20;
 /// Inference-mirror EMA weight per adam step (~50-step time constant): the
 /// rendered cache tracks a smoothed trajectory of the optimizer instead of
 /// its per-step oscillation.
@@ -404,6 +407,7 @@ pub fn init_nrc_buffers(
     allocator: Option<Res<Allocator>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    settings: Res<crate::SolariSettings>,
 ) {
     if existing.is_some() {
         return;
@@ -445,12 +449,9 @@ pub fn init_nrc_buffers(
     let bias16: Buffer = bias16.into();
     let records: Buffer = records.into();
 
-    // deterministic He-uniform init, mirrored three ways. `SOLARI_NRC_SEED`
-    // overrides (A/B: does a trained-cache artifact follow the init?).
-    let mut state: u64 = std::env::var("SOLARI_NRC_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0x9e3779b97f4a7c15);
+    // Deterministic He-uniform init, mirrored three ways;
+    // `SolariSettings::nrc_seed` sets the seed.
+    let mut state: u64 = settings.nrc_seed;
     let mut next = move || {
         state ^= state << 13;
         state ^= state >> 7;
@@ -598,7 +599,8 @@ pub fn init_nrc_buffers(
         loss: mk("nrc_loss", batch * 4, storage),
         loss_staging: mk(
             "nrc_loss_staging",
-            batch * 20,
+            // 4 loss bytes + 16 target bytes per record.
+            batch * LOSS_STAGING_BYTES_PER_RECORD,
             BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         ),
         zeros: mk("nrc_zeros", 1024, storage),
@@ -993,8 +995,8 @@ pub fn dispatch_training(
 }
 
 /// `Render::Cleanup`: fully non-blocking staged loss readback — a blocking
-/// poll here races the raw-VK trace machinery (device-lost class, learned
-/// the hard way). Copy → map_async next frame → read once the callback fires.
+/// poll here races the raw-VK trace machinery and can lose the device.
+/// Copy → map_async next frame → read once the callback fires.
 pub fn log_nrc_loss(bufs: Option<ResMut<NrcBuffers>>, _device: Res<RenderDevice>) {
     use std::sync::atomic::Ordering;
     let Some(mut bufs) = bufs else { return };
@@ -1025,7 +1027,6 @@ pub fn log_nrc_loss(bufs: Option<ResMut<NrcBuffers>>, _device: Res<RenderDevice>
                     .map(|&l| l as f64)
                     .sum();
                 let mean = finite_sum / (batch - nan_losses).max(1) as f64;
-                let nan_targets = targets.iter().filter(|t| !t.is_finite()).count();
                 let max_target = targets
                     .chunks(4)
                     .map(|c| c[0].max(c[1]).max(c[2]))
@@ -1038,7 +1039,6 @@ pub fn log_nrc_loss(bufs: Option<ResMut<NrcBuffers>>, _device: Res<RenderDevice>
                     "nrc: step {} relative-L2 {mean:.5} (nan {nan_losses}, valid {valid}/{batch}, max target {max_target:.2})",
                     bufs.step
                 );
-                let _ = nan_targets;
             }
             bufs.loss_staging.unmap();
             bufs.loss_state = 0;

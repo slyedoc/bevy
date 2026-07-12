@@ -64,10 +64,9 @@ impl<T: GpuSlotTable> GpuSlot<T> {
 
 /// Slot allocator core: a monotonic counter + free-list, split out from
 /// [`GpuSlotAllocator`] so the recycle logic is unit-testable without the
-/// `GpuSlotTable` machinery. A freed slot is returned to the pool immediately —
-/// the slot-recycle ABA on the `GlobalTransform` readback is closed by stamping the
-/// owning `Entity` into each readback record (entity-keyed, lag-independent), so no
-/// reuse-deferral is needed here.
+/// `GpuSlotTable` machinery. A freed slot is returned to the pool immediately:
+/// slot-recycle ABA on the `GlobalTransform` readback is closed by the owning
+/// `Entity` stamped into each readback record, so no reuse-deferral is needed.
 #[derive(Default)]
 struct SlotFreeList {
     next: u32,
@@ -92,9 +91,9 @@ impl SlotFreeList {
 }
 
 /// Main-world slot allocator for table `T`: a monotonic counter + free-list
-/// ([`SlotFreeList`]). The forward [`GpuSlot<T>`] component covers entity→slot; the
-/// reverse direction is no longer tracked here — the `GlobalTransform` readback
-/// carries the owning `Entity` and resolves it directly (see `transform::readback`).
+/// ([`SlotFreeList`]). The [`GpuSlot<T>`] component covers entity→slot; no
+/// reverse map is kept — the `GlobalTransform` readback carries the owning
+/// `Entity` and resolves it directly (see `transform::readback`).
 #[derive(Resource)]
 pub struct GpuSlotAllocator<T: GpuSlotTable> {
     slots: SlotFreeList,
@@ -376,8 +375,8 @@ mod tests {
 
     #[test]
     fn mass_free_then_reuse() {
-        // Mirrors a regenerate: free a large batch, confirm it's all reusable at once
-        // (no quarantine delay) before the high-water grows again.
+        // Mirrors a regenerate: free a large batch, confirm it's all reusable at
+        // once before the high-water grows again.
         let mut f = SlotFreeList::default();
         let slots: Vec<u32> = (0..1000).map(|_| f.allocate()).collect();
         for &s in &slots {

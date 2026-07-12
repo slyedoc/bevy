@@ -33,6 +33,7 @@ mod propagate;
 mod readback;
 mod subtract;
 
+pub(crate) use frontier::latch_xform_debug;
 pub use frontier::{
     dispatch_transform_frontier, init_transform_frontier, prepare_transform_frontier,
     prepare_transform_frontier_bind_group, transform_frontier_bind_group_layout,

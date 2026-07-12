@@ -37,6 +37,7 @@ fn main() {
         .add_plugins((
             DefaultPlugins,
             SolariPlugin,
+            SolariAtmospherePlugin,
             FeathersPlugins,
             FreeCameraPlugin,
             FrameTimeDiagnosticsPlugin::default(),

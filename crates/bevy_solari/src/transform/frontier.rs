@@ -1,9 +1,8 @@
 //! GPU frontier expansion — turn this frame's *changed* nodes into changed nodes
 //! **plus all their descendants**, entirely on the GPU.
 //!
-//! The propagate walk recomposes only the nodes in its dispatch list; a moving
-//! parent's descendants didn't change their own `local`, so they used to need a
-//! CPU-side marker + subtree re-push (the late `SolariFrame`). This pass replaces that: the changed
+//! The propagate walk recomposes only the nodes in its dispatch list, and a
+//! moving parent's descendants didn't change their own `local` — so the changed
 //! `local` delta (plus [`GpuFrameSeeds`] — GPU-moved nodes with no CPU change edge)
 //! seeds a worklist that expands level-by-level through the `first_child` /
 //! `next_sibling` columns, deduped by a per-node frame-epoch stamp. The result —
@@ -42,11 +41,17 @@ use super::graph::{
 
 const WORKGROUP_SIZE: u32 = 64;
 
-/// `SOLARI_XFORM_DEBUG=1`: trace the changed-path seed/walk decisions — the
-/// silent-bail points where cold-start seed loss hides.
+static XFORM_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Latch [`SolariSettings::xform_debug`](crate::SolariSettings) at plugin `finish`.
+pub(crate) fn latch_xform_debug(on: bool) {
+    let _ = XFORM_DEBUG.set(on);
+}
+
+/// [`SolariSettings::xform_debug`](crate::SolariSettings): trace the changed-path
+/// seed/walk decisions — the silent-bail points where cold-start seed loss hides.
 pub(crate) fn xform_debug() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SOLARI_XFORM_DEBUG").as_deref() == Ok("1"))
+    XFORM_DEBUG.get().copied().unwrap_or(false)
 }
 /// Max expansion depth (hierarchy levels below a moved node). Must match
 /// `transform_frontier.wgsl`; deeper descendants go stale (mirror of the walk's

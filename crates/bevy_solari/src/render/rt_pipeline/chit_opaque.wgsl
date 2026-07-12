@@ -3,10 +3,10 @@
 // structure: NEE samples a light and tests visibility with a `traceRay` shadow ray
 // (SKIP_CLOSEST_HIT + TERMINATE_ON_FIRST_HIT, routed to the dedicated `miss_shadow`
 // program via an explicit miss index). The fixed-function traversal keeps the
-// shadow query OFF the chit's register file — unlike an inline `rayQuery`, which is
-// what previously blew this shader's occupancy. The raygen driver owns the bounce
-// loop + throughput; this shader fills the payload with the radiance at this vertex
-// and the next ray to trace.
+// shadow query OFF the chit's register file — an inline `rayQuery` here would blow
+// this shader's occupancy. The raygen driver owns the bounce loop + throughput;
+// this shader fills the payload with the radiance at this vertex and the next ray
+// to trace.
 enable wgpu_ray_tracing_pipeline;
 enable primitive_index;
 
@@ -38,7 +38,7 @@ var<hit_attribute> bary: vec2<f32>;
 @group(1) @binding(7) var<storage, read_write> gbuffer_specular: array<vec4<f32>>;
 @group(1) @binding(8) var<storage, read_write> gbuffer_motion: array<vec4<f32>>;
 #endif
-// ReSTIR DI reservoirs (rung 3): 2 interleaved slots per pixel (see `Reservoir`).
+// ReSTIR DI reservoirs: 2 interleaved slots per pixel (see `Reservoir`).
 // The primary hit merges last frame's slot temporally and writes this frame's.
 @group(1) @binding(9) var<storage, read_write> reservoirs: array<Reservoir>;
 // Primary-hit surface attributes for the spatial merge+shade pass (flag bit 3):
@@ -174,7 +174,7 @@ fn chit_opaque(
     // Estimator flags (RtCamera.atmo.w): bit 0 = NEE off (SolariReference validation
     // lever — BSDF-only). With NEE off, emissive MIS weights MUST stay 1 or the
     // technique's share of the energy is simply dropped (biased dark).
-    // Bit 1 = ReSTIR DI (rung 3): reservoir + temporal reuse at the primary vertex,
+    // Bit 1 = ReSTIR DI: reservoir + temporal reuse at the primary vertex,
     // emissive-only single-sample NEE at bounce vertices, directionals sampled
     // deterministically per light everywhere (the sun never enters a reservoir).
     let flags = bitcast<u32>(camera.atmo.w);
@@ -206,7 +206,7 @@ fn chit_opaque(
     var emitted = mis_weight * ray_hit.material.emissive;
     payload.emissive_mis = emitted;
 
-    // Direct lighting via RIS (rung 2): stream M light candidates through a
+    // Direct lighting via RIS: stream M light candidates through a
     // one-slot weighted reservoir — each weighted w = p̂/p, where the target
     // p̂ = luminance(w_mis · BRDF · L · G) folds the NEE-vs-BSDF MIS weight into
     // the technique's integrand (RIS is unbiased for ANY integrand, and the
@@ -229,7 +229,7 @@ fn chit_opaque(
         if restir_mode {
             if emissive_light_count() > 0u {
                 // Candidates: M at the primary vertex (the reservoir), single-sample
-                // NEE at bounce vertices — rung 2 proved per-bounce M is pure cost.
+                // NEE at bounce vertices — per-bounce M is pure cost.
                 let cand_m = select(1u, ris_m, is_primary);
                 for (var c = 0u; c < cand_m; c += 1u) {
                     let cand = generate_random_emissive_light_sample(&rng);
@@ -276,10 +276,9 @@ fn chit_opaque(
                     if prev_clip.w > 1.0e-4 {
                         let prev_uv = (prev_clip.xy / prev_clip.w) * vec2<f32>(0.5, -0.5) + 0.5;
                         if all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv < vec2<f32>(1.0)) {
-                            // DI keeps the nearest fetch: the stochastic pick is
-                            // re-landing one domain at a time (GI first — see
-                            // raygen) to pin the edge-fizz source before DI gets
-                            // its own jitter + fallback.
+                            // DI history uses the nearest fetch; GI's
+                            // stochastic-bilinear decorrelation (see raygen)
+                            // is not applied to DI.
                             let pp = vec2<u32>(prev_uv * camera.dims.xy);
                             let prev_slot = (pp.y * u32(camera.dims.x) + pp.x) * 2u
                                 + (1u - (camera.frame.x & 1u));
@@ -320,8 +319,8 @@ fn chit_opaque(
                 }
             }
         } else {
-            // Rung-2 path (restir off), byte-identical estimator: stratified
-            // candidates (directional + emissive) through the one-slot reservoir.
+            // ReSTIR off: stratified candidates (directional + emissive)
+            // through the one-slot reservoir.
             for (var c = 0u; c < ris_m; c += 1u) {
                 let cand = generate_random_light_sample(&rng);
                 if cand.light_sample.light_id == NULL_LIGHT_ID {

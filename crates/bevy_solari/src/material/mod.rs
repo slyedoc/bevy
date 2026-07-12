@@ -1,4 +1,5 @@
-//! `bevy_solari`'s own material type and its plugin to avoid bevy_pbr systems and cpu time
+//! `bevy_solari`'s own material type, independent of `bevy_pbr`'s `Material`
+//! systems and their per-frame CPU cost.
 //!
 //! While `PbrPlugin` is still enabled, [`StandardSolariMaterial`] also provides a
 //! `From<&StandardMaterial>` bridge so existing content (code-authored or
@@ -105,7 +106,7 @@ pub struct StandardSolariMaterial {
     pub texture_array_b: Option<Handle<Image>>,
     /// Third layered-texture slot (e.g. tangent-space normal layers).
     pub texture_array_c: Option<Handle<Image>>,
-    /// SBT hit-group class (`0` = opaque/glass routing); set from a [`SolariMaterialClass<S>`](crate::SolariMaterialClass).
+    /// SBT hit-group class (`0` = opaque/glass routing); set from a [`SolariHitGroupClass<S>`](crate::SolariHitGroupClass).
     pub chit_class: u32,
     /// Per-material data for the `chit_class` shader, read as `load_material_bindless(id).chit_data`.
     pub chit_data: [u32; 4],
@@ -247,9 +248,8 @@ pub struct StandardSolariMaterialPlugin;
 impl Plugin for StandardSolariMaterialPlugin {
     fn build(&self, app: &mut App) {
         app
-        // add since we are disabling `PbrPlugin` under solari, so it doesn't register `Assets<StandardMaterial>`
+        // With `PbrPlugin` disabled nothing else registers `Assets<StandardMaterial>`.
         .init_asset::<StandardMaterial>()
-        // our custom material
         .init_asset::<StandardSolariMaterial>()
             // `ReflectAsset` on `StandardSolariMaterial` + `ReflectHandle` on its handle, so
             // `.bsn` scenes can define materials inline (see `bevy_scene` dynamic BSN).
@@ -296,8 +296,9 @@ fn insert_dfg_lut(app: &mut App) {
     }
 
     // Self-baked split-sum table (64×64 RG f16) integrating THIS crate's exact
-    // sampler/eval pair — tests/bake_dfg.rs regenerates it after any BRDF change.
-    // bevy_pbr's dfg.ktx2 disagreed ~2.4% at the roughness-1 row (furnace leak).
+    // sampler/eval pair (bevy_pbr's dfg.ktx2 integrates a slightly different
+    // BRDF and leaks energy in a furnace test) — tests/bake_dfg.rs regenerates
+    // it after any BRDF change.
     let mut lut = Image::new(
         bevy_render::render_resource::Extent3d {
             width: 64,

@@ -1,14 +1,12 @@
-// Phase A of the `vk_tessellated_clusters` port: the per-pattern tessellation
-// table + its cluster templates.
+// The per-pattern tessellation table + its cluster templates, ported from
+// `vk_tessellated_clusters/src/tessellation_table.cpp`.
 //
-// Ported from `vk_tessellated_clusters/src/tessellation_table.cpp`. Where that
-// sample builds templates with 8-bit cluster indices, we expand the table's
-// packed 8-bit indices to 32-bit and the UV-packed barycentrics to `vec3` so the
-// CLAS-template build reuses the exact 32-bit path already proven during the
-// template-path A/B bring-up (since removed). The output is a
-// per-edge-segment lookup table of cluster-template addresses + instantiation
-// sizes that the GPU classify/tessellate passes (Phases B/C) index by a
-// triangle's three edge factors — giving crack-free adaptive tessellation.
+// Where that sample builds templates with 8-bit cluster indices, the table's
+// packed 8-bit indices are expanded to 32-bit and the UV-packed barycentrics to
+// `vec3` for the CLAS-template build. The output is a per-edge-segment lookup
+// table of cluster-template addresses that the GPU classify/tessellate passes
+// index by a triangle's three edge factors — giving crack-free adaptive
+// tessellation.
 #![allow(unsafe_code, reason = "raw VK cluster-AS template build via as_hal_mut")]
 
 use ash::vk::{self, TaggedStructure};
@@ -25,7 +23,7 @@ use super::tess_table_data as table;
 
 /// One subdivision pattern's slice into the shared vertex / triangle pools.
 /// Matches `vk_tessellated_clusters`' `ConfigEntry` and the raw `CONFIGS` layout
-/// (4 × `u16`). The GPU classify/tessellate passes read this (keyed by
+/// (4 × `u16`). The GPU tessellate passes read this (keyed by
 /// [`TessellationTable::lookup_index`]) to decode a triangle's microtopology.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -39,10 +37,10 @@ pub struct ConfigEntry {
 /// Render-world resource: the adaptive-tessellation pattern table and its
 /// per-pattern cluster templates. Built once on a cluster-AS-capable device.
 ///
-/// `template_addresses` / `template_instantiation_sizes` are indexed by
-/// [`Self::lookup_index`] (the three per-edge segment counts), with `0` in unused
-/// slots. The flipped-winding template is stored for the mirrored permutation
-/// `(x, z, y)`, so any edge ordering resolves to a watertight pattern.
+/// `template_addresses` is indexed by [`Self::lookup_index`] (the three per-edge
+/// segment counts), with `0` in unused slots. The flipped-winding template is
+/// stored for the mirrored permutation `(x, z, y)`, so any edge ordering resolves
+/// to a watertight pattern.
 #[derive(Resource)]
 pub struct TessellationTable {
     /// Max segments per edge the table covers (11).
@@ -54,8 +52,6 @@ pub struct TessellationTable {
     /// Largest per-pattern triangle / vertex counts (cluster-AS sizing).
     pub max_triangles: u32,
     pub max_vertices: u32,
-    /// Largest instantiated CLAS byte size across all patterns (gen-cluster pool sizing).
-    pub max_cluster_size: u32,
 
     /// Shader-visible table data (consumed by the GPU tessellate passes):
     /// UV-packed barycentrics, 8-bit-packed triangle indices, and the
@@ -65,13 +61,6 @@ pub struct TessellationTable {
     pub configs: Buffer,
     /// `u64` cluster-template address per lookup slot (`0` = unused).
     pub template_addresses: Buffer,
-    /// `u32` instantiation byte size per lookup slot.
-    pub template_instantiation_sizes: Buffer,
-
-    /// CPU mirror of the lookup tables (handy for sizing / debug; the GPU reads
-    /// the buffers above).
-    pub template_addresses_cpu: Vec<u64>,
-    pub template_instantiation_sizes_cpu: Vec<u32>,
 
     /// Backing AS storage for every template — kept alive for the resource's
     /// lifetime since `template_addresses` point into it.
@@ -245,23 +234,9 @@ impl TessellationTable {
             total_verts as u32,
         );
 
-        // ── Per-template instantiation sizes (INSTANTIATE / COMPUTE_SIZES) ────
-        let instantiation_sizes_raw = Self::query_instantiation_sizes(
-            render_device,
-            render_queue,
-            allocator,
-            fns,
-            cluster_fns,
-            &template_addresses_raw.addresses,
-            max_tris,
-            max_verts,
-        );
-
         // ── Remap (raw config order) → (lookup-indexed) tables, with symmetry ─
         let mut configs_lut = vec![ConfigEntry::default(); num_configs];
         let mut addresses_lut = vec![0u64; num_configs];
-        let mut sizes_lut = vec![0u32; num_configs];
-        let mut max_cluster_size = 0u32;
 
         let s = max_size_configs;
         let lookup = |x: u32, y: u32, z: u32| -> usize {
@@ -276,16 +251,12 @@ impl TessellationTable {
                     let li = lookup(x, y, z);
                     configs_lut[li] = e;
                     addresses_lut[li] = template_addresses_raw.addresses[config_idx];
-                    sizes_lut[li] = instantiation_sizes_raw[config_idx];
-                    max_cluster_size = max_cluster_size.max(instantiation_sizes_raw[config_idx]);
                     // Mirrored permutation (x, z, y) uses the flipped template.
                     if z != y && x > 1 {
                         let lf = lookup(x, z, y);
                         let fc = config_idx + max_configs;
                         configs_lut[lf] = e;
                         addresses_lut[lf] = template_addresses_raw.addresses[fc];
-                        sizes_lut[lf] = instantiation_sizes_raw[fc];
-                        max_cluster_size = max_cluster_size.max(instantiation_sizes_raw[fc]);
                     }
                     config_idx += 1;
                 }
@@ -309,19 +280,14 @@ impl TessellationTable {
         let configs = make_storage("tess_table.configs", bytemuck::cast_slice(&configs_lut));
         let template_addresses =
             make_storage("tess_table.template_addresses", bytemuck::cast_slice(&addresses_lut));
-        let template_instantiation_sizes = make_storage(
-            "tess_table.template_instantiation_sizes",
-            bytemuck::cast_slice(&sizes_lut),
-        );
 
         tracing::debug!(
             "tess_table: built {} patterns ({} templates incl. flips), max_tris={} max_verts={} \
-             max_cluster_size={} num_configs={}",
+             num_configs={}",
             max_configs,
             total_templates,
             max_tris,
             max_verts,
-            max_cluster_size,
             num_configs,
         );
 
@@ -331,14 +297,10 @@ impl TessellationTable {
             num_configs,
             max_triangles: max_tris,
             max_vertices: max_verts,
-            max_cluster_size,
             vertices,
             indices,
             configs,
             template_addresses,
-            template_instantiation_sizes,
-            template_addresses_cpu: addresses_lut,
-            template_instantiation_sizes_cpu: sizes_lut,
             _template_storage: template_addresses_raw.storage,
         }
     }
@@ -469,128 +431,6 @@ impl TessellationTable {
 
         TemplateBuildResult { addresses, storage }
     }
-
-    /// `INSTANTIATE_TRIANGLE_CLUSTER` in `COMPUTE_SIZES` mode over each template
-    /// (only `cluster_template_address` set, like the sample's pass 3) → per-template
-    /// instantiated CLAS byte size. Raw config order (incl. flips).
-    fn query_instantiation_sizes(
-        render_device: &RenderDevice,
-        render_queue: &RenderQueue,
-        allocator: &Allocator,
-        fns: &ClusterExtensionFns,
-        cluster_fns: &ash::nv::cluster_acceleration_structure::Device,
-        template_addresses: &[u64],
-        max_tris: u32,
-        max_verts: u32,
-    ) -> Vec<u32> {
-        let count = template_addresses.len() as u32;
-        let descs: Vec<vk::ClusterAccelerationStructureInstantiateClusterInfoNV> = template_addresses
-            .iter()
-            .map(|&addr| vk::ClusterAccelerationStructureInstantiateClusterInfoNV {
-                cluster_id_offset: 0,
-                geometry_index_offset_and_reserved: vk::Packed24_8::new(0, 0),
-                cluster_template_address: addr,
-                // Unused for COMPUTE_SIZES (size depends only on the template).
-                vertex_buffer: vk::StridedDeviceAddressNV {
-                    start_address: 0,
-                    stride_in_bytes: 0,
-                },
-            })
-            .collect();
-        let desc_stride =
-            size_of::<vk::ClusterAccelerationStructureInstantiateClusterInfoNV>() as u64;
-        let desc_bytes_len = (descs.len() as u64) * desc_stride;
-        // SAFETY: instantiate info is repr(C) POD; flat byte view valid.
-        let desc_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(descs.as_ptr().cast::<u8>(), desc_bytes_len as usize)
-        };
-        let src_infos = blas_input_buffer(render_device, render_queue, "tess_table.inst.src", desc_bytes);
-        let src_infos_addr = allocator.wgpu_buffer_device_address(&src_infos).get();
-        let count_buf =
-            blas_input_buffer(render_device, render_queue, "tess_table.inst.count", &count.to_le_bytes());
-        let count_addr = allocator.wgpu_buffer_device_address(&count_buf).get();
-
-        let mut triangle_input = vk::ClusterAccelerationStructureTriangleClusterInputNV::default()
-            .vertex_format(vk::Format::R32G32B32_SFLOAT)
-            .max_geometry_index_value(0)
-            .max_cluster_unique_geometry_count(1)
-            .max_cluster_triangle_count(max_tris)
-            .max_cluster_vertex_count(max_verts)
-            .max_total_triangle_count(max_tris * count)
-            .max_total_vertex_count(max_verts * count)
-            .min_position_truncate_bit_count(0);
-        let op_input = vk::ClusterAccelerationStructureOpInputNV {
-            p_triangle_clusters: &mut triangle_input as *mut _,
-        };
-        let size_input = vk::ClusterAccelerationStructureInputInfoNV::default()
-            .max_acceleration_structure_count(count)
-            .flags(
-                vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
-                    | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS,
-            )
-            .op_type(vk::ClusterAccelerationStructureOpTypeNV::INSTANTIATE_TRIANGLE_CLUSTER)
-            .op_mode(vk::ClusterAccelerationStructureOpModeNV::COMPUTE_SIZES)
-            .op_input(op_input);
-        let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
-        // SAFETY: input fully populated; function table loaded.
-        unsafe {
-            cluster_fns.get_cluster_acceleration_structure_build_sizes(&size_input, &mut sizes);
-        }
-        let scratch = allocator.create_buffer(
-            render_device,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            wgpu::BufferUsages::STORAGE,
-            sizes.build_scratch_size.max(1) + 255,
-            MemoryLocation::GpuOnly,
-            "tess_table.inst_scratch",
-        );
-        let scratch_addr = align256(allocator.wgpu_buffer_device_address(&scratch).get());
-
-        let sizes_array_size = (count as u64) * 4;
-        let dst_sizes = allocator.create_buffer(
-            render_device,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            sizes_array_size,
-            MemoryLocation::GpuOnly,
-            "tess_table.inst_dst_sizes",
-        );
-        let dst_sizes_addr = allocator.wgpu_buffer_device_address(&dst_sizes).get();
-
-        let cmd = vk::ClusterAccelerationStructureCommandsInfoNV {
-            s_type: vk::ClusterAccelerationStructureCommandsInfoNV::STRUCTURE_TYPE,
-            p_next: core::ptr::null_mut(),
-            input: size_input,
-            dst_implicit_data: 0,
-            scratch_data: scratch_addr,
-            dst_addresses_array: vk::StridedDeviceAddressRegionKHR::default(),
-            dst_sizes_array: vk::StridedDeviceAddressRegionKHR {
-                device_address: dst_sizes_addr,
-                stride: 4,
-                size: sizes_array_size,
-            },
-            src_infos_array: vk::StridedDeviceAddressRegionKHR {
-                device_address: src_infos_addr,
-                stride: desc_stride,
-                size: desc_bytes_len,
-            },
-            src_infos_count: count_addr,
-            address_resolution_flags:
-                vk::ClusterAccelerationStructureAddressResolutionFlagsNV::default(),
-            _marker: core::marker::PhantomData,
-        };
-        let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("tess_table.inst_sizes"),
-        });
-        // SAFETY: fns loaded; encoder Vulkan-backed; descriptors reference live buffers.
-        unsafe {
-            crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
-                &mut encoder, fns, &cmd,
-            );
-            crate::gpu::extension::cmd_global_as_barrier(&mut encoder, render_device, false);
-        }
-        submit_and_read_u32(render_device, render_queue, encoder, &dst_sizes, count)
-    }
 }
 
 /// `RenderStartup`: build the per-pattern tessellation table once on a
@@ -680,49 +520,6 @@ fn submit_and_read_u64(
         mapped
             .chunks_exact(8)
             .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
-            .collect()
-    };
-    readback.unmap();
-    out
-}
-
-/// Submit `encoder`, wait, then copy `count` × `u32` out of `src` to the CPU.
-fn submit_and_read_u32(
-    render_device: &RenderDevice,
-    render_queue: &RenderQueue,
-    encoder: wgpu::CommandEncoder,
-    src: &wgpu::Buffer,
-    count: u32,
-) -> Vec<u32> {
-    let bytes = (count as u64) * 4;
-    let build_idx = render_queue.submit([encoder.finish()]);
-    let _ = render_device.wgpu_device().poll(wgpu::PollType::Wait {
-        submission_index: Some(build_idx),
-        timeout: None,
-    });
-    let readback = render_device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("tess_table.readback_u32"),
-        size: bytes,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut rb = render_device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("tess_table.readback_copy_u32"),
-    });
-    rb.copy_buffer_to_buffer(src, 0, &readback, 0, bytes);
-    let rb_idx = render_queue.submit([rb.finish()]);
-    readback
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, |r| r.expect("tess_table: u32 readback map failed"));
-    let _ = render_device.wgpu_device().poll(wgpu::PollType::Wait {
-        submission_index: Some(rb_idx),
-        timeout: None,
-    });
-    let out: Vec<u32> = {
-        let mapped = readback.slice(..).get_mapped_range();
-        mapped
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect()
     };
     readback.unmap();

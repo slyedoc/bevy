@@ -1,40 +1,27 @@
-// Bevy's workspace lints deny `unsafe-code`. The whole point of
-// this module is to call NV cluster-AS Vulkan extensions via raw
-// `ash` bindings + `as_hal_mut` escape hatches — fundamentally
-// unsafe by design. Every public unsafe function documents its
-// invariants in a `# Safety` section.
+// Raw `ash` + `as_hal_mut` extension calls are unavoidably unsafe; every
+// public unsafe function documents its invariants in a `# Safety` section.
 #![allow(unsafe_code)]
 
 //! NV cluster-AS / partitioned-AS extension wrappers — Vulkan +
 //! NVIDIA (Turing+) only. bevy_solari assumes Vulkan; see
 //! crate-level docs.
 //!
-//! Strategy
-//! --------
-//!
 //! The cluster pipeline reaches into `wgpu::hal::vulkan` via
 //! [`wgpu::CommandEncoder::as_hal_mut`] and calls
 //! `VK_NV_cluster_acceleration_structure` /
-//! `VK_NV_partitioned_acceleration_structure` directly through
-//! [`ash`]. This is the maintainer-blessed pattern for
-//! vendor-specific extensions (per wgpu issue [#4067] "Underlying
-//! API Interoperability" and RT tracking [#6762]) — wgpu does not
-//! expose these extensions and won't, because they're NV-only and
-//! built around raw `VkDeviceAddress` references that don't fit
-//! wgpu's safe abstraction.
-//!
-//! Device init
-//! -----------
+//! `VK_NV_partitioned_acceleration_structure` directly through [`ash`] —
+//! the maintainer-blessed pattern for vendor-specific extensions (wgpu
+//! issues [#4067], [#6762]); wgpu does not expose them because they are
+//! NV-only and built around raw `VkDeviceAddress` references that don't
+//! fit wgpu's safe abstraction.
 //!
 //! Extension enable runs through bevy_render's `raw_vulkan_init`
-//! infrastructure (see [`RawVulkanInitSettings`]).
+//! infrastructure (see [`RawVulkanInitSettings`]):
 //! [`crate::SolariInitPlugin`] registers a Vulkan device-creation
-//! callback that probes adapter support and chains the cluster-AS
-//! + partitioned-AS feature structs into the `VkDeviceCreateInfo`.
-//!
-//! [`SolariInitPlugin`] is added to `DefaultPlugins` before
-//! `RenderPlugin` (same slot as `DlssInitPlugin`), so apps using
-//! `DefaultPlugins` get the callbacks wired up automatically.
+//! callback that probes adapter support and chains the feature structs
+//! into the `VkDeviceCreateInfo`. [`SolariInitPlugin`] is added to
+//! `DefaultPlugins` before `RenderPlugin` (same slot as `DlssInitPlugin`),
+//! so apps using `DefaultPlugins` get the callbacks automatically.
 //!
 //! [#4067]: https://github.com/gfx-rs/wgpu/issues/4067
 //! [#6762]: https://github.com/gfx-rs/wgpu/issues/6762
@@ -66,7 +53,7 @@ pub struct DiagnosticCheckpointsFeature;
 pub struct PartitionedAccelerationStructureFeature;
 
 
-/// Marker type registered in [`AdditionalVulkanFeatures`] when
+/// Marker type for `VK_NV_ray_tracing_linear_swept_spheres` (ray-traced hair).
 pub struct LinearSweptSpheresFeature;
 
 /// Marker registered in [`AdditionalVulkanFeatures`] when
@@ -184,11 +171,10 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
             // `array<array<f32, 16>, 16>` SPD intermediate) get
             // miscompiled → ERROR_DEVICE_LOST mid-frame.
             //
-            // NV's driver tolerates the relaxed-model path, and our
-            // atomic shaders (selector counters, BLAS args) have run
-            // correctly against it (verified via readback). The VUID
-            // is informational on this hardware; flip device_scope
-            // ON once naga emits explicit workgroup layouts.
+            // NV's driver tolerates the relaxed-model path and the atomic
+            // shaders (selector counters, BLAS args) run correctly against
+            // it; the VUID is informational on this hardware. TODO: flip
+            // device_scope ON once naga emits explicit workgroup layouts.
 
             if supports(nv::cluster_acceleration_structure::NAME) {
                 args.extensions
@@ -220,9 +206,8 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 ));
                 *args.create_info = core::mem::take(args.create_info).push(features);
 
-                // Read the device's maxPartitionCount once (Stage-0 residual; the
-                // floating-origin PTLAS build clamps partition_count to it). Chained
-                // into a properties2 query on the physical device we have in hand.
+                // Query the device's partitioned-AS properties (maxPartitionCount
+                // bounds the PTLAS build's partition_count).
                 let mut pas_props =
                     vk::PhysicalDevicePartitionedAccelerationStructurePropertiesNV::default();
                 // The NV props struct isn't marked `ExtendsPhysicalDeviceProperties2` in
@@ -232,6 +217,16 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 props2.p_next = &mut pas_props as *mut _ as *mut core::ffi::c_void;
                 instance.get_physical_device_properties2(physical_device, &mut props2);
 
+                // Fail fast rather than clamp: the partition count is compiled into
+                // ptlas_fill.wgsl's spatial hash, so a quietly smaller PTLAS would
+                // desync the fill pass.
+                assert!(
+                    pas_props.max_partition_count >= crate::accel::ptlas::PTLAS_PARTITION_COUNT,
+                    "device maxPartitionCount ({}) < PTLAS_PARTITION_COUNT ({}) — \
+                     this adapter cannot run bevy_solari's partitioned-AS path",
+                    pas_props.max_partition_count,
+                    crate::accel::ptlas::PTLAS_PARTITION_COUNT,
+                );
             }
 
             // Ray-traced hair via linear swept spheres. Blackwell-only; on
@@ -323,15 +318,6 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 *args.create_info = core::mem::take(args.create_info).push(features);
             }
 
-            // NV ray-tracing validation — the driver's own RT-specific checks (AS
-            // build/traversal sanity, SBT, invalid addresses during a trace) that
-            // the standard validation layers can't see. Reported through the
-            // VK_EXT_debug_utils messenger wgpu already registers, so the messages
-            // surface alongside the other `wgpu_hal::vulkan::instance` lines; the
-            // driver auto-flushes them at device idle / device lost. The driver
-            // only EXPOSES the extension when the developer sets
-            // `NV_ALLOW_RAYTRACING_VALIDATION=1`, so `supports()` gates it for free
-            // (no cost in normal runs).
             // Opacity micro-maps — alpha-cutout meshes carry a baked OMM so the RT
             // cores skip the `ahit_alpha` any-hit on resolved opaque/transparent
             // micro-regions. The NV cluster CLAS build references the OMM array +
@@ -351,6 +337,11 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 );
             }
 
+            // VK_NV_ray_tracing_validation (disabled): driver-side RT checks (AS
+            // build/traversal sanity, SBT, invalid addresses during a trace) the
+            // standard validation layers can't see, reported through the
+            // VK_EXT_debug_utils messenger wgpu registers. The driver only exposes
+            // the extension when `NV_ALLOW_RAYTRACING_VALIDATION=1` is set.
             // if supports(nv::ray_tracing_validation::NAME) {
             //     args.extensions.push(nv::ray_tracing_validation::NAME);
             //     let features = Box::leak(Box::new(
@@ -486,25 +477,6 @@ pub fn init_cluster_extension_fns(
     commands.insert_resource(fns);
 }
 
-/// Issue `vkCmdBuildClusterAccelerationStructureIndirectNV` against
-/// the active Vulkan command buffer underlying `encoder`.
-///
-/// All inputs (op-input args buffer, scratch, dst arrays) are
-/// addressed via `VkDeviceAddress` inside `commands_info` — the
-/// caller resolves wgpu buffers to their device addresses (via
-/// `vkGetBufferDeviceAddressKHR`, reachable through the standard
-/// KHR acceleration-structure function table) and emits any
-/// pre/post barriers around this call (cluster_AS does not
-/// participate in wgpu-core's automatic barrier insertion).
-///
-/// # Safety
-///
-/// Caller must uphold every Vulkan rule of
-/// `vkCmdBuildClusterAccelerationStructureIndirectNV`. The
-/// destination buffers must be properly sized + bound; the source
-/// info array's device addresses must point at valid per-op input
-/// structs; `fns.cluster` must be `Some` (the extension was
-/// enabled at device creation).
 /// Global checkpoint fn table for device-lost reporting from anywhere (the
 /// fence-wait victim sites don't carry `ClusterExtensionFns`).
 static CHECKPOINT_FNS: std::sync::OnceLock<nv::device_diagnostic_checkpoints::Device> =
@@ -543,7 +515,7 @@ pub const CKPT_PTLAS: usize = 0x2000;
 pub const CKPT_MICROMAP: usize = 0x3000;
 
 /// Declared buffer access for a raw-VK op — invisible to wgpu's tracker, so
-/// [`validate_raw_access`] checks it instead under `SOLARI_VALIDATE=1`:
+/// [`validate_raw_access`] checks it instead under `SolariSettings::validate`:
 /// every declared range must be fully committed before the op records.
 pub struct RawAccess<'a> {
     pub op: &'static str,
@@ -551,11 +523,17 @@ pub struct RawAccess<'a> {
     pub writes: &'a [(&'a crate::gpu::allocator::SparseBuffer, core::ops::Range<u64>)],
 }
 
-/// SOLARI_VALIDATE=1 — umbrella debug gate: raw-op access checks here + the
-/// PTLAS record validation pass.
+static VALIDATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Latch [`SolariSettings::validate`](crate::SolariSettings) at plugin `finish`.
+pub(crate) fn latch_validate(on: bool) {
+    let _ = VALIDATE.set(on);
+}
+
+/// Umbrella debug gate ([`SolariSettings::validate`](crate::SolariSettings)):
+/// raw-op access checks here + the PTLAS record validation pass.
 pub fn solari_validate_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SOLARI_VALIDATE").as_deref() == Ok("1"))
+    VALIDATE.get().copied().unwrap_or(false)
 }
 
 /// An uncommitted range consumed by a raw op is a future device-lost — log it
@@ -578,18 +556,28 @@ pub fn validate_raw_access(a: &RawAccess) {
     }
 }
 
+/// Issue `vkCmdBuildClusterAccelerationStructureIndirectNV` against the active
+/// Vulkan command buffer underlying `encoder`.
+///
+/// All inputs (op-input args buffer, scratch, dst arrays) are addressed via
+/// `VkDeviceAddress` inside `commands_info` — the caller resolves wgpu buffers
+/// to their device addresses and emits any pre/post barriers around this call
+/// (cluster_AS does not participate in wgpu-core's automatic barrier insertion).
+///
+/// # Safety
+///
+/// Caller must uphold every Vulkan rule of
+/// `vkCmdBuildClusterAccelerationStructureIndirectNV`. The destination buffers
+/// must be properly sized + bound; the source info array's device addresses
+/// must point at valid per-op input structs; `fns.cluster` must be `Some`.
 pub unsafe fn cmd_build_cluster_acceleration_structures_indirect(
     encoder: &mut wgpu::CommandEncoder,
     fns: &ClusterExtensionFns,
     commands_info: &vk::ClusterAccelerationStructureCommandsInfoNV<'_>,
 ) {
-    // Raw-VK command recording bypasses wgpu's command encoder, so
-    // wgpu's GPU diagnostics never see it and it's invisible on Tracy.
-    // Span the encode here in the shared wrapper so every call site
-    // (clas_arena / blas_rebuild) shows the
-    // `vkCmdBuildClusterAccelerationStructureIndirectNV` CPU record
-    // cost without each site repeating the span. (GPU execution time is
-    // captured separately by the per-pass `*.gpu_wait` poll spans.)
+    // Raw-VK recording is invisible to wgpu's diagnostics and Tracy; span the
+    // CPU record cost here for every call site (GPU time is captured by the
+    // per-pass `*.gpu_wait` poll spans).
     let _span = tracing::info_span!("vk.build_cluster_as_indirect").entered();
     let cluster = fns
         .cluster
@@ -613,24 +601,6 @@ pub unsafe fn cmd_build_cluster_acceleration_structures_indirect(
     }
 }
 
-/// Issue `vkCmdBuildPartitionedAccelerationStructuresNV` against the
-/// active Vulkan command buffer underlying `encoder`.
-///
-/// `build_info`'s `src_acceleration_structure_data` /
-/// `dst_acceleration_structure_data` are **storage buffer device
-/// addresses**, not AS-handle addresses — NV's spec asks for the
-/// underlying buffer's `vkGetBufferDeviceAddressKHR` result, and the
-/// validation layer flags `vkGetAccelerationStructureDeviceAddressKHR`
-/// results as `VUID-VkDeviceAddress-size-11364`. Reach the storage
-/// buffer via
-/// [`wgpu::hal::vulkan::AccelerationStructure::raw_buffer`] (added
-/// in the solari-pt wgpu patches).
-///
-/// # Safety
-///
-/// Caller must uphold every Vulkan rule of
-/// `vkCmdBuildPartitionedAccelerationStructuresNV` and ensure
-/// `fns.partitioned` is `Some`.
 /// Insert a kitchen-sink memory barrier covering raw-VK AS / scratch /
 /// compute writes that wgpu's tracker doesn't see. Use after raw-VK
 /// AS builds + compute writes to make the produced data visible to
@@ -815,6 +785,23 @@ pub unsafe fn cmd_build_micromaps(
     }
 }
 
+/// Issue `vkCmdBuildPartitionedAccelerationStructuresNV` against the active
+/// Vulkan command buffer underlying `encoder`.
+///
+/// `build_info`'s `src_acceleration_structure_data` /
+/// `dst_acceleration_structure_data` are **storage buffer device addresses**,
+/// not AS-handle addresses — NV's spec asks for the underlying buffer's
+/// `vkGetBufferDeviceAddressKHR` result, and the validation layer flags
+/// `vkGetAccelerationStructureDeviceAddressKHR` results as
+/// `VUID-VkDeviceAddress-size-11364`. Reach the storage buffer via
+/// [`wgpu::hal::vulkan::AccelerationStructure::raw_buffer`] (added in the
+/// solari wgpu patches).
+///
+/// # Safety
+///
+/// Caller must uphold every Vulkan rule of
+/// `vkCmdBuildPartitionedAccelerationStructuresNV` and ensure
+/// `fns.partitioned` is `Some`.
 pub unsafe fn cmd_build_partitioned_acceleration_structures(
     encoder: &mut wgpu::CommandEncoder,
     fns: &ClusterExtensionFns,

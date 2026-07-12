@@ -13,11 +13,10 @@
 //!    view target (the blit) and the packed guide STORAGE BUFFERS (chit-direct).
 //! 2. [`solari_dlss_resolve`] unpacks those buffers into the guide TEXTURES RR wants.
 //! 3. [`solari_dlss_render`] runs ray reconstruction: view-target color + guides →
-//!    the denoised (and, later, upscaled) view-target output.
+//!    the denoised view-target output.
 //!
-//! Phase 3a (this milestone): DLAA only — render resolution == display resolution
-//! (no upscaling). Every non-`Off` mode is treated as DLAA here; the true per-mode
-//! render-resolution + `MainPassResolutionOverride` upscaling lands next.
+//! Upscaling is not yet implemented: every non-`Off` mode runs as DLAA (render
+//! resolution == display resolution).
 
 use std::{
     ops::Deref,
@@ -114,20 +113,6 @@ impl SolariDlssMode {
             Self::UltraPerformance => "ultra performance",
         }
     }
-
-    /// The `dlss_wgpu` quality mode this maps to (the render→display ratio).
-    /// Used by the upscaling milestone; Phase 3a forces DLAA.
-    #[allow(dead_code)]
-    pub(crate) fn perf_quality_mode(self) -> DlssPerfQualityMode {
-        match self {
-            Self::Auto => DlssPerfQualityMode::Auto,
-            Self::Off | Self::Dlaa => DlssPerfQualityMode::Dlaa,
-            Self::Quality => DlssPerfQualityMode::Quality,
-            Self::Balanced => DlssPerfQualityMode::Balanced,
-            Self::Performance => DlssPerfQualityMode::Performance,
-            Self::UltraPerformance => DlssPerfQualityMode::UltraPerformance,
-        }
-    }
 }
 
 impl core::fmt::Display for SolariDlssMode {
@@ -143,9 +128,9 @@ impl core::fmt::Display for SolariDlssMode {
 pub struct SolariDlssContext {
     pub context: Mutex<DlssRayReconstruction>,
     feature_flags: DlssFeatureFlags,
-    // The `dlss_wgpu` quality the context was built at — NOT `SolariDlssMode`. In
-    // Phase 3a every active mode maps to DLAA, so cycling modes keeps this constant
-    // and the context is reused (recreating it mid-flight hangs the GPU).
+    // The `dlss_wgpu` quality the context was built at — NOT `SolariDlssMode`.
+    // Every active mode maps to DLAA, so cycling modes keeps this constant and
+    // the context is reused (recreating it mid-flight hangs the GPU).
     perf_quality: DlssPerfQualityMode,
 }
 
@@ -335,9 +320,6 @@ fn create_dlss_textures(render_device: &RenderDevice, size: UVec2) -> SolariDlss
 /// trace is live) and set the sub-pixel jitter when DLSS is on. No-op when the SDK is
 /// absent (DLSS unsupported). Runs before `rt_pipeline` (which reads the jitter later,
 /// in `Core3d`).
-///
-/// Phase 3a: always DLAA (render == display); the true per-mode render resolution +
-/// `MainPassResolutionOverride` upscaling lands in the next milestone.
 pub fn prepare_solari_dlss(
     sdk: Option<Res<SolariDlssSdk>>,
     mode: Res<SolariDlssMode>,
@@ -367,8 +349,8 @@ pub fn prepare_solari_dlss(
     // crank the gain and the lit meshes blow out.
     let feature_flags =
         DlssFeatureFlags::LowResolutionMotionVectors | DlssFeatureFlags::HighDynamicRange;
-    // Phase 3a: every active mode runs as DLAA (render == display). The per-mode
-    // `mode.perf_quality_mode()` render resolution is applied in the upscaling milestone.
+    // Every active mode runs as DLAA (render == display) until upscaling is
+    // implemented.
     let perf_quality = DlssPerfQualityMode::Dlaa;
 
     for (entity, camera, context, textures) in &mut views {
@@ -376,14 +358,14 @@ pub fn prepare_solari_dlss(
             continue;
         };
 
-        // CRITICAL: the NGX feature lifecycle (create/destroy) must NEVER run while the
-        // raw trace is live — it hard-hangs the GPU (the restir path didn't hit this
-        // because it had no raw trace; draining alone didn't cover it). So the per-view
-        // context is created ONCE, as early as possible — the first frame the viewport
-        // is known, before the rt_pipeline has even built or traced — and kept for the
-        // view's lifetime regardless of mode. `SolariDlssMode` gates ONLY whether the
-        // resolve/render run (see the run conditions) and whether the trace is jittered,
-        // never the context. Recreated only on a resolution/quality change (rare).
+        // CRITICAL: the NGX feature lifecycle (create/destroy) must NEVER run while
+        // the raw trace is live — it hard-hangs the GPU. So the per-view context is
+        // created ONCE, as early as possible — the first frame the viewport is known,
+        // before the rt_pipeline has even built or traced — and kept for the view's
+        // lifetime regardless of mode. `SolariDlssMode` gates ONLY whether the
+        // resolve/render run (see the run conditions) and whether the trace is
+        // jittered, never the context. Recreated only on a resolution/quality change
+        // (rare).
         let reuse = match context.as_deref() {
             Some(c) => {
                 UVec2::from(c.context.lock().unwrap().upscaled_resolution()) == upscaled
@@ -504,8 +486,8 @@ pub fn solari_dlss_resolve(
 }
 
 /// `Core3d` (after `solari_dlss_resolve`, before tonemapping): run DLSS Ray
-/// Reconstruction — denoise (+ later upscale) the noisy view-target color using the
-/// guide textures, writing the result back into the view target.
+/// Reconstruction — denoise the noisy view-target color using the guide textures,
+/// writing the result back into the view target.
 pub fn solari_dlss_render(
     view: ViewQuery<(
         &ExtractedView,

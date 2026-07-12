@@ -37,6 +37,7 @@ fn main() {
         .add_plugins((
             DefaultPlugins,
             SolariPlugin,
+            SolariAtmospherePlugin,
             FeathersPlugins,
             FreeCameraPlugin,
             FrameTimeDiagnosticsPlugin::default(),
@@ -75,7 +76,7 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut solari_materials: ResMut<Assets<StandardSolariMaterial>>,
-    portal_class: Res<bevy::solari::SolariMaterialClass<bevy::solari::PortalSurface>>,
+    portal_class: Res<bevy::solari::SolariHitGroupClass<bevy::solari::PortalSurface>>,
 ) {
     // ── Two portals, FACING EACH OTHER ─────────────────────────────────────
     //

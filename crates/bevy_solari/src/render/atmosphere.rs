@@ -2,16 +2,22 @@
 //!
 //! A compute pre-pass ([`atmosphere_bake.wgsl`](mod@self)) bakes the atmosphere
 //! into a cube from [`SolariAtmosphere`] + the primary [`SolariDirectionLight`];
-//! the pathtracer samples that cube on a ray miss (the existing skybox path).
+//! the pathtracer samples that cube on a ray miss (the skybox path).
 //! The cube persists, so the bake re-runs only when its inputs change (a moving
 //! sun re-bakes; a static sky is free). Fully solari-owned — no `bevy_pbr`
 //! atmosphere / raster `GpuLights` coupling — so it works with `PbrPlugin`
 //! disabled.
 
+use bevy_app::{App, Plugin};
+use bevy_core_pipeline::{
+    core_3d::main_opaque_pass_3d,
+    schedule::{Core3d, Core3dSystems},
+};
 use bevy_ecs::{
     component::Component,
     query::With,
     resource::Resource,
+    schedule::{common_conditions::resource_exists, IntoScheduleConfigs},
     system::{Commands, Query, Res, ResMut},
 };
 use bevy_math::{Mat3, Quat, Vec3};
@@ -28,7 +34,7 @@ use bevy_render::{
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
     sync_world::RenderEntity,
-    Extract,
+    Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_transform::components::GlobalTransform;
 
@@ -36,6 +42,53 @@ use crate::lights::SolariDirectionLight;
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 use crate::render::SolariCamera;
+
+/// Opt-in atmosphere support: registers the [`SolariAtmosphere`] /
+/// [`SolariGlobalFog`] / [`SolariAtmosphereVolume`] extract → bake → bind
+/// systems. Add after [`SolariPlugin`](crate::SolariPlugin); without this
+/// plugin those components are inert and solari registers none of the
+/// atmosphere systems or GPU state.
+pub struct SolariAtmospherePlugin;
+
+impl Plugin for SolariAtmospherePlugin {
+    fn build(&self, app: &mut App) {
+        app.register_type::<SolariAtmosphere>()
+            .register_type::<SolariGlobalFog>()
+            .register_type::<SolariAtmosphereVolume>();
+
+        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+            return;
+        };
+        render_app
+            .init_resource::<SolariAtmosphereGpu>()
+            .init_resource::<SolariAtmosphereVolumesGpu>()
+            .add_systems(RenderStartup, init_atmosphere_pipeline)
+            .add_systems(
+                ExtractSchedule,
+                (extract_solari_atmosphere, extract_atmosphere_volumes),
+            )
+            .add_systems(
+                Render,
+                (prepare_atmosphere_sky, prepare_atmosphere_volumes)
+                    .in_set(RenderSystems::PrepareResources),
+            )
+            .add_systems(
+                Render,
+                prepare_atmosphere_bind_group.in_set(RenderSystems::PrepareBindGroups),
+            )
+            // Bake before the trace consumes the cube (same MainPass slot as the
+            // trace; see `SolarRenderPlugin`'s compose-first ordering).
+            .add_systems(
+                Core3d,
+                (dispatch_atmosphere_bake, dispatch_atmosphere_lut_bake)
+                    .chain()
+                    .run_if(resource_exists::<SolariPipelines>)
+                    .before(super::rt_pipeline::rt_pipeline)
+                    .before(main_opaque_pass_3d)
+                    .in_set(Core3dSystems::MainPass),
+            );
+    }
+}
 
 /// Edge length of each face of the baked sky cube.
 const SKY_SIZE: u32 = 256;
@@ -240,9 +293,9 @@ pub const MAX_ATMOSPHERE_VOLUMES: usize = 4;
 
 // Transmittance LUT: T(radius, sun-zenith cosine) per volume, baked by
 // `atmosphere_lut_bake.wgsl` into the SAME device-address buffer after the
-// header+volumes block. Kills the march's inner 8-step sun integral (the
-// 550→120 fps cost) — one bilinear buffer lookup instead. Layout constants
-// mirror `raygen.wgsl` / the bake shader.
+// header+volumes block — the march does one bilinear buffer lookup per step
+// instead of an inner sun integral. Layout constants mirror `raygen.wgsl` /
+// the bake shader.
 pub const ATMO_LUT_W: u32 = 256; // mu = cos(zenith) axis
 pub const ATMO_LUT_H: u32 = 64; // radius axis (bottom→top)
 pub const ATMO_LUT_OFFSET: u64 = 512; // header 32B + volumes 256B, padded
@@ -502,8 +555,8 @@ pub fn extract_solari_atmosphere(
         // ZENITH angle, azimuth 0 (quantized — the only thing that re-bakes),
         // and (b) derive the world→bake rotation the miss shader applies to
         // cube sample directions (rides `RtCamera.sky_frame`, never re-bakes).
-        // Flat scenes (`up ≈ +Y`, the default) take the identity path and are
-        // bit-exact with the old behavior. NOTE: with a non-+Y frame the
+        // Flat scenes (`up ≈ +Y`, the default) take the identity path.
+        // NOTE: with a non-+Y frame the
         // world-space aerial fog march sees the frame-local sun — global fog
         // is a flat-world feature; leave `SolariGlobalFog` off on planets.
         let up = atmosphere.up.normalize_or(Vec3::Y);

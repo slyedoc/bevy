@@ -13,8 +13,7 @@
 //! compact `(slot, value)` delta, and the byte-wise scatter shader
 //! (`gpu_instances_scatter.wgsl`) places them. A `KEEP_PREVIOUS` column also
 //! shifts the current value into a previous-frame buffer on the GPU (the GPU
-//! already holds last frame's value — no second upload). This is the same
-//! family as Bevy's raster `UniformComponentPlugin<C>` / `GpuArrayBufferPlugin<T>`.
+//! already holds last frame's value — no second upload).
 
 use core::marker::PhantomData;
 use core::num::NonZero;
@@ -61,10 +60,6 @@ const COLUMN_VIRTUAL_BYTES: u64 = 1024 * 1024 * 1024;
 struct ScatterParams {
     count: u32,
     words_per_value: u32,
-    /// 1 on a grown buffer (history columns): `previous = new` instead of
-    /// shifting the fresh buffer's garbage.
-    force_init: u32,
-    _pad1: u32,
 }
 
 /// All `GpuColumn` prepare systems run in this set, so callers can order
@@ -73,10 +68,6 @@ struct ScatterParams {
 #[derive(SystemSet, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct GpuColumnPrepareSet;
 
-/// Describes a per-[`GpuEntity`] GPU column: its value type, where the value
-/// is read from, which entities changed each frame, and whether it keeps a
-/// previous-frame copy. [`GpuColumnPlugin<C>`] turns this into a self-contained
-/// scatter pipeline.
 /// A GPU-mirrored table: a slot space whose columns scatter per-frame deltas.
 /// `InstanceManager` (per-instance columns) and `TransformGraph` (transform-table
 /// columns) are tables. `high_water` is a property of the *table* — shared by all
@@ -86,6 +77,10 @@ pub trait GpuTable: Resource {
     fn high_water(&self) -> u32;
 }
 
+/// Describes a per-[`GpuEntity`] GPU column: its value type, where the value
+/// is read from, which entities changed each frame, and whether it keeps a
+/// previous-frame copy. [`GpuColumnPlugin<C>`] turns this into a self-contained
+/// scatter pipeline.
 pub trait GpuColumnDesc: Send + Sync + 'static {
     /// The per-slot value (`Pod`, size a multiple of 4 bytes).
     type Value: Pod;
@@ -139,7 +134,7 @@ pub struct GpuColumn<C: GpuColumnDesc> {
     pending: u32,
     /// Byte range of newly-committed sparse pages a growth needs zeroed (pages
     /// are UNDEFINED on first residency). [`dispatch_column`] records the clear
-    /// before the scatter — matching the old wgpu zero-init — then takes it.
+    /// before the scatter, then takes it.
     pending_clear: Option<Range<u64>>,
     _marker: PhantomData<fn() -> C>,
 }
@@ -186,9 +181,8 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
     /// Bytes the committed pages cover this frame (`capacity_slots * STRIDE`).
     /// Consumers MUST bind a range of exactly this size — NOT the whole sparse
     /// buffer — so `arrayLength()` in shaders is the real slot count, not the
-    /// `COLUMN_VIRTUAL_BYTES` reservation (binding the full 1 GiB made
-    /// `arrayLength(&directional_lights)` ~33M → the path tracer's light loop hung
-    /// the GPU), and so an out-of-range index is bounds-checked, not a page fault.
+    /// `COLUMN_VIRTUAL_BYTES` reservation (a shader loop bounded by it hangs the
+    /// GPU), and so an out-of-range index is bounds-checked, not a page fault.
     #[inline]
     pub fn committed_bytes(&self) -> u64 {
         self.capacity_slots as u64 * Self::STRIDE
@@ -233,7 +227,7 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
     /// realloc, no old→new copy, and consumer bind groups stay valid (existing
     /// pages keep their data). The newly-committed region is undefined on first
     /// residency, so it's queued for a zero-clear in [`dispatch_column`] before
-    /// the scatter (matching the old wgpu zero-init).
+    /// the scatter.
     fn ensure_capacity(&mut self, high_water: u32) {
         if high_water <= self.capacity_slots {
             return;
@@ -248,22 +242,17 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
         self.pending_clear = Some(old_slots as u64 * Self::STRIDE..committed);
     }
 
-    /// Upload a pre-built `[slot, words…]` delta straight to the GPU buffer
-    /// (the producer already built the records) — `reserve` the delta buffer,
-    /// then `write_buffer` the slice into it directly. No CPU staging Vec is
-    /// touched: one upload, no gather/copy/swap. History columns never
-    /// `force_init` — a growth preserves the previous buffer by GPU copy, so the
-    /// scatter always shifts `current → previous`. The bind group rebuilds each
+    /// Upload a pre-built `[slot, words…]` delta straight to the GPU delta
+    /// buffer. Sparse pages persist across growth, so the history scatter
+    /// always shifts `current → previous`. The bind group rebuilds each
     /// scattering frame, picking up any buffer the `reserve` reallocated.
     fn upload_prebuilt(&mut self, records: &[u32], device: &RenderDevice, queue: &RenderQueue) {
         self.pending = records.len() as u32 / (Self::WORDS + 1);
         self.delta.reserve(records.len(), device);
-        // Upload via the staging-view path (`write_buffer_with`), NOT `write_buffer`.
-        // On a mass regenerate a "tiny" column (parent / material_id / …) becomes a
-        // multi-MB delta (every entity is first-sight); the plain `write_buffer` copy
-        // path corrupts at that scale (garbage `parent[]`/`material_id[]` → wrong
-        // transforms + materials), while the staging view the big `local` delta uses
-        // is fine. Route everything through it.
+        // Upload via the staging-view path (`write_buffer_with`), NOT `write_buffer`:
+        // the plain `write_buffer` copy path corrupts multi-MB deltas (a mass
+        // regenerate makes every column's delta large), yielding garbage
+        // `parent[]`/`material_id[]`.
         if let (Some(buffer), Some(bytes)) = (
             self.delta.buffer(),
             NonZero::<u64>::new(records.len() as u64 * 4),
@@ -276,8 +265,6 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
         *self.params.get_mut() = ScatterParams {
             count: self.pending,
             words_per_value: Self::WORDS,
-            force_init: 0,
-            _pad1: 0,
         };
         self.params.write_buffer(device, queue);
     }
@@ -314,8 +301,6 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
         *self.params.get_mut() = ScatterParams {
             count: self.pending,
             words_per_value: Self::WORDS,
-            force_init: 0,
-            _pad1: 0,
         };
         self.params.write_buffer(device, queue);
     }
@@ -499,13 +484,8 @@ fn init_column<C: GpuColumnDesc>(
     });
 }
 
-/// `Render::Prepare`: grow + build + upload column `C`'s delta. Runs after
-/// `extract` populates the `InstanceManager`. Parallel with the other columns.
-///
-/// Growth no longer re-scatters every active slot from a CPU mirror — the
-/// realloc stashes the old buffers and [`dispatch_column`] copies them old→new
-/// on the GPU, so prepare only ever uploads this frame's change delta (whether
-/// a column supplies it pre-built or gathers it via `dirty` + `value`).
+/// `Render::Prepare`: grow the column and upload this frame's delta. Runs after
+/// `extract` populates the table. Parallel with the other columns.
 fn prepare_column<C: GpuColumnDesc>(
     mut column: Option<ResMut<GpuColumn<C>>>,
     table: Option<Res<C::Table>>,
@@ -535,19 +515,15 @@ fn prepare_column<C: GpuColumnDesc>(
     column.ensure_capacity(high_water);
 
     // The producer already built this frame's `[slot, words…]` records; upload
-    // the slice straight to the GPU buffer (no gather, no copy, no staging Vec).
-    // Nothing changed → skip the upload; `pending = 0` gates the dispatch and
-    // the buffer keeps its data. Bind-only columns hit this every steady frame.
+    // the slice straight to the GPU buffer.
     let records = C::delta_records(&table);
     if records.is_empty() {
         // Nothing new this frame. DON'T clear `pending` here: if a previous
-        // delta is still un-scattered (its compute pipeline hadn't compiled yet,
-        // so `dispatch_column` skipped it), zeroing `pending` would abandon it
-        // forever — fatal for a fully-static scene whose instances were all
-        // bound on frame 1, before pipeline warmup (every column value stays
-        // zero → transforms collapse every instance → all rays miss).
-        // `dispatch_column` clears `pending` once it actually scatters, so a
-        // steady-state static frame already has `pending == 0` here.
+        // delta is still un-scattered (`dispatch_column` skipped it because its
+        // pipeline hadn't compiled), zeroing `pending` would abandon it forever
+        // — fatal for a fully-static scene whose instances all bound before
+        // pipeline warmup. `dispatch_column` clears `pending` once it actually
+        // scatters (retain-until-consumed).
         return;
     }
     column.upload_prebuilt(records, &render_device, &render_queue);
@@ -571,9 +547,9 @@ fn prepare_column_bind_group<C: GpuColumnDesc>(
     column.prepare_bind_group(&render_device, &pipeline_cache);
 }
 
-/// `RenderGraph` (`Scatter`): on a growth, copy the old buffers old→new on the
-/// GPU (preserving every slot's value), then scatter column `C`'s delta with
-/// its own pipeline. Both record into the shared `RenderContext` encoder.
+/// `RenderGraph` (`Scatter`): on a growth, zero the newly-committed pages, then
+/// scatter column `C`'s delta with its own pipeline. Both record into the shared
+/// `RenderContext` encoder.
 fn dispatch_column<C: GpuColumnDesc>(
     column: Option<ResMut<GpuColumn<C>>>,
     pipeline_cache: Res<PipelineCache>,
@@ -604,11 +580,11 @@ fn dispatch_column<C: GpuColumnDesc>(
     let encoder = ctx.command_encoder();
     // Newly-committed sparse pages are UNDEFINED on first residency. Zero the
     // grown `[old..new)` region before scattering so unscattered-but-active slots
-    // read 0 (matching the old wgpu zero-init — and giving `scatter_with_history`'s
-    // `previous = old current` a defined 0 for a brand-new slot). Existing pages
-    // persist with their data, so only the new region is cleared. No pipeline
-    // needed, so a cold-pipeline frame still zeroes; `pending` stays live to
-    // scatter once the pipeline compiles.
+    // read 0 (and `scatter_with_history`'s `previous = old current` reads a
+    // defined 0 for a brand-new slot). Existing pages persist with their data,
+    // so only the new region is cleared. No pipeline needed, so a cold-pipeline
+    // frame still zeroes; `pending` stays live to scatter once the pipeline
+    // compiles.
     if let Some(range) = clear {
         let len = range.end - range.start;
         if len > 0 {

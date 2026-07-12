@@ -1,10 +1,10 @@
-//! Ray-tracing-pipeline shading path (milestone: primary visibility only).
+//! Ray-tracing-pipeline shading path.
 //!
 //! The raw-VK [`RtPipeline`](crate::gpu::rt_pipeline::RtPipeline) records a
 //! `cmd_trace_rays` that writes a per-pixel output **storage buffer** (no image
 //! layout to fight wgpu over); a small wgpu compute pass ([`blit.wgsl`]) then
-//! copies that buffer into the view's HDR storage texture — the same target the
-//! reference path tracer writes — so the rest of the frame is unchanged.
+//! copies that buffer into the view's HDR storage texture, so the rest of the
+//! frame is unchanged.
 //!
 //! Runs for every [`SolariCamera`] view; the component's variant selects the
 //! integrator (realtime ReSTIR vs reference accumulation).
@@ -53,6 +53,7 @@ use crate::pipelines::SolariPipelines;
 use crate::render::atmosphere::{
     AtmosphereSky, SolariAtmosphereGpu, SolariAtmosphereView, SolariAtmosphereVolumesGpu,
 };
+use crate::render::sky::{SolariCustomSky, SolariViewClearColor, SolariViewSkyShader};
 use crate::render::view_cull::SolariEnvironmentMap;
 use crate::render::{
     CameraReframe, DiEstimator, GiEstimator, SolariCamera, SolariReference,
@@ -61,9 +62,6 @@ use crate::resource_manager::SolariResourceManager;
 use crate::transform::{TransformGraph, TransformPropagate};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 
-/// `RenderStartup`: build the RT pipeline (raygen/miss/chit + SBT) if the
-/// `VK_KHR_ray_tracing_pipeline` feature is present and the raw-VK allocator
-/// exists. Absent otherwise — the run condition then skips the dispatch.
 /// Raw `VkDescriptorSetLayout` of the wgpu bind group built from `descriptor`,
 /// or `None` if not Vulkan-backed. The pipeline-cache dedups layouts by
 /// descriptor, so the handle is stable across frames — safe to bake into the RT
@@ -169,9 +167,9 @@ pub enum SolariDebugView {
     NrcCache,
     /// Lighting only: every opaque surface shades with a WHITE base color, so
     /// the image is pure light transport — the albedo-demodulated presentation
-    /// GI papers use for estimator comparison. Not a paint: it renders,
-    /// accumulates, and exams like a normal image (estimator flag bit 28,
-    /// which also restarts any running mean when toggled).
+    /// GI papers use for estimator comparison. Not a paint: it renders and
+    /// accumulates like a normal image (estimator flag bit 28, which also
+    /// restarts any running mean when toggled).
     WhiteWorld,
 }
 
@@ -237,7 +235,7 @@ pub struct RtBlit {
     pub params: bevy_render::render_resource::Buffer,
 }
 
-/// Rung-0 diff harness controls (main-world, extracted). Bump `freeze_epoch` to
+/// Freeze/diff harness controls (main-world, extracted). Bump `freeze_epoch` to
 /// snapshot the current accumulated image; `diff` displays `|current − frozen|`
 /// as a heatmap through the blit; bump `dump_epoch` to write the accumulation
 /// buffer as an EXR into `target/tmp/` for offline RMSE/FLIP.
@@ -258,7 +256,7 @@ impl Default for SolariFreezeDiff {
     }
 }
 
-/// Per-view frozen snapshot of the accumulated output (rung-0 diff reference).
+/// Per-view frozen snapshot of the accumulated output (the diff reference).
 #[derive(Component)]
 pub struct RtFrozen {
     pub buffer: bevy_render::render_resource::Buffer,
@@ -280,7 +278,7 @@ pub fn rt_freeze_ops(
     freeze_diff: Option<Res<SolariFreezeDiff>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    mut seen: Local<(u32, u32, bool)>,
+    mut seen: Local<(u32, u32, u32)>,
     mut commands: Commands,
 ) {
     let Some(fd) = freeze_diff else { return };
@@ -288,12 +286,16 @@ pub fn rt_freeze_ops(
     let mut do_dump = fd.dump_epoch != seen.1;
     seen.0 = fd.freeze_epoch;
     seen.1 = fd.dump_epoch;
+    // Re-arm the spp latch when the configured threshold changes (0 = none fired).
+    if seen.2 != 0 && seen.2 != fd.dump_at_spp {
+        seen.2 = 0;
+    }
     for (entity, output, accumulation, frozen, camera) in &views {
         let spp = accumulation.map_or(0, |a| a.n);
         // Equal-sample capture: fire once when crossing the spp threshold.
-        if fd.dump_at_spp > 0 && spp >= fd.dump_at_spp && !seen.2 {
+        if fd.dump_at_spp > 0 && spp >= fd.dump_at_spp && seen.2 != fd.dump_at_spp {
             do_dump = true;
-            seen.2 = true;
+            seen.2 = fd.dump_at_spp;
         }
         if !do_freeze && !do_dump {
             continue;
@@ -418,7 +420,7 @@ pub fn init_rt_blit(
     commands.insert_resource(RtBlit { layout, pipeline, params });
 }
 
-/// The ReSTIR spatial merge+shade pass (rung 3): pipeline + its group-1 layout
+/// The ReSTIR spatial merge+shade pass: pipeline + its group-1 layout
 /// (group 0 is the shared scene bind group — TLAS/lights/materials/DFG LUT).
 #[derive(Resource)]
 pub struct RestirSpatial {
@@ -466,7 +468,6 @@ pub struct RestirSpatialParams {
 /// `RenderStartup`: build the spatial pass pipeline (scene group 0 + own group 1).
 pub fn init_restir_spatial(
     mut commands: Commands,
-    pipeline_cache: Res<PipelineCache>,
     asset_server: Res<AssetServer>,
     render_device: Res<RenderDevice>,
 ) {
@@ -508,17 +509,20 @@ pub fn init_restir_spatial(
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let _ = &pipeline_cache; // pipeline queued by `queue_restir_spatial_pipeline`
     commands.insert_resource(RestirSpatial {
-        layout, pipeline: None, shader, params, params_finalize, geo_addr,
+        layout,
+        pipeline: None,
+        shader,
+        params,
+        params_finalize,
+        geo_addr,
     });
 }
 
 /// `Render::Prepare`: queue the spatial pipeline the moment the scene-columns
 /// layout exists (frame ~2 — it can't be built at `RenderStartup`), so it
-/// compiles alongside the cold-start batch instead of lazily on first use
-/// (which shipped a ~0.5 s window with the pass's DI/GI missing). Registered
-/// into the one readiness gate like every other pipeline.
+/// compiles alongside the cold-start batch instead of lazily on first use.
+/// Registered into the one readiness gate like every other pipeline.
 pub fn queue_restir_spatial_pipeline(
     restir_spatial: Option<ResMut<RestirSpatial>>,
     scene_bindings: Res<RaytracingSceneBindings>,
@@ -597,7 +601,7 @@ pub struct RtOutputBuffer {
     pub light_samples: bevy_render::render_resource::Buffer,
     pub light_samples_raw: vk::Buffer,
     pub light_samples_size: u64,
-    /// ReSTIR GI canonical samples (rung 4a): 2 slots/pixel × 48 B, slot-indexed
+    /// ReSTIR GI canonical samples: 2 slots/pixel × 48 B, slot-indexed
     /// like `reservoirs`. Raygen-written at path end (the suffix radiance is only
     /// known there), raygen-read for the store/recon shade gates.
     pub gi_samples: bevy_render::render_resource::Buffer,
@@ -729,7 +733,7 @@ pub fn prepare_rt_output(
             .map(|b| b.raw_handle())
             .expect("rt_camera buffer must be Vulkan-backed");
         // Persistent previous-basis buffer for GPU motion vectors — `rt_camera.wgsl`'s
-        // `PrevCamera` (mat4 + `valid`, padded to 80 B). Zero-cleared so `valid` starts 0
+        // `PrevCamera` ([`RT_PREV_CAMERA_SIZE`]). Zero-cleared so `valid` starts 0
         // (frame 1 ⇒ zero motion, not a read of uninitialized memory).
         let camera_prev_buffer = allocator.create_buffer(
             &render_device,
@@ -945,6 +949,21 @@ struct RtCameraGpuInputs {
     exposure: f32,
 }
 
+static CAMERA_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Latch [`SolariSettings::camera_debug`](crate::SolariSettings) at plugin `finish`.
+pub(crate) fn latch_camera_debug(on: bool) {
+    let _ = CAMERA_DEBUG.set(on);
+}
+
+/// [`SolariSettings::camera_debug`](crate::SolariSettings): log which camera path
+/// fills the buffer (GPU pass vs CPU fallback) and why — the fallback is silent
+/// by design, which makes a wrong-basis frame indistinguishable from a right one
+/// in logs.
+fn camera_debug() -> bool {
+    CAMERA_DEBUG.get().copied().unwrap_or(false)
+}
+
 /// Dispatch the `rt_camera` compute pass to fill `output.camera_buffer` from the
 /// camera's transform-table slot. Returns `false` (⇒ caller does the CPU fallback)
 /// when the pass can't run this frame: unsupported device, pipeline/layout not ready,
@@ -962,13 +981,6 @@ fn try_dispatch_rt_camera(
     output: &RtOutputBuffer,
     inputs: RtCameraGpuInputs,
 ) -> bool {
-    // `SOLARI_CAMERA_DEBUG=1`: log which camera path fills the buffer (GPU pass vs
-    // CPU fallback) and why — the fallback is silent by design, which makes a
-    // wrong-basis frame indistinguishable from a right one in logs.
-    fn camera_debug() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("SOLARI_CAMERA_DEBUG").as_deref() == Ok("1"))
-    }
     let (Some(pipelines), Some(resources), Some(propagate), Some(slot)) =
         (pipelines, resources, propagate, camera_slot)
     else {
@@ -1063,7 +1075,7 @@ fn try_dispatch_rt_camera(
 /// Default opaque surface (class 0) — BRDF + NEE + alpha-cutout any-hit.
 pub struct OpaqueSurface;
 
-impl crate::SolariMaterial for OpaqueSurface {
+impl crate::SolariHitGroup for OpaqueSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "opaque",
@@ -1083,7 +1095,7 @@ impl crate::SolariMaterial for OpaqueSurface {
 /// Glass surface (class 1) — Fresnel reflect/refract; routed by `specular_transmission > 0`.
 pub struct GlassSurface;
 
-impl crate::SolariMaterial for GlassSurface {
+impl crate::SolariHitGroup for GlassSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "glass",
@@ -1099,7 +1111,7 @@ impl crate::SolariMaterial for GlassSurface {
 /// Hair surface (class 2) — Chiang fiber BSDF / LSS bark; reached via the reserved hair record.
 pub struct HairSurface;
 
-impl crate::SolariMaterial for HairSurface {
+impl crate::SolariHitGroup for HairSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "hair",
@@ -1115,7 +1127,7 @@ impl crate::SolariMaterial for HairSurface {
 /// Portal surface (class 3) — teleports rays; pair the instance with a [`SolariPortal`](crate::bindings::SolariPortal).
 pub struct PortalSurface;
 
-impl crate::SolariMaterial for PortalSurface {
+impl crate::SolariHitGroup for PortalSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "portal",
@@ -1140,7 +1152,11 @@ pub(crate) fn rt_pipeline(
         &RtOutputBuffer,
         Option<&RtViewBindings>,
         Option<&SolariAtmosphereView>,
-        Option<&SolariEnvironmentMap>,
+        (
+            Option<&SolariEnvironmentMap>,
+            Option<&SolariViewClearColor>,
+            Has<SolariViewSkyShader>,
+        ),
         Option<&RtPrevViewProj>,
         Option<&SolariDlssJitter>,
         Option<&CameraReframe>,
@@ -1165,11 +1181,13 @@ pub(crate) fn rt_pipeline(
     ),
     materials: RtMaterials,
     // Tupled: baked sky cube + atmosphere GPU state (sky_frame quat) +
-    // world-space atmosphere volumes (address for raygen's march).
+    // world-space atmosphere volumes (address for raygen's march) + the live
+    // custom-sky module the miss shader composes.
     atmosphere_res: (
         Option<Res<AtmosphereSky>>,
         Option<Res<SolariAtmosphereGpu>>,
         Option<Res<SolariAtmosphereVolumesGpu>>,
+        Res<SolariCustomSky>,
     ),
     env_images: RtEnvImages,
     pipeline_cache: Res<PipelineCache>,
@@ -1206,7 +1224,7 @@ pub(crate) fn rt_pipeline(
     ) = render_res;
     let (mut frame_counter, mut settle_frames) = counters;
     let (cluster_mesh_manager, tess_classify, hit_group_registry, deform) = geometry_res;
-    let (atmosphere_sky, atmosphere_gpu, atmosphere_volumes) = atmosphere_res;
+    let (atmosphere_sky, atmosphere_gpu, atmosphere_volumes, custom_sky) = atmosphere_res;
     let view_entity = view.entity();
     let (
         view,
@@ -1215,7 +1233,7 @@ pub(crate) fn rt_pipeline(
         output,
         view_bindings,
         atmosphere_view,
-        environment_map,
+        (environment_map, view_clear_color, sky_shader),
         prev_view_proj,
         dlss_jitter,
         reframe,
@@ -1226,10 +1244,10 @@ pub(crate) fn rt_pipeline(
         cyl_window,
     ) = view.into_inner();
     // The camera's [`SolariCamera`] variant selects the integrator: production
-    // ReSTIR (realtime) or the exam harness (reference accumulation).
+    // ReSTIR (realtime) or reference accumulation.
     let (reference, restir_rt) = (solari_camera.reference(), solari_camera.restir());
 
-    // Environment cube the miss shader samples (same priority as the megakernel):
+    // Environment cube the miss shader samples:
     // the baked atmosphere cube if this view has one, else the view's skybox image,
     // else the fallback cube. The atmosphere cube is a STORAGE image (GENERAL) the
     // RT path never samples via wgpu, so we transition it ourselves. The skybox /
@@ -1260,13 +1278,17 @@ pub(crate) fn rt_pipeline(
             }),
         );
     }
-    // Match the megakernel (view_cull.rs): the baked atmosphere cube is already
-    // physical radiance (brightness 1.0); otherwise the skybox's raw cd/m²; else 0
+    // Brightness convention (matches view_cull.rs): the baked atmosphere cube is
+    // already physical radiance (brightness 1.0); otherwise the skybox's raw cd/m²; else 0
     // (no sky ⇒ miss stays at the clear color). Brightness stays 0 while the skybox
     // image is still loading — the stand-in is the WHITE fallback cube, and lighting
     // it up would flash the whole sky white until the real cubemap lands.
+    // Negative brightness = `SolariSky::Procedural`/`Shader`: the miss evaluates
+    // the composed `custom_sky` module instead (atmosphere still wins).
     let environment_brightness = if atmosphere_view.is_some() {
         1.0
+    } else if sky_shader {
+        -1.0
     } else {
         environment_map
             .filter(|env| env_images.texture_assets.get(&env.image).is_some())
@@ -1311,6 +1333,7 @@ pub(crate) fn rt_pipeline(
                     columns_layout,
                     &material_classes,
                     &registry.groups,
+                    (&custom_sky.source, custom_sky.generation),
                 ) {
                     commands.insert_resource(built);
                 }
@@ -1324,10 +1347,14 @@ pub(crate) fn rt_pipeline(
     // either the live count has outgrown those records (an instance routing to a
     // slot past the hit region would read out of bounds) OR a material's CLASS
     // changed (glass loading/unloading, a live edit) — the record's hit-group
-    // handle is baked, so the new class only takes effect after a rebuild. Drain
+    // handle is baked, so the new class only takes effect after a rebuild — or the
+    // custom-sky module changed (its composed SPIR-V is baked into the miss). Drain
     // the GPU first so dropping the old pipeline (when this frame's `remove`
     // command applies) can't free a `VkPipeline` a still-executing trace uses.
-    if materials.len() > rt.capacity() || rt.classes_changed(&material_classes) {
+    if materials.len() > rt.capacity()
+        || rt.classes_changed(&material_classes)
+        || rt.custom_sky_generation() != custom_sky.generation
+    {
         let _ = render_device
             .wgpu_device()
             .poll(wgpu::PollType::wait_indefinitely());
@@ -1549,8 +1576,7 @@ pub(crate) fn rt_pipeline(
         // lazily-queued spatial pass when its levers are on. Pipelines are not
         // enough: the cluster→BLAS→PTLAS stream lands the scene several frames
         // AFTER the last pipeline compiles, and accumulating those black frames
-        // is a permanent ~K/N energy deficit (the cell 0.92 "estimator bug" was
-        // exactly this). So also require the scene quiet — no pending journal
+        // is a permanent ~K/N energy deficit. So also require the scene quiet — no pending journal
         // records or mesh uploads, PTLAS built — for a few consecutive frames
         // (build latency the CPU can't observe directly).
         let spatial_pending = (reference.di_spatial().is_some()
@@ -1577,7 +1603,7 @@ pub(crate) fn rt_pipeline(
         // SAME reference estimator (spf on the GPU ⇒ reference RR), and the
         // history-maturity window lets the chain reach ITS stationary state
         // before n starts advancing — else the first m-cap frames shade ~0.4×
-        // and bake a permanent deficit (the cell 0.92 "estimator bug", part 2).
+        // and bake a permanent deficit.
         let history_frames = if reference.di_restir() || reference.gi_restir() {
             reference.m_cap().ceil() as u32 + 4
         } else {
@@ -1663,8 +1689,8 @@ pub(crate) fn rt_pipeline(
         view_from_world: view_from_world.to_cols_array(),
         clip_from_world: clip_from_world.to_cols_array(),
         prev_clip_from_world: prev_clip_from_world.to_cols_array(),
-        // .xyz = ray origin; .w = camera exposure (carried for shader-side tooling;
-        // the trace no longer consumes it — radiance stays physical, the blit exposes).
+        // .xyz = ray origin; .w = camera exposure (carried for shader-side tooling
+        // only — radiance stays physical, the blit applies exposure).
         camera_position: Vec3::ZERO.extend(camera.exposure).to_array(),
         // .x = frame index (RNG seed); .y = SER material-hint bits =
         // ceil(log2(material_count)), the number of low bits of the SBT-record-index
@@ -1682,8 +1708,12 @@ pub(crate) fn rt_pipeline(
             // surface's height map (grayscale) to validate the displacement wiring.
             show_displacement as u32,
         ],
-        // .x = sky brightness; .yzw = clear color (black for bevy_city).
-        sky: [environment_brightness, 0.0, 0.0, 0.0],
+        // .x = sky brightness (< 0 ⇒ custom sky shader); .yzw = the camera's clear
+        // color — physical radiance like everything traced (the blit exposes it).
+        sky: {
+            let clear = view_clear_color.map_or(Vec3::ZERO, |c| c.0);
+            [environment_brightness, clear.x, clear.y, clear.z]
+        },
         // Sub-pixel jitter (pixels) for DLSS temporal accumulation; zero without an
         // active DLSS context (the trace renders a fresh frame with no accumulator,
         // so an unaccumulated jitter would only shimmer).
@@ -1872,7 +1902,7 @@ pub(crate) fn rt_pipeline(
     trace_encoder.keep_bind_group_alive(columns_bg);
     ctx.add_command_buffer(trace_encoder.finish());
 
-    // ReSTIR spatial merge+shade (rung 3): after the trace (all reservoirs +
+    // ReSTIR spatial merge+shade: after the trace (all reservoirs +
     // surfaces exist), before the blit. Adds `blend_w · DI` (physical radiance)
     // into the accumulated output — the same blend weight the raygen used this
     // frame, so accumulation composes without a history buffer.
@@ -2034,7 +2064,7 @@ pub(crate) fn rt_pipeline(
         }
     }
 
-    // NRC online training (zero/docs/nrc.md rung 1): this frame's raygen-written
+    // NRC online training: this frame's raygen-written
     // records → encode → fwd → loss → bwd → adam, all on the shared ctx encoder.
     // The inference mirrors the NEXT frame's raygen reads update at the end —
     // one frame of cache latency, invisible for a cache converging over dozens.
@@ -2066,7 +2096,7 @@ pub(crate) fn rt_pipeline(
     // Blit the per-pixel output buffer into the view's HDR storage texture (a
     // normal wgpu compute pass on the shared ctx encoder → runs after the trace
     // buffer, so the view target stays wgpu-layout-tracked). The diff view
-    // (rung-0 harness) rides here: |current − frozen| heatmap when enabled.
+    // rides here: |current − frozen| heatmap when enabled.
     // Exposure applies HERE: the buffer holds physical radiance. Debug views
     // paint raw non-radiance values → exposure 1.0 so they display verbatim.
     let frozen_valid = frozen.filter(|f| f.pixels == output.pixels);

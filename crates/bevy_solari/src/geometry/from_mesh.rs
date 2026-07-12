@@ -1,21 +1,20 @@
 //! `Mesh → ClusterMesh` bake. Calls `meshopt` directly to build
-//! clusters + stacked LOD levels.
+//! clusters + stacked discrete LOD levels.
 //!
-//! **v1 strategy: stacked discrete LOD levels.** Each level is built
-//! bottom-up by clustering + partitioning the current triangle
-//! stream, then simplifying each partition under boundary-locked
-//! simplification to produce the next coarser stream.
+//! Each level is built bottom-up by clustering + partitioning the
+//! current triangle stream, then simplifying each partition under
+//! boundary-locked simplification to produce the next coarser stream.
 //! [`ClusterLodGroup`]s at level N carry the simplification error
 //! metric so the runtime selector can pick the coarsest level whose
 //! error projects below the on-screen pixel threshold.
 //!
-//! Per-region LOD variation (proper Nanite-style DAG cut where
-//! adjacent regions of one instance use different LODs) needs
+//! Per-region LOD variation (a proper Nanite-style DAG cut where
+//! adjacent regions of one instance use different LODs) would need
 //! per-triangle source-group provenance threaded through meshopt's
-//! reorderings. The asset format already carries
-//! [`ClusterLodGroup::children_offset`] / `children_count` for future
-//! DAG-cut consumers; v1 leaves them at 0 (treat each group as a
-//! leaf) and the selector evaluates groups by LOD level + error
+//! reorderings. The asset format carries
+//! [`ClusterLodGroup::children_offset`] / `children_count` for
+//! DAG-cut consumers; the bake leaves them at 0 (treat each group as
+//! a leaf) and the selector evaluates groups by LOD level + error
 //! against the camera.
 
 use alloc::sync::Arc;
@@ -571,10 +570,9 @@ impl TryFrom<&Mesh> for ClusterMesh {
             // Link to the closest coarser-level (level N+1) group if one exists.
             // If none does, this group has no coarser level above it — a single-LOD
             // mesh, or a coarsest-level group — so it's a genuine top-level group:
-            // leave `parent_group == NONE`. Linking it to a SAME-level group (the
-            // old `unwrap_or(root_group_id)`) makes the runtime DAG cut treat that
-            // same-level group as a coarser parent and cull this one, leaving holes
-            // (this is what broke single-LOD meshes like the glTF fox).
+            // leave `parent_group == NONE`. Linking it to a SAME-level group would
+            // make the runtime DAG cut treat that group as a coarser parent and
+            // cull this one, leaving holes.
             if let Some((id, _)) = best {
                 g.parent_group = id;
                 orphan_count += 1;

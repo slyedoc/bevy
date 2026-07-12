@@ -1,6 +1,6 @@
-// Phase C step 2a: build one `VkClusterAccelerationStructureInstantiateClusterInfoNV`
-// per emitted part triangle, so the raw-VK indirect INSTANTIATE (step 2b) turns
-// each part's config template + its `gen_vertices` slice into a CLAS.
+// Build one `VkClusterAccelerationStructureInstantiateClusterInfoNV` per emitted
+// part triangle, so the raw-VK indirect INSTANTIATE turns each part's config
+// template + its `gen_vertices` slice into a CLAS.
 //
 // The descriptor is 32 bytes / 8 u32 (matches the ash struct):
 //   [0] cluster_id_offset
@@ -26,7 +26,7 @@ struct InstParams {
     max_verts: u32,
     part_capacity: u32,
     // ClusterIDNV base baked into each tess CLAS (sentinel above the real cluster
-    // pool so the chit shades via the facet normal, like the CPU showcase).
+    // pool so the closest-hit detects tess hits).
     cluster_id_base: u32,
     _pad0: u32,
     _pad1: u32,

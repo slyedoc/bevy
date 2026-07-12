@@ -7,7 +7,7 @@
 // commits in hardware and pays nothing here. When the base-color alpha at the hit
 // UV is below the material's cutoff the texel is a hole, so `ignoreIntersection()`
 // rejects the candidate and the ray continues through it — for primary, bounce, AND
-// shadow rays (shadow rays are no longer force-opaque, so foliage casts cutout
+// shadow rays (shadow rays are not force-opaque, so foliage casts cutout
 // shadows; see chit_opaque `SHADOW_RAY_FLAGS`).
 enable wgpu_ray_tracing_pipeline;
 enable primitive_index;

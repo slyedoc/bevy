@@ -1,10 +1,9 @@
 // Ray-generation: the path-tracer driver. Owns the bounce loop and the
 // raygen-resident volume/traversal effects (fog extinction + black-hole ray
-// bending) — these operate *between* traceRay calls, so they're here, not in any
-// hit shader (Phase 4). Each bounce's surface response comes from the
-// SBT-selected closest-hit (opaque/glass/hair), which fills the payload with the
-// emitted radiance + attenuation + the next ray. v1 fidelity is stand-in (the
-// hit shaders don't yet resolve real geometry/materials); the structure is real.
+// bending) — these operate *between* traceRay calls, so they live here, not in
+// any hit shader. Each bounce's surface response comes from the SBT-selected
+// closest-hit (opaque/glass/hair), which fills the payload with the emitted
+// radiance + attenuation + the next ray.
 enable wgpu_ray_tracing_pipeline;
 enable f16;
 enable wgpu_cooperative_vector;
@@ -49,7 +48,7 @@ const BH_CAPTURE_RADIUS: f32 = 0.5;
 @group(1) @binding(7) var<storage, read_write> gbuffer_specular: array<vec4<f32>>;
 @group(1) @binding(8) var<storage, read_write> gbuffer_motion: array<vec4<f32>>;
 #endif
-// ReSTIR DI reservoirs (rung 3): 2 slots per pixel, interleaved by frame parity
+// ReSTIR DI reservoirs: 2 slots per pixel, interleaved by frame parity
 // (see `Reservoir`). raygen clears this pixel's CURRENT slot; the opaque chit
 // fills it on a primary hit — sky/glass pixels then carry dead (M=0) history.
 @group(1) @binding(9) var<storage, read_write> reservoirs: array<Reservoir>;
@@ -59,7 +58,7 @@ const BH_CAPTURE_RADIUS: f32 = 0.5;
 // ReSTIR GI canonical samples: 2 slots/pixel, interleaved by frame parity.
 @group(1) @binding(12) var<storage, read_write> gi_samples: array<GiSample>;
 
-// NRC (zero/docs/nrc.md rung 1): inference mirrors + training records.
+// NRC inference mirrors + training records.
 // Struct layout MUST MATCH nrc/nrc_mlp.wgsl and nrc/mod.rs.
 struct NrcRecord {
     pos_rough: vec4<f32>,
@@ -286,8 +285,8 @@ struct AtmoHeader {
 const ATMO_VOLUME_STEPS: u32 = 16u;
 // Transmittance LUT (mirrors `atmosphere.rs` / `atmosphere_lut_bake.wgsl`):
 // per volume, T(radius, sun-zenith cos) baked to a 256×64 vec4 grid living in
-// the same buffer at byte 512. One bilinear lookup replaces the 8-step sun
-// integral per march step (the 550→120 fps cost).
+// the same buffer at byte 512. One bilinear lookup replaces an 8-step sun
+// integral per march step.
 const ATMO_LUT_W: u32 = 256u;
 const ATMO_LUT_H: u32 = 64u;
 const ATMO_LUT_OFFSET: u32 = 512u;
@@ -408,7 +407,7 @@ fn raygen(
     // This frame's sample average (numerator; /rounds after the loop).
     var frame_sum = vec3<f32>(0.0);
 
-    // NRC training paths (zero/docs/nrc.md): hash-scattered pixels record up
+    // NRC training paths: hash-scattered pixels record up
     // to 4 path vertices each into the 16k record ring; targets are the
     // path's own suffix radiance, propagated after the walk. Scattering beats
     // a contiguous band: every training step sees the whole frame's light
@@ -1034,9 +1033,9 @@ fn raygen(
         let cycles = f32(clock_delta(clk0, u32(shader_clock())));
         // Per-pixel cost spans orders of magnitude → map log2(cycles) → color, pivoting
         // at the data center so the knob is a CONTRAST control, not a shift. jitter.z =
-        // center (the green midpoint; `-` / `=` slide it to the scene's midrange);
-        // jitter.w = contrast (color change per log2 stop; `[` / `]` crank it — higher
-        // pushes the slowest toward red and the fastest toward blue).
+        // center (the green midpoint — slide it to the scene's midrange); jitter.w =
+        // contrast (color change per log2 stop — higher pushes the slowest toward red
+        // and the fastest toward blue).
         let t = 0.5 + (log2(max(cycles, 1.0)) - camera.jitter.z) * camera.jitter.w;
         final_color = cost_heatmap(t);
     }

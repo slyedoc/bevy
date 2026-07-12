@@ -49,7 +49,7 @@ use bevy_render::render_resource::{
 
 /// Registry of every solari-created pipeline (label + cache id). Empty means
 /// "not a solari device / startup hasn't run" and reads as NOT ready, so gated
-/// systems stay dormant exactly like the old per-column gates.
+/// systems stay dormant.
 #[derive(Resource, Default)]
 pub struct SolariPipelineRegistry {
     compute: Vec<(&'static str, CachedComputePipelineId)>,

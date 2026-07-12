@@ -4,7 +4,7 @@
 // wgpu-layout-tracked — the raw write only ever touches the buffer.
 @group(0) @binding(0) var<storage, read> rt_output: array<vec4<f32>>;
 @group(0) @binding(1) var view_output: texture_storage_2d<rgba16float, write>;
-// Frozen reference snapshot (rung-0 diff harness). Bound to `rt_output` itself
+// Frozen reference snapshot (freeze/diff harness). Bound to `rt_output` itself
 // when nothing is frozen; `params.x` gates the mode so that alias is never read.
 @group(0) @binding(2) var<storage, read> frozen: array<vec4<f32>>;
 // .x = mode (0 passthrough, 1 diff heatmap), .y = diff scale, .z = camera

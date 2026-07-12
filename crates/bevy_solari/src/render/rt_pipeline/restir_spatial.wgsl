@@ -1,16 +1,16 @@
-// ReSTIR DI spatial reuse + shade (rung 3, session 2). Runs AFTER the trace:
+// ReSTIR DI spatial reuse + shade. Runs AFTER the trace:
 // every pixel's post-temporal reservoir exists, so neighbors can merge — the
 // barrier the in-chit path can't provide. Merges K disk-sampled neighbors
 // (depth/normal-validated), traces ONE ray-query visibility ray for the winner,
 // and adds the DI into the accumulated output with the SAME blend weight the
 // raygen used this frame (`output += blend_w · DI`, physical radiance) —
-// accumulation composes without a history buffer. Shade-only: reservoirs are NOT written
-// back, so the bias study isolates the spatial combiner (no feedback loop).
+// accumulation composes without a history buffer. Shade-only: reservoirs are
+// NOT written back (no feedback loop).
 //
 // Two combiners (`params.unbiased`):
 //   0 = naive Algorithm-4 M-sum — BIASED: neighbors whose domain can't produce
-//       the winner still inflate M → the classic darkening (the exam wants to
-//       SEE this in the freeze-diff before fixing it).
+//       the winner still inflate M → the classic darkening. Kept for A/B
+//       comparison in the freeze-diff harness.
 //   1 = Z-count — re-evaluate the winner's p̂ at each contributor's surface and
 //       count only the M that could have produced it (Bitterli Alg. 6).
 enable wgpu_ray_query;
@@ -346,8 +346,6 @@ fn di_spatial(px: u32, gid: vec2<u32>) {
     if own.light_id != NULL_LIGHT_ID && own.w > 0.0 {
         let own_stored = light_samples[px * 2u + params.parity];
         let own_ls = unpack_stored_light(own_stored);
-        // Own pixel: the chit's EXACT f/p̂ (same surface it was computed on) — a
-        // G-buffer recompute here drifts ~6% dark on dim pixels via w_mis.
         // Own pixel: the chit's EXACT f/p̂ (computed on this same surface) — a
         // G-buffer recompute here drifts ~6% dark on dim pixels via w_mis.
         let phat = own_stored.phat;

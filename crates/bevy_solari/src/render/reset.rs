@@ -32,7 +32,7 @@ pub struct CameraReset {
 }
 
 impl CameraReset {
-    /// App-side request for a plain history drop (the old `CameraReset(true)`).
+    /// App-side request for a plain history drop.
     pub const fn request() -> Self {
         Self { history: true, reframed: false }
     }

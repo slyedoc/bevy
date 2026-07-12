@@ -112,11 +112,6 @@ pub struct ClusterMeshUpload {
     pub geometry_id: u32,
 }
 
-/// One entry in [`ClusterMeshManager::pending_clas_uploads`] —
-/// metadata + cluster data that downstream CLAS-build code needs.
-/// The manager queues a [`PendingClasUpload`] on every fresh mesh
-/// upload; [`crate::geometry::clas_arena`] drains the queue after the
-/// per-mesh vertex / index writes have landed.
 /// Opacity micro-map payload threaded from a [`ClusterMesh`] to the CLAS build
 /// (cheap `Arc` clones). Present only when the mesh carries a baked OMM *and*
 /// `VK_EXT_opacity_micromap` is available. The CLAS build (`clas_arena`) builds
@@ -131,6 +126,11 @@ pub struct OmmUploadData {
     pub usage: Arc<[OmmUsage]>,
 }
 
+/// One entry in [`ClusterMeshManager::pending_clas_uploads`] —
+/// metadata + cluster data that downstream CLAS-build code needs.
+/// The manager queues a [`PendingClasUpload`] on every fresh mesh
+/// upload; [`crate::geometry::clas_arena`] drains the queue after the
+/// per-mesh vertex / index writes have landed.
 #[derive(Clone, Debug)]
 pub struct PendingClasUpload {
     pub asset_id: AssetId<ClusterMesh>,
@@ -164,8 +164,8 @@ pub struct ClusterMeshManager {
     pub vertex_uvs: PersistentGpuBuffer<Arc<[Vec2]>>,
     /// Per-vertex `u32` user data, parallel to `vertex_positions` (zeros when a mesh has none).
     pub vertex_custom: PersistentGpuBuffer<Arc<[u32]>>,
-    /// Interleaved (AoS) copy of the four vertex streams above, parallel to
-    /// `vertex_positions` (same global vertex index). One contiguous 28-byte
+    /// Interleaved (AoS) copy of the vertex attribute streams above, parallel
+    /// to `vertex_positions` (same global vertex index). One contiguous 16-byte
     /// [`PackedVertex`] per vertex for the bindless RT-pipeline resolve's
     /// cache-friendly `physical_load`; the SoA pools stay for the CLAS build
     /// and the AS-selector's position/normal reads.

@@ -4,15 +4,15 @@
 // `world[node]` is a pure function of the node's own `local`/`parent` ancestor
 // chain — it depends on no other node's world. So one thread per node can compute
 // it independently by walking up the parent chain and composing locals
-// (root∘…∘parent∘local), in a SINGLE pass: no Jacobi iteration, no ping-pong,
-// no read/write hazard (each thread writes only its own world slots and reads
+// (root∘…∘parent∘local), in a SINGLE pass: no iteration, no ping-pong, no
+// read/write hazard (each thread writes only its own world slots and reads
 // the read-only local/`parent` columns).
 //
 // We exploit that to do only the work that changed: the dispatch runs one thread
 // per *changed* node (the local columns' delta this frame — `changed[k*stride]`
 // is the slot), recomputing just those worlds into the PERSISTENT world buffers;
-// static nodes keep last frame's value. On a capacity growth (`full_rebuild`) we
-// instead run one thread per node (id = slot).
+// static nodes keep last frame's value. The cold-start `full_rebuild` instead
+// runs one thread per node (id = slot).
 //
 // The translation is accumulated in f64 so a node's absolute position survives at
 // AU/interstellar magnitude — the huge magnitude is NOT subtracted here. A separate
@@ -35,13 +35,10 @@ struct PropagateParams {
     // Threads to dispatch on the `full_rebuild` path (node_count); the changed
     // path's true count lives GPU-side in the frontier header (word 1).
     count: u32,
-    // Unused on the frontier path (slots are flat); kept for layout stability.
-    record_stride: u32,
-    // 1 → node = thread id (walk every node, e.g. after a growth); 0 → node =
+    // 1 → node = thread id (walk every node; cold-start rebuild); 0 → node =
     // `frontier[HEADER + k]` (this frame's changed nodes + their descendants,
     // expanded GPU-side by `transform_frontier.wgsl`).
     full_rebuild: u32,
-    _pad: u32,
 }
 
 const ROOT_PARENT: u32 = 0xffffffffu;

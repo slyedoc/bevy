@@ -9,14 +9,12 @@
 //! With the `transform_f64` cargo feature (which `bevy_solari` requires),
 //! `Transform.translation` is a genuine `f64` vector, mirrored to the GPU as a
 //! native-`f64` column ([`LocalTranslationColumn`]) — solari's floating-origin
-//! coordinate, the successor to `big_space`'s integer `CellCoord` (Aevyrie,
-//! MIT/Apache; used as the reference algorithm, credited). The propagation pass
-//! ([`super::propagate`]) walks ancestors accumulating the translation in `f64`
-//! (via `SHADER_F64`), producing each node's **absolute** world; the subtract
-//! pass ([`super::subtract`]) then subtracts the camera's own absolute world so
-//! the small origin-relative `f32` the acceleration structure is built from
-//! survives at any magnitude. No `cell_edge` knob, no range ceiling, no
-//! recenter, no per-entity opt-in — every `Transform` is precise.
+//! coordinate. The propagation pass ([`super::propagate`]) walks ancestors
+//! accumulating the translation in `f64` (via `SHADER_F64`), producing each
+//! node's **absolute** world; the subtract pass ([`super::subtract`]) then
+//! subtracts the camera's own absolute world so the small origin-relative `f32`
+//! the acceleration structure is built from survives at any magnitude. Every
+//! `Transform` is precise — no recenter, no per-entity opt-in.
 
 use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::prelude::*;
@@ -96,7 +94,7 @@ crate::gpu_table! {
 /// A **GPU-moved node**: its motion comes from a GPU pass writing its `local`/world directly
 /// (e.g. an orbital-mechanics compute pass), with **no CPU-side change**, so the change filter
 /// never sees it. Tagged nodes are appended to the frontier **seed** every frame; the GPU
-/// frontier then expands to their descendants. (The old per-frame CPU subtree re-push is gone.)
+/// frontier then expands to their descendants.
 #[derive(Component, Default, Clone, Copy, Debug)]
 pub struct SolariGpuFrame;
 
@@ -176,11 +174,9 @@ pub fn clear_static_first_sight(mut main_world: ResMut<MainWorld>) {
 ///
 /// `Without<TransformStatic>` is on the **whole** filter (not a sub-branch), so the
 /// static bulk is excluded at *archetype* granularity — the query never visits
-/// those entities. (Skipping only the tick *reads* didn't help: the cost is the
-/// per-entity visit over 2M, not the comparison.) An entity tagged *after* its first
-/// extract was already scattered while still a mover; one tagged *before* (born static)
-/// is caught instead by the [`StaticFirstSightQueue`] path below, so `TransformStatic`
-/// is safe to add at spawn.
+/// those entities. An entity tagged *after* its first extract was already scattered
+/// while still a mover; one tagged *before* (born static) is caught instead by the
+/// [`StaticFirstSightQueue`] path below, so `TransformStatic` is safe to add at spawn.
 type TransformChangeFilter = (
     With<GlobalTransform>,
     Without<TransformStatic>,
@@ -275,8 +271,8 @@ fn push_children_chain(
 /// Each column is (re)scattered **only when its own source changed**:
 /// - the local pair on `Changed<Transform>` (the mover hot path).
 /// - `parent` only on `Changed<ChildOf>` / first sight. A parent slot is stable,
-///   so movers skip the random-access `nodes.get` parent lookup entirely — that
-///   lookup (latency-bound) was the dominant residual cost when done per-frame.
+///   so movers skip the random-access (latency-bound) `nodes.get` parent lookup
+///   entirely.
 ///
 /// The GPU column buffers persist, so a column not re-scattered this frame keeps
 /// last value. Roots (no `ChildOf`) get `ROOT_PARENT`, scattered once at first sight.

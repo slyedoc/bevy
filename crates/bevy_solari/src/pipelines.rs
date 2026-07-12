@@ -63,7 +63,7 @@ pub struct SolariPipelines {
     pub ptlas_seed: CachedComputePipelineId,
     pub ptlas_incremental: CachedComputePipelineId,
     pub ptlas_finalize: CachedComputePipelineId,
-    /// Debug (SOLARI_PTLAS_VALIDATE): flags + nulls corrupt BLAS addresses in
+    /// Debug (SolariSettings::ptlas_validate): flags + nulls corrupt BLAS addresses in
     /// the WRITE stream before the partitioned-AS build consumes them.
     pub ptlas_validate: CachedComputePipelineId,
 
@@ -107,7 +107,6 @@ pub fn embed_solari_shaders(app: &mut App) {
     embedded_asset!(app, "geometry/tess_gen_verts.wgsl");
     embedded_asset!(app, "geometry/tess_gen_attrs.wgsl");
     embedded_asset!(app, "geometry/tess_instantiate.wgsl");
-    embedded_asset!(app, "geometry/tess_scatter.wgsl");
     embedded_asset!(app, "geometry/tess_ptlas_write.wgsl");
     embedded_asset!(app, "accel/deform.wgsl");
     embedded_asset!(app, "accel/instantiate.wgsl");
@@ -374,8 +373,8 @@ pub fn init_solari_pipelines(
         constants: vec![],
     });
 
-    // Every id joins the one readiness gate ([`solari_pipelines_ready`]) —
-    // subset gates are the recurring startup-race class.
+    // Every id joins the one readiness gate ([`solari_pipelines_ready`]);
+    // gating on only a subset invites startup races.
     for (label, id) in [
         ("transform_frontier_seed", transform_frontier_seed),
         ("transform_frontier_expand", transform_frontier_expand),

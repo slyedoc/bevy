@@ -10,13 +10,11 @@
 //                      frame's (the gather shifts current→previous before
 //                      this pass) — or (b) whose GEOMETRY was rebuilt this
 //                      frame (`geometry_dirty`), its shared BLAS content
-//                      changed in place. (a) is how the PTLAS learns which
-//                      instances moved now that the CPU no longer tracks
-//                      moves; comparing actual world transforms also catches
-//                      parent-driven moves the CPU `Changed<Transform>` path
-//                      missed. `force_all` writes every active instance (full
-//                      rebuild). Static frame → nothing moved/dirty → pure CPU
-//                      delta (added ∪ disabled).
+//                      changed in place. Move detection is GPU-side only;
+//                      comparing actual world transforms also catches
+//                      parent-driven moves. `force_all` writes every active
+//                      instance (full rebuild). Static frame → nothing
+//                      moved/dirty → pure CPU delta (added ∪ disabled).
 //   finalize         — one thread. Writes the live record count into the
 //                      build op's `arg_count` field (GPU-driven count).
 //
@@ -345,7 +343,7 @@ const BUILT_NO_LEVEL: u32 = 0xFFFFFFFFu;
 // matches). The CPU seed is authoritative.
 @group(1) @binding(18) var<storage, read_write> seed_epoch: array<u32>;
 
-// Debug lane (SOLARI_PTLAS_VALIDATE): [0..4)=valid VA span lo/hi (CPU-written
+// Debug lane (SolariSettings::ptlas_validate): [0..4)=valid VA span lo/hi (CPU-written
 // u64 halves), [4]=instance capacity, [5]=partition count, [6]=bad count,
 // [7..)=up to 15 × (kind, record, slot, value.x, value.y). kind: 1=address
 // outside the span, 2=instance_index >= capacity, 3=bad partition_index.
@@ -367,7 +365,7 @@ fn validate_flag(kind: u32, record: u32, slot: u32, value: vec2<u32>) {
     }
 }
 
-/// SOLARI_PTLAS_VALIDATE: after finalize, flag + defuse any record that would
+/// SolariSettings::ptlas_validate: after finalize, flag + defuse any record that would
 /// MMU-fault the partitioned-AS build: a BLAS address outside the allocator's
 /// sparse VA span, an instance_index past the build's instance_count, or a
 /// partition_index that is neither GLOBAL nor a real partition.

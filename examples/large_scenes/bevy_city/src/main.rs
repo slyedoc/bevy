@@ -38,7 +38,7 @@ use bevy::{
 };
 
 #[cfg(feature = "solari")]
-use bevy::{core_pipeline::Skybox, solari::prelude::*};
+use bevy::solari::prelude::*;
 
 use crate::generate_city::spawn_city;
 use crate::{
@@ -128,6 +128,8 @@ fn main() {
         },
         #[cfg(feature = "solari")]
         SolariPlugin,
+        #[cfg(feature = "solari")]
+        SolariAtmospherePlugin,
     ));
 
     app.insert_resource(args.clone())
@@ -210,12 +212,11 @@ fn mark_city_static(
     }
 }
 
-/// Give the solari camera a [`Skybox`] (sky) once it exists. The pathtracer
-/// samples its cube in the ray direction on a miss instead of returning black.
-/// `Without<Skybox>` makes this archetype-filtered — it runs once and then idles.
-/// `brightness` is in cd/m² (solari single-exposes it like the rest of the scene),
-/// so it's a calibrated value, not a finicky multiplier — tune to taste. (Only the
-/// `Pathtrace` view samples it today; the realtime ReSTIR path doesn't yet.)
+/// Give the solari camera a [`SolariSky::Image`] environment once it exists. The
+/// miss shader samples its cube in the ray direction instead of returning black.
+/// `Without<SolariSky>` makes this archetype-filtered — it runs once and then
+/// idles. `brightness` is in cd/m² (solari single-exposes it like the rest of the
+/// scene), so it's a calibrated value, not a finicky multiplier — tune to taste.
 #[cfg(feature = "solari")]
 #[expect(
     dead_code,
@@ -224,13 +225,12 @@ fn mark_city_static(
 fn add_solari_environment_map(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    camera: Query<Entity, (With<SolariCamera>, Without<Skybox>)>,
+    camera: Query<Entity, (With<SolariCamera>, Without<SolariSky>)>,
 ) {
     for entity in &camera {
-        commands.entity(entity).insert(Skybox {
-            image: Some(asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2")),
+        commands.entity(entity).insert(SolariSky::Image {
+            image: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
             brightness: 3000.0,
-            ..default()
         });
     }
 }

@@ -88,8 +88,6 @@ pub struct AnimatedBlas {
     count: Buffer,
     /// Per-slot BuildClustersBottomLevelInfoNV args (GPU-written).
     blas_args: Buffer,
-    /// Per-slot active instance slot (GPU-written; consumed by the address flip).
-    pub blas_instance_slot: Buffer,
 
     /// Per-frame instantiated-CLAS storage arena.
     instantiated_clas_storage: SparseBuffer,
@@ -135,11 +133,10 @@ pub fn animated_blas_bind_group_layout() -> BindGroupLayoutDescriptor {
                 storage_buffer_sized(false, None),           // 5 instantiate_args (rw)
                 storage_buffer_sized(false, None),           // 6 count (rw)
                 storage_buffer_sized(false, None),           // 7 blas_args (rw)
-                storage_buffer_sized(false, None),           // 8 blas_instance_slot (rw)
-                storage_buffer_sized(false, None),           // 9 instance_blas_address (rw)
-                storage_buffer_read_only_sized(false, None), // 10 instance_e_build
-                storage_buffer_read_only_sized(false, None), // 11 cluster_groups
-                storage_buffer_read_only_sized(false, None), // 12 cluster_to_group
+                storage_buffer_sized(false, None),           // 8 instance_blas_address (rw)
+                storage_buffer_read_only_sized(false, None), // 9 instance_e_build
+                storage_buffer_read_only_sized(false, None), // 10 cluster_groups
+                storage_buffer_read_only_sized(false, None), // 11 cluster_to_group
             ),
         ),
     )
@@ -156,8 +153,6 @@ pub fn init_animated_blas(
     let Some(allocator) = allocator else {
         return;
     };
-    // The bind-group layout lives in `SolariResourceManager`, the pipeline id in
-    // `SolariPipelines`. This init owns only the pass's buffers.
     let instantiate_args = raw_storage(
         &render_device,
         "animated.instantiate_args",
@@ -174,13 +169,6 @@ pub fn init_animated_blas(
         "animated.blas_args",
         MAX_ANIMATED_INSTANCES as u64 * BLAS_ARG_STRIDE,
     );
-    let blas_instance_slot = render_device.create_buffer(&BufferDescriptor {
-        label: Some("animated.blas_instance_slot"),
-        size: MAX_ANIMATED_INSTANCES as u64 * 4,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-
     let instantiated_clas_storage = allocator.create_sparse_buffer(
         &render_device,
         vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
@@ -254,7 +242,6 @@ pub fn init_animated_blas(
         instantiate_args,
         count,
         blas_args,
-        blas_instance_slot,
         instantiated_clas_storage,
         instantiated_clas_addrs,
         instantiated_clas_sizes,
@@ -268,13 +255,15 @@ pub fn init_animated_blas(
 }
 
 /// `Render::Prepare`: size the BLAS pool stride, write per-frame CPU inputs
-/// (count zero, blas_count, blas dst addresses, params), commit sparse pages.
+/// (count zero, blas_count, blas dst addresses, the params uniform), commit
+/// sparse pages.
 pub fn prepare_animated_blas(
     resources: Option<ResMut<AnimatedBlas>>,
     deform: Option<Res<Deform>>,
     instances: Option<Res<InstanceManager>>,
     fns: Option<Res<ClusterExtensionFns>>,
     allocator: Option<Res<Allocator>>,
+    render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
     let (Some(mut resources), Some(deform), Some(instances), Some(fns), Some(allocator)) =
@@ -320,8 +309,6 @@ pub fn prepare_animated_blas(
     // Params: deform pool + instantiated-CLAS-addr device addresses.
     let deform_addr = deform.positions.stable_addr().get();
     let clas_addrs = allocator.wgpu_buffer_device_address(&resources.instantiated_clas_addrs).get();
-    // Set params here; the uniform is uploaded by `prepare_animated_blas_params`
-    // (which has the `RenderDevice`).
     *resources.params.get_mut() = InstantiateParams {
         num_slots: active,
         blas_stride: stride as u32,
@@ -338,6 +325,7 @@ pub fn prepare_animated_blas(
             (pool_base >> 32) as u32,
         ),
     };
+    resources.params.write_buffer(&render_device, &render_queue);
 
     // Commit sparse pages for this frame's worst case.
     let total_clusters = MAX_TOTAL_ANIMATED_CLUSTERS as u64;
@@ -351,23 +339,6 @@ pub fn prepare_animated_blas(
         .blas_pool
         .commit(0..((active as u64) * stride).max(1));
     resources.blas_scratch.commit(0..(64 * 1024 * 1024));
-}
-
-/// `Render::Prepare` (after [`prepare_animated_blas`]): write the params uniform
-/// (needs the `RenderDevice`).
-pub fn prepare_animated_blas_params(
-    resources: Option<ResMut<AnimatedBlas>>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    deform: Option<Res<Deform>>,
-) {
-    let (Some(mut resources), Some(deform)) = (resources, deform) else {
-        return;
-    };
-    if deform.active_count() == 0 {
-        return;
-    }
-    resources.params.write_buffer(&render_device, &render_queue);
 }
 
 /// `Render::PrepareBindGroups`: (re)build the instantiate bind group.
@@ -412,7 +383,6 @@ pub fn prepare_animated_blas_bind_group(
             resources.instantiate_args.as_entire_binding(),
             resources.count.as_entire_binding(),
             resources.blas_args.as_entire_binding(),
-            resources.blas_instance_slot.as_entire_binding(),
             sharing.instance_blas_address.wgpu_buffer.as_entire_binding(),
             sharing.instance_e_build.wgpu_buffer.as_entire_binding(),
             cluster_meshes.groups.buffer().as_entire_binding(),
@@ -424,9 +394,6 @@ pub fn prepare_animated_blas_bind_group(
 
 /// `RenderGraph` (`BuildAnimatedBlas`): instantiate compute → raw-VK INSTANTIATE
 /// build → raw-VK per-instance BLAS build.
-///
-/// NOT YET WIRED into the graph — see the module header. Turning it on also
-/// needs the `instance_blas_address` flip + PTLAS rewrite + resolve fetch.
 pub fn dispatch_animated_blas(
     resources: Option<Res<AnimatedBlas>>,
     deform: Option<Res<Deform>>,
@@ -614,7 +581,7 @@ pub fn dispatch_animated_blas(
         _marker: core::marker::PhantomData,
     };
 
-    // Declared access (SOLARI_VALIDATE): the CPU-knowable ranges of the two
+    // Declared access (SolariSettings::validate): the CPU-knowable ranges of the two
     // raw builds — instantiate writes the CLAS storage + scratch, the BLAS
     // build writes the pool + scratch (per-cluster dst addrs are GPU-computed).
     let total_clusters = MAX_TOTAL_ANIMATED_CLUSTERS as u64;

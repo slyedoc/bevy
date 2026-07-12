@@ -1,8 +1,9 @@
 // Primary/bounce miss: the environment (skybox / baked-atmosphere cube) becomes
-// the path's terminal radiance — sampled, not marched. Matches the megakernel's
-// miss: env cube × brightness, or the clear color when there's no skybox.
+// the path's terminal radiance — sampled, not marched. Env cube × brightness,
+// or the clear color when there's no skybox.
 enable wgpu_ray_tracing_pipeline;
 
+#import bevy_solari::custom_sky::sample_custom_sky
 #import bevy_solari::rt_payload::{RtPayload, RtCamera}
 
 // RT-pipeline-private set (set 1): camera carries sky brightness + clear color;
@@ -29,6 +30,10 @@ fn miss_primary(@builtin(world_ray_direction) dir: vec3<f32>) {
     let volumes_active = bitcast<u32>(camera.atmo.z) != 0u;
     if volumes_active && payload.p_bounce == 0.0 {
         payload.emitted = camera.sky.yzw;
+    } else if brightness < 0.0 {
+        // `SolariSky::Procedural` / `SolariSky::Shader`: the composed
+        // `bevy_solari::custom_sky` module evaluates the sky in physical radiance.
+        payload.emitted = sample_custom_sky(dir);
     } else if brightness > 0.0 {
         // World→bake frame: a spherical-planet atmosphere bakes its cube in a
         // canonical up-=-+Y frame; `sky_frame` re-aims it at the camera's

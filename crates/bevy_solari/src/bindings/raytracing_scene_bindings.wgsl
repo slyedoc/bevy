@@ -95,11 +95,9 @@ struct DirectionalLight {
 @group(0) @binding(0)  var<storage> cluster_indices: array<u32>;
 @group(0) @binding(1)  var<storage> clusters: array<Cluster>;
 
-// Per-instance ray-shading state — written by
-// `prepare_raytracing_scene_bindings` from `InstanceManager`.
-// Slot-indexed world transforms as `mat3x4` affines (column k = 4x4
-// row k), GPU-scattered by `cluster::gpu_instances`. Apply via the
-// `affine_*` helpers below.
+// Per-instance ray-shading state: slot-indexed world transforms as `mat3x4`
+// affines (column k = 4x4 row k), GPU-scattered by `cluster::gpu_instances`.
+// Apply via the `affine_*` helpers below.
 // `transforms` / `previous_frame_transforms` / `material_ids` are GPU columns,
 // bound from the shared scene-columns group (`ecs_gpu::SceneColumns`) — the group
 // index is supplied per-pipeline via the `SOLARI_SCENE_COLUMNS_GROUP` shader-def.
@@ -942,9 +940,8 @@ fn resolve_triangle_data_full_mat_fetch(
     //     micro-vertex smooth, displacement-aware normals from the per-CLAS metadata
     //     table + per-instance normal buffer and let the core interpolate them, so the
     //     displaced surface shades without micro-triangle faceting.
-    //   - FACET (table unwired): geometric normal from the position-fetch positions.
-    // UV is fixed (no per-micro-vertex UVs yet) in both; textured tess shading is a
-    // later brick.
+    //   - FACET (table unwired): geometric normal from the position-fetch positions,
+    //     fixed UV.
     if cluster_global_id >= arrayLength(&clusters) {
         if geometry_addresses.tess_clusters != 0 {
             // Per-CLAS metadata (16 B): normal-buffer address (lo/hi u32) + primitive

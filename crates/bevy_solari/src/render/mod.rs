@@ -9,6 +9,7 @@ pub mod dlss;
 pub mod gizmo_depth;
 pub mod rt_pipeline;
 mod reset;
+pub mod sky;
 pub mod view_cull;
 
 use bevy_app::{App, Plugin, Update};
@@ -18,8 +19,6 @@ use bevy_core_pipeline::{
     core_3d::{main_opaque_pass_3d, main_transparent_pass_3d},
     schedule::{Core3d, Core3dSystems},
 };
-// Only the DLSS resolve/render systems order against tonemapping now that the RT
-// compose runs inside `MainPass`; gate the import so the non-DLSS build is clean.
 use bevy_core_pipeline::tonemapping::tonemapping;
 use bevy_ecs::schedule::{common_conditions::resource_exists, IntoScheduleConfigs, SystemCondition};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
@@ -75,8 +74,7 @@ impl Plugin for SolarRenderPlugin {
             .register_required_components_with::<SolariCamera, ClusterConfig>(
                 || ClusterConfig::None,
             )
-            .register_type::<atmosphere::SolariAtmosphere>()
-            .register_type::<atmosphere::SolariGlobalFog>();
+            .register_type::<sky::SolariSky>();
 
         // Solari's RT compute pass writes the view's main texture directly, which needs
         // `STORAGE_BINDING`. `Camera` already requires `CameraMainTextureUsages` (without
@@ -99,8 +97,7 @@ impl Plugin for SolarRenderPlugin {
         );
 
         // DLSS Ray Reconstruction quality mode (global, extracted). The SDK is
-        // created in `SolariPlugin::finish` (`dlss::init_dlss`); the per-view context,
-        // guide buffers, and RR dispatch land in later phases.
+        // created in `SolariPlugin::finish` (`dlss::init_dlss`).
         app.init_resource::<dlss::SolariDlssMode>()
             .add_plugins(ExtractResourcePlugin::<dlss::SolariDlssMode>::default());
         app.init_resource::<crate::nrc::SolariNrc>()
@@ -126,10 +123,7 @@ impl Plugin for SolarRenderPlugin {
         render_app
             // Empty; surfaces register into it (built-ins via `SolariPlugin`).
             .init_resource::<crate::gpu::rt_pipeline::SolariHitGroupRegistry>()
-            .init_resource::<view_cull::SolariViewUniforms>()
-            .init_resource::<atmosphere::SolariAtmosphereGpu>()
-            .init_resource::<atmosphere::SolariAtmosphereVolumesGpu>()
-            .add_systems(RenderStartup, atmosphere::init_atmosphere_pipeline)
+            .init_resource::<sky::SolariCustomSky>()
             .add_systems(RenderStartup, rt_pipeline::init_rt_blit)
             .add_systems(RenderStartup, rt_pipeline::init_restir_spatial)
             .add_systems(RenderStartup, crate::nrc::init_nrc_pipelines)
@@ -155,36 +149,17 @@ impl Plugin for SolarRenderPlugin {
                     )
                         .chain(),
                     (reset::clear_camera_reframe, reset::extract_camera_reframe).chain(),
-                    view_cull::extract_solari_view_cull_masks,
-                    view_cull::extract_solari_skybox,
-                    atmosphere::extract_solari_atmosphere,
-                    atmosphere::extract_atmosphere_volumes,
+                    view_cull::extract_solari_sky,
+                    sky::extract_solari_custom_sky,
                     rt_pipeline::extract_rt_camera_slot,
                     rt_pipeline::extract_cylindrical_window,
                 ),
             )
             .add_systems(
                 Render,
-                (
-                    rt_pipeline::prepare_rt_output,
-                    view_cull::prepare_solari_view_uniforms,
-                    atmosphere::prepare_atmosphere_sky,
-                    atmosphere::prepare_atmosphere_volumes,
-                )
-                    .in_set(RenderSystems::PrepareResources),
+                rt_pipeline::prepare_rt_output.in_set(RenderSystems::PrepareResources),
             )
-            // .add_systems(
-            //     Render,
-            //     // Zero the camera jitter — the RT path writes a fresh frame and
-            //     // has no temporal accumulator, so a jittered projection would just
-            //     // shimmer.
-            //     jitter::zero_solari_jitter.in_set(RenderSystems::PrepareViews),
-            // )
-            .add_systems(
-                Render,
-                atmosphere::prepare_atmosphere_bind_group.in_set(RenderSystems::PrepareBindGroups),
-            )
-            // Rung-0 harness ops (freeze snapshot / EXR dump) after the frame's trace.
+            // Freeze-diff harness ops (freeze snapshot / EXR dump) after the frame's trace.
             .add_systems(
                 Render,
                 rt_pipeline::rt_freeze_ops.in_set(RenderSystems::Cleanup),
@@ -195,26 +170,19 @@ impl Plugin for SolarRenderPlugin {
             // ray-traced scene instead of being clobbered by a blit that runs after
             // them. (The camera must not clear — `ClearColorConfig::None` — or the
             // opaque pass would wipe the composed image; the RT pass already covers
-            // every pixel via the sky/miss shader.) Mirrors solari-pt's `compose`
-            // ordering; `gizmo_depth` (Stage 2) then bridges RT depth between the
-            // opaque and transparent phases so overlays occlude correctly.
+            // every pixel via the sky/miss shader.) `gizmo_depth` then bridges RT
+            // depth between the opaque and transparent phases so overlays occlude
+            // correctly.
             .add_systems(
                 Core3d,
-                (
-                    atmosphere::dispatch_atmosphere_bake
-                        .run_if(resource_exists::<SolariPipelines>),
-                    atmosphere::dispatch_atmosphere_lut_bake
-                        .run_if(resource_exists::<SolariPipelines>),
-                    rt_pipeline::rt_pipeline
-                        // No `resource_exists::<RtPipeline>` gate — the system
-                        // lazily builds it on the first ready frame.
-                        .run_if(
-                            resource_exists::<rt_pipeline::RtBlit>
-                                .and_then(resource_exists::<RaytracingSceneBindings>)
-                                .and_then(resource_exists::<SceneColumns>),
-                        ),
-                )
-                    .chain()
+                rt_pipeline::rt_pipeline
+                    // No `resource_exists::<RtPipeline>` gate — the system
+                    // lazily builds it on the first ready frame.
+                    .run_if(
+                        resource_exists::<rt_pipeline::RtBlit>
+                            .and_then(resource_exists::<RaytracingSceneBindings>)
+                            .and_then(resource_exists::<SceneColumns>),
+                    )
                     .before(main_opaque_pass_3d)
                     .in_set(Core3dSystems::MainPass),
             )
@@ -260,7 +228,7 @@ impl Plugin for SolarRenderPlugin {
 
 /// Opts a camera into solari's ray-traced rendering: the integrator [`mode`]
 /// plus the active debug-view paint. The default mode is the production
-/// realtime stack; the reference integrator is the exam/ground-truth harness
+/// realtime stack; the reference integrator is the ground-truth harness
 /// every realtime technique is validated against.
 ///
 /// Changing [`mode`] (the variant, or the active variant's levers) drops
@@ -423,7 +391,7 @@ pub enum SolariLighting {
     /// Production per-frame stack: ReSTIR DI + GI reconnection reservoirs with
     /// NRC termination, feeding DLSS Ray Reconstruction as the denoiser.
     Realtime(SolariRestir),
-    /// Ground-truth progressive accumulation with the exam levers.
+    /// Ground-truth progressive accumulation with per-estimator levers.
     Reference(SolariReference),
 }
 
@@ -453,8 +421,8 @@ pub struct SolariReference {
     #[reflect(@1.0..=16.0f32)]
     pub samples_per_frame: u32,
     /// When false, render fresh frames instead of averaging (estimator levers stay
-    /// active). With the rung-0 dump this captures a SINGLE warmed restir frame —
-    /// the per-frame variance metric temporal reuse actually improves.
+    /// active). With the freeze/EXR dump this captures a SINGLE warmed restir frame —
+    /// the per-frame variance temporal reuse actually improves.
     pub accumulate: bool,
     /// The direct-illumination estimator at each path vertex.
     pub di: DiEstimator,
@@ -468,9 +436,7 @@ pub struct SolariReference {
     /// the pixel CENTER: the converged image is aliased, but temporal
     /// reprojection lands on the exact same surface points every frame —
     /// the isolation lever for jitter-induced target-function mismatch in
-    /// reservoir merges (grade no-jitter chains against a no-jitter NEE
-    /// exam; the truth stays jittered, so silhouettes carry aliasing error
-    /// in both).
+    /// reservoir merges.
     pub jitter: bool,
 }
 
@@ -570,15 +536,14 @@ pub struct GiArm {
     /// this bucket is measured under. di-terminated + gi-only images sum to
     /// the full image.
     pub only: bool,
-    /// NRC (zero/docs/nrc.md rung 2): terminate this arm's paths at bounce 2
-    /// into the neural radiance cache (estimator flag bit 20). Biased by
-    /// cache error — graded by freeze-diff/RMSE against the untouched arm.
+    /// Terminate this arm's paths at bounce 2 into the neural radiance cache
+    /// (estimator flag bit 20). Biased by cache error.
     pub nrc: bool,
     /// Maximum indirect bounces (path segments past the primary hit).
     /// Default 1, matching [`SolariRestir::bounces`] — each deeper traced
     /// bounce adds little energy at spike variance. Truncation is biased by
-    /// the missing tail: converged truths and exams that want full transport
-    /// spell `bounces: 32` (Russian roulette then does the terminating).
+    /// the missing tail: converged ground-truth renders that want full
+    /// transport spell `bounces: 32` (Russian roulette then does the terminating).
     #[reflect(@1.0..=32.0f32)]
     pub bounces: u32,
 }
@@ -602,10 +567,10 @@ pub enum DiEstimator {
     /// BSDF-only brute force (no next-event estimation). Validation lever: NEE
     /// on and off MUST converge to the same image — any difference is a pdf/MIS bug.
     BsdfOnly,
-    /// Next-event estimation with RIS (rung 2): M light candidates stream
-    /// through a one-slot reservoir, one shadow ray for the winner.
+    /// Next-event estimation with RIS: M light candidates stream through a
+    /// one-slot reservoir, one shadow ray for the winner.
     Nee(DiNee),
-    /// ReSTIR DI (rung 3): persist the primary vertex's reservoir per pixel and
+    /// ReSTIR DI: persist the primary vertex's reservoir per pixel and
     /// temporally merge last frame's (reprojected + geometry-validated). Emissive
     /// candidates then run at the primary vertex only; bounce vertices fall back
     /// to single-sample emissive NEE and directionals are shaded per light.
@@ -643,15 +608,12 @@ pub struct DiRestir {
     /// Temporal history cap, ×`ris_candidates` — history counts for at most
     /// this many frames' worth of candidates (uncapped M = frozen shadows).
     /// Default 1 — see [`SolariRestir::m_cap`]. History never aids accumulated
-    /// convergence either (correlation slows it, and under AA jitter the
-    /// merge's target-function mismatch biases it) — certify chains with
-    /// [`jitter`](SolariReference::jitter) off, reading the excess over a
-    /// no-jitter NEE control.
+    /// convergence either: correlation slows it, and under AA jitter the
+    /// merge's target-function mismatch biases it.
     #[reflect(@1.0..=64.0f32)]
     pub m_cap: f32,
-    /// Spatial reuse (rung 3 session 2): a post-trace compute pass merges
-    /// each pixel's reservoir with disk neighbors and owns the winner's
-    /// visibility + shade.
+    /// Spatial reuse: a post-trace compute pass merges each pixel's
+    /// reservoir with disk neighbors and owns the winner's visibility + shade.
     pub spatial: Option<SpatialReuse>,
 }
 
@@ -673,7 +635,7 @@ pub enum GiEstimator {
     /// Plain path tracing of the suffix.
     #[default]
     PathTraced,
-    /// ReSTIR GI (rung 4a.1): raygen stores the canonical GI sample
+    /// ReSTIR GI: raygen stores the canonical GI sample
     /// `{x_s, n_s, L_gi, pdf, a0}` per pixel and shades GI from the STORED
     /// sample.
     Restir(GiRestir),
@@ -724,7 +686,7 @@ pub struct SpatialReuse {
     /// Neighbor disk radius, pixels.
     #[reflect(@1.0..=128.0f32)]
     pub radius: f32,
-    /// false = naive M-sum combiner (BIASED — the visible-darkening study);
+    /// false = naive M-sum combiner (BIASED — visibly darkens);
     /// true = Z-count (only M whose surface could produce the winner). Costs
     /// one shadow ray per contributor.
     pub unbiased_zcount: bool,
@@ -746,8 +708,7 @@ impl Default for SpatialReuse {
 
 /// Production ReSTIR on a [`SolariCamera`]: per-frame (no accumulation) DI
 /// reservoirs with temporal + optional spatial reuse, and GI reconnection
-/// reservoirs — the certified full stack (restir_roadmap rungs 3–4a), feeding
-/// DLSS Ray Reconstruction as the denoiser.
+/// reservoirs, feeding DLSS Ray Reconstruction as the denoiser.
 ///
 /// Selected via [`SolariLighting::Realtime`] (the default).
 #[cfg_attr(feature = "bevy_solari_debug", derive(serde::Serialize, serde::Deserialize))]
@@ -762,15 +723,13 @@ pub struct SolariRestir {
     /// this many frames' worth of candidates. Default 1: DLSS-RR does the
     /// temporal accumulation downstream, and reservoir history it can't see
     /// is temporally-sticky error it preserves as detail — one frame's worth
-    /// keeps the merge while handing RR temporally-white input (grades best
-    /// on FLIP and flicker, static and motion, few- and many-light scenes).
+    /// keeps the merge while handing RR temporally-white input.
     #[reflect(@1.0..=64.0f32)]
     pub m_cap: f32,
     /// Spatial reuse. DEFAULT None — under DLSS RR, spatial reuse's disk-sized
     /// winner patches read as swimming pool-caustic light (correlated noise
     /// poses as illumination structure); RR does the variance reduction
-    /// instead. The exam-certified spatial path stays available for non-RR
-    /// consumers (equal-time tables in restir_roadmap).
+    /// instead. The spatial path stays available for non-RR consumers.
     pub spatial: Option<SpatialReuse>,
     /// GI reconnection reservoirs (temporal + spatial). Off = ReSTIR DI only.
     pub gi: bool,

@@ -1,4 +1,4 @@
-// Phase C step 1 of the vk_tessellated_clusters port: GPU micro-vertex generation.
+// GPU micro-vertex generation for the adaptive tessellation path.
 //
 // One workgroup per emitted part triangle (indirect, sized by `classify`'s
 // `finalize`), one thread per config micro-vertex. Each thread reads the part's
@@ -7,11 +7,8 @@
 // reflections are already baked into which template `config_lookup` selects),
 // barycentrically interpolates the base triangle's position / normal / UV,
 // displaces along the interpolated normal, and writes the WORLD-space position
-// into `gen_vertices` at a fixed `max_verts` stride per part. Phase C step 2
-// instantiates each part's config template against its slice of `gen_vertices`.
-//
-// Mirrors `tess_displace.wgsl`'s displacement math; the difference is per-part
-// adaptive config patterns instead of one uniform level per cluster.
+// into `gen_vertices` at a fixed `max_verts` stride per part. The instantiate
+// pass builds each part's config template against its slice of `gen_vertices`.
 
 #import bevy_render::utils::octahedral_decode_signed
 

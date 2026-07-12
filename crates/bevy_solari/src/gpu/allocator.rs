@@ -1,46 +1,30 @@
-// This module reaches into raw Vulkan via `as_hal` because the
-// cluster-AS pipeline needs buffers with usage flags wgpu does not
-// expose publicly (`ACCELERATION_STRUCTURE_STORAGE_BIT_KHR`,
-// `ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR`). The
-// resulting buffers are still owned by wgpu — `create_buffer_from_hal`
-// wraps the raw `VkBuffer` + `VkDeviceMemory` as a `wgpu::Buffer` so
-// downstream code uses wgpu's normal bind-group / lifetime
-// machinery, mirroring how `dlss_wgpu` interops with wgpu.
+// Raw-Vulkan interop (`as_hal`, ash) is unavoidably unsafe; safety contracts
+// are documented at each unsafe block.
 #![allow(unsafe_code)]
 
 //! Raw-Vulkan buffer creation for the cluster acceleration-structure
 //! pipeline, wrapped as `wgpu::Buffer`.
 //!
-//! Why
-//! ---
+//! NV cluster_AS / partitioned_AS storage and AS-build-input buffers need
+//! Vulkan usage flags that `wgpu::BufferUsages` does not expose (wgpu issue
+//! [#7872]). The blessed interop pattern, used by wgpu's own KHR BLAS
+//! implementation (`wgpu-hal/src/vulkan/device.rs`) and by `dlss_wgpu`
+//! (wgpu issue [#4067]):
 //!
-//! NV cluster_AS / partitioned_AS storage and AS-build-input buffers
-//! need Vulkan usage flags that `wgpu::BufferUsages` does not expose
-//! (the maintainers are explicitly moving away from Vulkan-only flag
-//! additions — wgpu issue [#7872]). The blessed interop pattern, used
-//! by wgpu's own KHR BLAS implementation
-//! (`wgpu-hal/src/vulkan/device.rs`) and by `dlss_wgpu` (wgpu issue
-//! [#4067]), is:
-//!
-//! 1. Caller creates the raw `VkBuffer` with whatever Vulkan flags it
-//!    needs, allocates and binds `VkDeviceMemory`.
-//! 2. Caller wraps the pair via [`wgpu::hal::vulkan::Buffer::from_raw_managed`].
-//! 3. Caller hands the hal buffer to [`wgpu::Device::create_buffer_from_hal`].
+//! 1. Create the raw `VkBuffer` with the required Vulkan flags, allocate and
+//!    bind `VkDeviceMemory`.
+//! 2. Wrap the pair via [`wgpu::hal::vulkan::Buffer::from_raw_managed`].
+//! 3. Hand the hal buffer to [`wgpu::Device::create_buffer_from_hal`].
 //!
 //! From step 3 on the buffer is a normal `wgpu::Buffer` — bind groups,
-//! tracker, `Drop` (which frees both buffer + memory) all work as
-//! usual. The cluster-AS build paths reach the raw `VkBuffer` via
+//! tracker, `Drop` (which frees both buffer + memory) all work as usual.
+//! The cluster-AS build paths reach the raw `VkBuffer` via
 //! `buffer.as_hal::<Vulkan>()` when needed.
 //!
-//! Memory
-//! ------
-//!
-//! No gpu-allocator. The AS pipeline allocates a small number of
-//! monolithic buffers (one CLAS arena, one BLAS pool, one PTLAS
-//! storage, a few scratch + per-frame buffers). Sub-ranges within
-//! the arenas are tracked CPU-side as byte offsets — `range-alloc`
-//! does the bookkeeping. Direct `vkAllocateMemory` per buffer avoids
-//! the gpu-allocator/wgpu double-ownership of memory the
+//! No gpu-allocator: the AS pipeline allocates a small number of monolithic
+//! buffers, and sub-ranges within the arenas are tracked CPU-side as byte
+//! offsets (`range-alloc`). Direct `vkAllocateMemory` per buffer avoids the
+//! gpu-allocator/wgpu double-ownership of memory the
 //! [`Buffer::from_raw_managed`] contract creates.
 //!
 //! [#7872]: https://github.com/gfx-rs/wgpu/issues/7872
@@ -72,8 +56,7 @@ pub enum MemoryLocation {
     /// Args buffers staged from CPU, vertex/index uploads, etc.
     CpuToGpu,
     /// GPU-writable, CPU-readable — `HOST_VISIBLE | HOST_COHERENT`.
-    /// Readback for one-shot debugging (e.g. mapping per-cluster CLAS
-    /// addresses back during CLAS-arena bring-up).
+    /// Readback for one-shot debugging.
     GpuToCpu,
 }
 
@@ -157,7 +140,7 @@ struct AllocatorInner {
     /// queue, so binding on wgpu's queue is always legal.
     queue: RenderQueue,
     /// (min, max) VA over every sparse reservation — the "plausible device
-    /// address" span for debug validation (`SOLARI_PTLAS_VALIDATE`).
+    /// address" span for debug validation (`SolariSettings::ptlas_validate`).
     sparse_va_span: Mutex<(u64, u64)>,
 }
 
@@ -571,9 +554,8 @@ impl Allocator {
 /// **Lifecycle**: `Drop` unbinds every committed page, destroys the
 /// `VkBuffer` (after the wgpu Buffer handle is also dropped — wgpu
 /// tracks lifetime through `from_raw`), then frees every memory
-/// chunk we ever allocated. Memory chunks are *never* freed
-/// individually mid-lifetime — `commit` only grows the committed set.
-/// Page eviction is a future milestone.
+/// chunk ever allocated. Memory chunks are never freed individually
+/// mid-lifetime — `commit` only grows the committed set.
 pub struct SparseBuffer {
     /// Raw `VkBuffer` — sparse-bindable. Stable for the lifetime.
     raw: vk::Buffer,
@@ -703,8 +685,7 @@ impl SparseBuffer {
                 // larger than `MAX_CHUNK_BYTES`: a single `vkAllocateMemory` must stay
                 // under `maxMemoryAllocationSize` (~4 GB on NV), and large OMM-bearing
                 // BLAS pools blow past that in one run. Page-aligned so each bind lands
-                // on a page boundary. Sub-allocating from a shared pool would reduce the
-                // VkDeviceMemory count; first-version keeps it dumb.
+                // on a page boundary.
                 const MAX_CHUNK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
                 let max_chunk = (MAX_CHUNK_BYTES / page_size) * page_size;
                 let mut chunk_offset = run_start * page_size;
@@ -757,9 +738,6 @@ impl SparseBuffer {
         // submission lock across the bind + wait — Vulkan requires
         // `VkQueue` to be externally synchronized, INCLUDING against
         // wgpu's own submits/presents on other threads.
-        // The actual page bind + blocking fence wait — the part that
-        // only runs when new pages are committed (growth / streaming).
-        // Steady state skips this entirely (binds.is_empty() above).
         let _bind_span = tracing::info_span!(
             "queue_bind_sparse+wait",
             label = self.label,
@@ -819,18 +797,11 @@ impl Drop for SparseBuffer {
         // (teardown drops mid-last-frame); drain before freeing.
         self.allocator.quiesce_before_raw_destroy();
         let device = &self.allocator.inner.device;
-        // `wgpu_buffer` (and the `bevy_buffer` clone of the same handle)
-        // drop via their own Drop after this method returns — the last
-        // of the two calls vkDestroyBuffer on `raw`. We do NOT destroy
-        // `raw` ourselves to avoid double-free; wgpu's from_raw wrapper
-        // owns the destroy. Both are fields here, so neither outlives the
-        // struct (the destroy fires once, after the chunks are freed below).
-        //
-        // But: sparse bindings hold the memory chunks live as far
-        // as the driver is concerned. After wgpu destroys the
-        // buffer, all bindings are implicitly released, and the
-        // memory can be freed. So we just free the chunks here
-        // and let wgpu destroy the buffer.
+        // wgpu's `from_raw` wrapper owns the vkDestroyBuffer on `raw` — do NOT
+        // destroy it here (double-free). `wgpu_buffer` and `bevy_buffer` are
+        // fields, so they drop after this body and the destroy fires once.
+        // Destroying the buffer implicitly releases its sparse bindings, so
+        // only the memory chunks need freeing here.
         let chunks = std::mem::take(&mut *self.memory_chunks.lock().unwrap());
         for memory in chunks {
             // SAFETY: chunks were allocated via vkAllocateMemory on

@@ -2,8 +2,8 @@
 //! the light **direction from the GPU transform table**.
 //!
 //! The ray tracer needs directional-light data in the render world but shouldn't
-//! depend on `bevy_pbr` running (it owns its material type via [`crate::material`];
-//! lights are the other `bevy_pbr` runtime dependency the scene binder had).
+//! depend on `bevy_pbr` running — the crate likewise owns its material type via
+//! [`crate::material`].
 //!
 //! [`SolariDirectionLight`] is a self-contained directional ("sun") light: a small
 //! main-world component (color / illuminance / sun-disk angular size). It is a
@@ -251,7 +251,7 @@ pub struct LightSources {
     cached_uniform: bool,
 }
 
-/// Validation lever (rung 1): force UNIFORM emissive-light picking instead of the
+/// Debug lever: force UNIFORM emissive-light picking instead of the
 /// power-weighted CDF. Converged images must match; only variance may differ.
 #[derive(Resource, Clone, Default, bevy_render::extract_resource::ExtractResource)]
 pub struct SolariUniformLights {
@@ -261,9 +261,9 @@ pub struct SolariUniformLights {
 /// `Render::Prepare`: rebuild the light-source table — but only when the light
 /// set could have changed (a material's emissiveness edited, an instance added /
 /// released / re-materialed, or a directional light added / removed). On a
-/// move-only frame the O(active) walk is skipped and the table reused — the
-/// headline saving. (Light *transforms* are GPU-side via the PTLAS; this only
-/// tracks which sources exist.)
+/// move-only frame the O(active) walk is skipped and the table reused. (Light
+/// *transforms* are GPU-side via the PTLAS; this only tracks which sources
+/// exist.)
 pub fn prepare_light_sources(
     mut lights: ResMut<LightSources>,
     materials: Res<SolariMaterialAssets>,

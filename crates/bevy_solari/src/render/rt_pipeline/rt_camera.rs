@@ -29,7 +29,7 @@ pub struct RtCameraPassParams {
     /// Inverse projection. `inverse_view_proj = world_from_view · view_from_clip`.
     pub view_from_clip: Mat4,
     /// Floating-origin recenter rebase for the previous basis (identity unless
-    /// `reframe_active`); the GPU keeps the previous `clip_from_world` itself now.
+    /// `reframe_active`); the GPU keeps the previous `clip_from_world` itself.
     pub reframe_prev_from_current: Mat4,
     /// Passthrough → `RtCamera.frame` (`.x` RNG seed, `.y` SER hint bits, `.z` debug view).
     pub frame: UVec4,

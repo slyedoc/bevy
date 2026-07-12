@@ -1,5 +1,5 @@
 //! Block → PTLAS-partition-index allocator for the floating-origin acceleration
-//! structure (design: `docs/big_space_native.md` §12.1). Each populated cell
+//! structure. Each populated cell
 //! **block** (`cell >> BLOCK_SHIFT`) maps to a dense PTLAS partition index whose
 //! `WRITE_PARTITION_TRANSLATION` carries `(block_origin − origin) × cell_edge`, so
 //! instances store only their block-local transform and a floating-origin recenter
@@ -11,7 +11,7 @@
 //! (whose instances are written regardless). That is the key distinction from
 //! big_space's `PartitionId`, which re-keys *resident* entities on merge/split.
 //!
-//! INVARIANTS (design §13 — enforce, don't assume):
+//! INVARIANTS (enforce, don't assume):
 //! 1. Block presence MUST be derived from "≥ 1 resident instance", never a separate
 //!    streaming signal that can flicker — else [`reconcile`](PartitionAllocator::reconcile)
 //!    could free then re-key a resident block to a different index.
@@ -30,7 +30,7 @@ use crate::ecs_gpu::SlotPool;
 /// Bits a cell coordinate is right-shifted by to get its block coordinate — a block
 /// is a `2^BLOCK_SHIFT` cube of cells sharing one PTLAS partition (one translation).
 /// Coarsening (raising this) trades partition count for a larger block-local transform
-/// range; tune against the device `max_partition_count`. v1 = `0` (one cell per block).
+/// range; tune against the device `max_partition_count`. `0` = one cell per block.
 pub const BLOCK_SHIFT: u32 = 0;
 
 /// The block coordinate containing `cell` (`cell >> BLOCK_SHIFT`, component-wise).

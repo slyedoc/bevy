@@ -66,7 +66,7 @@ fn main() {
     .add_systems(PostUpdate, update_control_text)
     // convert meshes to raytracing meshes after scene load, so the glTF meshes can be used as-is without extra processing for raytracing support (in particular, we generate missing UVs and tangents, which the pathtracer needs for its debug visualizations, but the forward renderer doesn't care about).
     // The glTF materials load as `StandardMaterial` (PbrPlugin is enabled), so also
-    // convert them to `SolariMaterial` — otherwise every RT instance gets the
+    // convert them to `StandardSolariMaterial` — otherwise every RT instance gets the
     // default material and the scene renders untextured / unlit.
     .add_systems(
         Update,

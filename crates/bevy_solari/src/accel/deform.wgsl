@@ -1,21 +1,20 @@
 // Skeletal deform — linear-blend skinning of animated cluster meshes on the GPU.
 //
 // One thread per (active animated slot, vertex). For each vertex it blends the
-// 4 influencing joints' skin matrices (`world[palette[j]] * inverse_bind[j]`,
+// 4 influencing joints' skin matrices (`joint_world(palette[j]) * inverse_bind[j]`,
 // both `mat3x4` affines), transforms the rest-pose position/normal, then
 // pre-multiplies the inverse of the instance's own world transform so the
 // output pool holds MESH-LOCAL skinned positions — keeping the resolve path's
 // `transforms[instance_id]` application identical to static instances.
 //
-// Inputs are read straight from the GPU transform table (`world[]`, produced by
-// the propagate pass — joints are nodes) and the shared cluster pools; no CPU
-// skin-matrix upload. See `crates/bevy_solari/cluster_animation_plan.md`.
+// Inputs are read straight from the GPU transform table (joints are nodes) and
+// the shared cluster pools; no CPU skin-matrix upload.
 
 // Same octahedral normal codec the cluster pool + resolve path use, so deformed
 // normals read back consistently with the static `vertex_normals`.
 #import bevy_render::utils::{octahedral_encode, octahedral_decode_signed}
 
-// Per active animated instance. Mirrors `deform.rs::AnimatedSlotGpu` (32 B).
+// Per active animated instance. Mirrors `deform.rs::AnimatedSlotGpu` (36 B).
 struct AnimatedSlot {
     instance_slot: u32,      // GpuEntity slot of the skinned instance
     mesh_vertex_base: u32,   // global vertex-pool slot of vertex 0 (rest pos/normal)

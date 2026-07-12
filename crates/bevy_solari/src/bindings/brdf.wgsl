@@ -12,8 +12,7 @@ enable wgpu_ray_query;
 
 // Rec. 709 luma. Inlined from `bevy_core_pipeline::tonemapping` so this module's
 // import graph stays within solari + bevy_render (the RT-pipeline composer
-// registers a small, self-contained module set; the megakernel composes this
-// identically).
+// registers a small, self-contained module set).
 fn luminance(v: vec3<f32>) -> f32 {
     return dot(v, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
@@ -274,7 +273,7 @@ fn bend_shading_normal(shading_normal: vec3<f32>, wo: vec3<f32>) -> vec3<f32> {
 // Split-sum scale/bias from the self-baked 64×64 INCLUSIVE-grid LUT (texel j = the
 // value at j/63, endpoints included — see tests/bake_dfg.rs). The remap puts uv 0/1
 // exactly on the first/last texel centers, so the steep E falloff at roughness 1 is
-// representable (a plain clamp grid leaked ~2.5% energy there — the furnace test).
+// representable (a plain clamp grid leaks energy there).
 fn F_AB(perceptual_roughness: f32, NdotV: f32) -> vec2<f32> {
     let uv = vec2<f32>(NdotV, perceptual_roughness) * (63.0 / 64.0) + (0.5 / 64.0);
     return textureSampleLevel(brdf_dfg_lut, brdf_dfg_lut_sampler, uv, 0.0).rg;

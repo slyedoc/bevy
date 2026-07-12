@@ -4,14 +4,12 @@
 //! `world[node]` is a pure function of the node's own `local`/`parent` ancestor
 //! chain (`world = local[root] ∘ … ∘ local[parent] ∘ local[node]`), independent
 //! of every other node's world. So one thread walks a node's chain and writes
-//! its world in a SINGLE pass — no Jacobi iteration, no ping-pong, no hazard.
+//! its world in a SINGLE pass — no iteration, no ping-pong, no hazard.
 //!
-//! The buffers are **persistent**: each frame we recompute only the nodes whose
-//! `local` changed (the column's delta — `changed[k*stride]` is the slot), and
-//! static nodes keep last frame's value. This is the symmetric twin of the PTLAS
-//! move detection — use the change delta we already build instead of brute-forcing
-//! all nodes every frame. A capacity growth repopulates the whole buffer once
-//! (`full_rebuild`: one thread per node).
+//! The buffers are **persistent**: each frame only the nodes whose `local`
+//! changed are recomputed (the column's delta — `changed[k*stride]` is the
+//! slot), and static nodes keep last frame's value. The cold-start
+//! `full_rebuild` walks every node once (one thread per node).
 //!
 //! The translation is accumulated in `f64`, so a node's absolute position survives
 //! at AU/interstellar magnitude — the huge magnitude is NOT subtracted here. The
@@ -73,11 +71,8 @@ const WORLD_VIRTUAL_BYTES: u64 = 1024 * 1024 * 1024;
 struct PropagateParams {
     /// Threads to dispatch: `full_rebuild` → node_count; else changed-record count.
     count: u32,
-    /// Words per changed record (`WORDS + 1`); slot at `k * record_stride`.
-    record_stride: u32,
-    /// 1 → walk every node (id = slot); 0 → walk only `changed[k*stride]`.
+    /// 1 → walk every node (id = slot); 0 → walk only the frontier worklist.
     full_rebuild: u32,
-    _pad: u32,
 }
 
 /// Render-world resource: the persistent world buffers + the ancestor-walk pipeline.
@@ -106,10 +101,10 @@ pub struct TransformPropagate {
     /// [`dispatch_transform_propagate`] *actually* runs the full repopulate. While
     /// the propagate pipeline is still compiling the dispatch bails and the latch
     /// stays set, so the first successful frame walks every node created during
-    /// warmup (the old all-black-on-load race). After that it stays clear: new
-    /// nodes are caught by the per-frame changed-path, and the worlds persist across
-    /// growth (sparse — no realloc), so growth needs no re-rebuild. Same retain-
-    /// until-consumed rule `dispatch_column` uses for its `pending`.
+    /// warmup. After that it stays clear: new nodes are caught by the per-frame
+    /// changed-path, and the worlds persist across growth (sparse — no realloc),
+    /// so growth needs no re-rebuild. Same retain-until-consumed rule
+    /// `dispatch_column` uses for its `pending`.
     needs_full_rebuild: bool,
     /// Range of newly-committed sparse pages (in *slots*) a growth needs zeroed (pages
     /// are UNDEFINED on first residency); [`dispatch_transform_propagate`] records the clear
@@ -289,9 +284,7 @@ pub fn prepare_transform_propagate(
     propagate.world_dirty = propagate.dispatch_count > 0 || grew;
     *propagate.params.get_mut() = PropagateParams {
         count: propagate.dispatch_count,
-        record_stride: 1,
         full_rebuild: full_rebuild as u32,
-        _pad: 0,
     };
     propagate.params.write_buffer(&render_device, &render_queue);
 }

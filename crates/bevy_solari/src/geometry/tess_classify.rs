@@ -1,13 +1,13 @@
-// Phase B of the vk_tessellated_clusters port: GPU per-base-triangle classify.
+// GPU per-base-triangle classification for the adaptive tessellation path.
 //
-// A self-contained compute pass (own bind group + submit, like the tess showcase)
-// that classifies every tessellated instance's base triangles into per-edge
-// tessellation factors and emits a work list (`part_triangles`) keyed to the
-// Phase-A [`TessellationTable`] patterns. Phase C consumes the list to displace +
-// instantiate. See `tess_classify.wgsl` for the per-triangle math.
+// A self-contained compute pass (own bind group + submit) that classifies every
+// tessellated instance's base triangles into per-edge tessellation factors and
+// emits a work list (`part_triangles`) keyed to the [`TessellationTable`]
+// patterns, consumed by the displace + instantiate passes. See
+// `tess_classify.wgsl` for the per-triangle math.
 #![allow(clippy::type_complexity)]
-// Explicit `wgpu::` qualification on render-resource types (some are also glob-
-// re-exported via `render_resource::*`); keep the prefix for clarity at call sites.
+// Some render-resource types are also glob-re-exported via `render_resource::*`;
+// keep the explicit `wgpu::` prefix at call sites.
 #![allow(unused_qualifications)]
 #![allow(unsafe_code, reason = "raw VK cluster-AS instantiate via the extension fns")]
 
@@ -49,26 +49,19 @@ fn align_up(addr: u64, align: u64) -> u64 {
 /// pre-sized for every part at the table's MAX config, so denser tessellation only
 /// costs GPU work, never memory.
 const PX_PER_SEGMENT: f32 = 6.0;
-/// Max `part_triangles` the work list holds (one per classified base triangle).
-const PART_CAPACITY: u32 = 1 << 20;
-/// Capacity (in parts) of the Phase-C gen-vertex / (later) CLAS pools. Bounded so
-/// the GPU build can't explode like the CPU path — `gen_vertices` is
-/// `GEN_CAPACITY * MAX_VERTS * 12` bytes. Sized for the displacement instances.
+/// Capacity (in parts) of the whole tessellation path: the `part_triangles` work
+/// list, the gen-vertex / instantiate / CLAS pools (bounds `gen_vertices` at
+/// `GEN_CAPACITY * MAX_VERTS * 12` bytes). The classify shader drops (and does
+/// not count) parts past this, so `counts[0]` — the raw build's
+/// `src_infos_count` — can never index past the pools.
 const GEN_CAPACITY: u32 = 1 << 18; // 262144 parts
-/// Fixed micro-vertices per part slot (the table's max, validated by Phase A).
+/// Fixed micro-vertices per part slot (the table's max).
 const MAX_VERTS: u32 = 78;
 /// Max distinct tessellated instances the per-instance displacement binding array
 /// reserves (partially bound — only the live instances are filled). The gen pass
 /// indexes it by `instance_index`, so it must cover the showcase instance count.
 /// MUST equal the sized `binding_array<texture_2d<f32>, N>` in `tess_gen_verts.wgsl`.
 const MAX_TESS_DISPLACEMENT_MAPS: u32 = 256;
-/// Displacement height (object units); `SOLARI_TESS_SCALE` overrides.
-fn displacement_scale() -> f32 {
-    std::env::var("SOLARI_TESS_SCALE")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(0.05)
-}
 
 /// `tess_classify.wgsl::Params` mirror. `ShaderType` lays it out std140 to match
 /// the uniform on the shader side.
@@ -101,14 +94,13 @@ struct WorkClusterGpu {
     /// Global base of this cluster's vertices in the shared pool. The stored index
     /// values are SOURCE-CLUSTER-LOCAL (the mesh manager rebases `index_offset` /
     /// `vertex_offset` to the global pool but leaves the index *values* local, like
-    /// the chit + `tess_displace`), so `classify` must add this to every fetched
-    /// index to land on the right global vertex.
+    /// the closest-hit), so `classify` must add this to every fetched index to land
+    /// on the right global vertex.
     vertex_base: u32,
     /// Prefix-sum base part index for this cluster (Σ prior clusters' `triangle_count`).
     /// Part index = `part_base + triangle`, a DETERMINISTIC slot (every base triangle
     /// emits exactly one part) — so a part's `cluster_id` (`TESS_CLUSTER_ID_BASE + idx`)
-    /// is stable across frames, unlike the old global-atomic append order (which
-    /// strobed the cluster-debug colors and would desync per-part metadata).
+    /// is stable across frames.
     part_base: u32,
 }
 
@@ -150,7 +142,7 @@ pub struct InstParams {
     pub _pad2: u32,
 }
 
-/// Render-world resource for the classify + (Phase C) vertex-gen passes.
+/// Render-world resource for the classify + downstream tessellation passes.
 #[derive(Resource)]
 pub struct TessClassify {
     pub pipeline: CachedComputePipelineId,
@@ -160,9 +152,9 @@ pub struct TessClassify {
     params: UniformBuffer<ClassifyParams>,
     instances: RawBufferVec<InstanceGpu>,
     work_clusters: RawBufferVec<WorkClusterGpu>,
-    /// `[part, full, split]` atomic counters (part is also the append cursor).
+    /// `counts[0]` = emitted part count (the indirect INSTANTIATE's `src_infos_count`).
     counts: Buffer,
-    /// Emitted [`tess_classify.wgsl::TessTriangleInfo`] work list (Phase C input).
+    /// Emitted [`tess_classify.wgsl::TessTriangleInfo`] work list (gen-pass input).
     pub part_triangles: Buffer,
     /// `DispatchIndirectCommand` for the gen pass (one workgroup per part).
     gen_dispatch: Buffer,
@@ -171,16 +163,16 @@ pub struct TessClassify {
     built_instances: usize,
     bind_group: Option<BindGroup>,
 
-    // ── Phase C step 1: micro-vertex generation ─────────────────────────────
+    // ── Micro-vertex generation ──────────────────────────────────────────────
     gen_pipeline: CachedComputePipelineId,
     gen_layout: BindGroupLayoutDescriptor,
     gen_params: StorageBuffer<GenParams>,
-    /// World-space micro-vertices, stride 3 f32, slot `part*MAX_VERTS + v`. Phase C
-    /// step 2 instantiates each part's template against its slice of this.
+    /// World-space micro-vertices, stride 3 f32, slot `part*MAX_VERTS + v`. The
+    /// instantiate pass builds each part's CLAS against its slice of this.
     pub gen_vertices: Buffer,
     gen_bind_group: Option<BindGroup>,
 
-    // ── Phase C shading: per-micro-triangle smooth normals + UVs ─────────────
+    // ── Per-micro-triangle smooth normals + UVs ──────────────────────────────
     attr_pipeline: CachedComputePipelineId,
     attr_layout: BindGroupLayoutDescriptor,
     attr_params: UniformBuffer<AttrParams>,
@@ -196,12 +188,12 @@ pub struct TessClassify {
     pub gen_attrs_meta_addr: u64,
     attr_bind_group: Option<BindGroup>,
 
-    // ── Phase C step 2a: per-part CLAS instantiate descriptors ───────────────
+    // ── Per-part CLAS instantiate descriptors ────────────────────────────────
     instantiate_pipeline: CachedComputePipelineId,
     instantiate_layout: BindGroupLayoutDescriptor,
     inst_params: UniformBuffer<InstParams>,
     /// One `VkClusterAccelerationStructureInstantiateClusterInfoNV` (8 u32 / 32 B)
-    /// per emitted part — consumed by the step-2b raw-VK indirect INSTANTIATE.
+    /// per emitted part — consumed by the raw-VK indirect INSTANTIATE.
     pub instantiate_infos: Buffer,
     instantiate_bind_group: Option<BindGroup>,
     /// Device address of `gen_vertices` (resolved once the allocator is present);
@@ -211,12 +203,12 @@ pub struct TessClassify {
     /// constant per instance set) — bounds the descriptor-build dispatch CPU-side.
     total_base_tris: u32,
 
-    // ── Phase C step 2b: raw-VK indirect INSTANTIATE → tess CLAS pool ─────────
+    // ── Raw-VK indirect INSTANTIATE → tess CLAS pool ─────────────────────────
     /// Persistent CLAS storage (implicit-dst), sized once from the instantiate size
     /// query for `tess_clas_sized_for` parts and reused every frame.
     tess_clas_storage: Option<Buffer>,
     tess_clas_scratch: Option<Buffer>,
-    /// GPU-written per-part CLAS device addresses (the step-3 BLAS input).
+    /// GPU-written per-part CLAS device addresses (the per-instance BLAS input).
     pub tess_clas_addresses: Option<Buffer>,
     tess_clas_storage_addr: u64,
     tess_clas_scratch_addr: u64,
@@ -224,24 +216,17 @@ pub struct TessClassify {
     /// Part count the CLAS pool was sized for (re-query + realloc if it changes).
     tess_clas_sized_for: u32,
 
-    // ── Phase C step 3a: group CLAS by instance → per-instance BLAS ──────────
-    scatter_pipeline: CachedComputePipelineId,
-    scatter_layout: BindGroupLayoutDescriptor,
-    /// Per-instance contiguous CLAS-address array (the BLAS `cluster_references`).
-    /// Identity copy of `clas_addresses` (parts are already grouped by instance).
-    references: Option<Buffer>,
-    references_addr: u64,
-    scatter_bind_group: Option<BindGroup>,
+    // ── Group CLAS by instance → per-instance BLAS ───────────────────────────
     /// Per-instance prefix-sum offsets (CPU), `[0, c0, c0+c1, …]`, len = num_instances.
     per_instance_offsets: Vec<u32>,
     /// Per-instance base-tri (= part) counts, len = num_instances.
     per_instance_counts: Vec<u32>,
-    // ── Phase C step 3b: per-instance BLAS addresses ─────────────────────────
+    // ── Per-instance BLAS addresses ──────────────────────────────────────────
     /// GPU-written per-instance BLAS device addresses (the PTLAS-write input).
     pub blas_addresses: Option<Buffer>,
     blas_addresses_addr: u64,
     /// Keep this + last frame's `InstanceBlas` storage alive while their builds /
-    /// any in-flight trace complete (2-deep ring; nothing traces them yet).
+    /// any in-flight trace complete (2-deep ring).
     blas_keepalive: Vec<Vec<InstanceBlas>>,
     /// Instance count the scatter/BLAS buffers were sized for.
     blas_sized_for: u32,
@@ -306,7 +291,7 @@ pub fn init_tess_classify(
         constants: vec![],
     });
 
-    // Phase C step 1: vertex-gen layout + pipeline.
+    // Vertex-gen layout + pipeline.
     let gen_layout = BindGroupLayoutDescriptor::new(
         "tess_gen_verts_layout",
         &BindGroupLayoutEntries::sequential(
@@ -342,7 +327,7 @@ pub fn init_tess_classify(
 
     let counts = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tess_classify.counts"),
-        size: 16, // 3 u32 + pad
+        size: 16, // u32 count + pad
         // BLAS_INPUT ⇒ wgpu adds SHADER_DEVICE_ADDRESS (counts[0] is the indirect
         // INSTANTIATE's `src_infos_count`, read by device address).
         usage: wgpu::BufferUsages::STORAGE
@@ -353,7 +338,7 @@ pub fn init_tess_classify(
     });
     let part_triangles = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tess_classify.part_triangles"),
-        size: (PART_CAPACITY as u64) * 32, // TessTriangleInfo = 32 B
+        size: (GEN_CAPACITY as u64) * 32, // TessTriangleInfo = 32 B
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     });
@@ -369,14 +354,14 @@ pub fn init_tess_classify(
         label: Some("tess_classify.gen_vertices"),
         size: (GEN_CAPACITY as u64) * (MAX_VERTS as u64) * 12,
         // BLAS_INPUT ⇒ SHADER_DEVICE_ADDRESS — the INSTANTIATE reads this as the
-        // CLAS vertex source by device address. COPY_SRC for the gen readback validation.
+        // CLAS vertex source by device address.
         usage: wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::BLAS_INPUT
             | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
 
-    // Phase C shading: per-micro-triangle smooth-normal/UV layout + pipeline.
+    // Per-micro-triangle smooth-normal/UV layout + pipeline.
     let attr_layout = BindGroupLayoutDescriptor::new(
         "tess_gen_attrs_layout",
         &BindGroupLayoutEntries::sequential(
@@ -405,7 +390,7 @@ pub fn init_tess_classify(
         constants: vec![],
     });
 
-    // Phase C step 2a: per-part CLAS-instantiate descriptor builder.
+    // Per-part CLAS-instantiate descriptor builder.
     let instantiate_layout = BindGroupLayoutDescriptor::new(
         "tess_instantiate_layout",
         &BindGroupLayoutEntries::sequential(
@@ -429,29 +414,6 @@ pub fn init_tess_classify(
         zero_initialize_workgroup_memory: false,
         constants: vec![],
     });
-    // Phase C step 3a: CLAS-by-instance scatter.
-    let scatter_layout = BindGroupLayoutDescriptor::new(
-        "tess_scatter_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 clas_addresses
-                storage_buffer_sized(false, None),           // 1 references (rw)
-                storage_buffer_read_only_sized(false, None), // 2 counts
-            ),
-        ),
-    );
-    let scatter_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("tess_scatter".into()),
-        layout: vec![scatter_layout.clone()],
-        shader: bevy_asset::load_embedded_asset!(asset_server.as_ref(), "tess_scatter.wgsl"),
-        shader_defs: vec![],
-        entry_point: Some("scatter".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
-
     let instantiate_infos = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tess_classify.instantiate_infos"),
         // VkClusterAccelerationStructureInstantiateClusterInfoNV = 32 B / part.
@@ -482,7 +444,6 @@ pub fn init_tess_classify(
         ("tess_gen_verts", gen_pipeline),
         ("tess_gen_attrs", attr_pipeline),
         ("tess_instantiate", instantiate_pipeline),
-        ("tess_scatter", scatter_pipeline),
     ] {
         registry.register(label, id);
     }
@@ -526,11 +487,6 @@ pub fn init_tess_classify(
         tess_clas_scratch_addr: 0,
         tess_clas_addresses_addr: 0,
         tess_clas_sized_for: 0,
-        scatter_pipeline,
-        scatter_layout,
-        references: None,
-        references_addr: 0,
-        scatter_bind_group: None,
         per_instance_offsets: Vec::new(),
         per_instance_counts: Vec::new(),
         blas_addresses: None,
@@ -577,7 +533,7 @@ fn tess_instantiate_input<'a>(
 
 /// `Render::Prepare`: build the CPU work lists (cached), write params from the
 /// camera, (re)build the bind group, then record + submit the classify dispatch.
-/// Self-submitting like the tess showcase, so no render-graph wiring is needed.
+/// Self-submitting, so no render-graph wiring is needed.
 pub fn run_tess_classify(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -591,6 +547,7 @@ pub fn run_tess_classify(
     allocator: Option<Res<Allocator>>,
     fns: Option<Res<ClusterExtensionFns>>,
     views: Query<&ExtractedView, With<ExtractedCamera>>,
+    settings: Res<crate::SolariSettings>,
 ) {
     let (present, sc, mm, tb) =
         (classify.is_some(), showcase.is_some(), mesh_manager.is_some(), table.is_some());
@@ -646,8 +603,7 @@ pub fn run_tess_classify(
     // in the LOD metric makes a static camera re-derive different per-edge segment
     // counts at boundaries every frame → constant re-tessellation → the micro-triangle
     // numbering (and shading) strobes on dense surfaces. The unjittered metric keeps
-    // tessellation stable when still; it still adapts as the camera actually moves.
-    // Mirrors the rt_pipeline's unjittered `clip_from_world` (used for motion vectors).
+    // tessellation stable when still and adapts as the camera actually moves.
     let clip_from_world = view.clip_from_view * view.world_from_view.to_matrix().inverse();
 
     // Build the per-instance + per-cluster work lists for this instance set. Rebuilt
@@ -693,16 +649,27 @@ pub fn run_tess_classify(
             return;
         }
         // Each base triangle emits exactly one part, so the total base-tri count IS the
-        // emitted part count (the constant `part=…` in the readback) — used to bound the
-        // step-2a descriptor-build dispatch CPU-side without an extra indirect pass.
-        classify.total_base_tris = classify
+        // emitted part count — used to bound the descriptor-build dispatch CPU-side
+        // without an extra indirect pass. Clamped to `GEN_CAPACITY` to match the
+        // classify shader's drop of parts past capacity.
+        let total_base_tris: u32 = classify
             .work_clusters
             .values()
             .iter()
             .map(|c| c.triangle_count)
             .sum();
+        if total_base_tris > GEN_CAPACITY {
+            tracing::warn!(
+                "tess_classify: {} base triangles exceed the part capacity ({}); \
+                 the excess will not be tessellated",
+                total_base_tris,
+                GEN_CAPACITY,
+            );
+        }
+        classify.total_base_tris = total_base_tris.min(GEN_CAPACITY);
         // Per-instance part counts (= base-tri counts) + prefix-sum base offsets into
-        // `references` — drives the step-3a scatter + per-instance BLAS sublists.
+        // `tess_clas_addresses` — drives the per-instance BLAS sublists. Clamped to
+        // the same capacity so no BLAS references a part slot past the pools.
         let num_instances = showcase.instances.len();
         let mut counts = vec![0u32; num_instances];
         for c in classify.work_clusters.values() {
@@ -712,9 +679,10 @@ pub fn run_tess_classify(
         }
         let mut offsets = vec![0u32; num_instances];
         let mut acc = 0u32;
-        for (o, &c) in offsets.iter_mut().zip(counts.iter()) {
-            *o = acc;
-            acc += c;
+        for (o, c) in offsets.iter_mut().zip(counts.iter_mut()) {
+            *o = acc.min(GEN_CAPACITY);
+            acc += *c;
+            *c = acc.min(GEN_CAPACITY) - *o;
         }
         classify.per_instance_counts = counts;
         classify.per_instance_offsets = offsets;
@@ -736,10 +704,10 @@ pub fn run_tess_classify(
         }
     }
 
-    // Phase C step 2b: size + allocate the tess CLAS pool once per instance set (the part
-    // count is fixed = total_base_tris). The instantiate size query bounds the implicit-dst
-    // storage for the worst case (every part its max-size template); the actual per-frame
-    // build uses the GPU `counts[0]` as `src_infos_count`.
+    // Size + allocate the tess CLAS pool once per instance set (the part count is
+    // fixed = total_base_tris). The instantiate size query bounds the implicit-dst
+    // storage for the worst case (every part its max-size template); the actual
+    // per-frame build uses the GPU `counts[0]` as `src_infos_count`.
     if let (Some(alloc), Some(fns_res)) = (allocator.as_ref(), fns.as_ref()) {
         if let Some(cluster_fns) = fns_res.cluster.as_ref() {
             if classify.total_base_tris > 0 && classify.tess_clas_sized_for != classify.total_base_tris
@@ -811,23 +779,8 @@ pub fn run_tess_classify(
                     sizes.build_scratch_size,
                 );
 
-                // Step 3a/3b buffers, same instance-set lifetime: the per-instance scatter
-                // `references` (total_base_tris × u64 CLAS addr) + the per-instance BLAS
-                // addresses. Parts are already grouped by instance (deterministic index),
-                // so the scatter is an identity copy — no base-offset / cursor buffers.
+                // Per-instance BLAS addresses, same instance-set lifetime.
                 let num_instances = classify.per_instance_counts.len().max(1) as u32;
-                let references = alloc.create_buffer(
-                    &render_device,
-                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
-                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                    (count as u64) * 8,
-                    MemoryLocation::GpuOnly,
-                    "tess_classify.references",
-                );
-                classify.references_addr = alloc.wgpu_buffer_device_address(&references).get();
-                if let Some(old) = classify.references.replace(references.into()) {
-                    retire.retire(&render_queue, "tess_classify.references", old);
-                }
                 let blas_addresses = alloc.create_buffer(
                     &render_device,
                     vk::BufferUsageFlags::STORAGE_BUFFER
@@ -904,7 +857,7 @@ pub fn run_tess_classify(
         work_cluster_count,
         max_size: table.max_size,
         max_size_configs: table.max_size_configs,
-        part_capacity: PART_CAPACITY,
+        part_capacity: GEN_CAPACITY,
         _pad: 0,
     };
     classify.params.write_buffer(&render_device, &render_queue);
@@ -940,9 +893,9 @@ pub fn run_tess_classify(
     );
     classify.bind_group = Some(bind_group);
 
-    // Phase C step 1 wiring: resolve the (single) displacement map + build the
-    // gen-verts bind group. Gated on the displacement being resident (the showcase
-    // sets it); without it we still run classify but skip vertex gen.
+    // Vertex-gen wiring: resolve the displacement maps + build the gen-verts bind
+    // group. Gated on the displacements being resident; without them classify still
+    // runs but vertex gen is skipped.
     let gen_pipeline = pipeline_cache.get_compute_pipeline(classify.gen_pipeline);
     let finalize_pipeline = pipeline_cache.get_compute_pipeline(classify.finalize_pipeline);
     // Per-instance displacement: gather EVERY instance's own map into the binding
@@ -964,7 +917,7 @@ pub fn run_tess_classify(
             if !disp_views.is_empty() && disp_views.len() <= MAX_TESS_DISPLACEMENT_MAPS as usize =>
         {
             *classify.gen_params.get_mut() = GenParams {
-                displacement_scale: displacement_scale(),
+                displacement_scale: settings.tess_displacement_scale,
                 displacement_bias: 0.0,
                 max_verts: MAX_VERTS,
                 has_displacement: 1,
@@ -1000,11 +953,11 @@ pub fn run_tess_classify(
         _ => false,
     };
 
-    // Phase C shading: build the attr-pass bind group + params. Produces the smooth
-    // normals + UVs (denormalized per micro-triangle) + the per-part metadata the
-    // closest-hit reads via `geometry_addresses.tess_clusters`. Gated on the gen pass
-    // (shares its inputs + indirect grid) + the attr buffers being sized. Clone the
-    // buffer handles (Arc) so they don't borrow `classify` across the params write.
+    // Attr pass: build the bind group + params. Produces the smooth normals + UVs
+    // (denormalized per micro-triangle) + the per-part metadata the closest-hit
+    // reads via `geometry_addresses.tess_clusters`. Gated on the gen pass (shares
+    // its inputs + indirect grid) + the attr buffers being sized. Clone the buffer
+    // handles (Arc) so they don't borrow `classify` across the params write.
     let gen_attrs_buf = classify.gen_attrs.clone();
     let gen_attrs_meta_buf = classify.gen_attrs_meta.clone();
     let attr_pipeline_ready = pipeline_cache.get_compute_pipeline(classify.attr_pipeline).is_some();
@@ -1045,8 +998,8 @@ pub fn run_tess_classify(
         false
     };
 
-    // Phase C step 2a: build one CLAS-instantiate descriptor per emitted part. Gated on
-    // the gen pass running (it fills `gen_vertices`) + the allocator-resolved gen address.
+    // Build one CLAS-instantiate descriptor per emitted part. Gated on the gen pass
+    // running (it fills `gen_vertices`) + the allocator-resolved gen address.
     let instantiate_pipeline = pipeline_cache.get_compute_pipeline(classify.instantiate_pipeline);
     let inst_ready = match (gen_ready, instantiate_pipeline, classify.gen_vertices_addr) {
         (true, Some(_), addr) if addr != 0 => {
@@ -1055,8 +1008,8 @@ pub fn run_tess_classify(
                 gen_base_hi: (addr >> 32) as u32,
                 max_verts: MAX_VERTS,
                 part_capacity: GEN_CAPACITY,
-                // Sentinel ClusterIDNV base above the real cluster pool (step 2b/3 shades
-                // tess CLAS via the facet normal, like the CPU showcase).
+                // Sentinel ClusterIDNV base above the real cluster pool, so the
+                // closest-hit detects tess hits.
                 cluster_id_base: TESS_CLUSTER_ID_BASE,
                 _pad0: 0,
                 _pad1: 0,
@@ -1084,8 +1037,8 @@ pub fn run_tess_classify(
         _ => false,
     };
 
-    // step 2b readiness: the descriptors built (inst_ready), the cluster-AS fns loaded,
-    // and the CLAS pool sized for the current part count.
+    // CLAS-build readiness: the descriptors built (inst_ready), the cluster-AS fns
+    // loaded, and the CLAS pool sized for the current part count.
     let clas_build_ready = inst_ready
         && fns.as_ref().and_then(|f| f.cluster.as_ref()).is_some()
         && classify.tess_clas_storage.is_some()
@@ -1142,7 +1095,7 @@ pub fn run_tess_classify(
                 pass.dispatch_workgroups_indirect(&classify.gen_dispatch, 0);
             }
         }
-        // step 2a: build per-part CLAS-instantiate descriptors. Bounded by the CPU-known
+        // Build per-part CLAS-instantiate descriptors. Bounded by the CPU-known
         // base-tri count (the shader still guards `p >= counts[0]`); 64-wide.
         if inst_ready {
             let inst_groups = classify.total_base_tris.div_ceil(64).min(65535);
@@ -1157,12 +1110,12 @@ pub fn run_tess_classify(
     }
     render_queue.submit([encoder.finish()]);
 
-    // step 2b: raw-VK indirect INSTANTIATE_TRIANGLE_CLUSTER — turn each part's GPU-built
-    // descriptor + gen_vertices slice into a CLAS in the persistent pool. Must be its OWN
-    // encoder (wgpu forbids mixing raw + wgpu-pass commands in one encoder); the opening
-    // `as_barrier` synchronizes against the prior submit's compute writes (same queue,
-    // submission order preserved). `src_infos_count = counts[0]` (GPU actual count, so
-    // Phase-D culling just works); bounded by the size-query's `total_base_tris`.
+    // Raw-VK indirect INSTANTIATE_TRIANGLE_CLUSTER — turn each part's GPU-built
+    // descriptor + gen_vertices slice into a CLAS in the persistent pool. Must be its
+    // OWN encoder (wgpu forbids mixing raw + wgpu-pass commands in one encoder); the
+    // opening `as_barrier` synchronizes against the prior submit's compute writes
+    // (same queue, submission order preserved). `src_infos_count = counts[0]` (the
+    // GPU actual count); bounded by the size-query's `total_base_tris`.
     if clas_build_ready {
         let alloc = allocator.as_ref().unwrap();
         let fns_res = fns.as_ref().unwrap();
@@ -1219,49 +1172,22 @@ pub fn run_tess_classify(
         render_queue.submit([build_encoder.finish()]);
     }
 
-    // step 3a/3b: group the per-part CLAS by instance (scatter) → build one BLAS per
-    // instance. Gated on the 2b CLAS build + the scatter pipeline + the C3 buffers.
-    let scatter_pipeline = pipeline_cache.get_compute_pipeline(classify.scatter_pipeline);
+    // Build one BLAS per instance from its contiguous CLAS-address sublist.
+    // Gated on the CLAS build + the BLAS-address buffers.
     let c3_ready = clas_build_ready
-        && scatter_pipeline.is_some()
-        && classify.references.is_some()
         && classify.blas_addresses.is_some()
         && classify.tess_clas_addresses.is_some();
     if c3_ready {
         let alloc = allocator.as_ref().unwrap();
         let fns_res = fns.as_ref().unwrap();
 
-        // Scatter: own wgpu encoder (the prior 2b build submit's trailing AS-barrier makes
-        // the CLAS addresses visible to this compute read; same queue, submission order).
-        let sbg = render_device.create_bind_group(
-            "tess_scatter_bind_group",
-            &pipeline_cache.get_bind_group_layout(&classify.scatter_layout),
-            &BindGroupEntries::sequential((
-                classify.tess_clas_addresses.as_ref().unwrap().as_entire_binding(),
-                classify.references.as_ref().unwrap().as_entire_binding(),
-                classify.counts.as_entire_binding(),
-            )),
-        );
-        classify.scatter_bind_group = Some(sbg);
-        let mut scatter_encoder =
-            render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tess_classify.scatter"),
-            });
-        {
-            let mut pass = scatter_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("tess_scatter"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(scatter_pipeline.unwrap());
-            pass.set_bind_group(0, classify.scatter_bind_group.as_ref().unwrap(), &[]);
-            pass.dispatch_workgroups(classify.total_base_tris.div_ceil(64).min(65535), 1, 1);
-        }
-        render_queue.submit([scatter_encoder.finish()]);
-
-        // Per-instance BLAS: one BLAS from each instance's contiguous CLAS-reference
-        // sublist (raw-only encoder; record_build_per_instance_blas leads with an
-        // AS-barrier that syncs against the scatter submit). The driver writes each BLAS
-        // address into `blas_addresses[i]` GPU-side.
+        // Per-instance BLAS: one BLAS from each instance's contiguous sublist of
+        // `tess_clas_addresses` — the INSTANTIATE writes the per-part CLAS addresses
+        // at DETERMINISTIC indices already grouped by instance, so the flat address
+        // array is directly each BLAS's `cluster_references` (raw-only encoder;
+        // `record_build_per_instance_blas` leads with an AS-barrier that syncs
+        // against the CLAS-build submit). The driver writes each BLAS address into
+        // `blas_addresses[i]` GPU-side.
         let mut blas_encoder =
             render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tess_classify.blas_build"),
@@ -1271,7 +1197,8 @@ pub fn run_tess_classify(
             if cnt == 0 {
                 continue;
             }
-            let refs_addr = classify.references_addr + (classify.per_instance_offsets[i] as u64) * 8;
+            let refs_addr =
+                classify.tess_clas_addresses_addr + (classify.per_instance_offsets[i] as u64) * 8;
             let blas = record_build_per_instance_blas(
                 &render_device,
                 &render_queue,

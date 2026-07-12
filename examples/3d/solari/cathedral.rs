@@ -43,6 +43,7 @@ fn main() {
         .add_plugins((
             DefaultPlugins,
             SolariPlugin,
+            SolariAtmospherePlugin,
             // GPU picking backend: cursor rays traced against the PTLAS.
             SolariPickingPlugin,
             FeathersPlugins,
@@ -100,7 +101,7 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut solari_materials: ResMut<Assets<SolariMaterial>>,
+    mut solari_materials: ResMut<Assets<StandardSolariMaterial>>,
 ) {
     // Dusty air filling the nave, floor to vault: a thin box of white medium,
     // dense enough to catch the window shafts but light enough to read through.
@@ -156,7 +157,7 @@ fn setup_scene(
         let center_x = (i as f32 - 2.5) * 5.2; // midpoints: -13, -7.8, ... 13
         commands.spawn((
             Mesh3d(pane.clone()),
-            SolariMaterial3d(solari_materials.add(SolariMaterial {
+            SolariMaterial3d(solari_materials.add(StandardSolariMaterial {
                 base_color: Color::WHITE,
                 perceptual_roughness: 0.0,
                 specular_transmission: 1.0,

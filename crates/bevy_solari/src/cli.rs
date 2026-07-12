@@ -23,7 +23,7 @@ use crate::render::{SolariCamera, SolariLighting};
 
 /// The shared camera levers. Default is the reference estimator rendering
 /// fresh frames (live feedback for interactive testing); `--accum` opts into
-/// progressive accumulation (the exam/convergence mode); `--camera` selects
+/// progressive accumulation (the convergence mode); `--camera` selects
 /// any estimator configuration verbatim.
 #[derive(clap::Args, Clone, Debug)]
 pub struct SolariCameraArgs {
@@ -36,13 +36,13 @@ pub struct SolariCameraArgs {
     #[arg(long)]
     pub camera: Option<String>,
 
-    /// reference: paths per pixel per frame (exams typically pass 16+)
+    /// reference: paths per pixel per frame (convergence runs typically use 16+)
     #[arg(long, default_value_t = 1)]
     pub spp: u32,
 
-    /// reference: progressively accumulate frames into a converging mean (the
-    /// exam mode). Default is fresh frames — live feedback while testing
-    /// levers, restir history stays warm
+    /// reference: progressively accumulate frames into a converging mean.
+    /// Default is fresh frames — live feedback while testing levers, restir
+    /// history stays warm
     #[arg(long)]
     pub accum: bool,
 
@@ -94,7 +94,15 @@ impl SolariCameraArgs {
             "normal-facing" => SolariDebugView::NormalFacing,
             "nrc" => SolariDebugView::NrcCache,
             "white" | "lighting" => SolariDebugView::WhiteWorld,
-            _ => SolariDebugView::None,
+            "" | "none" => SolariDebugView::None,
+            other => {
+                bevy_log::warn!(
+                    "--debug-view: unknown value `{other}` (expected one of: heatmap/cost, \
+                    any-hit, displacement, cluster/clusters, triangles, normal-facing, nrc, \
+                    white/lighting, none); using none"
+                );
+                SolariDebugView::None
+            }
         }
     }
 }

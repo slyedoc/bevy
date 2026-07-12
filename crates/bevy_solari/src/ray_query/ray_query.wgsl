@@ -3,7 +3,7 @@
 //
 // Self-contained on purpose: it declares `tlas` locally and traces inline, pulling
 // in NOTHING from the big `scene_bindings` module. `#import`ing even one item makes
-// naga_oil preprocess that whole module, which tripped two ways: (1) the bindless
+// naga_oil preprocess that whole module, which breaks two ways: (1) the bindless
 // resolve path there (`resolve_ray_hit_full` / `load_material_bindless` /
 // `alpha_test` / the shared `trace_ray`) reaches `physical_load` buffer-device-address
 // loads, needing the `PhysicalStorageBufferAddresses` capability that only the

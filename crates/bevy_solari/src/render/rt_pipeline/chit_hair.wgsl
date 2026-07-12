@@ -1,11 +1,10 @@
-// Hair closest-hit — the rt_pipeline-NATIVE fiber path. Structured exactly like
+// Hair closest-hit: the fiber path on the RT pipeline. Structured like
 // `chit_opaque`: next-event estimation with a `traceRay` shadow ray to the
 // dedicated `miss_shadow` program (fixed-function traversal, off the register
-// file), and a BSDF-sampled continuation ray the RAYGEN loop drives. It is NOT
-// the inline integrator in `hair_shade.wgsl` (which runs its own `rayQuery` bounce
-// loop) — keeping hair on the pipeline path is the whole point, and lets the
-// inline `wgpu_ray_query` machinery be retired. Only the pure Chiang fiber BSDF
-// (`bevy_solari::hair`) and `resolve_hair_hit` are reused (both rayQuery-free).
+// file), and a BSDF-sampled continuation ray the RAYGEN loop drives. Distinct
+// from the inline integrator in `hair_shade.wgsl` (which runs its own `rayQuery`
+// bounce loop); only the Chiang fiber BSDF (`bevy_solari::hair`) and
+// `resolve_hair_hit` are shared (both rayQuery-free).
 enable wgpu_ray_tracing_pipeline;
 enable primitive_index;
 

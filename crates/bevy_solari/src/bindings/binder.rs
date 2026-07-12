@@ -46,12 +46,12 @@ pub struct RaytracingSceneBindings {
     pub materials_device_address: crate::gpu::allocator::StableAddr,
 }
 
-/// The scene's per-frame-rebuilt tables, now on persistent **stable-address**
+/// The scene's per-frame-rebuilt tables, on persistent **stable-address**
 /// buffers. The RT trace reads them by device address (`materials`) or descriptor
 /// (`light_sources` / `active_light_list`); a stable handle/address that's never
-/// freed means an in-flight trace can never read a reallocated/freed buffer — the
-/// root of the regenerate device-lost. Built once in [`init_solari_scene_buffers`]
-/// and overwritten each frame. (`directional_lights` is already a `GpuColumn`.)
+/// freed means an in-flight trace can never read a reallocated/freed buffer.
+/// Built once in [`init_solari_scene_buffers`] and overwritten each frame.
+/// (`directional_lights` is a `GpuColumn`.)
 #[derive(Resource)]
 pub struct SolariSceneBuffers {
     /// `array<Material>`, read bindlessly by `physical_load<Material>`.
@@ -159,10 +159,10 @@ pub fn prepare_raytracing_scene_bindings(
     let mut textures = CachedBindingArray::new();
     let mut samplers = Vec::new();
     // Materials live in a persistent, stable-address `StableStorageBuffer` (built
-    // once in `init_solari_materials`). The RT chit reads them by device address
-    // (`physical_load<Material>`); a stable address that's never freed means the
-    // in-flight trace can't read a reallocated/freed materials buffer (the regen
-    // device-lost). `SHADER_DEVICE_ADDRESS` comes from the sparse buffer itself.
+    // once in `init_solari_scene_buffers`). The RT chit reads them by device
+    // address (`physical_load<Material>`); a stable address that's never freed
+    // means an in-flight trace can't read a reallocated/freed materials buffer.
+    // `SHADER_DEVICE_ADDRESS` comes from the sparse buffer itself.
     let Some(mut scene_buffers) = scene_buffers else {
         return;
     };
@@ -173,13 +173,6 @@ pub fn prepare_raytracing_scene_bindings(
         active_light_list,
         array_sampler,
     } = &mut *scene_buffers;
-    // Per-instance `transforms` / `previous_frame_transforms` /
-    // `material_ids` are slot-indexed GPU columns now (`GpuInstances`,
-    // scattered from a delta) — bound directly, not rebuilt here. Same
-    // for `instance_cluster_ranges`, which reuses the slot-indexed
-    // `instance_lod_inputs` column. Only the light buffers are still
-    // built per frame (into the persistent `light_sources` / `active_light_list`).
-
     let mut process_texture = |texture_handle: &Option<Handle<_>>| -> Option<u32> {
         match texture_handle {
             Some(texture_handle) => match texture_assets.get(texture_handle.id()) {
@@ -225,7 +218,7 @@ pub fn prepare_raytracing_scene_bindings(
         return;
     }
     // Reset to all-default then overwrite the live slots — freed slots stay
-    // default (black) holes, matching the old fresh-buffer-per-frame behavior.
+    // default (black) holes.
     let materials_vec = materials.get_mut();
     materials_vec.clear();
     materials_vec.resize(material_count, GpuMaterial::default());
@@ -344,7 +337,7 @@ pub fn prepare_raytracing_scene_bindings(
     // buffers, so the trace can never capture a reallocating one (compile-time).
     raytracing_scene_bindings.materials_device_address = materials.trace_device_address();
 
-    // PTLAS is built by `ptlas::dispatch_ptlas`; no TLAS build here.
+    // The TLAS (PTLAS) is built by `ptlas::dispatch_ptlas`.
 
     let (dfg_view, dfg_sampler) = texture_assets
         .get(&dfg_lut.texture)
@@ -402,14 +395,13 @@ impl RaytracingSceneBindings {
                 "raytracing_scene_bind_group_layout",
                 // `transforms` / `previous_frame_transforms` / `material_ids` /
                 // `directional_lights` / `instance_cluster_ranges` are GPU columns,
-                // now bound from the shared `ecs_gpu::SceneColumns` group — not here.
+                // bound from the shared `ecs_gpu::SceneColumns` group — not here.
                 // Vertex attributes + materials are reached bindlessly by
-                // buffer-device-address, so the cluster vertex pools and materials
-                // are no longer bound, and deform is gone with the animation
-                // subsystem. Bindings are CONTIGUOUS (0..14) — a sparse/gappy layout
-                // would be compacted by wgpu to contiguous physical slots, desyncing
-                // it from the naga SPIR-V (which keeps the logical numbers) in the
-                // raw RT pipeline. Order matches `raytracing_scene_bindings.wgsl`.
+                // buffer-device-address. Bindings are CONTIGUOUS (0..14) — a
+                // sparse/gappy layout would be compacted by wgpu to contiguous
+                // physical slots, desyncing it from the naga SPIR-V (which keeps
+                // the logical numbers) in the raw RT pipeline. Order matches
+                // `raytracing_scene_bindings.wgsl`.
                 &BindGroupLayoutEntries::sequential(
                     // COMPUTE for any compute consumer; the RT-pipeline stages so the
                     // same bind group is visible to raygen + the hit/miss shaders.
@@ -514,9 +506,8 @@ struct GpuMaterial {
     dispersion: f32,
     // `0.5·log2(width·height)` of the base-color texture — the texture-size
     // term of the ray-cone texture LOD, baked here so the path tracer doesn't
-    // query `textureDimensions` per hit (a bindless descriptor fetch that
-    // crushed warp occupancy). Shared across the material's maps (they're
-    // near-always the same resolution).
+    // query `textureDimensions` per hit. Shared across the material's maps
+    // (they're near-always the same resolution).
     texel_lod_bias: f32,
     // Displacement (height) map: `TEXTURE_MAP_NONE` if absent. Consumed when the
     // surface is tessellated — each generated micro-vertex offsets along its
@@ -565,9 +556,4 @@ impl Default for GpuMaterial {
         }
     }
 }
-
-// `GpuLightSource` + `GpuDirectionalLight` now live in `crate::lights` (the lights
-// table owns them; emissive + directional light-source lists are built there,
-// direction resolved GPU-side); the binder only binds its buffer + builds the
-// light-source index list.
 

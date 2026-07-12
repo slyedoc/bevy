@@ -6,8 +6,7 @@
 //! inverse-bind poses, and [`dispatch_deform`] runs `deform.wgsl` to skin the
 //! rest-pose vertices into a per-instance region of the deform pool. The pool is
 //! consumed downstream by the instantiate pass (per-instance CLAS) and the
-//! resolve shader (deformed-vertex fetch) — see
-//! `crates/bevy_solari/cluster_animation_plan.md`.
+//! resolve shader (deformed-vertex fetch).
 //!
 //! Skinning sources joint world transforms straight from the GPU transform
 //! table (joints are nodes): the deform shader walks each joint's `local`/`parent`

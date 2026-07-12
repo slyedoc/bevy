@@ -104,6 +104,7 @@ fn main() {
             .disable::<bevy::pbr::PbrPlugin>()
             .disable::<bevy::dev_tools::render_debug::RenderDebugOverlayPlugin>(),
         SolariPlugin,
+        SolariAtmospherePlugin,
         FeathersPlugins,
         FreeCameraPlugin,
         FrameTimeDiagnosticsPlugin::default(),
@@ -149,7 +150,7 @@ fn setup_scene(
     mut hair_assets: ResMut<Assets<HairAsset>>,
 ) {
     // Ground plane — a regular `Mesh3d`; the `convert_*` systems bake it to a
-    // `ClusterMesh` / `SolariMaterial`. Gives the path tracer a surface for the
+    // `ClusterMesh` / `StandardSolariMaterial`. Gives the path tracer a surface for the
     // fur's shadow + bounce light, and keeps the cluster PTLAS non-empty (hair
     // instances are appended above the cluster slots).
     commands.spawn((

@@ -16,7 +16,7 @@ use bevy_render::{
 
 use crate::bindings::RaytracingMesh3d;
 use crate::ecs_gpu::GpuColumnPrepareSet;
-// Material-slot allocation lives in `crate::material` now (an asset-keyed
+// Material-slot allocation lives in `crate::material` (an asset-keyed
 // `ecs_gpu::SlotPool`); the instance plugin schedules its prepare since the
 // per-instance `MaterialColumn` resolves against it.
 use crate::material::{
@@ -58,11 +58,9 @@ impl Plugin for InstancePlugin {
         // after material resolution below.
         app.add_plugins(GpuInstancesPlugin);
 
-        // Main world: observer-driven instance-change set, replacing the per-frame
-        // `Or<(Added, Changed, Changed)>` query the extract used to scan over every
-        // RT-mesh entity. Observers fire only on real bind / material / cull-layer
-        // events, so steady state (movement only) flags nothing; the render-world
-        // flush drains the set.
+        // Main world: observer-driven instance-change set. Observers fire only on
+        // real bind / material / cull-layer events, so steady state (movement
+        // only) flags nothing; the render-world flush drains the set.
         app.init_resource::<RtInstanceChanges>()
             .add_observer(mark_instance_added)
             .add_observer(mark_instance_material_changed)

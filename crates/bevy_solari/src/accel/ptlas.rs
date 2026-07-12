@@ -1,11 +1,9 @@
-// Per-frame partitioned TLAS (NV partitioned_AS) build over the
-// per-instance BLAS device addresses produced by
-// `blas_rebuild::dispatch_blas_rebuild`. Fill compute writes
-// `WriteInstanceData[]` records GPU-side; raw VK build dispatches
-// `vkCmdBuildPartitionedAccelerationStructuresNV` in the same encoder.
 #![allow(unsafe_code, reason = "raw VK build via as_hal_mut")]
 
-//! Partitioned TLAS (PTLAS) build for the cluster-AS pipeline.
+//! Partitioned TLAS (PTLAS) build for the cluster-AS pipeline: fill compute
+//! writes `WriteInstanceData[]` records GPU-side over the per-instance BLAS
+//! addresses from [`super::blas_rebuild`], then a raw-VK
+//! `vkCmdBuildPartitionedAccelerationStructuresNV` consumes them.
 //!
 //! Why PTLAS (and not standard KHR TLAS)
 //! -------------------------------------
@@ -35,9 +33,9 @@
 //!   instance's BLAS device address is stable frame-to-frame and the
 //!   driver carries the instance across from `src` untouched.
 //!
-//! There is no `UPDATE_INSTANCE` batch. `UPDATE_INSTANCE` only refreshes
-//! a BLAS address (it cannot change a transform), and stable per-slot
-//! addresses leave nothing to refresh — so it was removed.
+//! `UPDATE_INSTANCE` is not used: it only refreshes a BLAS address (it
+//! cannot change a transform), and stable per-slot addresses leave
+//! nothing to refresh.
 //!
 //! Build mode: **double-buffered** incremental update. The NV partitioned
 //! build reads `src` (the previously-built PTLAS, "used as a basis") and
@@ -59,12 +57,11 @@
 //! own global entry, never the static partition. The static instances are
 //! written once and then carried from `src` untouched, so they never
 //! rebuild. This is the spec's recommended layout (frequent updates →
-//! global; stable bulk → a regular partition). A spatial grid of regular
-//! partitions was tried and reverted: hashing statics across many partitions
-//! gave each partition a scene-spanning AABB, and the overlap inflated
-//! ray-traversal cost far more than the cheaper per-cell rebuilds saved. One
-//! regular partition keeps the driver's BVH coherent. The static/mover split
-//! lives in `ptlas_fill.wgsl::resolve_partition`.
+//! global; stable bulk → a regular partition). One regular partition keeps
+//! the static BVH coherent; hashing statics across many partitions gives
+//! each a scene-spanning AABB whose overlap inflates ray-traversal cost far
+//! more than cheaper per-cell rebuilds save. The static/mover split lives in
+//! `ptlas_fill.wgsl::resolve_partition`.
 
 use ash::vk::{self, TaggedStructure};
 use bevy_ecs::{
@@ -157,11 +154,10 @@ pub struct PtlasWritePair {
     null_flag: u32,
 }
 
-/// Regular-partition count. Partition 0 = the legacy shared static partition
-/// (un-hinted statics); 1.. are CPU-assigned per streamed spatial cell via
-/// `SolariPartition` — tight AABBs by construction (the earlier HASHED grid
-/// gave scene-spanning partitions and was reverted; explicit cell ids don't).
-/// Movers stay in the global partition.
+/// Regular-partition count. Partition 0 holds un-hinted statics; 1.. are
+/// CPU-assigned per streamed spatial cell via `SolariPartition` — explicit
+/// cell ids give tight AABBs by construction, where a hashed grid would give
+/// scene-spanning partitions. Movers stay in the global partition.
 pub const PTLAS_PARTITION_COUNT: u32 = 16384;
 
 /// Uniform layout shared with `ptlas_fill.wgsl::PtlasFillParams`.
@@ -292,7 +288,7 @@ pub struct Ptlas {
     /// (or fight a null) inside one incremental build.
     pub deferred_adds: Vec<u32>,
 
-    /// Debug (SOLARI_PTLAS_VALIDATE): GPU report of corrupt BLAS addresses
+    /// Debug (SolariSettings::ptlas_validate): GPU report of corrupt BLAS addresses
     /// caught in the WRITE stream ([0..4)=valid span, [4]=count, [5..)=entries),
     /// its CPU-readback staging twin, and the in-flight flag.
     pub validate_report: Buffer,
@@ -317,7 +313,7 @@ pub struct Ptlas {
 
 /// u32 words in the validation report: 4 span + capacity + partition count +
 /// bad count + 15 × 5-word entries.
-// +2: trailing always-on heal counters (not just under SOLARI_PTLAS_VALIDATE):
+// +2: trailing always-on heal counters (not just under SolariSettings::ptlas_validate):
 // [82] null-AS records, [83] regular-partition writes in an incremental build.
 // Both drive the rebuild-until-clean warmup heal below.
 const VALIDATE_REPORT_WORDS: u64 = 7 + 15 * 5 + 2;
@@ -325,22 +321,28 @@ const VALIDATE_REPORT_WORDS: u64 = 7 + 15 * 5 + 2;
 /// address (transform not propagated / BLAS address not assigned yet).
 const NULL_COUNT_WORD: u64 = 82;
 
-/// SOLARI_PTLAS_VALIDATE=1 → scan + null corrupt BLAS addresses each build,
-/// logging offenders (slot + address) instead of device-losting in the build.
-fn ptlas_validate_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("SOLARI_PTLAS_VALIDATE").as_deref() == Ok("1")
-            || crate::gpu::extension::solari_validate_enabled()
-    })
+static VALIDATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static FULL_REBUILD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Latch [`SolariSettings`](crate::SolariSettings)'s PTLAS debug levers at
+/// plugin `finish`.
+pub(crate) fn latch_debug_levers(validate: bool, full_rebuild: bool) {
+    let _ = VALIDATE.set(validate);
+    let _ = FULL_REBUILD.set(full_rebuild);
 }
 
-/// SOLARI_PTLAS_FULL_REBUILD=1 → build from scratch every frame (no `src`
-/// carry). Bisect lever: if device-losts stop, the corruption lives in the
-/// incremental/carry path.
+/// [`SolariSettings::ptlas_validate`](crate::SolariSettings) → scan + null
+/// corrupt BLAS addresses each build, logging offenders (slot + address)
+/// instead of device-losting in the build.
+fn ptlas_validate_enabled() -> bool {
+    VALIDATE.get().copied().unwrap_or(false)
+}
+
+/// [`SolariSettings::ptlas_full_rebuild`](crate::SolariSettings) → build from
+/// scratch every frame (no `src` carry). Bisect lever: if device-losts stop,
+/// the corruption lives in the incremental/carry path.
 fn ptlas_force_full_rebuild() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SOLARI_PTLAS_FULL_REBUILD").as_deref() == Ok("1"))
+    FULL_REBUILD.get().copied().unwrap_or(false)
 }
 
 impl Ptlas {
@@ -557,16 +559,15 @@ pub fn prepare_ptlas_params(
     // the very first build (no `src` to carry from). A change in hair count
     // also grows/shrinks the space and is folded into `high_water`.
     let grew = high_water > resources.as_capacity;
-    // TODO: bounded-latency build batching — batch churn frames into a full
-    // rebuild every N frames (adds/removes wait ≤N; geometry is pinned so a
-    // lingering instance stays valid). At 1.76M instances the per-churn-frame
-    // full rebuild costs ~25 ms while streaming; batching amortizes it ~N×.
-    // Also re-test incremental multi-partition writes on each driver release —
-    // if fixed, drop `|| churn` below and this whole tax disappears.
     // ANY CPU-known churn (add/remove/rewrite) takes the full-rebuild path:
     // incremental updates that WRITE instances across many regular partitions
-    // fault the driver (580.159) — full rebuilds with 1024 partitions are clean
-    // and measured fast. Pure mover / no-op frames stay incremental (or skip).
+    // fault the driver (580.159); full rebuilds are clean. Pure mover / no-op
+    // frames stay incremental (or skip).
+    // TODO: bounded-latency build batching — batch churn frames into a full
+    // rebuild every N frames (adds/removes wait ≤N; geometry is pinned so a
+    // lingering instance stays valid) to amortize the per-churn-frame rebuild.
+    // Also re-test incremental multi-partition writes on each driver release —
+    // if fixed, drop `|| churn` below.
     let churn = !instances.added_slots().is_empty()
         || !instances.disabled_slots().is_empty()
         || !instances.rewrite_slots().is_empty()
@@ -618,14 +619,14 @@ pub fn prepare_ptlas_params(
         debug_assert!(full_rebuild);
     }
 
-    // We can't skip the build on a no-CPU-delta frame: a geometry's
+    // The build can't be skipped on a no-CPU-delta frame: a geometry's
     // shared BLAS can be rebuilt in place at a new LOD level (detected
     // GPU-side in `blas_sharing::elect_dirty`), and the instances
     // referencing it must be re-WRITTEN so the partition re-reads the
     // rebuilt BLAS bounds. `fill_incremental` writes only the CPU delta
     // plus instances of dirty geometries, so a truly static frame
-    // produces an empty WRITE op (cheap). [A GPU "any-dirty" readback
-    // could restore the full static-frame build skip — follow-up.]
+    // produces an empty WRITE op (cheap). TODO: a GPU "any-dirty"
+    // readback could skip the build entirely on static frames.
 
     // CPU-seeded delta. Full rebuild seeds nothing — `force_all` writes
     // every active instance GPU-side. Incremental seeds added ∪ rewrite ∪
@@ -1163,7 +1164,7 @@ pub fn dispatch_ptlas(
         render_queue.write_buffer(&resources.validate_report, 0, bytemuck::cast_slice(&head));
     }
     // Zero the heal counters every build (always on — they drive the
-    // rebuild-until-clean warmup heal, not just SOLARI_PTLAS_VALIDATE).
+    // rebuild-until-clean warmup heal, not just SolariSettings::ptlas_validate).
     render_queue.write_buffer(
         &resources.validate_report,
         NULL_COUNT_WORD * 4,
@@ -1225,8 +1226,8 @@ pub fn dispatch_ptlas(
                 pass.dispatch_workgroups(gx, gy, gz);
             }
         }
-        // Tessellation showcase (brick B4): append its single instance to the
-        // WRITE stream, after hair, before `finalize`.
+        // Tessellation showcase: append its instances to the WRITE stream,
+        // after hair, before `finalize`.
         if let Some(tw) = tess_write.as_ref() {
             if tw.tess_count > 0 {
                 if let (Some(tess_bg), Some(tess_pipe)) = (
@@ -1299,7 +1300,7 @@ pub fn dispatch_ptlas(
     }
     resources.validate_in_flight = validate_recorded;
 
-    // Declared access for the raw build — SOLARI_VALIDATE checks every range
+    // Declared access for the raw build — SolariSettings::validate checks every range
     // is committed BEFORE the GPU faults on an anonymous VA.
     let max_record_bytes = (resources.cpu_count + active_count + hair_count + tess_count).max(1)
         as u64

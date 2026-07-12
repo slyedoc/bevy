@@ -1,5 +1,5 @@
-// Phase 2c — append every tessellated displacement instance to the partitioned-AS
-// WRITE record stream, mirroring `hair/ptlas_hair_write.wgsl`. Recorded inside
+// Append every tessellated displacement instance to the partitioned-AS WRITE
+// record stream, mirroring `hair/ptlas_hair_write.wgsl`. Recorded inside
 // `accel::ptlas::dispatch_ptlas` after the hair write and before `finalize`, so the
 // single GPU record count covers it.
 //

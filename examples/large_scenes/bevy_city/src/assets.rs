@@ -209,7 +209,7 @@ pub fn load_assets(
         }
         .from_asset(format!("{base_url}/city-kit-roads/tile-low.glb")));
         // This is a mesh-only `Primitive` load, so it carries no baked material —
-        // author the asphalt color here (converted to `SolariMaterial` by the RT
+        // author the asphalt color here (converted to `StandardSolariMaterial` by the RT
         // bridge under solari, used directly otherwise), matching `grass_material`.
         let default_material =
             materials.add(StandardMaterial::from_color(Color::srgb_u8(105, 105, 110)));

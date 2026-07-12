@@ -25,32 +25,29 @@ use crate::gpu::allocator::{Allocator, SparseBuffer};
 
 /// `op`: write/refresh this entity's complete state into the table.
 pub const JOURNAL_OP_UPSERT: u32 = 0;
-/// `op`: remove this entity from the table (free its slot, bump its generation).
+/// `op`: remove this entity from the table (clear its PTLAS presence).
 pub const JOURNAL_OP_REMOVE: u32 = 1;
 
-/// One absolute-state instance change, keyed by a stable entity id. 32 bytes
-/// (std430-compatible plain `u32`s) — must match `reconcile.wgsl`'s
-/// `JournalRecord`.
-///
-/// Mesh pointers are intentionally absent: the reconcile looks them up GPU-side
-/// from a `geometry_id`-indexed descriptor table, so a streamed-in mesh needs no
-/// CPU re-pack and the record stays narrow. `node_key` is the **stable**
-/// transform-table slot (`GpuSlot<TransformGraph>`), resolved to a world matrix
-/// GPU-side — never a frozen transform.
 /// No explicit partition: the fill derives static→regular-0 / mover→global.
 pub const PARTITION_HINT_NONE: u32 = 0xffff_ffff;
 
+/// One absolute-state instance change. 48 bytes (12 plain `u32`s) — must match
+/// `reconcile.wgsl`'s `JournalRecord`.
+///
+/// `node_key` is the **stable** transform-table slot
+/// (`GpuSlot<TransformGraph>`), resolved to a world matrix GPU-side — never a
+/// frozen transform.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct InstanceJournalRecord {
     /// The instance slot this record targets (CPU-allocated by the
     /// `InstanceManager`). The reconcile writes all of this slot's columns
     /// atomically from one record, so a reused slot is fully re-initialized in a
-    /// single pass — no partial/stale column survives (the aliasing fix).
+    /// single pass — no partial/stale column survives.
     pub slot: u32,
     /// PTLAS regular-partition hint ([`PARTITION_HINT_NONE`] = derive from the
-    /// static flag as before). Spatially-tight ids (e.g. one per vegetation
-    /// cell) give the driver per-cell BVHs + per-cell incremental rebuilds.
+    /// static flag). Spatially-tight ids (e.g. one per vegetation cell) give
+    /// the driver per-cell BVHs + per-cell incremental rebuilds.
     pub partition_hint: u32,
     /// [`JOURNAL_OP_UPSERT`] or [`JOURNAL_OP_REMOVE`].
     pub op: u32,
@@ -160,8 +157,8 @@ pub struct RtJournal {
     /// after the reconcile actually dispatches over them (the retain-until-folded
     /// latch — the twin of [`GpuColumn`](crate::ecs_gpu::GpuColumn)'s `pending`). On
     /// the cold-start frames before the reconcile pipeline compiles, the records stay
-    /// here and are re-uploaded each frame, so the initial binds are never lost once
-    /// the reconcile becomes the columns' sole writer (the authority flip).
+    /// here and are re-uploaded each frame, so the initial binds are never lost
+    /// (the reconcile is the columns' sole writer).
     staging: Vec<InstanceJournalRecord>,
     /// Stable-address ring the reconcile reads. Grown by commit; never freed.
     pub buffer: SparseBuffer,
@@ -176,12 +173,6 @@ impl RtJournal {
     #[inline]
     pub fn push(&mut self, record: InstanceJournalRecord) {
         self.staging.push(record);
-    }
-
-    /// Records staged but not yet uploaded.
-    #[inline]
-    pub fn staged_len(&self) -> usize {
-        self.staging.len()
     }
 
     /// Drop the pending records — called by the reconcile **only after it has

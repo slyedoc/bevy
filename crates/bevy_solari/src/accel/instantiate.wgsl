@@ -10,7 +10,7 @@
 // contiguous block of CLAS addresses the INSTANTIATE build writes — consumed by
 // the per-instance BLAS build. See `accel/animated_blas.rs`.
 
-// Mirror of `deform.rs::AnimatedSlotGpu` (32 B).
+// Mirror of `deform.rs::AnimatedSlotGpu`.
 struct AnimatedSlot {
     instance_slot: u32,
     mesh_vertex_base: u32,
@@ -20,6 +20,7 @@ struct AnimatedSlot {
     palette_base: u32,
     inverse_bind_base: u32,
     joint_base: u32,
+    node_slot: u32,
 }
 
 // Mirror of the shared cluster pool record (48 B) — see raytracing_scene_bindings.
@@ -82,19 +83,17 @@ struct InstantiateParams {
 @group(0) @binding(6) var<storage, read_write> count: array<atomic<u32>>;
 // Output: per-slot BuildClustersBottomLevelInfoNV args (4 u32 = 16 B each).
 @group(0) @binding(7) var<storage, read_write> blas_args: array<u32>;
-// Output: per-slot active instance slot (so the BLAS pass can address-write).
-@group(0) @binding(8) var<storage, read_write> blas_instance_slot: array<u32>;
 // slot-indexed instance → BLAS device address (PTLAS reads this). Owned by
 // `blas_sharing`; `assign_address` (Classify) wrote the static shared address —
 // we run AFTER it (BuildAnimatedBlas stage) and overwrite for animated instances.
-@group(0) @binding(9) var<storage, read_write> instance_blas_address: array<vec2<u32>>;
+@group(0) @binding(8) var<storage, read_write> instance_blas_address: array<vec2<u32>>;
 // LOD selection (reused from the static path — the cut is pose-independent):
 // per-instance object-space error budget (written by `blas_sharing::classify`) +
 // the cluster DAG (groups + cluster→group). The cut picks the same clusters a
 // static instance of this geometry+band would get; we instantiate THEIR templates.
-@group(0) @binding(10) var<storage, read> instance_e_build: array<f32>;
-@group(0) @binding(11) var<storage, read> cluster_groups: array<ClusterLodGroup>;
-@group(0) @binding(12) var<storage, read> cluster_to_group: array<u32>;
+@group(0) @binding(9) var<storage, read> instance_e_build: array<f32>;
+@group(0) @binding(10) var<storage, read> cluster_groups: array<ClusterLodGroup>;
+@group(0) @binding(11) var<storage, read> cluster_to_group: array<u32>;
 
 // base (u64 as vec2<u32>) + offset (u32) with carry.
 fn u64_add(base: vec2<u32>, off: u32) -> vec2<u32> {
@@ -115,8 +114,8 @@ fn cluster_accepted(global_cluster: u32, group_base: u32, e_build: f32) -> bool 
         // A parent only represents a valid coarser cut if it's STRICTLY coarser.
         // The bake's back-fill (`from_mesh.rs`) gives single-LOD meshes a same-LOD
         // "parent" (no coarser level exists); treating that as a real parent would
-        // cull every group but the root. Requiring a coarser level fixes it and is
-        // a no-op for real multi-LOD DAGs (their parents are always coarser).
+        // cull every group but the root. Requiring a coarser level is a no-op for
+        // real multi-LOD DAGs (their parents are always coarser).
         if parent.lod_level > group.lod_level {
             parent_fits = parent.max_quadric_error <= e_build;
         }
@@ -180,7 +179,6 @@ fn instantiate(@builtin(global_invocation_id) gid: vec3<u32>) {
     blas_args[ba + 1u] = 8u; // cluster_references_stride
     blas_args[ba + 2u] = refs_addr.x;
     blas_args[ba + 3u] = refs_addr.y;
-    blas_instance_slot[slot_idx] = s.instance_slot;
 
     // Repoint this instance at its per-instance animated BLAS (stable address
     // `blas_pool_base + slot_idx * blas_stride`, where the EXPLICIT BLAS build

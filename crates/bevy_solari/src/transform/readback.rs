@@ -70,11 +70,11 @@ const HEADER_WORDS: u32 = 4;
 /// f64 translation (3×2 words) + the owning entity's bits (`[lo, hi]` — the
 /// identity the writeback resolves by).
 const RECORD_WORDS: u32 = 18;
-/// Max records read back per frame. The output buffer is sized to this and bevy's
-/// `Readback` streams the **whole** buffer each frame (it can't size to the live
-/// count), so this is also the per-frame transfer (`capacity × 72 B` ≈ 9.4 MB at
-/// 131072). A frame whose changed set exceeds it drops the overflow (warning).
-/// Tune to the scene's moving set; count-scoping the transfer is a follow-up.
+/// Max records read back per frame; the output buffer is sized to this. The
+/// transfer window is count-scoped from the previous delivery (see
+/// [`write_readback_global_transforms`]), so the full `capacity × 72 B` is not
+/// streamed every frame. A frame whose changed set exceeds it drops the
+/// overflow (warning). Tune to the scene's moving set.
 const READBACK_CAPACITY: u32 = 131072;
 /// Idle frames to retain a gather's records (keep the count header) after it ran. The transfer
 /// window is sized reactively from the previous delivery's count (see
@@ -110,10 +110,6 @@ pub struct TransformReadbackTarget {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
 struct ReadbackParams {
-    /// Number of changed records in the `local` delta this frame (dispatch bound).
-    changed_count: u32,
-    /// Words per `local` delta record (`WORDS + 1`); slot at `k * record_stride`.
-    record_stride: u32,
     /// World-buffer node coverage (out-of-range guard).
     node_count: u32,
     /// Max output records (overflow drops past this).
@@ -203,8 +199,6 @@ pub fn prepare_transform_readback(
     // (seeds + GPU-expanded descendants) is in the frontier header, dispatched indirect.
     readback.changed_count = frontier.seed_count();
     *readback.params.get_mut() = ReadbackParams {
-        changed_count: readback.changed_count,
-        record_stride: 1,
         node_count: propagate.node_count(),
         capacity: READBACK_CAPACITY,
     };

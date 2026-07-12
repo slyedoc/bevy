@@ -44,11 +44,6 @@ fn SafeSqrt(x: f32) -> f32 {
     return sqrt(max(0.0, x));
 }
 
-// pow(base, 20) without a loop-with-no-return; small fixed unrolled chain.
-fn Pow3(x: f32) -> f32 {
-    return x * x * x;
-}
-
 // ----- Bessel I0 and its log, used by the longitudinal Mp term ---------------
 
 fn I0(x: f32) -> f32 {
@@ -177,21 +172,6 @@ fn FrDielectric(cosThetaI_in: f32, eta: f32) -> f32 {
     return (Sqr(rParl) + Sqr(rPerp)) * 0.5;
 }
 
-// ----- sigma_a from a target reflectance (pbrt SigmaAFromReflectance) --------
-// Inverts the model so that the supplied `color` is the resulting diffuse albedo
-// for the given azimuthal roughness beta_n.
-fn SigmaAFromReflectance(c: vec3<f32>, beta_n: f32) -> vec3<f32> {
-    let denom = 5.969
-        - 0.215 * beta_n
-        + 2.532 * Sqr(beta_n)
-        - 10.73 * Pow3(beta_n)
-        + 5.574 * Sqr(Sqr(beta_n))
-        + 0.245 * beta_n * Sqr(Sqr(beta_n));
-    let lc = vec3<f32>(log(max(c.x, 1e-4)), log(max(c.y, 1e-4)), log(max(c.z, 1e-4)));
-    let s = lc / denom;
-    return s * s;
-}
-
 // ----- longitudinal variances v[] and azimuthal width s from roughness -------
 fn ComputeV(beta_m: f32) -> array<f32, 4> {
     var v: array<f32, 4>;
@@ -267,10 +247,9 @@ fn from_fiber(frame: FiberFrame, sinTheta: f32, phi: f32) -> vec3<f32> {
 }
 
 // ----- shared evaluation core ------------------------------------------------
-// Computes the full BSDF (sum over lobes) and, optionally, the per-lobe ap pdfs.
+// Computes the full BSDF (sum over lobes) and the combined pdf.
 // `h` is the offset across the fiber width; with no geometric normal available
-// we use the standard h = -1 + 2*gammaO mapping is not possible, so we fix h via
-// the azimuth of wo (a common real-time simplification: h derived from phi_o).
+// it is derived from the azimuth of wo (a common real-time simplification).
 struct HairEval {
     f: vec3<f32>,
     pdf: f32,

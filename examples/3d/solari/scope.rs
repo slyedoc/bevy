@@ -40,6 +40,7 @@ fn main() {
         .add_plugins((
             DefaultPlugins,
             SolariPlugin,
+            SolariAtmospherePlugin,
             FeathersPlugins,
             FreeCameraPlugin,
             FrameTimeDiagnosticsPlugin::default(),
@@ -75,12 +76,11 @@ const LENS_IOR: f32 = 1.52;
 
 fn setup_scene(
     mut commands: Commands,
-    asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut solari_materials: ResMut<Assets<StandardSolariMaterial>>,
 ) {
-    // BK7 crown glass, authored as `SolariMaterial` for its dispersion field
+    // BK7 crown glass, authored as `StandardSolariMaterial` for its dispersion field
     // (Abbe 64.2 → 20/64.2): an uncorrected singlet telescope fringes color
     // at high-contrast edges — real chromatic aberration, not a post effect.
     let glass = solari_materials.add(StandardSolariMaterial {

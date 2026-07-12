@@ -1,14 +1,13 @@
-// Per-instance bottom-level acceleration structures over the tessellation
-// path's generated CLASes. Raw Vulkan for the cluster-AS build, like `clas_arena`.
 #![allow(unsafe_code)]
 
-//! Per-instance cluster BLAS build for the GPU tessellation path.
+//! Per-instance cluster BLAS build for the GPU tessellation path (raw Vulkan for
+//! the cluster-AS build, like `clas_arena`).
 //!
 //! `tess_classify` generates one CLAS per tessellated part on the GPU;
 //! [`record_build_per_instance_blas`] records (no submit) a bottom-level
 //! acceleration structure over those CLASes — a tessellated instance gets its
-//! *own* BLAS over its generated CLASes (the architectural fork from solari's
-//! shared per-`(geometry, LOD)` BLAS). The per-CLAS `cluster_id`s are baked from
+//! *own* BLAS over its generated CLASes, unlike solari's shared
+//! per-`(geometry, LOD)` BLAS. The per-CLAS `cluster_id`s are baked from
 //! [`TESS_CLUSTER_ID_BASE`] so the closest-hit detects the tess hit and recovers
 //! the per-CLAS metadata index.
 
@@ -36,18 +35,13 @@ pub struct InstanceBlas {
 
 /// Record (no submit) a **per-instance** bottom-level acceleration structure over
 /// `cluster_count` CLASes whose device addresses live GPU-side at
-/// `cluster_references` (the tess gen pass's CLAS-address buffer's device address) —
-/// the addresses are read straight from that buffer, never uploaded from the CPU.
-/// The driver writes the chosen BLAS address (IMPLICIT) into `blas_dst_addr`,
-/// consumed GPU-side, never read back.
-///
-/// This is the architectural fork from solari's shared per-`(geometry, LOD)`
-/// BLAS: a tessellated instance gets its *own* BLAS over its generated CLAS.
-/// Mirrors the `BUILD_CLUSTERS_BOTTOM_LEVEL` op in [`crate::accel::blas_rebuild`].
-/// The driver writes the chosen BLAS device address (IMPLICIT) to `blas_dst_addr`
-/// — a device address into the caller's persistent per-instance address buffer
-/// (e.g. `+ instance_index * 8`), consumed GPU-side, never read back. The caller
-/// brackets this build with AS barriers and submits once.
+/// `cluster_references` — the addresses are read straight from that buffer, never
+/// uploaded from the CPU. The driver writes the chosen BLAS device address
+/// (IMPLICIT) to `blas_dst_addr` — a device address into the caller's persistent
+/// per-instance address buffer (e.g. `+ instance_index * 8`) — consumed GPU-side,
+/// never read back. Mirrors the `BUILD_CLUSTERS_BOTTOM_LEVEL` op in
+/// [`crate::accel::blas_rebuild`]. The build is bracketed with AS barriers; the
+/// caller submits the encoder once.
 ///
 /// # Panics
 ///
@@ -172,8 +166,7 @@ pub fn record_build_per_instance_blas(
     // SAFETY: function table loaded; encoder open + Vulkan-backed; the descriptor
     // strides/addresses reference the buffers above. Leading barrier: the preceding
     // instantiate's CLAS addresses are visible as `cluster_references`. Trailing
-    // barrier: the BLAS address + payload are visible to the readback copy and the
-    // later trace.
+    // barrier: the BLAS address + payload are visible to the later trace.
     unsafe {
         crate::gpu::extension::cmd_global_as_barrier(encoder, render_device, false);
         crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(

@@ -20,8 +20,6 @@ use wgpu::naga;
 
 use super::allocator::Allocator;
 
-/// Descriptor set 0 bindings the milestone RT shaders use. Kept tiny on purpose
-/// — real material/scene resources arrive when the shading branches are ported.
 // RT-pipeline-private descriptor set (set 1). Set 0 is the shared scene bind
 // group (raytracing_scene_bindings, incl. the TLAS at its binding 9) and set 2
 // is the scene-columns bind group — both built by wgpu and bound raw via
@@ -41,7 +39,7 @@ const BINDING_GBUFFER_NORMAL: u32 = 5; // storage: normal.xyz + linear roughness
 const BINDING_GBUFFER_DIFFUSE: u32 = 6; // storage: diffuse albedo.xyz + linear depth (.w)
 const BINDING_GBUFFER_SPECULAR: u32 = 7; // storage: specular albedo.xyz + hit distance (.w)
 const BINDING_GBUFFER_MOTION: u32 = 8; // storage: screen-space motion vector.xy (.zw unused)
-// ReSTIR DI reservoirs (rung 3): 2 interleaved 32-B slots per pixel, written by
+// ReSTIR DI reservoirs: 2 interleaved 32-B slots per pixel, written by
 // raygen (current-slot clear) + the opaque closest-hit (merge/store). Always
 // present — a fixed binding number past the DLSS range; Vulkan set layouts
 // tolerate the 5–8 gap when the `dlss` feature is off.
@@ -52,9 +50,9 @@ const BINDING_SURFACE: u32 = 10;
 // ReSTIR winner resolved-light samples (2 slots × 48 B/pixel): chit-written, read
 // by the wgpu spatial pass so it can reshade without `physical_load`. Always bound.
 const BINDING_LIGHT_SAMPLES: u32 = 11;
-/// ReSTIR GI canonical samples (rung 4a): 2 interleaved 48-B slots per pixel.
+/// ReSTIR GI canonical samples: 2 interleaved 48-B slots per pixel.
 const BINDING_GI_SAMPLES: u32 = 12;
-// NRC (zero/docs/nrc.md): transposed f16 weight mirror + f16 biases (raygen
+// NRC: transposed f16 weight mirror + f16 biases (raygen
 // inline coopvec inference), the training-record ring (raygen writes one
 // record per rotating pixel subset each frame), and the per-view
 // termination-query ring (raygen appends, the infer pass consumes).
@@ -81,7 +79,8 @@ pub struct RtCamera {
     /// 16-byte std140 slot.
     pub frame: [u32; 4],
     /// `.x` = sky/environment brightness (raw cd/m²; 0 ⇒ no skybox, miss stays
-    /// at the clear color in `.yzw`).
+    /// at the clear color in `.yzw`; < 0 ⇒ the composed `custom_sky` module
+    /// evaluates the sky instead).
     pub sky: [f32; 4],
     /// `.xy` = sub-pixel camera jitter in pixels (added to the primary ray);
     /// `.zw` = debug-heatmap colormap params (center/contrast — one debug view
@@ -119,7 +118,7 @@ pub struct RtCamera {
     /// this or they go stale every frame the camera moves (motion glitter).
     /// Zero on frame 1 and on the CPU fallback path.
     pub origin_delta: [f32; 4],
-    /// NRC (zero/docs/nrc.md): `.x` = position-encoding scene scale in meters
+    /// NRC: `.x` = position-encoding scene scale in meters
     /// (0 ⇒ NRC off: no record writes, debug view black); `.y` = spread-
     /// termination threshold c; `.z` = inline coopvec inference (0 = deferred).
     pub nrc: [f32; 4],
@@ -268,14 +267,19 @@ pub struct RtPipeline {
     /// compares this via [`Self::classes_changed`].
     material_classes: Vec<u32>,
 
+    /// Generation of the `bevy_solari::custom_sky` module source the primary miss
+    /// shader was composed with. `SolariSky::Shader` swaps the module at runtime;
+    /// the composed SPIR-V is baked, so a source change needs a pipeline rebuild —
+    /// the dispatch compares this against [`SolariCustomSky`](crate::render::sky::SolariCustomSky).
+    custom_sky_generation: u64,
+
     /// Shader modules retained for the pipeline's lifetime (destroyed on drop).
     modules: Vec<vk::ShaderModule>,
 
     /// Keeps the `VkDevice` alive until this drops. The cloned `ash::Device`
     /// above is a bare handle + fn table with NO ownership: at app teardown the
     /// render world drops resources in arbitrary order, and if wgpu destroys the
-    /// device first, [`Drop`]'s raw destroys segfault against a dead device (the
-    /// old exam harnesses hard-`process::exit`ed to dodge exactly this). The
+    /// device first, [`Drop`]'s raw destroys segfault against a dead device. The
     /// allocator transitively holds wgpu's queue → device, so holding it pins
     /// the device across our Drop.
     _device_keepalive: Allocator,
@@ -345,7 +349,9 @@ impl RtPipeline {
         columns_layout: vk::DescriptorSetLayout,
         material_classes: &[u32],
         hit_groups: &[SolariHitGroupDef],
+        custom_sky: (&str, u64),
     ) -> Option<Self> {
+        let (custom_sky_source, custom_sky_generation) = custom_sky;
         // One hit record per material slot; `material_classes[slot]` selects the
         // record's hit-group handle (opaque/glass/hair).
         let material_count = material_classes.len() as u32;
@@ -377,7 +383,13 @@ impl RtPipeline {
         )?;
         let miss_mod = create_shader_module(
             &device,
-            &compile_rt_wgsl(include_str!("../render/rt_pipeline/miss.wgsl"), "miss.wgsl", &[])?,
+            &compile_rt_wgsl(
+                include_str!("../render/rt_pipeline/miss.wgsl"),
+                "miss.wgsl",
+                // The swappable `bevy_solari::custom_sky` module (`SolariSky::Shader`);
+                // defaults to the built-in procedural gradient.
+                &[("custom_sky.wgsl", custom_sky_source)],
+            )?,
         )?;
         let miss_shadow_mod = create_shader_module(
             &device,
@@ -461,8 +473,8 @@ impl RtPipeline {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_CAMERA)
                 // The camera is a GPU buffer filled by the `rt_camera` compute pass (or a
-                // CPU fallback `write_buffer`) each frame. Kept `*_DYNAMIC` — bound at a
-                // constant offset 0 — so replacing the old ring needed no layout change.
+                // CPU fallback `write_buffer`) each frame; `*_DYNAMIC` bound at a constant
+                // offset of 0 (see `trace`).
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(1)
                 // raygen unprojects; miss reads sky brightness/clear color; the
@@ -588,7 +600,7 @@ impl RtPipeline {
         // The set-1 descriptor set + camera UBO + env binding are per-view, built
         // lazily in `create_view_bindings` (one per `SolariCamera`).
 
-        // --- SBT: raygen(1) + miss(1) + hit(ONE RECORD PER MATERIAL) ----------
+        // --- SBT: raygen + 2 miss + ONE HIT RECORD PER MATERIAL (+ hair) -------
         // Three regions, each base-aligned. The hit region holds one record per
         // material slot; an instance's `instance_contribution_to_hit_group_index`
         // = its material slot selects its record. Each HIT record is
@@ -596,8 +608,7 @@ impl RtPipeline {
         // material id (= record index), which `chit_opaque`'s `var<shader_record>`
         // reads as the canonical material binding (uniform per record → uniform
         // per warp after SER). Distinct per-material records also give SER a
-        // per-material reorder key and a slot for future per-class handles.
-        // raygen, primary miss, N hit groups (registry), shadow miss — computed above.
+        // per-material reorder key.
         const MISS_COUNT: u64 = 2; // miss index 0 = primary, 1 = shadow
         const HIT_RECORD_DATA: u64 = 4; // bytes of shader-record data (u32 material id)
         const RECORD_HEADROOM: u32 = 1024; // absorb streaming material growth post-build
@@ -722,10 +733,18 @@ impl RtPipeline {
             callable_region,
             record_capacity,
             material_classes: material_classes.to_vec(),
+            custom_sky_generation,
             modules,
             _device_keepalive: allocator.clone(),
         };
         Some(out)
+    }
+
+    /// Generation of the `bevy_solari::custom_sky` module the primary miss shader
+    /// was composed with; the dispatch rebuilds the pipeline when the live
+    /// [`SolariCustomSky`](crate::render::sky::SolariCustomSky) generation differs.
+    pub fn custom_sky_generation(&self) -> u64 {
+        self.custom_sky_generation
     }
 
     /// Per-material hit-record count the SBT was built for. The dispatch rebuilds
@@ -759,9 +778,7 @@ impl RtPipeline {
         // Baked prefix must match exactly; records past it were baked with the
         // opaque (class 0) handle + their record index, so a NEW class-0
         // material inside the headroom is already routed correctly — only a
-        // non-opaque class arriving there forces a rebuild. (The old exact
-        // Vec compare rebuilt the whole RT pipeline — a ~2 s driver compile —
-        // every time ANY material streamed in, making the headroom dead code.)
+        // non-opaque class arriving there forces a rebuild.
         self.material_classes[..] != current[..n] || current[n..].iter().any(|&c| c != 0)
     }
 
@@ -1271,8 +1288,7 @@ fn rt_capabilities() -> naga::valid::Capabilities {
         | naga::valid::Capabilities::FLOAT64
         // f16 pack/unpack builtins (planet erosion maps decode 4×f16 texels).
         | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
-        // True f16 + cooperative vectors: NRC inline inference in raygen
-        // (zero/docs/nrc.md rung 1).
+        // True f16 + cooperative vectors: NRC inline inference in raygen.
         | naga::valid::Capabilities::SHADER_FLOAT16
         | naga::valid::Capabilities::COOPERATIVE_VECTOR
 }
@@ -1282,7 +1298,7 @@ fn rt_capabilities() -> naga::valid::Capabilities {
 /// in slice order so later entries may import earlier ones and the built-ins).
 /// `None` when a module fails to compose (logged).
 fn rt_composer(
-    extra_modules: &[(&'static str, &'static str)],
+    extra_modules: &[(&str, &str)],
 ) -> Option<naga_oil::compose::Composer> {
     use naga_oil::compose::{ComposableModuleDescriptor, Composer};
 
@@ -1335,9 +1351,7 @@ fn rt_composer(
 /// built-in set — surfaces "module X won't parse / imports something unregistered"
 /// at `register_solari_chit` time instead of as an opaque whole-pipeline build
 /// failure. Composition errors inside are logged by `rt_composer` itself.
-fn validate_composable_modules(
-    modules: &[(&'static str, &'static str)],
-) -> Result<(), &'static str> {
+fn validate_composable_modules(modules: &[(&str, &str)]) -> Result<(), &'static str> {
     match rt_composer(modules) {
         Some(_) => Ok(()),
         None => Err("see preceding rt_pipeline compose error"),
@@ -1350,7 +1364,7 @@ fn validate_composable_modules(
 fn compile_rt_wgsl(
     source: &str,
     file_path: &str,
-    extra_modules: &[(&'static str, &'static str)],
+    extra_modules: &[(&str, &str)],
 ) -> Option<Vec<u32>> {
     match try_compile_rt_wgsl(source, file_path, extra_modules) {
         Ok(spv) => Some(spv),
@@ -1366,7 +1380,7 @@ fn compile_rt_wgsl(
 fn try_compile_rt_wgsl(
     source: &str,
     file_path: &str,
-    extra_modules: &[(&'static str, &'static str)],
+    extra_modules: &[(&str, &str)],
 ) -> Result<Vec<u32>, String> {
     use naga_oil::compose::{NagaModuleDescriptor, ShaderDefValue};
 
@@ -1377,8 +1391,7 @@ fn try_compile_rt_wgsl(
     // compile-out feature axis the raygen/chits can `#ifdef` on. Keep the axes few
     // and orthogonal (debug views ride a runtime uniform, not a def, to avoid a
     // variant explosion). `SOLARI_DLSS` is compile-time (tied to the cargo feature):
-    // when set, the trace emits the ray-reconstruction guide G-buffer. A future
-    // `SOLARI_RESTIR` axis would slot in here the same way.
+    // when set, the trace emits the ray-reconstruction guide G-buffer.
     #[allow(unused_mut)]
     let mut shader_defs: std::collections::HashMap<String, ShaderDefValue> = [(
         // The scene-columns bind-group index the scene bindings are written with.
@@ -1600,7 +1613,7 @@ mod tests {
 
     // Headless compose→validate→SPIR-V of every built-in RT shader — shader edits
     // fail here at `cargo test` time instead of as a runtime pipeline-build black
-    // screen (an expensive lesson when each GPU repro needs a supervised run).
+    // screen.
     #[test]
     fn rt_shaders_compile() {
         for (file, source) in [
@@ -1608,7 +1621,6 @@ mod tests {
                 "raygen.wgsl",
                 include_str!("../render/rt_pipeline/raygen.wgsl"),
             ),
-            ("miss.wgsl", include_str!("../render/rt_pipeline/miss.wgsl")),
             (
                 "miss_shadow.wgsl",
                 include_str!("../render/rt_pipeline/miss_shadow.wgsl"),
@@ -1644,6 +1656,20 @@ mod tests {
                 Ok(spv) => assert_no_runtime_descriptor_array(file, &spv),
                 Err(e) => panic!("{file}: {e}"),
             }
+        }
+
+        // The primary miss composes the swappable `custom_sky` module (default =
+        // the built-in procedural gradient), so it compiles with that extra.
+        match try_compile_rt_wgsl(
+            include_str!("../render/rt_pipeline/miss.wgsl"),
+            "miss.wgsl",
+            &[(
+                "custom_sky.wgsl",
+                include_str!("../render/rt_pipeline/custom_sky.wgsl"),
+            )],
+        ) {
+            Ok(spv) => assert_no_runtime_descriptor_array("miss.wgsl", &spv),
+            Err(e) => panic!("miss.wgsl: {e}"),
         }
     }
 }

@@ -4,12 +4,11 @@
 //! actually changed into [`RtInstanceChanges`] — `Add<RaytracingMesh3d>` (bind),
 //! `Insert<SolariMaterial3d>` / `Insert<RenderLayers>` (update) — and the despawn
 //! observer frees slots. The flush drains that set. No per-frame query scan: the
-//! full RT-mesh set is *never* iterated (the old `Or<(Added, Changed, …)>` extract
-//! had to tick-scan all 2M instances each frame just to find the few that
-//! changed). Transform moves are deliberately NOT tracked — movement is fully
-//! GPU-driven (transform table + PTLAS-fill move detection), so a moving scene
-//! flags nothing here. `active_slots` is **persistent** (push on bind, O(1)
-//! swap-remove on despawn via `slot_active_pos`).
+//! full RT-mesh set is *never* iterated. Transform moves are deliberately NOT
+//! tracked — movement is fully GPU-driven (transform table + PTLAS-fill move
+//! detection), so a moving scene flags nothing here. `active_slots` is
+//! **persistent** (push on bind, O(1) swap-remove on despawn via
+//! `slot_active_pos`).
 //!
 //! Per-slot data is written only when its source changes; static
 //! instances are never touched. The deltas
@@ -59,8 +58,6 @@ use bevy_render::{
 /// Lives on the **synced render entity** (`RaytracingMesh3d` requires
 /// `SyncToRenderWorld`, and `entity_sync_system` runs before
 /// `ExtractSchedule`, so the render entity always exists by extract time).
-/// The per-frame extract reads the slot back via `Query::get(render_entity)`
-/// — the ECS's native entity index, replacing the old `EntityHashMap`.
 /// Allocated on first sight of a resident mesh; freed by the
 /// [`free_cluster_slot`] observer when the render entity despawns.
 #[derive(Component, Clone, Copy)]
@@ -131,10 +128,8 @@ pub struct InstanceManager {
     /// walk + to detect material changes; resolved to the GPU material index
     /// (a delta record pushed to [`Self::material_delta`]) by
     /// [`resolve_instance_material_ids`]. The per-instance `group_base` /
-    /// `lod_input` / `geometry_id` / resolved `material_id` are no longer
-    /// mirrored CPU-side at all — they are scattered delta-direct (see the
-    /// per-column deltas below); the GPU buffer is their only home and is
-    /// preserved across a growth by GPU buffer copy.
+    /// `lod_input` / `geometry_id` / resolved `material_id` have no CPU
+    /// mirror — the GPU column buffer is their only home.
     instance_material_asset_ids: Vec<AssetId<StandardSolariMaterial>>,
 
     /// Per-slot 8-bit RT cull mask (from `RenderLayers`). CPU mirror kept
@@ -175,13 +170,12 @@ pub struct InstanceManager {
     /// region allocator in `blas_rebuild`).
     released_slots: Vec<GpuEntity>,
     /// Pre-built per-column scatter deltas — the raw `[slot, value-words…]`
-    /// records each `GpuColumn` uploads verbatim. The value the column needs is
-    /// appended here at its point of change (no per-slot CPU mirror to gather
-    /// CPU column scatter deltas. Only the columns the CPU still owns are here:
-    /// `material` (resolved when [`resolve_instance_material_ids`] resolves a changed
-    /// slot) and the cull `mask` (bind + `RenderLayers` change). The bind-only columns
-    /// (`group_base` / `lod_input` / `geometry_id` / `node_slot`) are written GPU-side
-    /// by the reconcile pass from the journal, so they have no CPU delta.
+    /// records each `GpuColumn` uploads verbatim, appended at the point of
+    /// change. Only the CPU-owned columns have a delta here: `material`
+    /// (pushed by [`resolve_instance_material_ids`] for changed slots) and the
+    /// cull `mask` (bind + `RenderLayers` change). The bind-only columns
+    /// (`group_base` / `lod_input` / `geometry_id` / `node_slot`) are written
+    /// GPU-side by the reconcile pass from the journal, so they have no CPU delta.
     material_delta: Vec<u32>,
     /// Cull mask scatter delta — pushed at bind and on a `RenderLayers` change.
     instance_mask_delta: Vec<u32>,
@@ -333,7 +327,6 @@ impl InstanceManager {
         self.max_active_cluster_count.max(1)
     }
 
-    /// This frame's `group_base` / `lod_input` / `geometry_id` / `material`
     /// This frame's material-id scatter delta — `[slot, material_id]` records
     /// pushed when [`resolve_instance_material_ids`] resolves a changed slot.
     /// Uploaded verbatim by [`super::gpu_instances::MaterialColumn`].
@@ -362,8 +355,7 @@ impl InstanceManager {
         let idx = slot_index as usize;
 
         // Grow the persistent per-slot storage to cover `idx`. Reused slots
-        // (popped from the free-list) are already in range. The per-column
-        // values are no longer mirrored CPU-side — they live only on the GPU.
+        // (popped from the free-list) are already in range.
         if idx >= self.slot_mesh_pointers.len() {
             self.slot_mesh_pointers.resize(idx + 1, None);
             ensure_indexed(&mut self.instance_material_asset_ids, idx, AssetId::default());
@@ -423,9 +415,9 @@ impl InstanceManager {
         slot
     }
 
-    /// Update an already-bound slot whose transform / material changed. The world
-    /// transform itself is produced GPU-side (the gather writes `TransformColumn`);
-    /// here we only record the move (for the PTLAS) + any material/mask change.
+    /// Update an already-bound slot whose material / cull mask changed. The world
+    /// transform is produced GPU-side (the gather writes `TransformColumn`), so
+    /// only material/mask changes are recorded here.
     fn update(
         &mut self,
         slot: GpuEntity,
@@ -533,16 +525,13 @@ pub fn init_instance_manager(mut commands: Commands, _render_device: Res<RenderD
 /// ([`mark_instance_added`] / [`mark_instance_material_changed`] /
 /// [`mark_instance_layers_changed`]), drained by [`flush_cluster_instances`].
 ///
-/// Replaces the old per-frame `Or<(Added, Changed, Changed)>` query, which had to
-/// scan every RT-mesh entity's change-ticks each frame just to find the few that
-/// changed (~0.76ms over 2M instances, even when nothing changed). Observers fire
-/// only on real events, so in steady state — things only *moving* — this set
-/// stays empty and the extract does zero work over zero entities.
+/// Observers fire only on real events, so in steady state — things only
+/// *moving* — this set stays empty and the extract does zero work.
 ///
 /// Movement is deliberately absent: it's handled entirely on the GPU (transform
-/// table → gather; the PTLAS fill detects moves by world-transform compare), so a
-/// moving entity's slot / material / mask / mesh / node_slot are unchanged and
-/// need no CPU re-pack.
+/// table → gather; the PTLAS fill detects moves by comparing current vs previous
+/// world transforms), so a moving entity's slot / material / mask / mesh /
+/// node_slot are unchanged and need no CPU re-pack.
 #[derive(Resource, Default)]
 pub struct RtInstanceChanges(EntityHashSet);
 
@@ -578,8 +567,6 @@ pub fn mark_instance_layers_changed(
     }
 }
 
-/// Unfiltered fetch of one entity's data, keyed by main entity. `RenderEntity`
-/// yields the synced render entity (where the slot/`RaytracingGpuEntity` lives).
 /// PTLAS regular-partition hint for an instance and its descendants (looked up
 /// through the hierarchy at bind time). Assign one id per streamed spatial cell
 /// so the partitioned build gets tight per-cell BVHs + per-cell rebuilds. Must
@@ -604,6 +591,8 @@ fn resolve_partition_hint(
     PARTITION_HINT_NONE
 }
 
+/// Unfiltered fetch of one entity's data, keyed by main entity. `RenderEntity`
+/// yields the synced render entity (where the slot/`RaytracingGpuEntity` lives).
 type ExtractGetData = (
     RenderEntity,
     &'static RaytracingMesh3d,
@@ -626,10 +615,8 @@ type ExtractGetData = (
 /// its lifecycle hangs off the **render** entity (`RaytracingGpuEntity`), and the
 /// `InstanceManager` has render-side bookkeeping (`active_slots`, PTLAS
 /// disabled/released deltas) that a freed slot must update — none of which the
-/// main-world allocator models. Forcing the fit would need cross-world freed-slot
-/// extraction for zero runtime gain. Since Stage 1 made this map off-hot-path
-/// (touched only on bind/material/layer/despawn, never per-frame), there's no
-/// perf reason to convert it either. Keep render-world.
+/// main-world allocator models. This map is off the hot path (touched only on
+/// bind/material/layer/despawn, never per-frame).
 ///
 /// [`GpuSlotAllocator`]: crate::ecs_gpu::GpuSlotAllocator
 /// [`GpuSlot<T>`]: crate::ecs_gpu::GpuSlot

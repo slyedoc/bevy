@@ -53,6 +53,7 @@ fn main() {
             .disable::<bevy::pbr::PbrPlugin>()
             .disable::<bevy::dev_tools::render_debug::RenderDebugOverlayPlugin>(),
         SolariPlugin,
+        SolariAtmospherePlugin,
         FeathersPlugins,
         FreeCameraPlugin,
     ))

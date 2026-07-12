@@ -177,10 +177,9 @@ pub fn prepare_scene_columns_bind_group(world: &mut World) {
         .iter()
         .map(|(binding, buffer, bytes)| BindGroupEntry {
             binding: *binding,
-            // Bind exactly the committed range, NOT the whole sparse virtual buffer
-            // — so the RT shaders' `arrayLength()` is the real slot count (binding
-            // the full 1 GiB made `arrayLength(&directional_lights)` ~33M and hung
-            // the path tracer's light loop).
+            // Bind exactly the committed range, NOT the whole sparse virtual buffer,
+            // so the RT shaders' `arrayLength()` is the real slot count (a loop
+            // bounded by the full virtual reservation hangs the GPU).
             resource: BindingResource::Buffer(BufferBinding {
                 buffer: &**buffer,
                 offset: 0,

@@ -21,10 +21,8 @@
 //             entity from these and writes its GlobalTransform (entity-keyed identity)
 
 struct ReadbackParams {
-    changed_count: u32,  // unused on the frontier path (count is GPU-side)
-    record_stride: u32,  // unused on the frontier path (slots are flat)
     node_count: u32,
-    capacity: u32,       // max output records
+    capacity: u32,  // max output records
 }
 
 // The frontier worklist (changed nodes + GPU-expanded descendants): count at

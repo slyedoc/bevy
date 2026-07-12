@@ -1,4 +1,4 @@
-// NRC MLP kernels, certified by the rung-0 gym (zero/docs/nrc.md).
+// NRC MLP kernels.
 // Convention: every matrix is ROW-major. Plain products use the T-suffixed
 // coop builtins; a transposed operand falls out of the unsuffixed
 // (column-major) load of the same row-major data — no transpose kernels.
@@ -254,7 +254,7 @@ fn nrc_infer_coopvec(@builtin(global_invocation_id) gid: vec3<u32>) {
     coopVecStore(v, &act_out, sample * WIDTH);
 }
 
-// ---- input encoding (shared with production rungs) ------------------------
+// ---- input encoding --------------------------------------------------------
 
 fn one_blob(x: f32, bin: u32) -> f32 {
     let center = (f32(bin) + 0.5) / f32(ONE_BLOB_K);
@@ -288,7 +288,7 @@ fn cyl_encode(v: vec3<f32>) -> vec2<f32> {
 
 const PI: f32 = 3.14159265;
 
-// 62 used features, padded to WIDTH; layout documented in zero/docs/nrc.md.
+// 62 used features, padded to WIDTH.
 // MUST MATCH the inline copy in rt_pipeline/raygen.wgsl (nrc_query).
 fn nrc_encode_cyl(
     pos: vec3<f32>,

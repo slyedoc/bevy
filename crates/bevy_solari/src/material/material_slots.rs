@@ -7,8 +7,8 @@
 //! slot.
 //!
 //! Stability is the prerequisite for `material_id` being a slot-indexed delta
-//! column: a reordering array (as the old iteration-order map was) would change
-//! every instance's `material_id` every frame and could never be a clean delta.
+//! column: a reordering (iteration-order) map would change every instance's
+//! `material_id` every frame and could never be a clean delta.
 
 use bevy_asset::AssetId;
 use bevy_ecs::{

@@ -1,10 +1,7 @@
-// Selector dispatches a wgpu compute pipeline against the cluster
-// scene bind group (group 0) and a selector-specific I/O bind group
-// (group 1). All buffer-allocation knobs use the sparse-buffer
-// allocator — no hardcoded byte caps; growth on demand.
 #![allow(unsafe_code, reason = "compute dispatch reads cluster scene buffers via raw VK")]
 
-//! Per-frame cluster LOD-selection compute pass — **per bucket**.
+//! Per-frame cluster LOD-selection compute pass — **per bucket**. All I/O
+//! buffers are sparse-allocated and grow by page commit, not reallocation.
 //!
 //! BLAS sharing (`super::blas_sharing`) groups instances into
 //! `(geometry, LOD-band)` buckets upstream. This pass runs one workgroup
@@ -57,10 +54,9 @@ use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
 use crate::geometry::ClasArena;
 
-/// User-facing selector knobs. Defaults match aurora's published
-/// "research" config. Consumed by the BLAS-sharing classify pass (which
-/// owns the screen-space projection now); kept here as the selector is
-/// the user-visible LOD resource.
+/// User-facing selector knobs. Consumed by the BLAS-sharing classify pass
+/// (which owns the screen-space projection); they live here because the
+/// selector is the user-visible LOD resource.
 #[derive(Resource, Copy, Clone, Debug)]
 pub struct ClusterSelectorSettings {
     /// Coarsest LOD whose projected world-space error is ≤ this many

@@ -55,7 +55,7 @@ fn main() {
     .insert_resource(UiTheme(create_dark_theme()))
     .add_systems(Startup, setup_scene)
     // The meshes are spawned as `RaytracingMesh3d` directly, but their materials
-    // are authored as `StandardMaterial` — convert those to `SolariMaterial` so the
+    // are authored as `StandardMaterial` — convert those to `StandardSolariMaterial` so the
     // RT path has real materials. Without it every instance falls back to the
     // default material: the 441 emissive spheres aren't emissive and the scene is
     // unlit (geometry still shows in the debug overlays, which ignore materials).

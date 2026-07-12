@@ -6,7 +6,7 @@
 //! frame that recorded them (a submitted trace completes several frames late). A
 //! captured address is only safe if its buffer's address is **stable for the
 //! buffer's lifetime and never freed** — otherwise an in-flight trace reads a
-//! reallocated/freed buffer → device lost (the regenerate crash class).
+//! reallocated/freed buffer → device lost.
 //!
 //! This sealed trait is implemented *only* for the sparse / stable-address wrappers
 //! ([`SparseBuffer`], [`StableStorageBuffer`], [`PersistentGpuBuffer`]). The trace

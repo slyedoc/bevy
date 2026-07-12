@@ -226,7 +226,7 @@ pub fn main() {
         .add_systems(Update, claude_auto_exit);
 
     #[cfg(feature = "solari")]
-    app.add_plugins((SolariPlugin, settings::LightSettingsPlugin))
+    app.add_plugins((SolariPlugin, SolariAtmospherePlugin, settings::LightSettingsPlugin))
         // PbrPlugin no longer registers `Assets<StandardMaterial>`, but proc_scene /
         // benchmark / mipmap systems still reference it.
         .init_asset::<StandardMaterial>()
@@ -243,7 +243,7 @@ pub fn main() {
         );
 
     // Under `solari` the GLB ships KTX2 textures with their own mip chains and
-    // its materials are `SolariMaterial`, so the `StandardMaterial` runtime
+    // its materials are `StandardSolariMaterial`, so the `StandardMaterial` runtime
     // mip generator is pure overhead — skip it entirely.
     #[cfg(not(feature = "solari"))]
     if !args.no_mip_generation {
@@ -456,7 +456,7 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
     // The dense alpha-tested foliage is the point: it stresses the any-hit
     // alpha-test path. See the README for the pipeline.
     // glTF-free under solari: load the importer-baked `.bsn` (entities arrive with
-    // `RaytracingMesh3d` + inline `SolariMaterial` already — no runtime mesh conversion). Bake it
+    // `RaytracingMesh3d` + inline `StandardSolariMaterial` already — no runtime mesh conversion). Bake it
     // with `san_miguel_import` and run with `BEVY_ASSET_ROOT` pointing at the directory that holds
     // `assets/san_miguel/` (the `solari_files` tree).
     // No `Spin`: San Miguel is static, and the OBJ geometry is offset from the world origin —

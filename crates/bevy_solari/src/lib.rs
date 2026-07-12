@@ -2,7 +2,7 @@
 
 //! Provides raytraced rendering.
 //!
-//! See [`SolariPlugins`] for more info.
+//! See [`SolariPlugin`] for more info.
 //!
 //! ![`bevy_solari` logo](https://raw.githubusercontent.com/bevyengine/bevy/refs/heads/main/assets/branding/bevy_solari.svg)
 //!
@@ -60,6 +60,7 @@ pub mod debug;
 pub mod helper;
 
 use bevy_app::{App, Plugin};
+use bevy_ecs::reflect::ReflectResource;
 use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use bevy_log::warn;
 use bevy_render::settings::WgpuFeatures;
@@ -98,41 +99,86 @@ impl SolariChitRegistryAppExt for App {
     }
 }
 
-/// A registrable ray-traced surface: add [`SolariMaterialPlugin<S>`], then set a
-/// material's `chit_class` from [`SolariMaterialClass<S>`].
-pub trait SolariMaterial: Send + Sync + 'static {
+/// A registrable ray-traced surface: add [`SolariHitGroupPlugin<S>`], then set a
+/// material's `chit_class` from [`SolariHitGroupClass<S>`].
+pub trait SolariHitGroup: Send + Sync + 'static {
     fn hit_group() -> SolariHitGroupDef;
 }
 
 /// SBT class assigned to surface `S`; read to set a material's `chit_class`.
 #[derive(bevy_ecs::resource::Resource)]
-pub struct SolariMaterialClass<S: SolariMaterial> {
+pub struct SolariHitGroupClass<S: SolariHitGroup> {
     class: u32,
     _marker: core::marker::PhantomData<fn() -> S>,
 }
 
-impl<S: SolariMaterial> SolariMaterialClass<S> {
+impl<S: SolariHitGroup> SolariHitGroupClass<S> {
     pub fn get(&self) -> u32 {
         self.class
     }
 }
 
-/// Registers surface `S` and exposes [`SolariMaterialClass<S>`]. Add after [`SolariPlugin`].
-pub struct SolariMaterialPlugin<S: SolariMaterial>(core::marker::PhantomData<fn() -> S>);
+/// Registers surface `S` and exposes [`SolariHitGroupClass<S>`]. Add after [`SolariPlugin`].
+pub struct SolariHitGroupPlugin<S: SolariHitGroup>(core::marker::PhantomData<fn() -> S>);
 
-impl<S: SolariMaterial> Default for SolariMaterialPlugin<S> {
+impl<S: SolariHitGroup> Default for SolariHitGroupPlugin<S> {
     fn default() -> Self {
         Self(core::marker::PhantomData)
     }
 }
 
-impl<S: SolariMaterial> Plugin for SolariMaterialPlugin<S> {
+impl<S: SolariHitGroup> Plugin for SolariHitGroupPlugin<S> {
     fn build(&self, app: &mut App) {
         let class = app.register_solari_chit(S::hit_group());
-        app.insert_resource(SolariMaterialClass::<S> {
+        app.insert_resource(SolariHitGroupClass::<S> {
             class,
             _marker: core::marker::PhantomData,
         });
+    }
+}
+
+/// Crate-wide tunables + debug levers. Override by inserting the resource
+/// before [`SolariPlugin`] runs (`App::insert_resource`); defaults match
+/// production behavior.
+///
+/// The debug booleans are latched into process-wide flags at plugin `finish`
+/// (their consumers are raw-VK helpers with no ECS access), so they are
+/// startup-only. `tess_displacement_scale` is read per frame (extracted to the
+/// render world) and can be tweaked live.
+#[derive(bevy_ecs::resource::Resource, Clone, bevy_render::extract_resource::ExtractResource, bevy_reflect::Reflect)]
+#[reflect(Resource)]
+pub struct SolariSettings {
+    /// Umbrella debug gate: raw-op access validation ([`gpu::extension::validate_raw_access`])
+    /// plus the PTLAS record-validation pass.
+    pub validate: bool,
+    /// Scan + null corrupt BLAS addresses each PTLAS build, logging offenders
+    /// instead of device-losting in the build. Implied by `validate`.
+    pub ptlas_validate: bool,
+    /// Build the PTLAS from scratch every frame (no `src` carry). Bisect lever:
+    /// if device-losts stop, the corruption lives in the incremental path.
+    pub ptlas_full_rebuild: bool,
+    /// Log which camera path fills the RT camera buffer (GPU pass vs CPU
+    /// fallback) and why.
+    pub camera_debug: bool,
+    /// Trace the transform frontier's changed-path seed/walk decisions.
+    pub xform_debug: bool,
+    /// Tessellation displacement height (object units).
+    pub tess_displacement_scale: f32,
+    /// Seed for the deterministic He-uniform NRC weight init.
+    pub nrc_seed: u64,
+}
+
+impl Default for SolariSettings {
+    fn default() -> Self {
+        Self {
+            validate: false,
+            ptlas_validate: false,
+            ptlas_full_rebuild: false,
+            camera_debug: false,
+            xform_debug: false,
+            tess_displacement_scale: 0.05,
+            nrc_seed: 0x9e3779b97f4a7c15,
+        }
     }
 }
 
@@ -190,7 +236,10 @@ pub mod prelude {
         ray_query::picking::SolariPickingPlugin,
         accel::ClusterSelectorSettings,
         instance::SolariPartition,
-        render::atmosphere::{SolariAtmosphere, SolariAtmosphereVolume, SolariGlobalFog},
+        render::atmosphere::{
+            SolariAtmosphere, SolariAtmospherePlugin, SolariAtmosphereVolume, SolariGlobalFog,
+        },
+        render::sky::SolariSky,
         render::rt_pipeline::SolariCylindricalWindow,
         render::rt_pipeline::SolariDebugView,
         render::rt_pipeline::SolariFreezeDiff,
@@ -203,7 +252,7 @@ pub mod prelude {
             SolariReference, SolariRestir, SpatialReuse,
         },
         transform::{NoGpuGlobalTransformReadback, SolariGpuFrame, TransformStatic},
-        SolariInitPlugin, SolariPlugin,
+        SolariInitPlugin, SolariPlugin, SolariSettings,
     };
 
     #[cfg(feature = "bevy_solari_debug")]
@@ -258,6 +307,11 @@ impl Plugin for SolariPlugin {
         // Embed every solari shader (must run during plugin build) — co-located
         // with their pipeline builds in `crate::pipelines`.
         pipelines::embed_solari_shaders(app);
+        app.init_resource::<SolariSettings>()
+            .register_type::<SolariSettings>()
+            .add_plugins(
+                bevy_render::extract_resource::ExtractResourcePlugin::<SolariSettings>::default(),
+            );
         app.add_plugins((
             SceneColumnsPlugin,
             ReconcilePlugin,
@@ -278,10 +332,10 @@ impl Plugin for SolariPlugin {
 
         // Built-in surfaces; order sets SBT class: opaque=0 (default), glass=1, hair=2, portal=3.
         app.add_plugins((
-            SolariMaterialPlugin::<OpaqueSurface>::default(),
-            SolariMaterialPlugin::<GlassSurface>::default(),
-            SolariMaterialPlugin::<HairSurface>::default(),
-            SolariMaterialPlugin::<PortalSurface>::default(),
+            SolariHitGroupPlugin::<OpaqueSurface>::default(),
+            SolariHitGroupPlugin::<GlassSurface>::default(),
+            SolariHitGroupPlugin::<HairSurface>::default(),
+            SolariHitGroupPlugin::<PortalSurface>::default(),
         ));
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
@@ -318,6 +372,18 @@ impl Plugin for SolariPlugin {
     }
 
     fn finish(&self, app: &mut App) {
+        // Latch the startup-only debug levers into their process-wide flags —
+        // their consumers are raw-VK helpers with no ECS access. `finish` sees
+        // the final resource regardless of `insert_resource` ordering in `main`.
+        let settings = app.world().resource::<SolariSettings>().clone();
+        gpu::extension::latch_validate(settings.validate);
+        accel::ptlas::latch_debug_levers(
+            settings.ptlas_validate || settings.validate,
+            settings.ptlas_full_rebuild,
+        );
+        render::rt_pipeline::latch_camera_debug(settings.camera_debug);
+        transform::latch_xform_debug(settings.xform_debug);
+
         let render_device = app.world().resource::<RenderDevice>();
         let features = render_device.features();
         if !features.contains(SolariPlugin::required_wgpu_features()) {
@@ -350,8 +416,8 @@ impl SolariPlugin {
             // absolute world translation in f64 and the subtract pass relativizes it
             // against the camera origin (see `transform/`).
             | WgpuFeatures::SHADER_F64
-            // NRC (zero/docs/nrc.md): f16 MLP weights, coopmat training passes,
-            // coopvec inline inference in raygen. NV-only by project decision.
+            // NRC: f16 MLP weights, coopmat training passes, coopvec inline
+            // inference in raygen (NV-only extensions).
             | WgpuFeatures::SHADER_F16
             | WgpuFeatures::EXPERIMENTAL_COOPERATIVE_MATRIX
             | WgpuFeatures::EXPERIMENTAL_COOPERATIVE_VECTOR

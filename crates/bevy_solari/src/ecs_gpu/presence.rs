@@ -133,9 +133,6 @@ fn on_remove_marker<C: GpuPresenceColumn>(
     events.events.push((remove.entity, false));
 }
 
-// (Readiness is checked inline in `drain_presence` so high-water can still be
-// mirrored every frame while events are held back until the pipeline compiles.)
-
 /// `ExtractSchedule`: mirror the slot high-water (always — so the flag buffer
 /// covers every slot and a consumer's `flags[slot]` read is never an uncommitted
 /// page, just the `0` default), and drain the observer events into the column's

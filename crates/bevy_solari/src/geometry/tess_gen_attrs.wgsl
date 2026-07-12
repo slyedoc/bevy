@@ -1,8 +1,7 @@
-// Phase C shading: per-micro-triangle smooth normals + UVs for the GPU-classify
-// tessellation path, in the DENORMALIZED layout the closest-hit's smooth-tess
-// branch already reads (`resolve_triangle_data_full_mat_fetch`, the
-// `geometry_addresses.tess_clusters != 0` path). Without it the tess hit shades with
-// a flat facet normal + a fixed UV(0.5) → grey, untextured.
+// Per-micro-triangle smooth normals + UVs for the GPU tessellation path, in the
+// DENORMALIZED layout the closest-hit's smooth-tess branch reads
+// (`resolve_triangle_data_full_mat_fetch`, the
+// `geometry_addresses.tess_clusters != 0` path).
 //
 // One workgroup per emitted part (same indirect grid as `tess_gen_verts`), one
 // thread per micro-triangle of the part's table config. For each micro-triangle it
@@ -14,8 +13,7 @@
 // contiguous at `(part * max_tris + micro_tri) * 9` u32. Thread 0 also writes the
 // part's metadata record (attr-buffer address + `primitive_base = part * max_tris`).
 //
-// Smooth (interpolated base) normals — no displacement-gradient bump yet (that's the
-// `tess_normals.wgsl` refinement); this fixes faceting + missing textures.
+// Normals are the interpolated base normals (no displacement-gradient bump).
 
 #import bevy_render::utils::{octahedral_decode_signed, octahedral_encode}
 

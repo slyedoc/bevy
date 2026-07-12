@@ -1,12 +1,6 @@
-//! Bind group layout + per-frame bind group for the cluster
+//! Bind group layout + cached bind group for the cluster
 //! scene state. Matches the `@group(0)` declarations in
 //! `cluster_bindings.wgsl`.
-//!
-//! Per-frame instance buffers (`InstanceManager`'s
-//! `StorageBuffer`s) are flushed to GPU here as well — the manager
-//! writes into the CPU-side Vec during extract; the GPU upload +
-//! bind-group rebuild happens together in
-//! [`prepare_cluster_scene_bind_group`].
 //!
 //! Skips bind-group creation while any required buffer hasn't been
 //! populated yet (scene has no `RaytracingMesh3d` entities, or no
@@ -94,11 +88,10 @@ pub struct ClusterSceneBindGroup {
     buffer_ids: Option<[BufferId; BIND_GROUP_BUFFER_COUNT]>,
 }
 
-/// Upload the slot-indexed instance buffers (when an instance was
-/// (re)bound) then rebuild the scene bind group (when a buffer handle
-/// changed). Runs in `Render::PrepareBindGroups` after the cluster-mesh-
-/// pool writes complete in `Render::PrepareAssets`. A static frame does
-/// neither — see [`ClusterSceneBindGroup`].
+/// Rebuild the scene bind group when a buffer handle changed. Runs in
+/// `Render::PrepareBindGroups` after the cluster-mesh-pool writes complete
+/// in `Render::PrepareAssets`. A static frame does nothing — see
+/// [`ClusterSceneBindGroup`].
 pub fn prepare_cluster_scene_bind_group(
     mut bind_group: ResMut<ClusterSceneBindGroup>,
     layout: Res<ClusterSceneBindGroupLayout>,

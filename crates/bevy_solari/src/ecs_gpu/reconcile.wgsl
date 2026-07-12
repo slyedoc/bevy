@@ -1,9 +1,8 @@
 // GPU instance reconcile — folds the CPU's absolute-state change journal into the
 // per-instance GPU columns. One thread per journal record; an UPSERT writes ALL of
 // a slot's columns from the single record, so a reused slot is fully re-initialized
-// in one pass (no partial/stale column survives — the aliasing fix). This replaces
-// the per-column delta scatters: the journal carries every column's value, and the
-// reconcile is the sole writer of these columns.
+// in one pass (no partial/stale column survives). The journal carries every
+// column's value; the reconcile is the sole writer of these columns.
 
 // Must match `instance::journal::InstanceJournalRecord` (48 B, 12 × u32).
 struct JournalRecord {
@@ -33,10 +32,10 @@ struct ReconcileParams {
 @group(0) @binding(1) var<uniform> params: ReconcileParams;
 
 // The set-once-at-bind per-instance columns, slot-indexed (the same buffers the
-// path tracer / PTLAS fill read). The reconcile is their sole writer — the CPU
-// delta scatter for these is removed. `material`/`mask` are NOT here: they change
-// after bind (material re-resolved in Prepare, mask on a RenderLayers change), so
-// they stay on their existing change-driven scatter paths.
+// path tracer / PTLAS fill read). The reconcile is their sole writer.
+// `material`/`mask` are NOT here: they change after bind (material re-resolved
+// in Prepare, mask on a RenderLayers change), so they use the change-driven
+// scatter paths instead.
 @group(0) @binding(2) var<storage, read_write> node_slots: array<u32>;
 @group(0) @binding(3) var<storage, read_write> geometry_ids: array<u32>;
 @group(0) @binding(4) var<storage, read_write> group_bases: array<u32>;
@@ -67,9 +66,7 @@ fn reconcile_apply(
     geometry_ids[slot] = rec.geometry_id;
     group_bases[slot] = rec.group_base;
     // This vec4 order MUST match `InstanceLodInputGpu` (cluster_base, cluster_count,
-    // group_base, root_group) — the layout the CPU delta scatter writes — so the
-    // reconcile and the CPU writer produce byte-identical columns (the authority flip
-    // relies on this).
+    // group_base, root_group).
     lod_inputs[slot] = vec4<u32>(rec.cluster_base, rec.cluster_count, rec.group_base, rec.root_group);
     partition_hints[slot] = rec.partition_hint;
 }

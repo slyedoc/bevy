@@ -1,13 +1,13 @@
 //! The concrete per-instance GPU columns — the GPU-side "components" of a
-//! [`GpuEntity`]. Each is a [`GpuColumnDesc`] (value type + source + dirty
-//! set); [`GpuColumnPlugin`] builds the scatter pipeline. [`GpuInstancesPlugin`]
-//! registers all of them.
+//! [`GpuEntity`]. Each is a [`GpuColumnDesc`]; [`GpuColumnPlugin`] builds the
+//! scatter pipeline. [`GpuInstancesPlugin`] registers all of them.
 //!
-//! One mechanism, a per-column dirty set: `transforms` scatters its pre-built
-//! `transform_delta` (and keeps its previous frame GPU-side, `KEEP_PREVIOUS`);
-//! `material_ids` on `material_dirty` (bind / asset swap / re-resolve);
-//! `group_bases` / `lod_inputs` / `geometry_ids` on `added_slots` (bind only).
-//! Every column scatters through the same `GpuColumn`.
+//! Writers vary per column: `transforms` is written GPU-side by the transform
+//! gather (and keeps its previous frame GPU-side, `KEEP_PREVIOUS`);
+//! `material_ids` / `instance_masks` scatter CPU-built deltas on change; the
+//! bind-only columns (`group_bases` / `lod_inputs` / `geometry_ids` /
+//! `node_slots` / `partition_hints`) are written by the GPU reconcile pass
+//! from the instance journal.
 
 use bevy_app::{App, Plugin};
 use bevy_ecs::system::{Res, SystemParam};
@@ -56,12 +56,7 @@ impl Affine3x4 {
 /// Current world transforms (cluster scene + raytracing groups read this).
 /// `KEEP_PREVIOUS`: the previous-frame transform (for ReSTIR temporal reuse)
 /// is shifted in on the GPU from the current buffer — no separate upload.
-///
-/// Delta-direct: the per-frame `(slot, world)` records are pre-built by the
-/// extract straight from the packed move data ([`InstanceManager::transform_delta`]),
-/// so this column never gathers values out of a CPU mirror — `prebuilt_delta`
-/// is uploaded verbatim. The GPU buffer is the source of truth across a
-/// capacity growth (`GpuColumn` copies it old→new), so there is no CPU mirror.
+/// Written GPU-side by the transform-gather pass; there is no CPU mirror.
 pub struct TransformColumn;
 impl GpuColumnDesc for TransformColumn {
     type Value = Affine3x4;

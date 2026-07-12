@@ -1,15 +1,15 @@
-// CLAS template arena — topology-only per-cluster acceleration-structure
-// templates for ANIMATED meshes. A template encodes a cluster's connectivity
-// (triangle/vertex counts, index buffer, geometry id) plus an
-// `instantiationBoundingBoxLimit` deform envelope, but NOT final vertex
-// positions. Each frame, `geometry::…instantiate` feeds the just-deformed
-// vertex positions into these templates (op `INSTANTIATE_TRIANGLE_CLUSTER`) to
-// produce a fresh per-instance CLAS, which a per-instance BLAS then references.
-//
-// Built once at upload, mirroring `clas_arena::upload_mesh` almost exactly: the
-// only differences are the op type (`BUILD_TRIANGLE_CLUSTER_TEMPLATE`), the
-// per-cluster `instantiation_bounding_box_limit`, and the destination table
-// (`cluster_template_addresses` instead of `cluster_clas_addresses`).
+//! CLAS template arena — topology-only per-cluster acceleration-structure
+//! templates for ANIMATED meshes. A template encodes a cluster's connectivity
+//! (triangle/vertex counts, index buffer, geometry id) plus an
+//! `instantiationBoundingBoxLimit` deform envelope, but NOT final vertex
+//! positions. Each frame, the instantiate pass feeds the just-deformed
+//! vertex positions into these templates (op `INSTANTIATE_TRIANGLE_CLUSTER`) to
+//! produce a fresh per-instance CLAS, which a per-instance BLAS then references.
+//!
+//! Built once at upload, mirroring `clas_arena::upload_mesh` almost exactly: the
+//! only differences are the op type (`BUILD_TRIANGLE_CLUSTER_TEMPLATE`), the
+//! per-cluster `instantiation_bounding_box_limit`, and the destination table
+//! (`cluster_template_addresses` instead of `cluster_clas_addresses`).
 #![allow(unsafe_code, reason = "raw-VK cluster-AS template build")]
 
 use ash::vk::{self, TaggedStructure};
@@ -142,7 +142,7 @@ impl ClusterTemplateArena {
             .expect("clas_template.upload_mesh_templates: cluster-AS extension fn table missing");
 
         // NV index type 4 = 32-bit indices. OPAQUE = 0b100 in the 3-bit
-        // geometry-flags subfield (see memory `aurora_cluster_as_opaque.md`).
+        // geometry-flags subfield (the subfield holds the enum value).
         const INDEX_TYPE_32BIT: u32 = 4;
         const OPAQUE_GEOMETRY_FLAG: u8 = 0b100;
 
@@ -340,7 +340,7 @@ impl ClusterTemplateArena {
         );
         let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses_buf).get();
 
-        // Declared access (SOLARI_VALIDATE): the implicit-dst window of the
+        // Declared access (SolariSettings::validate): the implicit-dst window of the
         // template pool this mesh's templates land in.
         crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
             op: "clas_template.upload",

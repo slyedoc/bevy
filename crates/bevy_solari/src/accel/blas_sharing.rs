@@ -9,8 +9,8 @@
 // This module owns the classify / dirty-election / address-assignment
 // GPU passes and the per-geometry BLAS storage pool. The selector and
 // `blas_rebuild` consume the dirty-build list here (they treat a "bucket"
-// as a dirty-geometry build entry — same buffer layout as before);
-// `ptlas` reads the slot-indexed `instance_blas_address`.
+// as a dirty-geometry build entry); `ptlas` reads the slot-indexed
+// `instance_blas_address`.
 //
 // See `blas_sharing.wgsl` for the pass algorithms.
 #![allow(unsafe_code, reason = "device-address plumbing for the geometry BLAS pool")]
@@ -311,18 +311,6 @@ pub fn prepare_blas_sharing(
         return;
     }
 
-    // One-time: init persistent built-level to NO_LEVEL so every
-    // geometry's first sighting triggers a build.
-    if resources.needs_init {
-        let init = vec![NO_LEVEL; MAX_GEOMETRIES as usize];
-        render_queue.write_buffer(
-            &resources.geometry_built_level,
-            0,
-            bytemuck::cast_slice(&init),
-        );
-        resources.needs_init = false;
-    }
-
     // Per-geometry BLAS region stride = worst-case single-mesh BLAS,
     // sized from the largest resident mesh (monotonic, grow-only). A
     // stride change moves every geometry's region — fine, the affected
@@ -350,15 +338,17 @@ pub fn prepare_blas_sharing(
     resources.geometry_count = geometry_count.max(1);
     let geometry_capacity = MAX_GEOMETRIES; // fixed-size scratch buffers
 
-    // If the stride grew, every geometry's region address moved → force
-    // a full rebuild by resetting built levels to NO_LEVEL.
-    if stride_changed && !resources.needs_init {
+    // Reset built levels to NO_LEVEL on the one-time init of the persistent
+    // table (so every geometry's first sighting triggers a build) and whenever
+    // the stride grows (every geometry's region address moved → full rebuild).
+    if resources.needs_init || stride_changed {
         let init = vec![NO_LEVEL; MAX_GEOMETRIES as usize];
         render_queue.write_buffer(
             &resources.geometry_built_level,
             0,
             bytemuck::cast_slice(&init),
         );
+        resources.needs_init = false;
     }
 
     let pool_base = resources.geometry_blas_pool.address;
@@ -556,7 +546,9 @@ pub fn dispatch_blas_sharing(
     let active_groups = active_count.div_ceil(WORKGROUP_SIZE);
     let geom_groups = geometry_count.div_ceil(WORKGROUP_SIZE);
 
-    // Separate passes so wgpu inserts the producer→consumer barriers.
+    // Separate passes (one encoder) so wgpu inserts the producer→consumer
+    // barriers between them. Records into the shared `RenderContext`
+    // encoder — the graph submits once for the frame.
     let steps: [(&wgpu::ComputePipeline, u32); 5] = [
         (geom_reset, geom_groups),
         (classify, active_groups),
@@ -565,9 +557,6 @@ pub fn dispatch_blas_sharing(
         (assign_address, active_groups),
     ];
 
-    // Separate passes (one encoder) so wgpu inserts the producer→consumer
-    // barriers between them. Records into the shared `RenderContext`
-    // encoder — the graph submits once for the frame.
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let encoder = ctx.command_encoder();

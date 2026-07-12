@@ -3,11 +3,11 @@
 //! Copies each RT instance's GPU-propagated world transform into the instance
 //! `TransformColumn` buffer that every RT consumer already reads (PTLAS fill,
 //! blas sharing, the raytracing scene), indexed by `node_slot[i]`:
-//! `transforms[i] = world[node_slot[i]]`. No consumer changes — they keep
-//! indexing transforms by instance slot. Runs after the propagation pass and
-//! also shifts current → previous (motion vectors / ReSTIR temporal, and the
-//! PTLAS-fill move detection). The instance world transform is produced entirely
-//! GPU-side now — there is no CPU instance-transform path.
+//! `transforms[i] = world[node_slot[i]]`. Consumers keep indexing transforms by
+//! instance slot. Runs after the propagation pass and also shifts
+//! current → previous (motion vectors / ReSTIR temporal, and the PTLAS-fill
+//! move detection). The instance world transform is produced entirely GPU-side;
+//! there is no CPU instance-transform path.
 
 use bevy_ecs::{
     resource::Resource,
@@ -106,9 +106,8 @@ pub fn prepare_transform_gather(
 }
 
 /// `Render::PrepareBindGroups`: (re)build the gather bind group. Rebuilt every
-/// frame — cheap (one small group), and immune to any bound buffer changing its
-/// allocation strategy later (a cached group over a swapped buffer is a silent
-/// session-long stale read; see the frontier seed-loss postmortem).
+/// frame — cheap (one small group), and immune to a bound buffer reallocating
+/// (a cached group over a swapped buffer is a silent session-long stale read).
 pub fn prepare_transform_gather_bind_group(
     mut gather: Option<ResMut<TransformGather>>,
     resource_manager: Option<Res<SolariResourceManager>>,

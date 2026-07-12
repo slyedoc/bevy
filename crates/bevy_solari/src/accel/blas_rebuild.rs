@@ -1,21 +1,18 @@
-// Per-frame cluster-AS BLAS rebuild — **per bucket** (BLAS sharing).
-//
-// Issues `vkCmdBuildClusterAccelerationStructureIndirectNV` (op type
-// BuildClustersBottomLevel) against the selector's per-bucket `args_buf`
-// + `selected_clas_refs`. EXPLICIT_DESTINATIONS: each bucket's BLAS is
-// built into its stable region inside `blas_sharing`'s `geometry_blas_pool`
-// (address = `pool_base + bucket_slot * worst_case_stride`), so the
-// address never changes while the bucket is live — the PTLAS treats an
-// instance whose bucket is unchanged as a no-op.
-//
-// The build count is **GPU-driven**: `src_infos_count` is the device
-// address of `blas_sharing`'s `dirty_build_count`, so the driver builds
-// exactly the number of live buckets, NOT the instance count. That is
-// the whole win — ~71k per-instance builds collapse to
-// `(unique geometries × LOD bands)` per-bucket builds.
 #![allow(unsafe_code, reason = "raw VK build command via as_hal_mut")]
 
 //! Per-frame per-bucket BLAS rebuild for the cluster-AS pipeline.
+//!
+//! Issues `vkCmdBuildClusterAccelerationStructureIndirectNV` (op type
+//! BuildClustersBottomLevel) with EXPLICIT_DESTINATIONS: each bucket's BLAS is
+//! built into its stable region inside `blas_sharing`'s `geometry_blas_pool`
+//! (address = `pool_base + bucket_slot * worst_case_stride`), so the address
+//! never changes while the bucket is live and the PTLAS treats an instance
+//! whose bucket is unchanged as a no-op.
+//!
+//! The build count is GPU-driven: `src_infos_count` is the device address of
+//! `blas_sharing`'s `dirty_build_count`, so the driver builds exactly the
+//! live buckets — bounded by `(unique geometries × LOD bands)`, not the
+//! instance count.
 //!
 //! Inputs:
 //! - `selector.args_buf` — per-bucket
@@ -56,13 +53,9 @@ use super::selector::Selector;
 /// destinations inherit that.
 pub const BLAS_REGION_ALIGN: u64 = 256;
 
-/// Virtual address space for the build scratch — 1 GB. Scratch is
-/// transient (driver overwrites every frame), but keeping it sparse
-/// avoids committing memory for the maximum-bucket worst case when
-/// scenes start small.
-// 8 GB virtual (sparse — only the per-frame build's scratch commits). OMM-bearing
-// cluster builds + dedup-off geometry counts push the scratch past the old 1 GB
-// reservation; the bump is free until actually committed.
+/// Virtual address space for the build scratch — 8 GB, sparse; only the
+/// per-frame build's scratch commits, so scenes that start small commit
+/// little. OMM-bearing cluster builds need this much headroom.
 pub const BLAS_SCRATCH_VIRTUAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// NV cluster-AS scratch alignment (`clusterScratchByteAlignment`).
@@ -94,12 +87,9 @@ pub fn init_blas_rebuild(
     commands.insert_resource(BlasRebuildResources { scratch });
 }
 
-/// Worst-case single-BLAS byte size for a mesh with `cluster_count`
-/// clusters (every cluster selected). Used to size a bucket's region.
-/// One-AS build-size query; results are cached by the caller.
-/// Build flags for the cluster→BLAS (CLUSTERS_BOTTOM_LEVEL) builds. When OMM is
-/// available the bottom-level build MUST declare OMM, or the driver under-sizes
-/// the per-geometry BLAS region (its referenced CLASes carry OMM) and the build
+/// Build flags for the cluster→BLAS (CLUSTERS_BOTTOM_LEVEL) builds. The
+/// bottom-level build MUST declare OMM, or the driver under-sizes the
+/// per-geometry BLAS region (its referenced CLASes carry OMM) and the build
 /// overflows the committed pool region (VUID-...opMode-10471). Mirrors the CLAS
 /// build's OMM opt-in in `clas_arena`. Use for BOTH the stride-sizing query and
 /// the actual build so they agree.
@@ -110,6 +100,9 @@ pub(crate) fn blas_build_flags() -> vk::BuildAccelerationStructureFlagsKHR {
         | vk::BuildAccelerationStructureFlagsKHR::ALLOW_OPACITY_MICROMAP_UPDATE_EXT
 }
 
+/// Worst-case single-BLAS byte size for a mesh with `cluster_count` clusters
+/// (every cluster selected). Sizes a bucket's pool region; results are cached
+/// by the caller.
 pub(crate) fn query_blas_size(
     cluster_fns: &nv::cluster_acceleration_structure::Device,
     cluster_count: u32,
@@ -273,7 +266,7 @@ pub fn dispatch_blas_rebuild(
         _marker: core::marker::PhantomData,
     };
 
-    // Declared access (SOLARI_VALIDATE): CPU-knowable ranges only — the BLAS
+    // Declared access (SolariSettings::validate): CPU-knowable ranges only — the BLAS
     // pool dst addresses are GPU-computed and can't be declared here.
     crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
         op: "blas_rebuild.build",

@@ -51,6 +51,7 @@ fn main() {
         .add_plugins((
             DefaultPlugins,
             SolariPlugin,
+            SolariAtmospherePlugin,
             FeathersPlugins,
             FreeCameraPlugin,
             FrameTimeDiagnosticsPlugin::default(),
@@ -84,7 +85,7 @@ fn setup_scene(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut solari_materials: ResMut<Assets<SolariMaterial>>,
+    mut solari_materials: ResMut<Assets<StandardSolariMaterial>>,
 ) {
     // The glassware (bottle + glass + wine), floor at y = 0. The asset's
     // second, larger bottle is stripped on spawn — the prism stands in its
@@ -139,7 +140,7 @@ fn setup_scene(
             },
         );
 
-    // A flint-glass prism (authored as `SolariMaterial` directly —
+    // A flint-glass prism (authored as `StandardSolariMaterial` directly —
     // `StandardMaterial` has no dispersion field). The triangle profile is
     // equilateral, flat side down; look through it edge-on for the strongest
     // wavelength split.
@@ -152,7 +153,7 @@ fn setup_scene(
             ),
             0.18,
         ))),
-        SolariMaterial3d(solari_materials.add(SolariMaterial {
+        SolariMaterial3d(solari_materials.add(StandardSolariMaterial {
             base_color: Color::WHITE,
             perceptual_roughness: 0.0,
             specular_transmission: 1.0,
@@ -236,7 +237,7 @@ fn setup_scene(
 }
 
 /// Thin-lens control panel (top right): focus-distance + aperture sliders
-/// writing straight to the camera's [`SolariLens`] (whose change detection
+/// writing straight to the camera's [`DepthOfField`] (whose change detection
 /// restarts the pathtracer's accumulation). DoF is visible in the pathtrace
 /// view; aperture 0 = pinhole.
 fn lens_ui() -> impl Scene {
@@ -328,7 +329,7 @@ fn lens_ui() -> impl Scene {
                     SliderPrecision(2)
                     on(slider_self_update)
                     on(|change: On<ValueChange<f32>>,
-                        mut materials: ResMut<Assets<SolariMaterial>>,
+                        mut materials: ResMut<Assets<StandardSolariMaterial>>,
                         mut resets: Query<&mut CameraReset>| {
                         let ids: Vec<_> = materials.ids().collect();
                         for id in ids {
@@ -339,7 +340,7 @@ fn lens_ui() -> impl Scene {
                             }
                         }
                         for mut reset in &mut resets {
-                            reset.0 = true;
+                            reset.history = true;
                         }
                     })
                 ),

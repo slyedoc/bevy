@@ -64,7 +64,7 @@ pub struct TessShowcaseInstances {
 
 /// `Update` (main world): collect EVERY displacement-mapped instance as a
 /// tessellation subject (mesh + world transform + its own displacement map),
-/// latched once all materials are loaded. Gated on `SOLARI_TESS`.
+/// latched once all materials are loaded.
 pub fn find_tess_showcase_instances(
     mut found: ResMut<TessShowcaseInstances>,
     materials: Res<Assets<StandardSolariMaterial>>,
@@ -144,8 +144,7 @@ pub fn find_tess_showcase_instances(
 pub struct TessBaseHidden;
 
 /// Marker: material inspected once — keeps the scan query archetype-empty in
-/// steady state (a runtime depth_map ADDITION won't re-hide; live-edit nicety
-/// traded away, this was O(every RT entity) per frame at 1.7M instances).
+/// steady state. A `depth_map` added at runtime won't re-hide the instance.
 #[derive(bevy_ecs::component::Component)]
 pub struct TessBaseChecked;
 
@@ -266,9 +265,9 @@ pub fn init_tess_ptlas_write(
     let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("tess_ptlas_write".into()),
         layout: vec![layout.clone()],
-        // Path is relative to THIS file's dir (`src/geometry/`); the
-        // `embedded_asset!` in `pipelines.rs` (at `src/`) registered it as
-        // `geometry/tess_ptlas_write.wgsl`, so loading from here uses the bare name.
+        // Path is relative to THIS file's dir (`src/geometry/`), so the asset
+        // `pipelines.rs` registered as `geometry/tess_ptlas_write.wgsl` loads
+        // from here by its bare name.
         shader: bevy_asset::load_embedded_asset!(asset_server.as_ref(), "tess_ptlas_write.wgsl"),
         shader_defs: vec![],
         entry_point: Some("tess_write".into()),
@@ -339,6 +338,7 @@ pub fn prepare_tess_ptlas_write(
     )>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    settings: Res<crate::SolariSettings>,
 ) {
     let Some(mut write) = write else {
         return;
@@ -366,6 +366,11 @@ pub fn prepare_tess_ptlas_write(
         .map(|(main, slot)| (main.id(), slot.0 .0))
         .collect();
 
+    // Displaced micro-verts recede up to `displacement_scale` along the normal
+    // (object units, applied pre-transform in the gen pass) — inflate the local box
+    // by that margin so the explicit bounds stay conservative.
+    let margin = settings.tess_displacement_scale;
+
     let gpu_instances: Vec<TessInstanceGpu> = found
         .instances
         .iter()
@@ -378,20 +383,20 @@ pub fn prepare_tess_ptlas_write(
             let (wmin, wmax) = world_aabb(
                 &inst.world_from_local,
                 inst.local_aabb_center,
-                inst.local_aabb_half,
+                [
+                    inst.local_aabb_half[0] + margin,
+                    inst.local_aabb_half[1] + margin,
+                    inst.local_aabb_half[2] + margin,
+                ],
             );
-            // DIAGNOSTIC: huge AABB to rule the explicit-bounds-mismatch hypothesis in/out.
-            // If the GPU tess geometry appears with this, the per-instance world AABB
-            // (wmin/wmax) was wrong; revert to wmin/wmax once confirmed.
-            let _ = (wmin, wmax);
             TessInstanceGpu {
                 transform_r0: Vec4::new(1.0, 0.0, 0.0, 0.0),
                 transform_r1: Vec4::new(0.0, 1.0, 0.0, 0.0),
                 transform_r2: Vec4::new(0.0, 0.0, 1.0, 0.0),
-                aabb_min: Vec4::new(-10000.0, -10000.0, -10000.0, 0.0),
-                aabb_max: Vec4::new(10000.0, 10000.0, 10000.0, 0.0),
+                aabb_min: Vec4::new(wmin[0], wmin[1], wmin[2], 0.0),
+                aabb_max: Vec4::new(wmax[0], wmax[1], wmax[2], 0.0),
                 // BLAS address read GPU-side from `blas_addresses[i]` (same instance order
-                // the step-3b loop built them in).
+                // the BLAS-build loop used).
                 blas_slot: i as u32,
                 sbt_record: material_slots
                     .as_ref()
@@ -407,9 +412,7 @@ pub fn prepare_tess_ptlas_write(
     *write.params.get_mut() = TessWriteParams {
         tess_count,
         tess_base: cluster_high_water + hair_count,
-        // Route to material 0's `chit_opaque` — geometry correct via position-fetch;
-        // shading uses material 0's textures (smooth tess normals are recovered in the
-        // chit; UV is fixed until textured tess shading lands).
+        // Unused by the write shader — each instance carries its own `sbt_record`.
         sbt_record: 0,
         mask: 0xff,
         // Static partition (0) — what `ptlas_fill::resolve_partition` assigns static
@@ -453,8 +456,8 @@ pub fn prepare_tess_ptlas_write_bind_group(
         write.bind_group = None;
         return;
     };
-    // The GPU per-instance BLAS-address buffer (`tess_classify` step 3b); absent until the
-    // CLAS pool is first sized, in which case there's nothing to inject yet.
+    // The GPU per-instance BLAS-address buffer (built by `tess_classify`); absent until
+    // the CLAS pool is first sized, in which case there's nothing to inject yet.
     let Some(blas_addresses) = classify.blas_addresses.as_ref() else {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);

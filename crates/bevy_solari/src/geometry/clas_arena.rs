@@ -1,9 +1,3 @@
-// CLAS arena reaches into raw Vulkan for the cluster-AS build itself
-// (`vkCmdBuildClusterAccelerationStructureIndirectNV`) and for the
-// per-cluster device-address readback. Every `unsafe` block notes
-// the Vulkan rule being honored.
-#![allow(unsafe_code)]
-
 //! Static CLAS arena: builds a [`vk::ClusterAccelerationStructure`]
 //! per cluster in each [`ClusterMesh`] at upload time and records
 //! the resulting per-cluster `VkDeviceAddress`es for later BLAS
@@ -12,25 +6,23 @@
 //! Design
 //! ------
 //!
-//! - **Storage pool**: one big `wgpu::Buffer` created with raw
-//!   Vulkan flags via [`Allocator::create_buffer`] (`AS_STORAGE_KHR`).
-//!   Sub-allocated per mesh via [`RangeAllocator`].
+//! - **Storage pool**: one sparse-backed buffer created with raw
+//!   Vulkan flags (`AS_STORAGE_KHR`), sub-allocated per mesh via
+//!   [`RangeAllocator`].
 //! - **Per-cluster CLAS-build inputs** (positions, indices, build
 //!   descriptors): vertex / index data is shared with the
-//!   [`ClusterMeshManager`]'s existing `PersistentGpuBuffer` pools —
+//!   [`ClusterMeshManager`]'s `PersistentGpuBuffer` pools —
 //!   the AS build references them by device address with per-cluster
 //!   offsets, no duplicate upload.
 //! - **Build mode**: `ImplicitDestinations` — the driver picks each
-//!   CLAS's address inside the per-mesh range we provide; we read
-//!   the addresses back via a host-visible staging buffer.
-//!   First-version debug shape; will migrate to `ExplicitDestinations`
-//!   (CPU-assigned addresses, no readback) once the upload path is
-//!   trusted.
-//! - **Trigger**: a render-world system in [`RenderSystems::PrepareAssets`]
-//!   walks [`ClusterMeshManager::cluster_mesh_slices`] for newly-uploaded
-//!   meshes and runs [`ClasArena::upload_mesh`] for each.
-//! - **Removal**: TBD — meshes leak in the arena for V1. Add eviction
-//!   when [`AssetEvent::Unused`] arrives, matching the manager.
+//!   CLAS's address inside the per-mesh range; the addresses are
+//!   copied GPU-side into the global [`ClasArena::cluster_clas_addresses`]
+//!   table (no CPU readback).
+//! - **Trigger**: [`upload_pending_clas`] in `RenderSystems::PrepareAssets`
+//!   drains [`ClusterMeshManager::pending_clas_uploads`] and runs
+//!   [`ClasArena::upload_mesh`] for each entry.
+// Raw Vulkan for the cluster-AS build (`vkCmdBuildClusterAccelerationStructureIndirectNV`).
+#![allow(unsafe_code)]
 
 use ash::vk::{self, TaggedStructure};
 use bevy_asset::AssetId;
@@ -387,15 +379,6 @@ impl ClasArena {
         let scratch_base = allocator.wgpu_buffer_device_address(&scratch).get();
         let scratch_addr = scratch_base.next_multiple_of(OMM_SCRATCH_ALIGN);
 
-        // tracing::info!(
-        //     "clas: micromap built — array_in={}B descs={} per_tri_idx={} micromap_size={} backing_addr={:#x}",
-        //     omm.array_data.len(),
-        //     omm.descs.len(),
-        //     omm.index.len(),
-        //     sizes.micromap_size,
-        //     backing_addr,
-        // );
-
         MicromapBuild {
             micromap,
             omm_fns: omm_fns.clone(),
@@ -418,8 +401,7 @@ impl ClasArena {
     /// per-cluster device addresses. The 24-bit `geometry_index`
     /// slot of each CLAS carries the **global** cluster id
     /// (`cluster_base + local_id`) so ray hits report
-    /// `RayIntersection.geometry_index = global_cluster_id`,
-    /// matching the aurora convention.
+    /// `RayIntersection.geometry_index = global_cluster_id`.
     ///
     /// `vertex_buffer_addr` / `index_buffer_addr` are the
     /// `VkDeviceAddress`es of [`ClusterMeshManager`]'s shared
@@ -479,18 +461,13 @@ impl ClasArena {
         //    reference its device addresses. The build itself is recorded into the
         //    same encoder as the CLAS build below (with a barrier between).
         let omm_build = omm.map(|o| self.create_micromap(render_device, render_queue, allocator, fns, o));
-        if omm_build.is_some() {
-            // tracing::info!(
-            //     "clas: OMM attached to {asset_id:?} ({cluster_count} clusters)"
-            // );
-        }
 
         // 1. Per-cluster build descriptors. Cluster ids: cluster_id
-        //    is mesh-local; geometry_index is global (matches aurora).
+        //    is mesh-local; geometry_index is global.
         //    NV index type 4 = 32-bit indices (the only index type the
-        //    cluster path supports in our pipeline). OPAQUE = 0b100 in
-        //    the 3-bit geometry-flags subfield — see memory note
-        //    `aurora_cluster_as_opaque.md`.
+        //    cluster path supports in this pipeline). OPAQUE = 0b100 in
+        //    the 3-bit geometry-flags subfield — the subfield holds the
+        //    enum value, not pre-positioned bits.
         const INDEX_TYPE_32BIT: u32 = 4;
         const OPAQUE_GEOMETRY_FLAG: u8 = 0b100;
         // OMM per-triangle index is 32-bit signed (i32, negative = special index).
@@ -667,14 +644,9 @@ impl ClasArena {
         if omm_build.is_some() {
             // OMM opt-in for the cluster build (else CLUSTER_OP_OMM_NOT_ALLOWED).
             // Use ONLY the lightest "update" flag — DATA_UPDATE (0x100) reserves
-            // space to rewrite the whole OMM and explodes the CLAS/BLAS size
-            // (saw 3.4 GB); our OMM is static (baked offline), no update needed.
+            // space to rewrite the whole OMM and explodes the CLAS/BLAS size;
+            // the OMM is static (baked offline), no update needed.
             build_flags |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_OPACITY_MICROMAP_UPDATE_EXT;
-            static LOGGED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::debug!("clas: OMM build_flags = {:#x}", build_flags.as_raw());
-            }
         }
         let size_input = vk::ClusterAccelerationStructureInputInfoNV::default()
             .max_acceleration_structure_count(cluster_count as u32)
@@ -755,7 +727,7 @@ impl ClasArena {
         );
         let dst_addresses_addr = allocator.wgpu_buffer_device_address(&dst_addresses_buf).get();
 
-        // Declared access (SOLARI_VALIDATE): the implicit-dst window of the
+        // Declared access (SolariSettings::validate): the implicit-dst window of the
         // arena this mesh's CLASes land in.
         crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
             op: "clas_arena.upload_mesh",
@@ -840,8 +812,7 @@ impl ClasArena {
             crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
         }
         // No CPU wait: the trailing global AS barrier + queue submission order
-        // make the build's dst_addresses visible to the copy below (the
-        // procedural instantiate path proves this exact pattern).
+        // make the build's dst_addresses visible to the copy below.
         render_queue.submit([encoder.finish()]);
 
         // Second encoder for the dst_addresses → global table copy.

@@ -144,10 +144,8 @@ impl<T: PersistentGpuBufferable> PersistentGpuBuffer<T> {
     /// Mark a section of the GPU buffer as no longer needed.
     pub fn mark_slice_unused(&mut self, buffer_slice: Range<BufferAddress>) {
         // Empty slices were never actually allocated (e.g. a small mesh with no
-        // interior `nodes`, or the deliberately-`0..0` `child_table`), and
-        // `free_range` panics on an empty range — so freeing one is a no-op.
-        // This only matters when cluster meshes are *removed* (live re-bake in
-        // tools like sly_tree, geometry churn); static scenes never hit it.
+        // interior `nodes`, or a deliberately-`0..0` `child_table`), and
+        // `free_range` panics on an empty range — freeing one is a no-op.
         if buffer_slice.start >= buffer_slice.end {
             return;
         }
@@ -156,7 +154,7 @@ impl<T: PersistentGpuBufferable> PersistentGpuBuffer<T> {
 
     /// Whether nothing has been uploaded yet (no pages committed). Consumers skip
     /// building bind groups until a pool has data — the sparse buffer is always
-    /// virtual-sized, so `buffer().size()` can no longer signal emptiness with `0`.
+    /// virtual-sized, so `buffer().size()` cannot signal emptiness with `0`.
     pub fn is_empty(&self) -> bool {
         self.committed_bytes == 0
     }

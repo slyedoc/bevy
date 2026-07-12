@@ -114,8 +114,8 @@ pub struct HairManager {
     /// Resident assets by id.
     entries: HashMap<AssetId<HairAsset>, HairAssetEntry>,
 
-    // Bump allocators (monotonic; eviction is a future milestone — hair sets
-    // are small and rarely unload).
+    // Bump allocators (monotonic, no eviction — hair sets are small and
+    // rarely unload).
     vertex_words: u64,
     radius_words: u64,
     index_words: u64,
@@ -252,8 +252,8 @@ pub fn extract_hair_assets(
         // tree growing) — `prepare_hair_geometry` re-places the data and swaps the
         // `entries` record, so the instance follows the same frame (the BuildBlas
         // pass runs before the trace) with no residency gap. The old arena range +
-        // BLAS handle are leaked (the bump arenas have no eviction yet — a future
-        // milestone), so keep modify frequency throttled.
+        // BLAS handle are leaked (the bump arenas have no eviction), so keep
+        // modify frequency throttled.
         if !modified && manager.entries.contains_key(&id) {
             continue;
         }

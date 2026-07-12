@@ -202,12 +202,12 @@ pub fn main() {
         );
 
     #[cfg(feature = "solari")]
-    app.add_plugins((SolariPlugin, settings::LightSettingsPlugin))
+    app.add_plugins((SolariPlugin, SolariAtmospherePlugin, settings::LightSettingsPlugin))
         // PbrPlugin no longer registers `Assets<StandardMaterial>`, but proc_scene /
         // benchmark / mipmap systems still reference it.
         .init_asset::<StandardMaterial>()
         // Bake meshes → ClusterMesh and bridge any code-authored StandardMaterials.
-        // (glTF materials already arrive as SolariMaterial via solari's glTF handler.)
+        // (glTF materials already arrive as StandardSolariMaterial via solari's glTF handler.)
         .add_systems(
             Update,
             (
@@ -217,7 +217,7 @@ pub fn main() {
         );
 
     // Under `solari` the GLB ships KTX2 textures with their own mip chains and
-    // its materials are `SolariMaterial`, so the `StandardMaterial` runtime
+    // its materials are `StandardSolariMaterial`, so the `StandardMaterial` runtime
     // mip generator is pure overhead — skip it entirely.
     #[cfg(not(feature = "solari"))]
     if !args.no_mip_generation {

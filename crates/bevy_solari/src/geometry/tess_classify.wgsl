@@ -1,9 +1,9 @@
-// Phase B of the vk_tessellated_clusters port: GPU per-base-triangle classify.
+// GPU per-base-triangle classification for the adaptive tessellation path.
 //
 // One thread per base triangle of every tessellated instance. For each triangle
 // it computes a per-EDGE tessellation factor (screen-space edge length → segment
 // count), classifies full / part / split, looks up the matching table config
-// (sorted edges → `lookup_index`, with a permutation so Phase C can map the
+// (sorted edges → `lookup_index`, with a permutation so the gen pass can map the
 // pattern's barycentrics back onto the actual edges), and appends a
 // `TessTriangleInfo` to the work list.
 //
@@ -43,7 +43,7 @@ struct TessTriangleInfo {
     instance_index: u32,
     config_lookup: u32,   // index into the table's template_addresses / configs
     edge_perm: u32,       // original edge indices in sorted (x>=y>=z) order, 2 bits each
-    i0: u32,              // the 3 global vertex indices (Phase C fetches pos/normal/uv)
+    i0: u32,              // the 3 global vertex indices (gen pass fetches pos/normal/uv)
     i1: u32,
     i2: u32,
     _pad0: u32,
@@ -55,11 +55,11 @@ struct TessTriangleInfo {
 @group(0) @binding(2) var<storage, read> work_clusters: array<WorkCluster>;
 @group(0) @binding(3) var<storage, read> vertex_positions: array<f32>; // stride 3 floats
 @group(0) @binding(4) var<storage, read> indices: array<u32>;
-// counts[0]=part (also the append cursor), [1]=full, [2]=split.
+// counts[0] = emitted part count (the indirect INSTANTIATE's src_infos_count).
 @group(0) @binding(5) var<storage, read_write> counts: array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> part_triangles: array<TessTriangleInfo>;
-// `DispatchIndirectCommand` (x, y, z) for the Phase-C vertex-gen pass: one
-// workgroup per emitted part triangle. Written by `finalize` after `classify`.
+// `DispatchIndirectCommand` (x, y, z) for the vertex-gen pass: one workgroup per
+// emitted part triangle. Written by `finalize` after `classify`.
 @group(0) @binding(7) var<storage, read_write> gen_dispatch: array<u32>;
 
 fn fetch_pos(i: u32) -> vec3<f32> {
@@ -116,8 +116,7 @@ fn classify(
             break;
         }
         let base = wc.index_base + t * 3u;
-        // Stored index values are SOURCE-CLUSTER-LOCAL → rebase onto the global pool
-        // (matches `tess_displace.wgsl`: `vertex_offset + cluster_indices[...]`).
+        // Stored index values are SOURCE-CLUSTER-LOCAL → rebase onto the global pool.
         let i0 = wc.vertex_base + indices[base];
         let i1 = wc.vertex_base + indices[base + 1u];
         let i2 = wc.vertex_base + indices[base + 2u];
@@ -133,20 +132,8 @@ fn classify(
             edge_segments(p2, p0),
         );
 
-        let maxe = max(e[0], max(e[1], e[2]));
-        if maxe <= 1u {
-            atomicAdd(&counts[1], 1u); // full (no subdivision)
-        }
-        // `edge_segments` already clamps to max_size, so anything that WANTED more
-        // is a split candidate. Recompute the unclamped want cheaply via the clamp
-        // hitting the ceiling: treat a maxed edge as "split" for the stat only
-        // (recursion is Phase D; we still emit it clamped as a part).
-        if maxe >= params.max_size {
-            atomicAdd(&counts[2], 1u); // split candidate
-        }
-
         // Sort edges descending → canonical (x>=y>=z) config; track the original
-        // edge index at each rank for Phase C's barycentric remap.
+        // edge index at each rank for the gen pass's barycentric remap.
         var pi = array<u32, 3>(0u, 1u, 2u);
         if e[0] < e[1] {
             let te = e[0]; e[0] = e[1]; e[1] = te;
@@ -164,12 +151,14 @@ fn classify(
         let perm = pi[0] | (pi[1] << 2u) | (pi[2] << 4u);
 
         // DETERMINISTIC part slot (every base triangle → exactly one part), so a
-        // part's cluster_id is stable frame-to-frame. The atomic still tallies the
-        // total into counts[0] (the indirect INSTANTIATE's src_infos_count) — order
-        // no longer matters since the write target is fixed.
+        // part's cluster_id is stable frame-to-frame. The atomic only tallies the
+        // total into counts[0] (the indirect INSTANTIATE's src_infos_count); the
+        // write target is fixed. A part past capacity is dropped AND uncounted —
+        // counts[0] must never exceed what `instantiate_infos` / the gen and CLAS
+        // pools were sized for, or the raw build reads uninitialized descriptors.
         let idx = wc.part_base + t;
-        atomicAdd(&counts[0], 1u);
         if idx < params.part_capacity {
+            atomicAdd(&counts[0], 1u);
             part_triangles[idx] = TessTriangleInfo(
                 wc.instance_idx, cfg, perm, i0, i1, i2, 0u, 0u,
             );
@@ -181,7 +170,7 @@ fn classify(
 
 // One-thread pass after `classify`: turn the emitted part count into the
 // vertex-gen pass's indirect dispatch — one workgroup per part triangle. A scene
-// emits >65535 parts (the per-dimension grid limit), so tile across x AND y:
+// can emit >65535 parts (the per-dimension grid limit), so tile across x AND y:
 // `x = min(n, 65535)`, `y = ceil(n / 65535)`. The gen pass recovers the flat part
 // index as `wg.x + wg.y * 65535` and bails past the real count / pool capacity.
 @compute @workgroup_size(1)

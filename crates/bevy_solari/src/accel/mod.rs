@@ -2,9 +2,8 @@
 //! the cluster scene into a ray-traceable TLAS.
 //!
 //! Four staged passes, run in order each frame:
-//! 1. [`blas_sharing`] — classify instances to LOD bands, elect one
-//!    provider BLAS per `(geometry, band)` bucket, assign per-instance
-//!    BLAS addresses.
+//! 1. [`blas_sharing`] — classify instances to LOD bands, elect dirty
+//!    geometries for rebuild, assign per-instance BLAS addresses.
 //! 2. [`selector`] — per-bucket object-space DAG cut → CLAS ref lists +
 //!    per-bucket BLAS-build args.
 //! 3. [`blas_rebuild`] — raw-VK indirect cluster-BLAS build (GPU-driven
@@ -53,12 +52,13 @@ pub use selector::{
 /// Acceleration-structure domain plugin. Owns the AS-build pipeline
 /// (classify → select → build BLAS → build TLAS) + its compute pipelines,
 /// and configures the [`SolariClusterSystems`] ordering the whole cluster
+/// pipeline runs under.
 pub struct AccelPlugin;
 
 impl Plugin for AccelPlugin {
     fn build(&self, app: &mut App) {
-        // All AS-pass shaders (selector/blas_sharing/ptlas_fill) are embedded
-        // centrally in `crate::pipelines`, co-located with their queue.
+        // The AS-pass shaders are embedded in `crate::pipelines`, co-located
+        // with the code that queues them.
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -120,9 +120,6 @@ impl Plugin for AccelPlugin {
                     deform::prepare_deform.in_set(RenderSystems::PrepareResources),
                     deform::prepare_deform_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     animated_blas::prepare_animated_blas.in_set(RenderSystems::PrepareResources),
-                    animated_blas::prepare_animated_blas_params
-                        .in_set(RenderSystems::PrepareResources)
-                        .after(animated_blas::prepare_animated_blas),
                     animated_blas::prepare_animated_blas_bind_group
                         .in_set(RenderSystems::PrepareBindGroups),
                 ),

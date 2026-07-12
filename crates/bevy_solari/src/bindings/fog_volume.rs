@@ -16,7 +16,7 @@
 //!
 //! The GPU table is a [`gpu_table!`](crate::gpu_table) column slot-indexed by
 //! `GpuSlot<SolariFogVolumes>`, scattered change-driven (component edits and
-//! transform motion) — the portal / black-hole pattern.
+//! transform motion), like the portal table.
 
 use bevy_ecs::{
     change_detection::DetectChanges,
