@@ -56,8 +56,9 @@ use crate::gpu::allocator::{Allocator, MemoryLocation, SparseBuffer};
 use crate::gpu::retire::GpuRetire;
 use crate::gpu::extension::{
     cmd_build_cluster_acceleration_structures_indirect, cmd_global_as_barrier,
-    ClusterExtensionFns,
+    ClusterExtensionFns, RayTracingPipelineFeature,
 };
+use bevy_render::renderer::raw_vulkan_init::AdditionalVulkanFeatures;
 
 /// Virtual address space reserved for the procedural CLAS slab arena — 8 GB,
 /// sparse-backed (only committed pages cost memory). Slabs are fixed-size per
@@ -281,7 +282,7 @@ pub struct ProceduralClusters {
     /// `(topology, band)` ⇒ the allocator is effectively a slab allocator.
     slab_storage: SparseBuffer,
     slab_alloc: RangeAllocator<u64>,
-    slabs: HashMap<AssetId<ClusterMesh>, Range<u64>>,
+    slabs: HashMap<AssetId<ClusterMesh>, MeshSlabs>,
     /// Slabs of removed meshes, parked INDEFINITELY: a stale PTLAS slot /
     /// shared-BLAS entry can hold the old CLAS addresses until overwritten, so
     /// reuse device-losts. Real recycling lands with geometry eviction.
@@ -289,6 +290,23 @@ pub struct ProceduralClusters {
     retired_slabs: Vec<Range<u64>>,
     /// Reused instantiate batch inputs (see [`BatchBufs`]).
     batch_bufs: BatchBufs,
+}
+
+/// Per-mesh live CLAS slab. A RE-instantiate always allocates a FRESH range and
+/// retires the old one: the NV driver (595.84, RTX 5090) device-losts on any
+/// `INSTANTIATE_TRIANGLE_CLUSTER` (IMPLICIT_DESTINATIONS) into a PREVIOUSLY-USED
+/// destination region — even a two-slab ping-pong with a full frame between
+/// reuses, complete barriers (incl. the RT stage), a forced same-frame BLAS
+/// rebuild, and a PTLAS re-spec still faults the next trace with a wild-address
+/// MMU read (bisected empirically with the flora grow-in-place workload; only
+/// never-before-used regions are safe). This is the same driver behavior the
+/// `retired_slabs` comment records for cross-mesh reuse. Until slab recycling
+/// can be validated against a driver fix, growth burns ~one slab per
+/// re-instantiate out of the 8 GB arena ([`Self::retired_slab_bytes`] is the
+/// telemetry) — callers should gate re-instantiation on actual content change,
+/// not frame rate.
+struct MeshSlabs {
+    live: Range<u64>,
 }
 
 impl ProceduralClusters {
@@ -340,8 +358,8 @@ impl ProceduralClusters {
     /// that frees the mesh pools (`instance_manager`); parked forever — see
     /// `retired_slabs`.
     pub fn remove(&mut self, asset_id: &AssetId<ClusterMesh>) {
-        if let Some(slab) = self.slabs.remove(asset_id) {
-            self.retired_slabs.push(slab);
+        if let Some(slabs) = self.slabs.remove(asset_id) {
+            self.retired_slabs.push(slabs.live);
         }
     }
 
@@ -779,6 +797,7 @@ pub fn instantiate_procedural(
     mut retire: ResMut<GpuRetire>,
     ready: Res<ProceduralReadyChannel>,
     sharing: Option<Res<crate::accel::blas_sharing::BlasSharing>>,
+    additional: Res<AdditionalVulkanFeatures>,
 ) {
     if queue.0.is_empty() {
         return;
@@ -800,6 +819,8 @@ pub fn instantiate_procedural(
         desc_offset: u64,
         desc_len: u64,
         slab_addr: u64,
+        /// The slab range this op writes (for declared-access validation).
+        slab_range: Range<u64>,
         scratch_offset: u64,
         addr_table_byte_start: u64,
         cluster_count: u32,
@@ -857,17 +878,23 @@ pub fn instantiate_procedural(
             });
         }
 
-        // Per-mesh fixed slab (reuse an existing one on re-instantiate).
-        let slab = if let Some(slab) = procedural.slabs.get(&asset_id) {
-            slab.clone()
-        } else {
-            let slab = procedural
+        // Fresh slab on EVERY instantiate; a re-instantiate retires the old
+        // range (implicit-destination region reuse is a driver device-lost —
+        // see [`MeshSlabs`]).
+        let slab = {
+            let p = &mut *procedural;
+            let fresh = p
                 .slab_alloc
                 .allocate_range_aligned(clas_slab_size, CLAS_STORAGE_ALIGN)
                 .expect("procedural: CLAS slab virtual-address space exhausted");
-            slab_commits.push(slab.clone());
-            procedural.slabs.insert(asset_id, slab.clone());
-            slab
+            slab_commits.push(fresh.clone());
+            if let Some(s) = p.slabs.get_mut(&asset_id) {
+                let old = core::mem::replace(&mut s.live, fresh.clone());
+                p.retired_slabs.push(old);
+            } else {
+                p.slabs.insert(asset_id, MeshSlabs { live: fresh.clone() });
+            }
+            fresh
         };
 
         // This mesh's window of the global CLAS-address table (the GPU-side
@@ -884,6 +911,7 @@ pub fn instantiate_procedural(
             desc_offset,
             desc_len: (r.cluster_count as u64) * inst_stride,
             slab_addr: procedural.slab_storage.address + slab.start,
+            slab_range: slab,
             scratch_offset,
             addr_table_byte_start,
             cluster_count: r.cluster_count,
@@ -950,8 +978,7 @@ pub fn instantiate_procedural(
             .collect();
         let writes: Vec<_> = ops
             .iter()
-            .filter_map(|op| procedural.slabs.get(&op.asset_id))
-            .map(|slab| (&procedural.slab_storage, slab.clone()))
+            .map(|op| (&procedural.slab_storage, op.slab_range.clone()))
             .collect();
         crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
             op: "procedural.instantiate",
@@ -989,8 +1016,18 @@ pub fn instantiate_procedural(
     // no wgpu commands touch this encoder afterward.
     unsafe {
         // Make the fill dispatches' vertex-pool writes (earlier submits this
-        // frame) visible to the AS-build stage.
-        cmd_global_as_barrier(&mut encoder, &render_device, false);
+        // frame) visible to the AS-build stage — AND order any still-in-flight
+        // trace (previous frame's `vkCmdTraceRays`, RT stage) BEFORE the slab
+        // rewrite. A RE-instantiate overwrites CLAS bytes a live mesh's rays
+        // may still be walking; without the RT stage in the barrier that WAR
+        // hazard reads mid-build garbage → wild-address MMU fault in traversal
+        // (first hit by flora's grow-in-place re-instantiate; the planet crate
+        // only ever instantiates never-traced memory, which is why `false`
+        // survived there). The RT stage flag is gated on the feature being
+        // enabled — including it without `rayTracingPipeline` is itself a
+        // device-lost (VUID-vkCmdPipelineBarrier-dstStageMask-07949).
+        let rt_pipeline = additional.has::<RayTracingPipelineFeature>();
+        cmd_global_as_barrier(&mut encoder, &render_device, rt_pipeline);
         for ((i, op), &dst_offset) in ops.iter().enumerate().zip(&dst_offsets) {
             let tset = &procedural.templates[&op.key_band];
             let op_input = vk::ClusterAccelerationStructureOpInputNV {
@@ -1062,11 +1099,24 @@ pub fn instantiate_procedural(
     if let Ok(mut ready) = ready.0.lock() {
         ready.extend(ops.iter().map(|op| op.asset_id));
     }
-    // CLAS bytes now exist — unblock BLAS-sharing elections (see `clas_ready`).
+    // CLAS bytes now exist — unblock BLAS-sharing elections (see `clas_ready`),
+    // AND invalidate the geometry's built level: a RE-instantiate repacks the
+    // slab (IMPLICIT_DESTINATIONS makes no address-stability promise), so a
+    // previously-built BLAS may hold stale CLAS references. `elect_dirty` only
+    // re-fires on `desired != built_level`, which a same-level re-instantiate
+    // never trips — resetting to NO_LEVEL forces the rebuild to re-read the
+    // fresh CLAS addresses this frame. (Without this, grow-in-place traversal
+    // dereferences repacked slab bytes → wild-address MMU fault.)
     if let Some(sharing) = sharing.as_ref() {
+        const NO_LEVEL: u32 = 0xFFFFFFFF;
         for op in &ops {
             if let Some(gid) = cluster_meshes.geometry_id_of(op.asset_id) {
                 render_queue.write_buffer(&sharing.clas_ready, gid as u64 * 4, &1u32.to_le_bytes());
+                render_queue.write_buffer(
+                    &sharing.geometry_built_level,
+                    gid as u64 * 4,
+                    &NO_LEVEL.to_le_bytes(),
+                );
             }
         }
     }
