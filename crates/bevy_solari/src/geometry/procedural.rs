@@ -170,7 +170,14 @@ struct TemplateSet {
     /// Driver-chosen per-cluster template device addresses (CPU-known after the
     /// one-time build+readback), local cluster order.
     template_addrs: Vec<u64>,
-    /// Worst-case CLAS bytes one instantiated mesh needs (aligned slab size).
+    /// Aligned worst-case bytes for ONE instantiated CLAS. With
+    /// EXPLICIT_DESTINATIONS every cluster of the set lands at
+    /// `slab_addr + local_id * clas_stride`, so a mesh's CLAS addresses are
+    /// fixed for its lifetime (mirrors `blas_sharing`'s
+    /// `pool_base + slot * stride` BLAS pool).
+    clas_stride: u64,
+    /// Worst-case CLAS bytes one instantiated mesh needs (aligned slab size)
+    /// = `cluster_count * clas_stride`.
     clas_slab_size: u64,
     /// Scratch bytes one instantiate op needs.
     op_scratch_size: u64,
@@ -249,12 +256,18 @@ impl BatchBufs {
             if let Some((old, _)) = self.dst_addresses.take() {
                 retire.retire(queue, "procedural.instantiate.dst_addresses", old);
             }
+            // TRANSFER_DST / COPY_DST: under EXPLICIT_DESTINATIONS this array is
+            // an op INPUT that the CPU writes (`write_buffer`), not just a
+            // driver-written output that gets copied out.
             let buf = allocator.create_buffer(
                 render_device,
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
-                    | vk::BufferUsageFlags::TRANSFER_SRC,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 cap,
                 MemoryLocation::GpuOnly,
                 "procedural.instantiate.dst_addresses",
@@ -292,19 +305,18 @@ pub struct ProceduralClusters {
     batch_bufs: BatchBufs,
 }
 
-/// Per-mesh live CLAS slab. A RE-instantiate always allocates a FRESH range and
-/// retires the old one: the NV driver (595.84, RTX 5090) device-losts on any
-/// `INSTANTIATE_TRIANGLE_CLUSTER` (IMPLICIT_DESTINATIONS) into a PREVIOUSLY-USED
-/// destination region — even a two-slab ping-pong with a full frame between
-/// reuses, complete barriers (incl. the RT stage), a forced same-frame BLAS
-/// rebuild, and a PTLAS re-spec still faults the next trace with a wild-address
-/// MMU read (bisected empirically with the flora grow-in-place workload; only
-/// never-before-used regions are safe). This is the same driver behavior the
-/// `retired_slabs` comment records for cross-mesh reuse. Until slab recycling
-/// can be validated against a driver fix, growth burns ~one slab per
-/// re-instantiate out of the 8 GB arena ([`Self::retired_slab_bytes`] is the
-/// telemetry) — callers should gate re-instantiation on actual content change,
-/// not frame rate.
+/// Per-mesh CLAS slab — allocated once, STABLE for the mesh's lifetime.
+///
+/// The instantiate uses EXPLICIT_DESTINATIONS: cluster `i` always lands at
+/// `slab.start + i * template_set.clas_stride`, so a mesh's CLAS addresses never
+/// change and a re-instantiate (grow-in-place geometry) simply rewrites its own
+/// bytes at the same addresses. Under IMPLICIT_DESTINATIONS the driver picks the
+/// packing, and re-instantiating a live mesh device-losts on this driver
+/// (595.84 / RTX 5090): a wild-address MMU read in traversal, surviving barriers
+/// (incl. the RT stage), a forced same-frame BLAS rebuild and a full PTLAS
+/// rebuild — only never-before-used destination regions were safe, which made
+/// growth burn a slab per update. Owning the layout removes both the driver's
+/// per-region state and the churn.
 struct MeshSlabs {
     live: Range<u64>,
 }
@@ -660,7 +672,7 @@ impl ProceduralClusters {
                     | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS,
             )
             .op_type(vk::ClusterAccelerationStructureOpTypeNV::INSTANTIATE_TRIANGLE_CLUSTER)
-            .op_mode(vk::ClusterAccelerationStructureOpModeNV::IMPLICIT_DESTINATIONS)
+            .op_mode(vk::ClusterAccelerationStructureOpModeNV::EXPLICIT_DESTINATIONS)
             .op_input(op_input);
         let mut inst_sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
         // SAFETY: input fully populated; fn table loaded.
@@ -669,14 +681,58 @@ impl ProceduralClusters {
                 .get_cluster_acceleration_structure_build_sizes(&inst_size_input, &mut inst_sizes);
         }
 
+        // Per-CLAS worst-case size: the same query bounded to ONE acceleration
+        // structure whose shape maxima are a single cluster's. Gives the fixed
+        // stride the explicit destination layout needs, with no COMPUTE_SIZES
+        // pass or readback — the trick `animated_blas` uses to stride its BLAS
+        // pool. Clusters smaller than the max just leave slack in their slot.
+        let mut one_input = vk::ClusterAccelerationStructureTriangleClusterInputNV::default()
+            .vertex_format(vk::Format::R32G32B32_SFLOAT)
+            .max_geometry_index_value((1 << 24) - 1)
+            .max_cluster_unique_geometry_count(1)
+            .max_cluster_triangle_count(max_tris)
+            .max_cluster_vertex_count(max_verts)
+            .max_total_triangle_count(max_tris)
+            .max_total_vertex_count(max_verts)
+            .min_position_truncate_bit_count(0);
+        let one_op_input = vk::ClusterAccelerationStructureOpInputNV {
+            p_triangle_clusters: &mut one_input as *mut _,
+        };
+        let one_size_input = vk::ClusterAccelerationStructureInputInfoNV::default()
+            .max_acceleration_structure_count(1)
+            .flags(
+                vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                    | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS,
+            )
+            .op_type(vk::ClusterAccelerationStructureOpTypeNV::INSTANTIATE_TRIANGLE_CLUSTER)
+            .op_mode(vk::ClusterAccelerationStructureOpModeNV::EXPLICIT_DESTINATIONS)
+            .op_input(one_op_input);
+        let mut one_sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
+        // SAFETY: input fully populated; fn table loaded.
+        unsafe {
+            cluster_fns
+                .get_cluster_acceleration_structure_build_sizes(&one_size_input, &mut one_sizes);
+        }
+        let clas_stride = align_up(
+            one_sizes.acceleration_structure_size.max(1),
+            CLAS_STORAGE_ALIGN,
+        );
+        // The strided layout must cover what the batched query asks for.
+        let clas_slab_size = align_up(
+            (clas_stride * cluster_count as u64)
+                .max(inst_sizes.acceleration_structure_size.max(1)),
+            CLAS_STORAGE_ALIGN,
+        );
+        tracing::debug!(
+            "procedural: template set ({key:#x}, {band}) clas_stride {clas_stride} x {cluster_count} = slab {clas_slab_size}",
+        );
+
         self.templates.insert(
             (key, band),
             TemplateSet {
                 template_addrs,
-                clas_slab_size: align_up(
-                    inst_sizes.acceleration_structure_size.max(1),
-                    CLAS_STORAGE_ALIGN,
-                ),
+                clas_stride,
+                clas_slab_size,
                 op_scratch_size: inst_sizes.build_scratch_size.max(1),
                 max_tris,
                 max_verts,
@@ -821,6 +877,8 @@ pub fn instantiate_procedural(
         slab_addr: u64,
         /// The slab range this op writes (for declared-access validation).
         slab_range: Range<u64>,
+        /// Per-CLAS stride inside the slab (explicit destination layout).
+        clas_stride: u64,
         scratch_offset: u64,
         addr_table_byte_start: u64,
         cluster_count: u32,
@@ -846,10 +904,17 @@ pub fn instantiate_procedural(
         let key_band = (r.topology_key, r.band);
         // Copy the per-set values out so the mutable slab bookkeeping below
         // doesn't fight the map borrows (template_addrs is ~a few dozen u64s).
-        let Some((template_addrs, clas_slab_size, op_scratch_size)) = procedural
+        let Some((template_addrs, clas_slab_size, clas_stride, op_scratch_size)) = procedural
             .templates
             .get(&key_band)
-            .map(|t| (t.template_addrs.clone(), t.clas_slab_size, t.op_scratch_size))
+            .map(|t| {
+                (
+                    t.template_addrs.clone(),
+                    t.clas_slab_size,
+                    t.clas_stride,
+                    t.op_scratch_size,
+                )
+            })
         else {
             continue; // ensure_template_set already logged.
         };
@@ -878,23 +943,21 @@ pub fn instantiate_procedural(
             });
         }
 
-        // Fresh slab on EVERY instantiate; a re-instantiate retires the old
-        // range (implicit-destination region reuse is a driver device-lost —
-        // see [`MeshSlabs`]).
-        let slab = {
-            let p = &mut *procedural;
-            let fresh = p
+        // Stable per-mesh slab: allocated on first instantiate, reused forever.
+        // A re-instantiate rewrites the same explicit destinations in place
+        // (see [`MeshSlabs`]).
+        let slab = if let Some(s) = procedural.slabs.get(&asset_id) {
+            s.live.clone()
+        } else {
+            let slab = procedural
                 .slab_alloc
                 .allocate_range_aligned(clas_slab_size, CLAS_STORAGE_ALIGN)
                 .expect("procedural: CLAS slab virtual-address space exhausted");
-            slab_commits.push(fresh.clone());
-            if let Some(s) = p.slabs.get_mut(&asset_id) {
-                let old = core::mem::replace(&mut s.live, fresh.clone());
-                p.retired_slabs.push(old);
-            } else {
-                p.slabs.insert(asset_id, MeshSlabs { live: fresh.clone() });
-            }
-            fresh
+            slab_commits.push(slab.clone());
+            procedural
+                .slabs
+                .insert(asset_id, MeshSlabs { live: slab.clone() });
+            slab
         };
 
         // This mesh's window of the global CLAS-address table (the GPU-side
@@ -912,6 +975,7 @@ pub fn instantiate_procedural(
             desc_len: (r.cluster_count as u64) * inst_stride,
             slab_addr: procedural.slab_storage.address + slab.start,
             slab_range: slab,
+            clas_stride,
             scratch_offset,
             addr_table_byte_start,
             cluster_count: r.cluster_count,
@@ -933,8 +997,11 @@ pub fn instantiate_procedural(
         core::slice::from_raw_parts(descriptors.as_ptr().cast::<u8>(), desc_bytes_len as usize)
     };
     // Reused batch inputs: src_infos (CPU-written), one shared scratch with
-    // per-op aligned regions, and the dst-addresses staging the GPU copies
-    // into the global table (which lacks AS-storage usage) — no CPU wait.
+    // per-op aligned regions, and the dst-addresses array. Under
+    // EXPLICIT_DESTINATIONS the latter is an op INPUT (we own the layout:
+    // cluster `i` at `slab_addr + i * clas_stride`) — the same buffer then
+    // GPU-copies into the global CLAS-address table, which is why the addresses
+    // are staged in a buffer rather than written straight to the table.
     let total_clusters: u64 = ops.iter().map(|op| op.cluster_count as u64).sum();
     procedural.batch_bufs.ensure(
         &render_device,
@@ -953,15 +1020,21 @@ pub fn instantiate_procedural(
         CLAS_SCRATCH_ALIGN,
     );
     let dst_addresses_addr = allocator.wgpu_buffer_device_address(dst_addresses_buf).get();
-    // Per-op byte offset into the dst buffer, in `ops` order.
+    // Per-op byte offset into the dst buffer, in `ops` order + the explicit
+    // destination addresses themselves (stable for the mesh's lifetime).
     let mut dst_offsets: Vec<u64> = Vec::with_capacity(ops.len());
+    let mut dst_addrs: Vec<u64> = Vec::with_capacity(total_clusters as usize);
     {
         let mut cursor = 0u64;
         for op in &ops {
             dst_offsets.push(cursor);
+            for i in 0..op.cluster_count as u64 {
+                dst_addrs.push(op.slab_addr + i * op.clas_stride);
+            }
             cursor += (op.cluster_count as u64) * 8;
         }
     }
+    render_queue.write_buffer(dst_addresses_buf, 0, bytemuck::cast_slice(&dst_addrs));
 
     // Declared access (SolariSettings::validate): slab dst windows + per-mesh vertex
     // reads — the reserve-without-commit class gets named here, not as an
@@ -1040,7 +1113,12 @@ pub fn instantiate_procedural(
                         | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS,
                 )
                 .op_type(vk::ClusterAccelerationStructureOpTypeNV::INSTANTIATE_TRIANGLE_CLUSTER)
-                .op_mode(vk::ClusterAccelerationStructureOpModeNV::IMPLICIT_DESTINATIONS)
+                // EXPLICIT: we own the destination layout (see [`MeshSlabs`]), so
+                // `dst_addresses_array` is an INPUT and `dst_implicit_data` is
+                // unused. Addresses are stable per mesh, which lets a
+                // re-instantiate rewrite in place — implicit packing device-losts
+                // on re-instantiate on this driver.
+                .op_mode(vk::ClusterAccelerationStructureOpModeNV::EXPLICIT_DESTINATIONS)
                 .op_input(op_input);
             let cmd = vk::ClusterAccelerationStructureCommandsInfoNV {
                 s_type: vk::ClusterAccelerationStructureCommandsInfoNV::STRUCTURE_TYPE,
