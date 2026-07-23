@@ -6,9 +6,10 @@
 // remaps it onto the actual triangle's edges (the classify permutation; winding
 // reflections are already baked into which template `config_lookup` selects),
 // barycentrically interpolates the base triangle's position / normal / UV,
-// displaces along the interpolated normal, and writes the WORLD-space position
+// displaces along the interpolated normal, and writes the OBJECT-space position
 // into `gen_vertices` at a fixed `max_verts` stride per part. The instantiate
-// pass builds each part's config template against its slice of `gen_vertices`.
+// pass builds each part's config template against its slice of `gen_vertices`;
+// the PTLAS instance transform (`world_rel[slot]`) places the BLAS in the world.
 
 #import bevy_render::utils::octahedral_decode_signed
 
@@ -21,12 +22,6 @@ struct TessTriangleInfo {
     i2: u32,
     _pad0: u32,
     _pad1: u32,
-}
-
-struct Instance {
-    r0: vec4<f32>,
-    r1: vec4<f32>,
-    r2: vec4<f32>,
 }
 
 struct GenParams {
@@ -52,17 +47,16 @@ struct GenParams {
 // Base mesh positions (stride 3 f32) and packed attrs (4 u32/vertex: normal[0], uv[2..3]).
 @group(0) @binding(4) var<storage, read> base_positions: array<f32>;
 @group(0) @binding(5) var<storage, read> base_packed: array<u32>;
-@group(0) @binding(6) var<storage, read> instances: array<Instance>;
 // Per-instance displacement maps, indexed by the part's `instance_index` (one part
 // per workgroup ⇒ the index is uniform across the workgroup). SIZED (not unsized): an
 // unsized binding_array compiles to an OpTypeRuntimeArray that a plain compute
 // pipeline can't instantiate without RuntimeDescriptorArray; the fixed size matches
 // the layout's `.count()` (MAX_TESS_DISPLACEMENT_MAPS) and is partially bound. The
 // bevy bindless features (TEXTURE_BINDING_ARRAY + non-uniform indexing) back it.
-@group(0) @binding(7) var displacement_textures: binding_array<texture_2d<f32>, 256>;
-@group(0) @binding(8) var displacement_sampler: sampler;
-// Output world-space micro-vertices, stride 3 f32, slot = part*max_verts + v.
-@group(0) @binding(9) var<storage, read_write> gen_vertices: array<f32>;
+@group(0) @binding(6) var displacement_textures: binding_array<texture_2d<f32>, 256>;
+@group(0) @binding(7) var displacement_sampler: sampler;
+// Output object-space micro-vertices, stride 3 f32, slot = part*max_verts + v.
+@group(0) @binding(8) var<storage, read_write> gen_vertices: array<f32>;
 
 fn load_pos(i: u32) -> vec3<f32> {
     let b = i * 3u;
@@ -75,11 +69,6 @@ fn load_uv(i: u32) -> vec2<f32> {
     let b = i * 4u;
     return vec2<f32>(bitcast<f32>(base_packed[b + 2u]), bitcast<f32>(base_packed[b + 3u]));
 }
-fn to_world(inst: Instance, p: vec3<f32>) -> vec3<f32> {
-    let h = vec4<f32>(p, 1.0);
-    return vec3<f32>(dot(inst.r0, h), dot(inst.r1, h), dot(inst.r2, h));
-}
-
 // The vertex shared by actual triangle edges `a` and `b` (edge k spans vertex k →
 // (k+1)%3).
 fn edge_common(a: u32, b: u32) -> u32 {
@@ -159,9 +148,11 @@ fn gen_verts(
     // Brighter texel = deeper (bevy `depth_map`): recede along -normal.
     pos += nrm * (params.displacement_bias - height * params.displacement_scale);
 
-    let world = to_world(instances[part.instance_index], pos);
+    // Object-space micro-vertex — the PTLAS instance transform places it in the
+    // floating-origin world at TLAS build, and the closest-hit re-applies that same
+    // ObjectToWorld to the position-fetched vertices (so shading lands in world too).
     let o = (p * params.max_verts + lid) * 3u;
-    gen_vertices[o + 0u] = world.x;
-    gen_vertices[o + 1u] = world.y;
-    gen_vertices[o + 2u] = world.z;
+    gen_vertices[o + 0u] = pos.x;
+    gen_vertices[o + 1u] = pos.y;
+    gen_vertices[o + 2u] = pos.z;
 }

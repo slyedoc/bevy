@@ -18,6 +18,8 @@ use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_render::RenderApp;
 use derive_more::derive::From;
 
+use crate::gpu::rt_pipeline::{SolariHitGroupDef, SolariHitGroupRegistry};
+
 pub mod material_slots;
 pub use material_slots::{
     init_material_slots, material_sbt_class, prepare_material_slots,
@@ -28,6 +30,59 @@ pub use material_slots::{
 mod gltf;
 #[cfg(feature = "gltf")]
 pub(crate) use gltf::nested_priority_from_extras;
+
+/// Register an RT closest-hit; returns its SBT class for a material's `chit_class`.
+/// Call during plugin `build`, after [`SolariPlugin`](crate::SolariPlugin).
+pub trait SolariChitRegistryAppExt {
+    fn register_solari_chit(&mut self, def: SolariHitGroupDef) -> u32;
+}
+
+impl SolariChitRegistryAppExt for App {
+    fn register_solari_chit(&mut self, def: SolariHitGroupDef) -> u32 {
+        self.sub_app_mut(RenderApp)
+            .world_mut()
+            .resource_mut::<SolariHitGroupRegistry>()
+            .register(def)
+    }
+}
+
+/// A registrable ray-traced surface: add [`SolariHitGroupPlugin<S>`], then set a
+/// material's `chit_class` from [`SolariHitGroupClass<S>`].
+pub trait SolariHitGroup: Send + Sync + 'static {
+    fn hit_group() -> SolariHitGroupDef;
+}
+
+/// SBT class assigned to surface `S`; read to set a material's `chit_class`.
+#[derive(bevy_ecs::resource::Resource)]
+pub struct SolariHitGroupClass<S: SolariHitGroup> {
+    class: u32,
+    _marker: core::marker::PhantomData<fn() -> S>,
+}
+
+impl<S: SolariHitGroup> SolariHitGroupClass<S> {
+    pub fn get(&self) -> u32 {
+        self.class
+    }
+}
+
+/// Registers surface `S` and exposes [`SolariHitGroupClass<S>`]. Add after [`SolariPlugin`](crate::SolariPlugin).
+pub struct SolariHitGroupPlugin<S: SolariHitGroup>(core::marker::PhantomData<fn() -> S>);
+
+impl<S: SolariHitGroup> Default for SolariHitGroupPlugin<S> {
+    fn default() -> Self {
+        Self(core::marker::PhantomData)
+    }
+}
+
+impl<S: SolariHitGroup> Plugin for SolariHitGroupPlugin<S> {
+    fn build(&self, app: &mut App) {
+        let class = app.register_solari_chit(S::hit_group());
+        app.insert_resource(SolariHitGroupClass::<S> {
+            class,
+            _marker: core::marker::PhantomData,
+        });
+    }
+}
 
 /// A physically-based material consumed by the `bevy_solari` ray tracer. Mirrors
 /// the `StandardMaterial` fields the scene binder reads; see the module docs for

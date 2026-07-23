@@ -22,13 +22,6 @@ struct Params {
     _pad: u32,
 }
 
-// Instance object→world affine, row-major mat3x4 (rows are vec4(basis_row, t)).
-struct Instance {
-    r0: vec4<f32>,
-    r1: vec4<f32>,
-    r2: vec4<f32>,
-}
-
 // One base cluster of a tessellated instance.
 struct WorkCluster {
     instance_idx: u32,
@@ -51,43 +44,51 @@ struct TessTriangleInfo {
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> instances: array<Instance>;
-@group(0) @binding(2) var<storage, read> work_clusters: array<WorkCluster>;
-@group(0) @binding(3) var<storage, read> vertex_positions: array<f32>; // stride 3 floats
-@group(0) @binding(4) var<storage, read> indices: array<u32>;
+@group(0) @binding(1) var<storage, read> work_clusters: array<WorkCluster>;
+@group(0) @binding(2) var<storage, read> vertex_positions: array<f32>; // stride 3 floats
+@group(0) @binding(3) var<storage, read> indices: array<u32>;
 // counts[0] = emitted part count (the indirect INSTANTIATE's src_infos_count).
-@group(0) @binding(5) var<storage, read_write> counts: array<atomic<u32>>;
-@group(0) @binding(6) var<storage, read_write> part_triangles: array<TessTriangleInfo>;
+@group(0) @binding(4) var<storage, read_write> counts: array<atomic<u32>>;
+@group(0) @binding(5) var<storage, read_write> part_triangles: array<TessTriangleInfo>;
 // `DispatchIndirectCommand` (x, y, z) for the vertex-gen pass: one workgroup per
 // emitted part triangle. Written by `finalize` after `classify`.
-@group(0) @binding(7) var<storage, read_write> gen_dispatch: array<u32>;
+@group(0) @binding(6) var<storage, read_write> gen_dispatch: array<u32>;
+// Gathered cluster-indexed origin-relative world column (mat3x4 per instance slot) —
+// the same `transforms` the closest-hit reads — plus each tess instance's cluster
+// slot. Screen-space edge factors MUST project origin-relative world (the params'
+// `clip_from_world` is itself origin-relative), else a moving camera re-derives wrong
+// densities. `slots[instance_idx]` is the cluster slot, so it indexes `transforms`.
+@group(0) @binding(7) var<storage, read> transforms: array<mat3x4<f32>>;
+@group(0) @binding(8) var<storage, read> slots: array<u32>;
 
 fn fetch_pos(i: u32) -> vec3<f32> {
     let b = i * 3u;
     return vec3<f32>(vertex_positions[b], vertex_positions[b + 1u], vertex_positions[b + 2u]);
 }
 
-fn to_world(inst: Instance, p: vec3<f32>) -> vec3<f32> {
+fn to_world(m: mat3x4<f32>, p: vec3<f32>) -> vec3<f32> {
     let h = vec4<f32>(p, 1.0);
-    return vec3<f32>(dot(inst.r0, h), dot(inst.r1, h), dot(inst.r2, h));
+    return vec3<f32>(dot(m[0], h), dot(m[1], h), dot(m[2], h));
 }
 
-// Screen-space pixel position scale of a clip point (offset-free: only the scale
-// matters for edge length, and it cancels in a difference). Returns the xy in
-// half-pixel units; callers take a distance.
-fn clip_to_px(world: vec3<f32>) -> vec2<f32> {
-    let c = params.clip_from_world * vec4<f32>(world, 1.0);
-    // Behind / on the near plane: collapse to origin so the edge reads as minimal.
-    if c.w <= 1e-5 {
-        return vec2<f32>(0.0);
-    }
+// Screen-space pixel position (offset-free: only the scale matters for edge length,
+// and the offset cancels in a difference). Returns xy in half-pixel units.
+fn clip_to_px(c: vec4<f32>) -> vec2<f32> {
     return (c.xy / c.w) * 0.5 * params.viewport;
 }
 
 // Per-edge segment count from the two endpoints' world positions. Symmetric in
-// (a, b), so a shared edge yields the same factor for both triangles.
+// (a, b), so a shared edge yields the same factor for both triangles (crack-free).
 fn edge_segments(a: vec3<f32>, b: vec3<f32>) -> u32 {
-    let len = distance(clip_to_px(a), clip_to_px(b));
+    let ca = params.clip_from_world * vec4<f32>(a, 1.0);
+    let cb = params.clip_from_world * vec4<f32>(b, 1.0);
+    // Either endpoint at/behind the near plane: the edge straddles the camera, so its
+    // projected length is undefined (a point behind the camera projects to infinity).
+    // That's the closest geometry ever gets → max out the tessellation.
+    if ca.w <= 1e-5 || cb.w <= 1e-5 {
+        return params.max_size;
+    }
+    let len = distance(clip_to_px(ca), clip_to_px(cb));
     let s = u32(round(len / max(params.px_per_segment, 1.0)));
     return clamp(s, 1u, params.max_size);
 }
@@ -107,7 +108,7 @@ fn classify(
         return;
     }
     let wc = work_clusters[wc_idx];
-    let inst = instances[wc.instance_idx];
+    let inst = transforms[slots[wc.instance_idx]];
 
     // Stride loop over the cluster's base triangles (handles any cluster size).
     var t = lid;

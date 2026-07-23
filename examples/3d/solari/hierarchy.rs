@@ -253,8 +253,8 @@ fn setup(
         Msaa::Off,
         SolariCamera::default(),
         FreeCamera {
-            walk_speed: 20.0,
-            run_speed: 2000.0,
+            walk_speed: 1.0,
+            run_speed: 5.0,
             ..default()
         },
         Transform::from_translation(camera_pos)

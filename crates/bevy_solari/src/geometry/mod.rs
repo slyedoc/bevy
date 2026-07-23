@@ -134,6 +134,11 @@ impl Plugin for GeometryPlugin {
                     upload_pending_clas
                         .in_set(RenderSystems::PrepareAssets)
                         .after(upload_pending_templates),
+                    // The classify → gen → BLAS dispatch bakes micro-vertices in OBJECT
+                    // space (origin-independent), so it stays in Prepare. Placement into
+                    // the floating-origin frame rides the PTLAS instance transform
+                    // (`world_rel[slot]`), consumed later at `BuildTlas` — no dependence
+                    // on when this dispatch submits.
                     tess_classify::run_tess_classify
                         .in_set(RenderSystems::PrepareResources),
                     tess_displace::prepare_tess_ptlas_write

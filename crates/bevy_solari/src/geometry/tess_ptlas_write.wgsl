@@ -32,17 +32,18 @@ struct TessWriteParams {
     partition_index: u32,
 }
 
-/// Mirrors `TessInstanceGpu` (Rust). Transform is 3 `vec4` rows (a `mat3x4`);
-/// explicit world AABB so the build never derives bounds from the BLAS. The BLAS
-/// device address is NOT carried here — it's read GPU-side from `blas_addresses`
-/// at `blas_slot` (written by the per-instance BLAS build, so the trace never
-/// stalls on a CPU readback).
+/// Mirrors `TessInstanceGpu` (Rust). The object-space BLAS is placed by the PTLAS
+/// instance transform = `transforms[instance_id]` (the origin-relative `world_rel`
+/// column), and the explicit world AABB is derived from that same transform (so the
+/// build never derives bounds from the BLAS). The BLAS device address is NOT carried
+/// here — it's read GPU-side from `blas_addresses` at `blas_slot` (written by the
+/// per-instance BLAS build, so the trace never stalls on a CPU readback).
 struct TessInstance {
-    transform_r0: vec4<f32>,
-    transform_r1: vec4<f32>,
-    transform_r2: vec4<f32>,
-    aabb_min: vec4<f32>,
-    aabb_max: vec4<f32>,
+    // Object-space AABB center / half (half pre-inflated by the displacement margin).
+    // The instance transform + explicit WORLD AABB are derived here from
+    // `transforms[instance_id]` (the origin-relative `world_rel` column).
+    aabb_center: vec4<f32>,
+    aabb_half: vec4<f32>,
     blas_slot: u32,
     sbt_record: u32,
     instance_id: u32,
@@ -55,6 +56,11 @@ struct TessInstance {
 // Per-instance BLAS device addresses (u64 as two u32 each), written GPU-side by
 // the per-instance BLAS builds. `0` = not (yet) built → inactive PTLAS instance.
 @group(0) @binding(4) var<storage, read> blas_addresses: array<u32>;
+// Gathered cluster-indexed origin-relative world column (mat3x4 per instance slot,
+// row k = (basis_row_k, t_k)) — the same `transforms` the closest-hit reads. Indexed
+// by `instance_id` (the cluster slot), which is why it must be the gathered column
+// and not the NODE-indexed `world_rel`.
+@group(0) @binding(5) var<storage, read> transforms: array<mat3x4<f32>>;
 
 @compute @workgroup_size(64)
 fn tess_write(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -67,19 +73,38 @@ fn tess_write(@builtin(global_invocation_id) gid: vec3<u32>) {
     let addr_base = inst.blas_slot * 2u;
     let blas_address = vec2<u32>(blas_addresses[addr_base], blas_addresses[addr_base + 1u]);
 
+    // PTLAS instance transform = the origin-relative world column (`world_rel[slot]`),
+    // read this frame. The BLAS is baked in OBJECT space, so this transform places it
+    // into the floating-origin world — like an ordinary cluster instance — and the
+    // closest-hit re-applies it (ObjectToWorld) to the position-fetched vertices.
+    // Read here (at TLAS build, after the subtract pass) so it tracks the moving origin.
+    let m = transforms[inst.instance_id];
     var transform: array<f32, 12>;
-    transform[0]  = inst.transform_r0.x; transform[1]  = inst.transform_r0.y;
-    transform[2]  = inst.transform_r0.z; transform[3]  = inst.transform_r0.w;
-    transform[4]  = inst.transform_r1.x; transform[5]  = inst.transform_r1.y;
-    transform[6]  = inst.transform_r1.z; transform[7]  = inst.transform_r1.w;
-    transform[8]  = inst.transform_r2.x; transform[9]  = inst.transform_r2.y;
-    transform[10] = inst.transform_r2.z; transform[11] = inst.transform_r2.w;
+    transform[0]  = m[0].x; transform[1]  = m[0].y; transform[2]  = m[0].z; transform[3]  = m[0].w;
+    transform[4]  = m[1].x; transform[5]  = m[1].y; transform[6]  = m[1].z; transform[7]  = m[1].w;
+    transform[8]  = m[2].x; transform[9]  = m[2].y; transform[10] = m[2].z; transform[11] = m[2].w;
 
     // Explicit world AABB so the partitioned build never derives bounds from the
-    // BLAS (a zero/NaN derived AABB hangs the build).
+    // BLAS (a zero/NaN derived AABB hangs the build). Derived from the 8 object-space
+    // corners under the same world transform as the instance.
+    let c = inst.aabb_center.xyz;
+    let h = inst.aabb_half.xyz;
+    var wmin = vec3<f32>(1e30);
+    var wmax = vec3<f32>(-1e30);
+    for (var corner = 0u; corner < 8u; corner = corner + 1u) {
+        let s = vec3<f32>(
+            select(-1.0, 1.0, (corner & 1u) != 0u),
+            select(-1.0, 1.0, (corner & 2u) != 0u),
+            select(-1.0, 1.0, (corner & 4u) != 0u),
+        );
+        let p = vec4<f32>(c + s * h, 1.0);
+        let w = vec3<f32>(dot(m[0], p), dot(m[1], p), dot(m[2], p));
+        wmin = min(wmin, w);
+        wmax = max(wmax, w);
+    }
     var explicit_aabb: array<f32, 6>;
-    explicit_aabb[0] = inst.aabb_min.x; explicit_aabb[1] = inst.aabb_min.y; explicit_aabb[2] = inst.aabb_min.z;
-    explicit_aabb[3] = inst.aabb_max.x; explicit_aabb[4] = inst.aabb_max.y; explicit_aabb[5] = inst.aabb_max.z;
+    explicit_aabb[0] = wmin.x; explicit_aabb[1] = wmin.y; explicit_aabb[2] = wmin.z;
+    explicit_aabb[3] = wmax.x; explicit_aabb[4] = wmax.y; explicit_aabb[5] = wmax.z;
 
     let slot = params.tess_base + i;
     let idx = atomicAdd(&write_count[0], 1u);

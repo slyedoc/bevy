@@ -82,60 +82,10 @@ use crate::transform::SolariTransformPlugin;
 use crate::debug::SolariDebugPlugin;
 
 pub use crate::gpu::rt_pipeline::{SolariAnyHitDef, SolariHitGroupDef, SolariHitGroupRegistry};
+pub use crate::material::{
+    SolariChitRegistryAppExt, SolariHitGroup, SolariHitGroupClass, SolariHitGroupPlugin,
+};
 pub use crate::render::rt_pipeline::{GlassSurface, HairSurface, OpaqueSurface, PortalSurface};
-
-/// Register an RT closest-hit; returns its SBT class for a material's `chit_class`.
-/// Call during plugin `build`, after [`SolariPlugin`].
-pub trait SolariChitRegistryAppExt {
-    fn register_solari_chit(&mut self, def: SolariHitGroupDef) -> u32;
-}
-
-impl SolariChitRegistryAppExt for App {
-    fn register_solari_chit(&mut self, def: SolariHitGroupDef) -> u32 {
-        self.sub_app_mut(RenderApp)
-            .world_mut()
-            .resource_mut::<SolariHitGroupRegistry>()
-            .register(def)
-    }
-}
-
-/// A registrable ray-traced surface: add [`SolariHitGroupPlugin<S>`], then set a
-/// material's `chit_class` from [`SolariHitGroupClass<S>`].
-pub trait SolariHitGroup: Send + Sync + 'static {
-    fn hit_group() -> SolariHitGroupDef;
-}
-
-/// SBT class assigned to surface `S`; read to set a material's `chit_class`.
-#[derive(bevy_ecs::resource::Resource)]
-pub struct SolariHitGroupClass<S: SolariHitGroup> {
-    class: u32,
-    _marker: core::marker::PhantomData<fn() -> S>,
-}
-
-impl<S: SolariHitGroup> SolariHitGroupClass<S> {
-    pub fn get(&self) -> u32 {
-        self.class
-    }
-}
-
-/// Registers surface `S` and exposes [`SolariHitGroupClass<S>`]. Add after [`SolariPlugin`].
-pub struct SolariHitGroupPlugin<S: SolariHitGroup>(core::marker::PhantomData<fn() -> S>);
-
-impl<S: SolariHitGroup> Default for SolariHitGroupPlugin<S> {
-    fn default() -> Self {
-        Self(core::marker::PhantomData)
-    }
-}
-
-impl<S: SolariHitGroup> Plugin for SolariHitGroupPlugin<S> {
-    fn build(&self, app: &mut App) {
-        let class = app.register_solari_chit(S::hit_group());
-        app.insert_resource(SolariHitGroupClass::<S> {
-            class,
-            _marker: core::marker::PhantomData,
-        });
-    }
-}
 
 /// Crate-wide tunables + debug levers. Override by inserting the resource
 /// before [`SolariPlugin`] runs (`App::insert_resource`); defaults match
@@ -143,8 +93,8 @@ impl<S: SolariHitGroup> Plugin for SolariHitGroupPlugin<S> {
 ///
 /// The debug booleans are latched into process-wide flags at plugin `finish`
 /// (their consumers are raw-VK helpers with no ECS access), so they are
-/// startup-only. `tess_displacement_scale` is read per frame (extracted to the
-/// render world) and can be tweaked live.
+/// startup-only. `tess_displacement_scale` / `tess_px_per_segment` are read per frame
+/// (extracted to the render world) and can be tweaked live.
 #[derive(bevy_ecs::resource::Resource, Clone, bevy_render::extract_resource::ExtractResource, bevy_reflect::Reflect)]
 #[reflect(Resource)]
 pub struct SolariSettings {
@@ -164,6 +114,12 @@ pub struct SolariSettings {
     pub xform_debug: bool,
     /// Tessellation displacement height (object units).
     pub tess_displacement_scale: f32,
+    /// Target screen pixels per tessellation edge segment: each base-triangle edge
+    /// gets `round(edge_pixels / this)` micro-segments, clamped to the table's
+    /// `1..=max_size`. LOWER ⇒ denser tessellation / more displacement detail; higher
+    /// ⇒ coarser. Free to lower — the CLAS + gen pools are pre-sized for every part at
+    /// the table's max config, so denser only costs GPU work, never memory.
+    pub tess_px_per_segment: f32,
     /// Seed for the deterministic He-uniform NRC weight init.
     pub nrc_seed: u64,
 }
@@ -177,6 +133,7 @@ impl Default for SolariSettings {
             camera_debug: false,
             xform_debug: false,
             tess_displacement_scale: 0.05,
+            tess_px_per_segment: 6.0,
             nrc_seed: 0x9e3779b97f4a7c15,
         }
     }
@@ -228,10 +185,14 @@ pub mod prelude {
         bindings::RaytracingMesh3d,
         bindings::SolariFogVolume,
         bindings::SolariPortal,
+        gpu::rt_pipeline::{SolariAnyHitDef, SolariHitGroupDef},
         geometry::ClusterMesh,
         hair::{Hair, HairAsset, HairMaterial, HairStrand, SolariBranches},
         lights::SolariDirectionLight,
-        material::{SolariMaterial3d, StandardSolariMaterial},
+        material::{
+            SolariChitRegistryAppExt, SolariHitGroup, SolariHitGroupClass, SolariHitGroupPlugin,
+            SolariMaterial3d, StandardSolariMaterial,
+        },
         nrc::SolariNrc,
         ray_query::picking::SolariPickingPlugin,
         accel::ClusterSelectorSettings,

@@ -966,9 +966,10 @@ fn resolve_triangle_data_full_mat_fetch(
             // Real UV-gradient tangent (needed for normal maps) derived from the
             // micro-triangle's positions + UVs — the tess attrs carry no tangent, and a
             // fixed `cross(up,n)` tangent makes normal maps light wrong. The positions
-            // are world-space (gen bakes world; inject is identity) and so is the result;
-            // the identity `transform` leaves it world below. Gram-Schmidt against n0 +
-            // handedness sign; fall back to an arbitrary tangent on degenerate UVs.
+            // (and normals) are OBJECT-space (gen bakes object; the PTLAS transform =
+            // `world_rel[slot]`), so the tangent is object-space here and `transform`
+            // rotates it to world below alongside the position/normal. Gram-Schmidt
+            // against n0 + handedness sign; fall back to arbitrary tangent on degenerate UV.
             let e1 = object_positions[1] - object_positions[0];
             let e2 = object_positions[2] - object_positions[0];
             let duv1 = uv1 - uv0;

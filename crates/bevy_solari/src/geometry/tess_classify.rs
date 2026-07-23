@@ -22,6 +22,7 @@ use bevy_render::{
     render_asset::RenderAssets,
     render_resource::{binding_types::*, *},
     renderer::{RenderDevice, RenderQueue},
+    sync_world::MainEntity,
     texture::GpuImage,
     view::ExtractedView,
 };
@@ -32,6 +33,8 @@ use ash::vk::{self, TaggedStructure};
 use crate::gpu::retire::GpuRetire;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::extension::ClusterExtensionFns;
+use crate::ecs_gpu::GpuColumn;
+use crate::instance::{RaytracingGpuEntity, TransformColumn};
 use super::clas_arena::CLAS_SCRATCH_ALIGN;
 use super::mesh_manager::ClusterMeshManager;
 use super::tess_displace::TessShowcaseInstances;
@@ -43,12 +46,6 @@ fn align_up(addr: u64, align: u64) -> u64 {
     (addr + (align - 1)) & !(align - 1)
 }
 
-/// Target screen pixels per edge segment (lower ⇒ denser tessellation, more height
-/// detail). The view-dependent factor for an edge is `round(edge_pixels / this)`,
-/// clamped to `1..=max_size`. Safe to lower freely: the CLAS pool + gen buffers are
-/// pre-sized for every part at the table's MAX config, so denser tessellation only
-/// costs GPU work, never memory.
-const PX_PER_SEGMENT: f32 = 6.0;
 /// Capacity (in parts) of the whole tessellation path: the `part_triangles` work
 /// list, the gen-vertex / instantiate / CLAS pools (bounds `gen_vertices` at
 /// `GEN_CAPACITY * MAX_VERTS * 12` bytes). The classify shader drops (and does
@@ -75,13 +72,6 @@ pub struct ClassifyParams {
     pub max_size_configs: u32,
     pub part_capacity: u32,
     pub _pad: u32,
-}
-
-/// `tess_classify.wgsl::Instance` — object→world affine, row-major mat3x4.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Default)]
-struct InstanceGpu {
-    rows: [[f32; 4]; 3],
 }
 
 /// `tess_classify.wgsl::WorkCluster`.
@@ -150,7 +140,11 @@ pub struct TessClassify {
     /// `finalize` entry of the classify shader → writes `gen_dispatch` indirect args.
     finalize_pipeline: CachedComputePipelineId,
     params: UniformBuffer<ClassifyParams>,
-    instances: RawBufferVec<InstanceGpu>,
+    /// Per-tess-instance cluster slot (tess index → RT instance slot), rebuilt each
+    /// frame from the render-world slot map. Classify reads the origin-relative world
+    /// as `transforms[slots[instance_idx]]` (the gathered, cluster-indexed column), so
+    /// the screen-space density projects in the same frame as the camera.
+    slots: RawBufferVec<u32>,
     work_clusters: RawBufferVec<WorkClusterGpu>,
     /// `counts[0]` = emitted part count (the indirect INSTANTIATE's `src_infos_count`).
     counts: Buffer,
@@ -258,13 +252,14 @@ pub fn init_tess_classify(
             ShaderStages::COMPUTE,
             (
                 uniform_buffer_sized(false, None),           // 0 params
-                storage_buffer_read_only_sized(false, None), // 1 instances
-                storage_buffer_read_only_sized(false, None), // 2 work_clusters
-                storage_buffer_read_only_sized(false, None), // 3 vertex_positions
-                storage_buffer_read_only_sized(false, None), // 4 indices
-                storage_buffer_sized(false, None),           // 5 counts (rw)
-                storage_buffer_sized(false, None),           // 6 part_triangles (rw)
-                storage_buffer_sized(false, None),           // 7 gen_dispatch (rw)
+                storage_buffer_read_only_sized(false, None), // 1 work_clusters
+                storage_buffer_read_only_sized(false, None), // 2 vertex_positions
+                storage_buffer_read_only_sized(false, None), // 3 indices
+                storage_buffer_sized(false, None),           // 4 counts (rw)
+                storage_buffer_sized(false, None),           // 5 part_triangles (rw)
+                storage_buffer_sized(false, None),           // 6 gen_dispatch (rw)
+                storage_buffer_read_only_sized(false, None), // 7 transforms (gathered column)
+                storage_buffer_read_only_sized(false, None), // 8 slots (tess idx → cluster slot)
             ),
         ),
     );
@@ -298,19 +293,18 @@ pub fn init_tess_classify(
             ShaderStages::COMPUTE,
             (
                 // Storage, not uniform: a bind group can't mix a uniform buffer with
-                // the binding array at slot 7.
+                // the binding array at slot 6.
                 storage_buffer_read_only_sized(false, None), // 0 gen params
                 storage_buffer_read_only_sized(false, None), // 1 part_triangles
                 storage_buffer_read_only_sized(false, None), // 2 configs
                 storage_buffer_read_only_sized(false, None), // 3 table_vertices
                 storage_buffer_read_only_sized(false, None), // 4 base_positions
                 storage_buffer_read_only_sized(false, None), // 5 base_packed
-                storage_buffer_read_only_sized(false, None), // 6 instances
-                // 7 per-instance displacement maps (binding array, partially bound).
+                // 6 per-instance displacement maps (binding array, partially bound).
                 texture_2d(TextureSampleType::Float { filterable: true })
                     .count(core::num::NonZero::new(MAX_TESS_DISPLACEMENT_MAPS).unwrap()),
-                sampler(SamplerBindingType::Filtering),      // 8 sampler
-                storage_buffer_sized(false, None),           // 9 gen_vertices (rw)
+                sampler(SamplerBindingType::Filtering),      // 7 sampler
+                storage_buffer_sized(false, None),           // 8 gen_vertices (rw)
             ),
         ),
     );
@@ -375,7 +369,6 @@ pub fn init_tess_classify(
                 storage_buffer_read_only_sized(false, None), // 5 base_packed
                 storage_buffer_sized(false, None),           // 6 gen_attrs (rw)
                 storage_buffer_sized(false, None),           // 7 meta (rw)
-                storage_buffer_read_only_sized(false, None), // 8 instances
             ),
         ),
     );
@@ -433,8 +426,8 @@ pub fn init_tess_classify(
     attr_params.set_label(Some("tess_classify.attr_params"));
     let mut inst_params = UniformBuffer::<InstParams>::default();
     inst_params.set_label(Some("tess_classify.inst_params"));
-    let mut instances = RawBufferVec::<InstanceGpu>::new(wgpu::BufferUsages::STORAGE);
-    instances.set_label(Some("tess_classify.instances"));
+    let mut slots = RawBufferVec::<u32>::new(wgpu::BufferUsages::STORAGE);
+    slots.set_label(Some("tess_classify.slots"));
     let mut work_clusters = RawBufferVec::<WorkClusterGpu>::new(wgpu::BufferUsages::STORAGE);
     work_clusters.set_label(Some("tess_classify.work_clusters"));
 
@@ -453,7 +446,7 @@ pub fn init_tess_classify(
         layout,
         finalize_pipeline,
         params,
-        instances,
+        slots,
         work_clusters,
         counts,
         part_triangles,
@@ -548,6 +541,13 @@ pub fn run_tess_classify(
     fns: Option<Res<ClusterExtensionFns>>,
     views: Query<&ExtractedView, With<ExtractedCamera>>,
     settings: Res<crate::SolariSettings>,
+    // The gathered, CLUSTER-slot-indexed origin-relative world column (the same buffer
+    // the closest-hit's `transforms` reads) + the render-world slot map, so the tess
+    // density projects origin-relative world in the same frame as the camera. NOTE: it
+    // must be the gathered `TransformColumn`, NOT `current_world()` (world_rel is
+    // NODE-indexed, so `transforms[cluster_slot]` there would read the wrong node).
+    transforms_col: Option<Res<GpuColumn<TransformColumn>>>,
+    gpu_entities: Query<(&MainEntity, &RaytracingGpuEntity)>,
 ) {
     let (present, sc, mm, tb) =
         (classify.is_some(), showcase.is_some(), mesh_manager.is_some(), table.is_some());
@@ -610,15 +610,11 @@ pub fn run_tess_classify(
     // when the set changes — but do NOT latch until the meshes are actually resident
     // (`tess_clusters` populated), else an early empty build would stick forever.
     if classify.built_instances != showcase.instances.len() {
-        classify.instances.clear();
         classify.work_clusters.clear();
         // Running prefix sum of base-triangle counts → each cluster's deterministic
         // part-index base (so `part = part_base + triangle` is stable across frames).
         let mut part_base = 0u32;
         for (i, inst) in showcase.instances.iter().enumerate() {
-            classify.instances.push(InstanceGpu {
-                rows: inst.world_from_local,
-            });
             if let Some(clusters) = mesh_manager.tess_clusters(inst.mesh) {
                 for c in clusters {
                     classify.work_clusters.push(WorkClusterGpu {
@@ -686,12 +682,11 @@ pub fn run_tess_classify(
         }
         classify.per_instance_counts = counts;
         classify.per_instance_offsets = offsets;
-        classify.instances.write_buffer(&render_device, &render_queue);
         classify.work_clusters.write_buffer(&render_device, &render_queue);
         classify.built_instances = showcase.instances.len();
         tracing::debug!(
             "tess_classify: built work lists — {} instances, {} work clusters, {} base tris",
-            classify.instances.len(),
+            showcase.instances.len(),
             classify.work_clusters.len(),
             classify.total_base_tris,
         );
@@ -853,7 +848,8 @@ pub fn run_tess_classify(
     *classify.params.get_mut() = ClassifyParams {
         clip_from_world,
         viewport,
-        px_per_segment: PX_PER_SEGMENT,
+        // Live density dial (the shader clamps to `max(_, 1.0)` px/segment).
+        px_per_segment: settings.tess_px_per_segment,
         work_cluster_count,
         max_size: table.max_size,
         max_size_configs: table.max_size_configs,
@@ -865,12 +861,38 @@ pub fn run_tess_classify(
     // Clear the counters each frame (CPU write — tiny).
     render_queue.write_buffer(&classify.counts, 0, &[0u8; 16]);
 
+    // The gathered cluster-indexed origin-relative world column. Required — the
+    // floating origin moves every frame, so the tess world transform must be read
+    // from here per frame, exactly like the cluster BLAS path.
+    let Some(transforms_col) = transforms_col.as_ref() else {
+        if chatty {
+            tracing::debug!("tess_classify bail: TransformColumn not present");
+        }
+        return;
+    };
+    let transforms = transforms_col.buffer();
+
+    // Rebuild the per-tess-instance → cluster-slot map each frame (cheap; a handful
+    // of instances). Cluster slots are stable once assigned, but a missing entry
+    // during warmup falls back to slot 0 (origin) rather than a stale absolute pose.
+    let slot_of: bevy_ecs::entity::EntityHashMap<u32> = gpu_entities
+        .iter()
+        .map(|(main, slot)| (main.id(), slot.0 .0))
+        .collect();
+    classify.slots.clear();
+    for inst in &showcase.instances {
+        classify
+            .slots
+            .push(slot_of.get(&inst.entity).copied().unwrap_or(0));
+    }
+    classify.slots.write_buffer(&render_device, &render_queue);
+
     // (Re)build the bind group (cheap; the buffers are stable, but the geometry
     // pool buffers can grow/realloc, so rebuild each run).
-    let (Some(params_binding), Some(instances_buf), Some(work_buf)) = (
+    let (Some(params_binding), Some(work_buf), Some(slots_buf)) = (
         classify.params.binding(),
-        classify.instances.buffer(),
         classify.work_clusters.buffer(),
+        classify.slots.buffer(),
     ) else {
         if chatty {
             tracing::debug!("tess_classify bail: classify bind-group buffers not allocated yet");
@@ -882,13 +904,14 @@ pub fn run_tess_classify(
         &pipeline_cache.get_bind_group_layout(&classify.layout),
         &BindGroupEntries::sequential((
             params_binding,
-            instances_buf.as_entire_binding(),
             work_buf.as_entire_binding(),
             positions.as_entire_binding(),
             indices.as_entire_binding(),
             classify.counts.as_entire_binding(),
             classify.part_triangles.as_entire_binding(),
             classify.gen_dispatch.as_entire_binding(),
+            transforms.as_entire_binding(),
+            slots_buf.as_entire_binding(),
         )),
     );
     classify.bind_group = Some(bind_group);
@@ -938,7 +961,6 @@ pub fn run_tess_classify(
                         table.vertices.as_entire_binding(),
                         positions.as_entire_binding(),
                         mesh_manager.vertex_packed.buffer().as_entire_binding(),
-                        instances_buf.as_entire_binding(),
                         disp_views.as_slice(),
                         disp_sampler,
                         classify.gen_vertices.as_entire_binding(),
@@ -983,7 +1005,6 @@ pub fn run_tess_classify(
                         mesh_manager.vertex_packed.buffer().as_entire_binding(),
                         gen_attrs.as_entire_binding(),
                         meta.as_entire_binding(),
-                        instances_buf.as_entire_binding(),
                     )),
                 );
                 classify.attr_bind_group = Some(abg);

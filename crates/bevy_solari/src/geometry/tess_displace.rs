@@ -18,14 +18,12 @@ use bevy_ecs::{
     system::{Commands, Query, Res, ResMut},
 };
 use bevy_image::Image;
-use bevy_math::ToRender;
 use bevy_math::Vec4;
 use bevy_render::{
     extract_resource::ExtractResource,
     render_resource::{binding_types::*, *},
     renderer::{RenderDevice, RenderQueue},
 };
-use bevy_transform::components::Transform;
 
 use super::asset::ClusterMesh;
 use crate::bindings::RaytracingMesh3d;
@@ -45,10 +43,8 @@ pub struct TessShowcaseInstanceData {
     /// vectors / no DLSS flicker), rather than assuming the surface is static.
     pub entity: Entity,
     pub displacement: Handle<Image>,
-    /// World-from-local affine, row-major 3×4 (`TransformMatrixKHR` layout).
-    pub world_from_local: [[f32; 4]; 3],
     /// Object-space AABB (from the `ClusterMesh`) — the PTLAS write derives the
-    /// instance's explicit world AABB from it (`world_aabb`).
+    /// instance's explicit world AABB from it via `transforms[instance_id]`.
     pub local_aabb_center: [f32; 3],
     pub local_aabb_half: [f32; 3],
 }
@@ -69,7 +65,7 @@ pub fn find_tess_showcase_instances(
     mut found: ResMut<TessShowcaseInstances>,
     materials: Res<Assets<StandardSolariMaterial>>,
     cluster_meshes: Res<Assets<ClusterMesh>>,
-    query: Query<(Entity, &SolariMaterial3d, &RaytracingMesh3d, &Transform)>,
+    query: Query<(Entity, &SolariMaterial3d, &RaytracingMesh3d)>,
 ) {
     if found.found {
         return;
@@ -78,7 +74,7 @@ pub fn find_tess_showcase_instances(
     // displacement") and every instance's material + cluster mesh is loaded, so the
     // full set (and its AABBs) is collected at once (the `.bsn` spawns atomically).
     if query.is_empty()
-        || query.iter().any(|(_, m, mesh, _)| {
+        || query.iter().any(|(_, m, mesh)| {
             materials.get(&m.0).is_none() || cluster_meshes.get(&mesh.0).is_none()
         })
     {
@@ -86,24 +82,13 @@ pub fn find_tess_showcase_instances(
     }
 
     let mut instances = Vec::new();
-    for (entity, mat3d, mesh3d, transform) in &query {
+    for (entity, mat3d, mesh3d) in &query {
         let mat = materials.get(&mat3d.0).expect("checked loaded above");
         let Some(displacement) = mat.depth_map.clone() else {
             continue;
         };
-        // Solari disables `TransformPlugin`, so CPU `GlobalTransform` is dead
-        // (identity) — the real placement lives in `Transform`. The `.bsn` is a flat
-        // root→children hierarchy with an identity root, so the local `Transform`
-        // IS the world transform. Row-major 3×4: world = matrix3 * local +
-        // translation; each row is (basis_row_r, translation_r).
-        let a = transform.compute_affine().to_render();
-        let (m, t) = (a.matrix3, a.translation);
-        let world_from_local = [
-            [m.x_axis.x, m.y_axis.x, m.z_axis.x, t.x],
-            [m.x_axis.y, m.y_axis.y, m.z_axis.y, t.y],
-            [m.x_axis.z, m.y_axis.z, m.z_axis.z, t.z],
-        ];
-        // Object-space AABB (checked loaded above) → drives the explicit world AABB.
+        // Object-space AABB (checked loaded above) → the write shader derives the
+        // explicit world AABB from it via `transforms[instance_id]`.
         let aabb = cluster_meshes
             .get(&mesh3d.0)
             .expect("checked loaded above")
@@ -119,7 +104,6 @@ pub fn find_tess_showcase_instances(
             material: mat3d.0.id(),
             entity,
             displacement,
-            world_from_local,
             local_aabb_center,
             local_aabb_half,
         });
@@ -197,15 +181,17 @@ pub struct TessWriteParams {
 }
 
 /// One injected tessellated instance (mirrors `tess_ptlas_write.wgsl::TessInstance`).
-/// Transform as 3 `vec4` rows (mat3x4); explicit world AABB so the partitioned
-/// build never derives bounds from the BLAS (a zero/NaN derived AABB hangs it).
+/// The BLAS is baked in OBJECT space, so both the PTLAS instance transform and the
+/// explicit AABB the partitioned build requires (a zero/NaN BLAS-derived AABB hangs
+/// it) are computed GPU-side in the write shader from `transforms[instance_id]` (the
+/// origin-relative `world_rel` column) — so they track the floating origin, rather
+/// than being baked at absolute CPU coords.
 #[derive(Copy, Clone, Default, ShaderType)]
 pub struct TessInstanceGpu {
-    pub transform_r0: Vec4,
-    pub transform_r1: Vec4,
-    pub transform_r2: Vec4,
-    pub aabb_min: Vec4,
-    pub aabb_max: Vec4,
+    /// Object-space AABB center / half-extent (half is pre-inflated by the
+    /// displacement margin). `.w` unused.
+    pub aabb_center: Vec4,
+    pub aabb_half: Vec4,
     /// Index into the GPU `blas_addresses` buffer — the PTLAS write reads the BLAS
     /// device address there, GPU-side (no CPU readback).
     pub blas_slot: u32,
@@ -245,6 +231,7 @@ fn tess_ptlas_write_layout() -> BindGroupLayoutDescriptor {
                 uniform_buffer::<TessWriteParams>(false), // 2 params
                 storage_buffer_read_only_sized(false, None), // 3 instances
                 storage_buffer_read_only_sized(false, None), // 4 blas_addresses
+                storage_buffer_read_only_sized(false, None), // 5 transforms (world_rel)
             ),
         ),
     )
@@ -288,35 +275,6 @@ pub fn init_tess_ptlas_write(
         tess_count: 0,
         bind_group: None,
     });
-}
-
-/// World AABB of a local center/half-extent under a row-major 3×4 transform (the 8
-/// transformed corners' min/max). Explicit bounds the partitioned PTLAS build requires.
-fn world_aabb(
-    world_from_local: &[[f32; 4]; 3],
-    center: [f32; 3],
-    half: [f32; 3],
-) -> ([f32; 3], [f32; 3]) {
-    let t = world_from_local;
-    let mut wmin = [f32::INFINITY; 3];
-    let mut wmax = [f32::NEG_INFINITY; 3];
-    for sx in [-1.0f32, 1.0] {
-        for sy in [-1.0f32, 1.0] {
-            for sz in [-1.0f32, 1.0] {
-                let p = [
-                    center[0] + sx * half[0],
-                    center[1] + sy * half[1],
-                    center[2] + sz * half[2],
-                ];
-                for r in 0..3 {
-                    let w = t[r][0] * p[0] + t[r][1] * p[1] + t[r][2] * p[2] + t[r][3];
-                    wmin[r] = wmin[r].min(w);
-                    wmax[r] = wmax[r].max(w);
-                }
-            }
-        }
-    }
-    (wmin, wmax)
 }
 
 /// `Render::Prepare`: set the PTLAS-write params from the armed tessellation set. The
@@ -376,25 +334,18 @@ pub fn prepare_tess_ptlas_write(
         .iter()
         .enumerate()
         .map(|(i, inst)| {
-            // The GPU gen pass bakes WORLD-space micro-vertices, so each per-instance BLAS
-            // is already world-space → inject at IDENTITY (don't re-apply world_from_local).
-            // The world AABB is `world_from_local · local_aabb` (8 corners) — the
-            // partitioned PTLAS build needs explicit bounds (BLAS-derived hangs it).
-            let (wmin, wmax) = world_aabb(
-                &inst.world_from_local,
-                inst.local_aabb_center,
-                [
-                    inst.local_aabb_half[0] + margin,
-                    inst.local_aabb_half[1] + margin,
-                    inst.local_aabb_half[2] + margin,
-                ],
-            );
+            // The GPU gen pass bakes WORLD-space micro-vertices in the origin-relative
+            // frame, so each per-instance BLAS is already world-space → inject at IDENTITY
+            // (don't re-apply the transform). The explicit world AABB is derived GPU-side
+            // in the write shader from `transforms[instance_id] · local_aabb` (8 corners),
+            // so it stays in the same origin-relative frame as the geometry.
+            let c = inst.local_aabb_center;
+            let h = inst.local_aabb_half;
             TessInstanceGpu {
-                transform_r0: Vec4::new(1.0, 0.0, 0.0, 0.0),
-                transform_r1: Vec4::new(0.0, 1.0, 0.0, 0.0),
-                transform_r2: Vec4::new(0.0, 0.0, 1.0, 0.0),
-                aabb_min: Vec4::new(wmin[0], wmin[1], wmin[2], 0.0),
-                aabb_max: Vec4::new(wmax[0], wmax[1], wmax[2], 0.0),
+                aabb_center: Vec4::new(c[0], c[1], c[2], 0.0),
+                // Pre-inflate the half-extent by the displacement margin (micro-verts
+                // recede up to `displacement_scale` along the normal).
+                aabb_half: Vec4::new(h[0] + margin, h[1] + margin, h[2] + margin, 0.0),
                 // BLAS address read GPU-side from `blas_addresses[i]` (same instance order
                 // the BLAS-build loop used).
                 blas_slot: i as u32,
@@ -428,6 +379,7 @@ pub fn prepare_tess_ptlas_write_bind_group(
     write: Option<ResMut<TessPtlasWrite>>,
     ptlas: Option<Res<crate::accel::ptlas::Ptlas>>,
     classify: Option<Res<super::tess_classify::TessClassify>>,
+    transforms_col: Option<Res<crate::ecs_gpu::GpuColumn<crate::instance::TransformColumn>>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
 ) {
@@ -467,6 +419,15 @@ pub fn prepare_tess_ptlas_write_bind_group(
         write.bind_group = None;
         return;
     };
+    // Gathered cluster-indexed origin-relative world column (the same buffer the
+    // closest-hit's `transforms` reads) — the write shader derives each instance's
+    // PTLAS transform + explicit AABB from `transforms[instance_id]`, so both rebase
+    // with the floating origin. NOT `current_world()` (that is NODE-indexed).
+    let Some(transforms_col) = transforms_col.as_ref() else {
+        write.bind_group = None;
+        return;
+    };
+    let transforms = transforms_col.buffer();
     {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
@@ -484,6 +445,7 @@ pub fn prepare_tess_ptlas_write_bind_group(
             params,
             instances,
             blas_addresses.as_entire_binding(),
+            transforms.as_entire_binding(),
         )),
     ));
 }

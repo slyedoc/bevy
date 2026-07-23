@@ -1811,6 +1811,24 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
+name = "solari_tessellation"
+path = "examples/3d/solari/tessellation.rs"
+doc-scrape-examples = true
+required-features = [
+    "bevy_solari",
+    "bevy_solari_debug",
+    "cluster_processor",
+    "free_camera",
+    "bevy_dev_tools",
+]
+
+[package.metadata.example.solari_tessellation]
+name = "Solari (GPU tessellation)"
+description = "View-adaptive GPU tessellation - displacement-mapped materials become real ray-traced micro-geometry with correct silhouettes and self-shadowing."
+category = "3D Rendering"
+wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
 name = "spherical_area_lights"
 path = "examples/3d/spherical_area_lights.rs"
 doc-scrape-examples = true

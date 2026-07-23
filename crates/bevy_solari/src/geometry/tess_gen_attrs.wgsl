@@ -28,12 +28,6 @@ struct TessTriangleInfo {
     _pad1: u32,
 }
 
-struct Instance {
-    r0: vec4<f32>,
-    r1: vec4<f32>,
-    r2: vec4<f32>,
-}
-
 struct AttrParams {
     // Device address of `gen_attrs` (lo/hi) — baked into each part's metadata record
     // so the closest-hit can `physical_load` the denormalized attrs.
@@ -61,19 +55,6 @@ struct AttrParams {
 @group(0) @binding(6) var<storage, read_write> gen_attrs: array<u32>;
 // Per-part metadata (16 B): attr address (lo/hi) + primitive_base + pad.
 @group(0) @binding(7) var<storage, read_write> part_meta: array<u32>;
-// Instance object→world affine (row-major mat3x4); rotates the object normal to
-// world, since gen bakes WORLD positions and the PTLAS inject is identity.
-@group(0) @binding(8) var<storage, read> instances: array<Instance>;
-
-// Rotate an object-space normal to world by the instance's linear part. Assumes
-// rotation + (near-)uniform scale (true for the showcase instances), so the basis
-// rotates the normal directly; re-normalized after.
-fn normal_to_world(inst: Instance, n: vec3<f32>) -> vec3<f32> {
-    let m0 = vec3<f32>(inst.r0.x, inst.r0.y, inst.r0.z);
-    let m1 = vec3<f32>(inst.r1.x, inst.r1.y, inst.r1.z);
-    let m2 = vec3<f32>(inst.r2.x, inst.r2.y, inst.r2.z);
-    return normalize(vec3<f32>(dot(m0, n), dot(m1, n), dot(m2, n)));
-}
 
 fn load_normal(i: u32) -> vec3<f32> {
     return octahedral_decode_signed(unpack2x16snorm(base_packed[i * 4u]));
@@ -158,8 +139,11 @@ fn gen_attrs_main(
         let vv = f32(bp >> 16u) / 32768.0;
         var b = vec3<f32>(1.0 - uu - vv, uu, vv);
         b = remap_bary(b, part.edge_perm);
-        let n_obj = normalize(b.x * n0 + b.y * n1 + b.z * n2);
-        let nrm = normal_to_world(instances[part.instance_index], n_obj);
+        // Object-space normal: gen bakes object-space positions, and the closest-hit
+        // applies the instance's ObjectToWorld (the PTLAS transform = `world_rel[slot]`)
+        // to BOTH the position-fetched vertices and this normal — so baking world here
+        // would double-rotate. Leave it in object space.
+        let nrm = normalize(b.x * n0 + b.y * n1 + b.z * n2);
         let uv = b.x * t0 + b.y * t1 + b.z * t2;
         gen_attrs[o + k * 3u + 0u] = pack_normal(nrm);
         gen_attrs[o + k * 3u + 1u] = bitcast<u32>(uv.x);
