@@ -1109,15 +1109,9 @@ fn resolve_triangle_data_core(
     let triangle_cross = cross(triangle_edge0, triangle_edge1);
     let triangle_area = length(triangle_cross) / 2.0;
 
-    // True (planar) triangle normal. The cross product's sign follows the
-    // index winding, which these assets don't keep consistent (authored for
-    // double-sided raster) — sign-match it to the interpolated vertex normal,
-    // which IS consistently outward, so inside/outside tests get an exact
-    // plane with a stable orientation.
-    var geometric_world_normal = normalize(triangle_cross);
-    if dot(geometric_world_normal, world_normal) < 0.0 {
-        geometric_world_normal = -geometric_world_normal;
-    }
+    // True (planar) triangle normal, outward by the CCW winding (glTF/bevy
+    // convention); closest-hit shaders reorient it to the hit side via `hit_kind`.
+    let geometric_world_normal = normalize(triangle_cross);
 
     // Ray-cone texture LOD (Akenine-Möller et al., Ray Tracing Gems ch.20). The
     // texture-size-INDEPENDENT term: the triangle's texel density (UV area vs

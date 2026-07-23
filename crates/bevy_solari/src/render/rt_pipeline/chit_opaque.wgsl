@@ -24,6 +24,9 @@ var<ray_payload> shadow_payload: ShadowPayload;
 // fixed-function triangle intersection writes (u, v); w = 1 - u - v.
 var<hit_attribute> bary: vec2<f32>;
 
+// Vulkan `gl_HitKindEXT` for a back-facing triangle (front-facing is 0xFE).
+const HIT_KIND_BACK_FACING: u32 = 0xFFu;
+
 // Camera UBO (set 1, binding 1) — always present in the layout. Used by the
 // displacement-debug view (`camera.frame.w`) regardless of DLSS, and by the DLSS
 // guide writes below; declared unconditionally so a non-DLSS build still compiles.
@@ -88,6 +91,11 @@ fn chit_opaque(
     // ClusterIDNV).
     @builtin(primitive_index) primitive_index: u32,
     @builtin(world_ray_direction) ray_direction: vec3<f32>,
+    // Hardware front/back-facing determination (`gl_HitKindEXT`): the triangle winding
+    // as the ray saw it (`0xFE` front, `0xFF` back). Drives two-sided shading —
+    // authoritative and immune to smoothed/artistic vertex normals, given the
+    // builder's consistent winding.
+    @builtin(hit_kind) hit_kind: u32,
     // Hit distance (world units) — converts the light's area pdf to solid angle
     // for the emissive-vs-NEE MIS weight.
     @builtin(ray_t_current_max) ray_t: f32,
@@ -165,6 +173,16 @@ fn chit_opaque(
     }
 
     let wo = -ray_direction;
+    // Two-sided opaque shading: the resolve orients both normals to the mesh's
+    // outward (front) side. A ray hitting the BACK — the inside of a closed mesh on a
+    // GI bounce, or a single-sided plane seen from behind — would then shade with the
+    // outward front normal facing away, reading as a see-through ghost of the front.
+    // Flip both normals to the hit side so the surface shades as a solid from either
+    // side, keyed on the hardware winding (`hit_kind`), not the interpolated normal.
+    if hit_kind == HIT_KIND_BACK_FACING {
+        ray_hit.geometric_world_normal = -ray_hit.geometric_world_normal;
+        ray_hit.world_normal = -ray_hit.world_normal;
+    }
     // Bend the smooth shading normal into the view hemisphere so silhouette
     // edges (interpolated normal past 90°) don't black out.
     let world_normal = bend_shading_normal(ray_hit.world_normal, wo);
