@@ -2,10 +2,10 @@
 //
 // One thread per base triangle of every tessellated instance. For each triangle
 // it computes a per-EDGE tessellation factor (screen-space edge length → segment
-// count), classifies full / part / split, looks up the matching table config
-// (sorted edges → `lookup_index`, with a permutation so the gen pass can map the
-// pattern's barycentrics back onto the actual edges), and appends a
-// `TessTriangleInfo` to the work list.
+// count), classifies full / part / split, canonicalizes the edge factors to a table
+// config (rotate the max factor to the front + a mirror `flip` bit, per
+// `vk_tessellated_clusters` `tess_getConfig`), and appends a `TessTriangleInfo` to
+// the work list.
 //
 // Crack-free guarantee: an edge factor depends ONLY on its two world-space
 // endpoints (symmetric `distance`), so two triangles sharing an edge derive the
@@ -34,9 +34,9 @@ struct WorkCluster {
 // Emitted per classified base triangle (32 bytes).
 struct TessTriangleInfo {
     instance_index: u32,
-    config_lookup: u32,   // index into the table's template_addresses / configs
-    edge_perm: u32,       // original edge indices in sorted (x>=y>=z) order, 2 bits each
-    i0: u32,              // the 3 global vertex indices (gen pass fetches pos/normal/uv)
+    config_lookup: u32,   // table slot: canonical (y>=z) or its mirror (z>y = flipped template)
+    flip: u32,            // 1 = mirror config; gen/attrs swap barycentrics `wuv.yxz`
+    i0: u32,              // the 3 global vertex indices, ROTATED to canonical (max factor first)
     i1: u32,
     i2: u32,
     _pad0: u32,
@@ -132,24 +132,25 @@ fn classify(
             edge_segments(p1, p2),
             edge_segments(p2, p0),
         );
+        var iv = array<u32, 3>(i0, i1, i2);
 
-        // Sort edges descending → canonical (x>=y>=z) config; track the original
-        // edge index at each rank for the gen pass's barycentric remap.
-        var pi = array<u32, 3>(0u, 1u, 2u);
-        if e[0] < e[1] {
-            let te = e[0]; e[0] = e[1]; e[1] = te;
-            let tp = pi[0]; pi[0] = pi[1]; pi[1] = tp;
-        }
-        if e[1] < e[2] {
-            let te = e[1]; e[1] = e[2]; e[2] = te;
-            let tp = pi[1]; pi[1] = pi[2]; pi[2] = tp;
-        }
-        if e[0] < e[1] {
-            let te = e[0]; e[0] = e[1]; e[1] = te;
-            let tp = pi[0]; pi[0] = pi[1]; pi[1] = tp;
+        // Canonicalize like `vk_tessellated_clusters` `tess_getConfig`: bring the max
+        // factor to slot 0 by a winding-preserving ROTATION (rotating the base vertices
+        // with it), then set a single flip bit if the remaining two are ascending
+        // (z > y = the mirror of a canonical config). The rotation resolves ties without
+        // a reflection, so `y == z` never needs a flip (which the table's mirror slots
+        // don't cover). `config_lookup` then indexes the canonical slot (y>=z) or its
+        // mirror slot (z>y → the flipped template).
+        let maxf = max(max(e[0], e[1]), e[2]);
+        if maxf == e[1] {
+            e = array<u32, 3>(e[1], e[2], e[0]);   // .yzx
+            iv = array<u32, 3>(iv[1], iv[2], iv[0]);
+        } else if maxf == e[2] {
+            e = array<u32, 3>(e[2], e[0], e[1]);   // .zxy
+            iv = array<u32, 3>(iv[2], iv[0], iv[1]);
         }
         let cfg = lookup_index(e[0], e[1], e[2]);
-        let perm = pi[0] | (pi[1] << 2u) | (pi[2] << 4u);
+        let flip = select(0u, 1u, e[2] > e[1]);
 
         // DETERMINISTIC part slot (every base triangle → exactly one part), so a
         // part's cluster_id is stable frame-to-frame. The atomic only tallies the
@@ -161,7 +162,7 @@ fn classify(
         if idx < params.part_capacity {
             atomicAdd(&counts[0], 1u);
             part_triangles[idx] = TessTriangleInfo(
-                wc.instance_idx, cfg, perm, i0, i1, i2, 0u, 0u,
+                wc.instance_idx, cfg, flip, iv[0], iv[1], iv[2], 0u, 0u,
             );
         }
 

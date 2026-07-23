@@ -2,21 +2,21 @@
 //
 // One workgroup per emitted part triangle (indirect, sized by `classify`'s
 // `finalize`), one thread per config micro-vertex. Each thread reads the part's
-// table config, fetches the matching barycentric (UV-packed) from the table,
-// remaps it onto the actual triangle's edges (the classify permutation; winding
-// reflections are already baked into which template `config_lookup` selects),
-// barycentrically interpolates the base triangle's position / normal / UV,
-// displaces along the interpolated normal, and writes the OBJECT-space position
-// into `gen_vertices` at a fixed `max_verts` stride per part. The instantiate
-// pass builds each part's config template against its slice of `gen_vertices`;
-// the PTLAS instance transform (`world_rel[slot]`) places the BLAS in the world.
+// table config, fetches the matching barycentric (UV-packed) from the table, and —
+// for a mirror config (`flip`) — swaps `wuv.yxz` (mirroring `vk_tessellated_clusters`'
+// `tess_getConfigVertexBarycentrics`). classify already rotated the base vertices to
+// the canonical order, so the barycentric interpolates straight over `i0/i1/i2`. It
+// then displaces along the interpolated normal and writes the OBJECT-space position
+// into `gen_vertices` at a fixed `max_verts` stride per part. The instantiate pass
+// builds each part's config template against its slice of `gen_vertices`; the PTLAS
+// instance transform (`world_rel[slot]`) places the BLAS in the world.
 
 #import bevy_render::utils::octahedral_decode_signed
 
 struct TessTriangleInfo {
     instance_index: u32,
     config_lookup: u32,
-    edge_perm: u32,
+    flip: u32,          // 1 = mirror config; swap barycentrics `wuv.yxz`
     i0: u32,
     i1: u32,
     i2: u32,
@@ -69,37 +69,6 @@ fn load_uv(i: u32) -> vec2<f32> {
     let b = i * 4u;
     return vec2<f32>(bitcast<f32>(base_packed[b + 2u]), bitcast<f32>(base_packed[b + 3u]));
 }
-// The vertex shared by actual triangle edges `a` and `b` (edge k spans vertex k →
-// (k+1)%3).
-fn edge_common(a: u32, b: u32) -> u32 {
-    let a1 = (a + 1u) % 3u;
-    let b1 = (b + 1u) % 3u;
-    if a == b || a == b1 {
-        return a;
-    }
-    return a1;
-}
-
-// Remap the canonical pattern's barycentric weights `w` (for the descending-sorted
-// triangle: edge 0 = longest) onto the ACTUAL triangle's vertices, given the edge
-// permutation `perm` (canonical rank → actual edge index, 2 bits each). Unlike a pure
-// rotation, this handles REFLECTIONS too — the seam fix. Canonical vertex i is shared
-// by canonical edges (i+2)%3 and i, so it maps to the actual vertex shared by actual
-// edges pi[(i+2)%3], pi[i] → the vertex permutation σ = (s0, s1, s2); scatter w by it
-// (static selects, since exactly one of s0/s1/s2 equals each output component).
-fn remap_bary(w: vec3<f32>, perm: u32) -> vec3<f32> {
-    let pi0 = perm & 3u;
-    let pi1 = (perm >> 2u) & 3u;
-    let pi2 = (perm >> 4u) & 3u;
-    let s0 = edge_common(pi2, pi0);
-    let s1 = edge_common(pi0, pi1);
-    let s2 = edge_common(pi1, pi2);
-    let ox = select(select(w.z, w.y, s1 == 0u), w.x, s0 == 0u);
-    let oy = select(select(w.z, w.y, s1 == 1u), w.x, s0 == 1u);
-    let oz = select(select(w.z, w.y, s1 == 2u), w.x, s0 == 2u);
-    return vec3<f32>(ox, oy, oz);
-}
-
 @compute @workgroup_size(128)
 fn gen_verts(
     @builtin(workgroup_id) wg: vec3<u32>,
@@ -122,9 +91,13 @@ fn gen_verts(
     let bp = table_vertices[first_vert + lid];
     let uu = f32(bp & 0xFFFFu) / 32768.0;
     let vv = f32(bp >> 16u) / 32768.0;
-    // Canonical weights: corner0 @ (0,0), corner1 @ (1,0), corner2 @ (0,1).
+    // Canonical weights (w, u, v): corner0 @ (0,0), corner1 @ (1,0), corner2 @ (0,1).
     var b = vec3<f32>(1.0 - uu - vv, uu, vv);
-    b = remap_bary(b, part.edge_perm);
+    // Mirror config: swap `wuv.yxz` (matches the flipped template's reversed winding
+    // so the net micro-triangle stays consistently wound). base verts pre-rotated.
+    if part.flip == 1u {
+        b = b.yxz;
+    }
 
     let p0 = load_pos(part.i0);
     let p1 = load_pos(part.i1);

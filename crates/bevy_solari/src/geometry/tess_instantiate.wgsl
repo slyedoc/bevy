@@ -11,8 +11,8 @@
 
 struct TessTriangleInfo {
     instance_index: u32,
-    config_lookup: u32,
-    edge_perm: u32,
+    config_lookup: u32,   // canonical or mirror slot → normal / flipped template
+    flip: u32,
     i0: u32,
     i1: u32,
     i2: u32,

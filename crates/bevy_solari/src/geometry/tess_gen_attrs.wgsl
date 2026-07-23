@@ -5,13 +5,12 @@
 //
 // One workgroup per emitted part (same indirect grid as `tess_gen_verts`), one
 // thread per micro-triangle of the part's table config. For each micro-triangle it
-// fetches the config's 3 local micro-vertex indices (table topology), remaps each
-// onto the base triangle's edges (the classify permutation, identical to
-// `tess_gen_verts` so attrs stay consistent with the generated positions),
-// interpolates the base triangle's smooth normal + UV, and writes them
-// denormalized: 3 × (packed-octahedral normal @0, uv @4) = 36 B per micro-triangle,
-// contiguous at `(part * max_tris + micro_tri) * 9` u32. Thread 0 also writes the
-// part's metadata record (attr-buffer address + `primitive_base = part * max_tris`).
+// fetches the config's 3 local micro-vertex indices (table topology), applies the
+// same mirror swap (`wuv.yxz` on `flip`) as `tess_gen_verts` so attrs land on the
+// generated positions, interpolates the base triangle's smooth normal + UV, and
+// writes them denormalized: 3 × (packed-octahedral normal @0, uv @4) = 36 B per
+// micro-triangle, contiguous at `(part * max_tris + micro_tri) * 9` u32. Thread 0
+// also writes the part's metadata record (attr-buffer address + `primitive_base`).
 //
 // Normals are the interpolated base normals (no displacement-gradient bump).
 
@@ -20,7 +19,7 @@
 struct TessTriangleInfo {
     instance_index: u32,
     config_lookup: u32,
-    edge_perm: u32,
+    flip: u32,          // 1 = mirror config; swap barycentrics `wuv.yxz`
     i0: u32,
     i1: u32,
     i2: u32,
@@ -67,30 +66,6 @@ fn pack_normal(n: vec3<f32>) -> u32 {
     return pack2x16snorm(octahedral_encode(n) * 2.0 - 1.0);
 }
 
-// Reflection-aware barycentric remap — MUST match `tess_gen_verts.wgsl` exactly so
-// attrs land on the same micro-vertices as the generated positions. See that file for
-// the derivation (vertex permutation σ from the edge permutation).
-fn edge_common(a: u32, b: u32) -> u32 {
-    let a1 = (a + 1u) % 3u;
-    let b1 = (b + 1u) % 3u;
-    if a == b || a == b1 {
-        return a;
-    }
-    return a1;
-}
-fn remap_bary(w: vec3<f32>, perm: u32) -> vec3<f32> {
-    let pi0 = perm & 3u;
-    let pi1 = (perm >> 2u) & 3u;
-    let pi2 = (perm >> 4u) & 3u;
-    let s0 = edge_common(pi2, pi0);
-    let s1 = edge_common(pi0, pi1);
-    let s2 = edge_common(pi1, pi2);
-    let ox = select(select(w.z, w.y, s1 == 0u), w.x, s0 == 0u);
-    let oy = select(select(w.z, w.y, s1 == 1u), w.x, s0 == 1u);
-    let oz = select(select(w.z, w.y, s1 == 2u), w.x, s0 == 2u);
-    return vec3<f32>(ox, oy, oz);
-}
-
 @compute @workgroup_size(128)
 fn gen_attrs_main(
     @builtin(workgroup_id) wg: vec3<u32>,
@@ -131,6 +106,12 @@ fn gen_attrs_main(
     // The micro-triangle's 3 local micro-vertex indices (packed 3×8-bit).
     let tri = table_indices[first_tri + micro_tri];
     var lv = array<u32, 3>(tri & 0xFFu, (tri >> 8u) & 0xFFu, (tri >> 16u) & 0xFFu);
+    // Mirror config: the flipped template swaps each micro-triangle's last two
+    // vertices (`.xzy`), so bake the attrs in that order to align with the CLAS's
+    // position-fetched vertices the closest-hit interpolates against.
+    if part.flip == 1u {
+        lv = array<u32, 3>(lv[0], lv[2], lv[1]);
+    }
 
     let o = (p * params.max_tris + micro_tri) * 9u;
     for (var k = 0u; k < 3u; k = k + 1u) {
@@ -138,7 +119,10 @@ fn gen_attrs_main(
         let uu = f32(bp & 0xFFFFu) / 32768.0;
         let vv = f32(bp >> 16u) / 32768.0;
         var b = vec3<f32>(1.0 - uu - vv, uu, vv);
-        b = remap_bary(b, part.edge_perm);
+        // Same barycentric mirror as `tess_gen_verts` so attrs land on the positions.
+        if part.flip == 1u {
+            b = b.yxz;
+        }
         // Object-space normal: gen bakes object-space positions, and the closest-hit
         // applies the instance's ObjectToWorld (the PTLAS transform = `world_rel[slot]`)
         // to BOTH the position-fetched vertices and this normal — so baking world here
