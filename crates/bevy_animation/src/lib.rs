@@ -11,6 +11,7 @@ extern crate alloc;
 
 pub mod animatable;
 pub mod animation_curves;
+pub mod animclip;
 pub mod gltf_curves;
 pub mod graph;
 #[cfg(feature = "bevy_mesh")]
@@ -37,7 +38,7 @@ use crate::{
     prelude::{AnimatableProperty, EvaluatorId},
 };
 
-use bevy_app::{AnimationSystems, App, Plugin, PostUpdate};
+use bevy_app::{AnimationSystems, App, Plugin, PostUpdate, Update};
 use bevy_asset::{Asset, AssetApp, AssetEventSystems, Assets};
 use bevy_ecs::{prelude::*, resource::IsResource, world::EntityMutExcept};
 use bevy_math::FloatOrd;
@@ -57,8 +58,8 @@ use uuid::Uuid;
 pub mod prelude {
     #[doc(hidden)]
     pub use crate::{
-        animatable::*, animation_curves::*, graph::*, transition::*, AnimationClip,
-        AnimationPlayer, AnimationPlugin, VariableCurve,
+        animatable::*, animation_curves::*, animclip::AnimatedScene, graph::*, transition::*,
+        AnimationClip, AnimationPlayer, AnimationPlugin, VariableCurve,
     };
 }
 
@@ -1282,9 +1283,14 @@ impl Plugin for AnimationPlugin {
         app.init_asset::<AnimationClip>()
             .init_asset::<AnimationGraph>()
             .init_asset_loader::<AnimationGraphAssetLoader>()
+            .init_asset_loader::<animclip::AnimationClipLoader>()
             .register_asset_reflect::<AnimationClip>()
             .register_asset_reflect::<AnimationGraph>()
+            .register_type::<animclip::AnimatedScene>()
             .init_resource::<ThreadedAnimationGraphs>()
+            // Binds a baked `.animclip` onto a spawned hierarchy by name-path. In `Update` so its
+            // commands are applied before `PostUpdate` runs the players it just inserted.
+            .add_systems(Update, animclip::wire_animated_scenes)
             .add_systems(
                 PostUpdate,
                 (
