@@ -203,6 +203,14 @@ impl Plugin for SolarRenderPlugin {
         // then denoise/upscale the view target. Gated on the SDK existing (RR
         // supported); per-view component presence (set by `prepare_solari_dlss`) gates
         // the actual mode. Both run after the trace + blit, before tonemapping.
+        //
+        // Also BEFORE the raster main pass, for the same compose-first reason the blit
+        // is: `solari_dlss_render` does a `post_process_write` over the whole view
+        // target, so it must land before the opaque/transparent phases draw overlays.
+        // `.before(tonemapping)` alone leaves it unordered against those phases — they
+        // conflict on `ViewTarget`, so the executor serializes them in an arbitrary
+        // order that can flip between frames, and a frame where DLSS ran last lost its
+        // gizmos (the navmesh overlay flickered).
         render_app
             .add_systems(RenderStartup, dlss::init_solari_dlss)
             .add_systems(
@@ -214,10 +222,12 @@ impl Plugin for SolarRenderPlugin {
                 (
                     dlss::solari_dlss_resolve
                         .after(rt_pipeline::rt_pipeline)
+                        .before(main_opaque_pass_3d)
                         .before(tonemapping)
                         .run_if(resource_exists::<dlss::SolariDlssSdk>.and_then(dlss::dlss_enabled)),
                     dlss::solari_dlss_render
                         .after(dlss::solari_dlss_resolve)
+                        .before(main_opaque_pass_3d)
                         .before(tonemapping)
                         .run_if(resource_exists::<dlss::SolariDlssSdk>.and_then(dlss::dlss_enabled)),
                 )
