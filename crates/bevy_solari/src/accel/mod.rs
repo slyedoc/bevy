@@ -136,7 +136,9 @@ impl Plugin for AccelPlugin {
                     deform::dispatch_deform
                         .run_if(resource_exists::<SolariPipelines>)
                         .in_set(SolariClusterSystems::Deform),
-                    dispatch_blas_rebuild.in_set(SolariClusterSystems::BuildBlas),
+                    dispatch_blas_rebuild
+                        .run_if(resource_exists::<SolariPipelines>)
+                        .in_set(SolariClusterSystems::BuildBlas),
                     animated_blas::dispatch_animated_blas
                         .run_if(resource_exists::<SolariPipelines>)
                         .in_set(SolariClusterSystems::BuildAnimatedBlas),

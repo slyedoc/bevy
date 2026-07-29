@@ -11,7 +11,8 @@ enable primitive_index;
 #import bevy_solari::rt_payload::{RtPayload, ShadowPayload, RtCamera}
 #import bevy_solari::hair::{eval_hair_bsdf, sample_hair_bsdf, pdf_hair_bsdf}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
-#import bevy_solari::sampling::{generate_random_light_sample, calculate_resolved_light_contribution, power_heuristic, NULL_LIGHT_ID}
+#import bevy_solari::sampling::{calculate_resolved_light_contribution, power_heuristic, NULL_LIGHT_ID}
+#import bevy_solari::light_sampling::generate_random_light_sample
 #import bevy_solari::scene_bindings::{resolve_hair_hit, lss_material_id, resolve_lss_surface, load_material_bindless, resolve_material_lod, HAIR_MATERIAL_NONE, MIRROR_ROUGHNESS_THRESHOLD, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX}
 
 var<incoming_ray_payload> payload: RtPayload;

@@ -32,7 +32,7 @@ use ash::vk::{self, TaggedStructure};
 
 use crate::gpu::retire::GpuRetire;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
-use crate::gpu::extension::ClusterExtensionFns;
+use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 use crate::ecs_gpu::GpuColumn;
 use crate::instance::{RaytracingGpuEntity, TransformColumn};
 use super::clas_arena::CLAS_SCRATCH_ALIGN;
@@ -1129,7 +1129,11 @@ pub fn run_tess_classify(
             pass.dispatch_workgroups(inst_groups, 1, 1);
         }
     }
-    render_queue.submit([encoder.finish()]);
+    // The encoders below go out in ONE submit. Submission order within a
+    // `vkQueueSubmit` is guaranteed, so each raw segment's leading seam still
+    // covers the segments recorded before it. They stay separate encoders because
+    // the fork panics if one encoder mixes wgpu passes with raw `as_hal_mut`.
+    let mut submission = vec![encoder.finish()];
 
     // Raw-VK indirect INSTANTIATE_TRIANGLE_CLUSTER — turn each part's GPU-built
     // descriptor + gen_vertices slice into a CLAS in the persistent pool. Must be its
@@ -1177,20 +1181,26 @@ pub fn run_tess_classify(
             render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tess_classify.clas_build"),
             });
-        // SAFETY: raw-only encoder; opening barrier makes the prior submit's descriptor/
-        // counts shader writes visible to the build; `tri_input` lives through the record
-        // call (input maxima consumed at record time); all addresses reference resident
-        // allocator buffers.
+        // SAFETY: raw-only encoder; the opening seam makes the prior submit's
+        // descriptor/counts shader writes visible to the build; `tri_input` lives
+        // through the record call (input maxima consumed at record time); all
+        // addresses reference resident allocator buffers. `tess_clas_storage` is
+        // rewritten in place at stable addresses every frame while the previous
+        // frame's trace may still be walking BLASes that reference it.
         unsafe {
-            crate::gpu::extension::cmd_global_as_barrier(&mut build_encoder, &render_device, false);
+            crate::gpu::extension::cmd_as_seam(
+                &mut build_encoder,
+                &render_device,
+                AsSeams::COMPUTE_TO_BUILD_INPUT | AsSeams::TRACE_TO_BUILD_WAR,
+            );
             crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
                 &mut build_encoder,
                 fns_res,
                 &cmd,
             );
-            crate::gpu::extension::cmd_global_as_barrier(&mut build_encoder, &render_device, false);
+            crate::gpu::extension::cmd_as_seam(&mut build_encoder, &render_device, AsSeams::BUILD_TO_BUILD_INPUT);
         }
-        render_queue.submit([build_encoder.finish()]);
+        submission.push(build_encoder.finish());
     }
 
     // Build one BLAS per instance from its contiguous CLAS-address sublist.
@@ -1232,16 +1242,28 @@ pub fn run_tess_classify(
             );
             built.push(blas);
         }
-        render_queue.submit([blas_encoder.finish()]);
-        // Old BLAS sets outlive their last consuming submit via the reaper
-        // (frame-count keepalives get outrun; completion flags don't).
-        classify.blas_keepalive.push(built);
-        if classify.blas_keepalive.len() > 2 {
-            let old = classify.blas_keepalive.remove(0);
-            retire.retire(&render_queue, "tess_classify.blas_set", old);
+        // One publish for the whole set: each build already carries a leading
+        // seam, so consecutive builds are separated, and only the last one needs
+        // its bytes made visible to traversal.
+        // SAFETY: raw-only encoder, still open + Vulkan-backed.
+        unsafe {
+            crate::gpu::extension::cmd_as_seam(&mut blas_encoder, &render_device, AsSeams::BUILD_TO_TRACE);
         }
+        submission.push(blas_encoder.finish());
+        classify.blas_keepalive.push(built);
         // The BLAS addresses are now valid in `blas_addresses` — the PTLAS inject may run.
         classify.blas_ready = true;
+    }
+
+    render_queue.submit(submission);
+
+    // Old BLAS sets outlive their last consuming submit via the reaper
+    // (frame-count keepalives get outrun; completion flags don't). Armed after
+    // the submit above, so `on_submitted_work_done` covers the builds that read
+    // them.
+    if classify.blas_keepalive.len() > 2 {
+        let old = classify.blas_keepalive.remove(0);
+        retire.retire(&render_queue, "tess_classify.blas_set", old);
     }
 
 }

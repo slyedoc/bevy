@@ -27,10 +27,7 @@ use bevy_render::{
         ComputePipelineDescriptor, PipelineCache, ShaderStages, StorageTextureAccess,
         TextureFormat, UniformBuffer,
     },
-    renderer::{
-        raw_vulkan_init::AdditionalVulkanFeatures, RenderContext, RenderDevice, RenderQueue,
-        ViewQuery,
-    },
+    renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
     sync_world::RenderEntity,
     texture::{FallbackImage, GpuImage},
     view::{ExtractedView, ViewTarget},
@@ -42,7 +39,6 @@ use crate::bindings::RaytracingSceneBindings;
 use crate::ecs_gpu::{GpuSlot, SceneColumns};
 use crate::geometry::ClusterMeshManager;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
-use crate::gpu::extension::RayTracingPipelineFeature;
 use crate::gpu::rt_pipeline::{
     RtCamera, RtGeometryAddresses, RtPipeline, RtViewBindings, SolariAnyHitDef, SolariHitGroupDef,
     SolariHitGroupRegistry,
@@ -188,11 +184,10 @@ impl SolariDebugView {
     }
 }
 
-/// Debug/feature inputs bundled into one [`SystemParam`] to keep the dispatch under
-/// bevy's 16-system-param limit: the device feature set + the debug-view toggles.
+/// Debug inputs bundled into one [`SystemParam`] to keep the dispatch under
+/// bevy's 16-system-param limit.
 #[derive(bevy_ecs::system::SystemParam)]
 pub(crate) struct RtDebug<'w> {
-    additional: Res<'w, AdditionalVulkanFeatures>,
     freeze_diff: Option<Res<'w, SolariFreezeDiff>>,
     nrc: Option<Res<'w, crate::nrc::SolariNrc>>,
     nrc_buffers: Option<ResMut<'w, crate::nrc::NrcBuffers>>,
@@ -1320,7 +1315,7 @@ pub(crate) fn rt_pipeline(
     // The per-view set 1 (output/camera/env) is built separately below. Inserted
     // via commands → live next frame.
     let Some(rt) = rt else {
-        if debug.additional.has::<RayTracingPipelineFeature>() && materials.len() > 0 {
+        if materials.len() > 0 {
             if let (Some(allocator), Some(scene_layout), Some(columns_layout), Some(registry)) = (
                 allocator.as_deref(),
                 raw_bgl(&pipeline_cache, &scene_bindings.bind_group_layout),

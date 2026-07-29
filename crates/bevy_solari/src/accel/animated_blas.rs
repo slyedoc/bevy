@@ -41,7 +41,7 @@ use super::deform::{Deform, MAX_ANIMATED_INSTANCES};
 use crate::ecs_gpu::GpuColumn;
 use crate::geometry::{ClusterMeshManager, ClusterTemplateArena};
 use crate::gpu::allocator::{Allocator, MemoryLocation, SparseBuffer};
-use crate::gpu::extension::ClusterExtensionFns;
+use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 use crate::instance::{InstanceManager, LodInputColumn};
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
@@ -602,22 +602,32 @@ pub fn dispatch_animated_blas(
         label: Some("animated_blas.builds"),
     });
     // SAFETY: cluster-AS fn table loaded; encoder open + Vulkan-backed; the
-    // command infos reference live buffers committed this frame. Barriers make
+    // command infos reference live buffers committed this frame. The seams make
     // the instantiate-compute writes + INSTANTIATE output visible as build input.
+    // `blas_pool` is rebuilt in place at stable addresses every frame, so the
+    // leading seam also orders the previous frame's trace ahead of the rewrite.
     unsafe {
-        crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
+        crate::gpu::extension::cmd_as_seam(
+            &mut encoder,
+            &render_device,
+            AsSeams::COMPUTE_TO_BUILD_INPUT | AsSeams::TRACE_TO_BUILD_WAR,
+        );
         crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
             &mut encoder,
             &fns,
             &inst_cmd,
         );
-        crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
+        crate::gpu::extension::cmd_as_seam(&mut encoder, &render_device, AsSeams::BUILD_TO_BUILD_INPUT);
         crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
             &mut encoder,
             &fns,
             &blas_cmd,
         );
-        crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
+        crate::gpu::extension::cmd_as_seam(
+            &mut encoder,
+            &render_device,
+            AsSeams::BUILD_TO_BUILD_INPUT | AsSeams::BUILD_TO_TRACE,
+        );
     }
     ctx.add_command_buffer(encoder.finish());
 }

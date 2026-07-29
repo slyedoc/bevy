@@ -56,7 +56,7 @@ use crate::instance::InstanceManager;
 use crate::material::StandardSolariMaterial;
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
-use crate::transform::{dispatch_transform_propagate, TransformGraph, TransformPropagate};
+use crate::transform::{dispatch_transform_subtract, TransformGraph, TransformPropagate};
 use crate::{SolariClusterSystems, SolariSetup};
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -536,13 +536,14 @@ impl Plugin for SolariLightsPlugin {
             )
             .add_systems(
                 RenderGraph,
-                // World is written by `dispatch_transform_propagate` (Propagate);
-                // the light columns scatter in `Scatter` (earlier set) — so by here
-                // settings + slots are in place and the world is ready.
+                // Resolve reads `current_world()` — the origin-relative `world_rel`
+                // written by `dispatch_transform_subtract`, not by the propagate walk
+                // that feeds it. The light columns scatter in `Scatter` (earlier set),
+                // so by here settings + slots are in place too.
                 dispatch_light_resolve
                     .run_if(resource_exists::<SolariPipelines>)
                     .in_set(SolariClusterSystems::Propagate)
-                    .after(dispatch_transform_propagate),
+                    .after(dispatch_transform_subtract),
             );
     }
 }

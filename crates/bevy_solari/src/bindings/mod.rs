@@ -60,6 +60,7 @@ pub fn register_scene_shaders(app: &mut App) {
     load_shader_library!(app, "brdf.wgsl");
     load_shader_library!(app, "raytracing_scene_bindings.wgsl");
     load_shader_library!(app, "sampling.wgsl");
+    load_shader_library!(app, "light_sampling.wgsl");
 }
 
 /// Bindings domain plugin: the WGSL libraries, the cluster scene bind

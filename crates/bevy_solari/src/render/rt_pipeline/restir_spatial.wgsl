@@ -111,6 +111,10 @@ fn spatial_visibility(ray_origin: vec3<f32>, light_pos: vec4<f32>) -> f32 {
     rayQueryInitialize(&rq, tlas, RayDesc(RAY_FLAG_TERMINATE_ON_FIRST_HIT, RAY_NO_CULL, RAY_T_MIN, t_max, ray_origin, dir));
     while rayQueryProceed(&rq) {
         let c = rayQueryGetCandidateIntersection(&rq);
+        // No alpha test: `alpha_test` reaches `physical_load`, and the
+        // `PhysicalStorageBufferAddresses` capability it needs is only available on
+        // the rt_pipeline's raw WGSL→SPIR-V path, not to a wgpu compute pipeline.
+        // Alpha-masked casters therefore shadow as solid here (see `ray_query.wgsl`).
         if c.kind == RAY_QUERY_INTERSECTION_TRIANGLE {
             rayQueryConfirmIntersection(&rq);
         }

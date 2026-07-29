@@ -835,17 +835,19 @@ pub fn init_allocator(
 ) {
     if !additional.has::<ClusterAccelerationStructureFeature>()
         || !additional.has::<crate::gpu::extension::OpacityMicromapFeature>()
+        || !additional.has::<crate::gpu::extension::RayTracingPipelineFeature>()
     {
         // Solari is silently disabled if we just return with no allocator — every
         // downstream `Option<Res<Allocator>>` init then no-ops, with no signal as to
         // why. Say it once so a "nothing renders" report has an obvious first answer.
-        // Opacity micromaps are required alongside cluster AS: every driver with
-        // the NV cluster extensions has VK_EXT_opacity_micromap, and requiring it
-        // keeps a no-OMM fallback out of every build/attach path.
+        // Opacity micromaps and the ray-tracing pipeline are required alongside
+        // cluster AS: every driver with the NV cluster extensions has both, and
+        // requiring them keeps fallback paths out of every build/attach path and
+        // makes `RAY_TRACING_SHADER_KHR` unconditionally legal in a barrier.
         bevy_log::warn_once!(
             "bevy_solari disabled: the GPU/driver lacks the cluster acceleration-structure \
-             feature (VK_NV_cluster_acceleration_structure et al.) or VK_EXT_opacity_micromap. \
-             All solari passes no-op."
+             feature (VK_NV_cluster_acceleration_structure et al.), VK_EXT_opacity_micromap, \
+             or VK_KHR_ray_tracing_pipeline. All solari passes no-op."
         );
         return;
     }

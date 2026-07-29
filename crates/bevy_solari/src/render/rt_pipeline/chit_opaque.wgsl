@@ -13,7 +13,8 @@ enable primitive_index;
 #import bevy_solari::rt_payload::{RtPayload, ShadowPayload, RtCamera}
 #import bevy_solari::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB, bend_shading_normal}
 #import bevy_solari::pbr::{rand_f, rand_u}
-#import bevy_solari::sampling::{generate_random_light_sample, generate_random_emissive_light_sample, calculate_resolved_light_contribution, random_emissive_light_pdf, random_emissive_light_pdf_flux, resolve_emissive_for_restir, resolve_light_sample, emissive_light_count, directional_light_count, power_heuristic, pick_luminance, LightSample, Reservoir, SurfaceGbuf, StoredLight, pack_stored_light, ResolvedLightSample, NULL_LIGHT_ID}
+#import bevy_solari::sampling::{calculate_resolved_light_contribution, emissive_light_count, directional_light_count, power_heuristic, pick_luminance, LightSample, Reservoir, SurfaceGbuf, StoredLight, pack_stored_light, ResolvedLightSample, NULL_LIGHT_ID}
+#import bevy_solari::light_sampling::{generate_random_light_sample, generate_random_emissive_light_sample, random_emissive_light_pdf, random_emissive_light_pdf_flux, resolve_emissive_for_restir, resolve_light_sample}
 #import bevy_solari::scene_bindings::{resolve_triangle_data_full_mat_fetch, offset_ray_origin, tlas, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, load_material_bindless, sample_texture_lod, TEXTURE_MAP_NONE, light_sources, active_light_list, set_reproj_origin_delta}
 #import bevy_render::utils::{octahedral_encode, octahedral_decode_signed}
 

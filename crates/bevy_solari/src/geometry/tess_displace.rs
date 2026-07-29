@@ -334,11 +334,12 @@ pub fn prepare_tess_ptlas_write(
         .iter()
         .enumerate()
         .map(|(i, inst)| {
-            // The GPU gen pass bakes WORLD-space micro-vertices in the origin-relative
-            // frame, so each per-instance BLAS is already world-space → inject at IDENTITY
-            // (don't re-apply the transform). The explicit world AABB is derived GPU-side
-            // in the write shader from `transforms[instance_id] · local_aabb` (8 corners),
-            // so it stays in the same origin-relative frame as the geometry.
+            // The GPU gen pass bakes micro-vertices in OBJECT space, so the PTLAS
+            // record places each per-instance BLAS with `transforms[instance_id]`
+            // (the origin-relative `world_rel` column), read GPU-side in the write
+            // shader. The explicit world AABB is derived there from that same
+            // transform (8 corners of the local box), so geometry and bounds stay
+            // in one frame.
             let c = inst.local_aabb_center;
             let h = inst.local_aabb_half;
             TessInstanceGpu {

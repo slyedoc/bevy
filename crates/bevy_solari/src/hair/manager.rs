@@ -32,7 +32,7 @@ use bevy_render::{
 use core::ops::Range;
 
 use crate::gpu::allocator::{Allocator, SparseBuffer};
-use crate::gpu::extension::ClusterExtensionFns;
+use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 
 use super::asset::HairAsset;
 
@@ -92,6 +92,13 @@ struct PendingBuild {
     index_address: vk::DeviceAddress,
     scratch_address: vk::DeviceAddress,
     segment_count: u32,
+    /// Arena sub-ranges this build touches, for `RawAccess` validation — the
+    /// addresses above are opaque to it.
+    vertex_range: Range<u64>,
+    radius_range: Range<u64>,
+    index_range: Range<u64>,
+    scratch_range: Range<u64>,
+    blas_range: Range<u64>,
 }
 
 /// Render-world resource: the hair geometry arenas, the per-asset residency
@@ -441,6 +448,11 @@ pub fn prepare_hair_geometry(
                     index_address,
                     scratch_address,
                     segment_count: upload.segment_count,
+                    vertex_range: vertex_word_base * 4..(vertex_word_base + vertex_words) * 4,
+                    radius_range: radius_word_base * 4..(radius_word_base + radius_words) * 4,
+                    index_range: index_word_base * 4..(index_word_base + index_words) * 4,
+                    scratch_range: scratch_off..scratch_off + scratch_size,
+                    blas_range: region..region + region_size,
                 }),
             },
         );
@@ -468,7 +480,27 @@ pub fn dispatch_hair_blas(
     }
 
     let encoder = ctx.command_encoder();
+    // Leading seam: `prepare_hair_geometry` stages the arenas with `write_buffer`
+    // in `Render/PrepareResources`, a different submit from this `RenderGraph`
+    // record — Vulkan's implicit host-write dependency covers only HOST writes,
+    // not the transfer that lands them.
+    // SAFETY: encoder open + Vulkan-backed.
+    unsafe {
+        crate::gpu::extension::cmd_as_seam(encoder, &render_device, AsSeams::UPLOAD_TO_BUILD_INPUT);
+    }
     for (handle, build) in pending {
+        crate::gpu::extension::validate_raw_access(&crate::gpu::extension::RawAccess {
+            op: "hair.blas_build",
+            reads: &[
+                (&manager.vertices, build.vertex_range.clone()),
+                (&manager.radii, build.radius_range.clone()),
+                (&manager.indices, build.index_range.clone()),
+            ],
+            writes: &[
+                (&manager.blas_pool, build.blas_range.clone()),
+                (&manager.scratch, build.scratch_range.clone()),
+            ],
+        });
         let lss = lss_geometry_data(
             build.vertex_address,
             build.radius_address,
@@ -504,7 +536,7 @@ pub fn dispatch_hair_blas(
     // SAFETY: encoder open + Vulkan-backed. Make the built BLASes visible to
     // the PTLAS build's instance reads + the traversal.
     unsafe {
-        crate::gpu::extension::cmd_global_as_barrier(encoder, &render_device, false);
+        crate::gpu::extension::cmd_as_seam(encoder, &render_device, AsSeams::BUILD_TO_TRACE);
     }
 }
 

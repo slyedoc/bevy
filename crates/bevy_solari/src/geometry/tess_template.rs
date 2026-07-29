@@ -15,7 +15,7 @@ use ash::vk::{self, TaggedStructure};
 use bevy_render::renderer::{RenderDevice, RenderQueue};
 
 use crate::gpu::allocator::{Allocator, MemoryLocation};
-use crate::gpu::extension::ClusterExtensionFns;
+use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 
 /// Base `cluster_id` (ClusterIDNV) for tessellated CLASes — each bakes
 /// `TESS_CLUSTER_ID_BASE + global_tess_clas_index`, comfortably above any real
@@ -164,17 +164,21 @@ pub fn record_build_per_instance_blas(
         _marker: core::marker::PhantomData,
     };
     // SAFETY: function table loaded; encoder open + Vulkan-backed; the descriptor
-    // strides/addresses reference the buffers above. Leading barrier: the preceding
-    // instantiate's CLAS addresses are visible as `cluster_references`. Trailing
-    // barrier: the BLAS address + payload are visible to the later trace.
+    // strides/addresses reference the buffers above. The leading seam makes the
+    // preceding instantiate's CLAS addresses visible as `cluster_references`; it
+    // also separates this build from the previous instance's, so the caller only
+    // has to publish the whole set to traversal once after the loop.
     unsafe {
-        crate::gpu::extension::cmd_global_as_barrier(encoder, render_device, false);
+        crate::gpu::extension::cmd_as_seam(
+            encoder,
+            render_device,
+            AsSeams::BUILD_TO_BUILD_INPUT | AsSeams::UPLOAD_TO_BUILD_INPUT,
+        );
         crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
             encoder,
             fns,
             &cmd,
         );
-        crate::gpu::extension::cmd_global_as_barrier(encoder, render_device, false);
     }
 
     let transient: Vec<Box<dyn core::any::Any + Send + Sync>> =

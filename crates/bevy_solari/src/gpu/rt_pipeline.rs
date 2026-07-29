@@ -238,8 +238,8 @@ struct MappedBuffer {
 /// live in [`RtViewBindings`], a component, so multiple views (split-screen) each
 /// trace into their own output with their own camera/env.
 ///
-/// Present only when `RayTracingPipelineFeature` is enabled; absence means the
-/// inline-`rayQuery` compute path is the only shading path.
+/// Built lazily once the scene layouts and materials exist; `RayTracingPipelineFeature`
+/// is a hard requirement, so absence here only ever means "not built yet".
 #[derive(Resource)]
 pub struct RtPipeline {
     device: ash::Device,
@@ -1337,6 +1337,7 @@ fn rt_composer(
     register!("../bindings/cluster_bindings.wgsl"); // -> utils
     register!("../bindings/raytracing_scene_bindings.wgsl"); // -> pbr, atmosphere, utils
     register!("../bindings/sampling.wgsl"); // -> pbr, scene_bindings, maths
+    register!("../bindings/light_sampling.wgsl"); // -> pbr, sampling, scene_bindings
     register!("../bindings/brdf.wgsl"); // -> pbr, sampling, scene_bindings, maths
     register!("../hair/hair.wgsl"); // bevy_solari::hair (Chiang fiber BSDF) -> pbr
     // Downstream modules (a hit group's `composable_modules`), after the built-ins
@@ -1583,6 +1584,33 @@ mod tests {
     /// descriptor variable instantiating `OpTypeRuntimeArray` (a `UniformConstant`
     /// pointer to a runtime array). Happens when an unsized `binding_array` misses
     /// the fixed-size substitution in the SPIR-V binding map.
+    /// `restir_spatial` is the one shader here that is NOT built through the raw
+    /// RT path — wgpu's `PipelineCache` compiles it as an ordinary compute
+    /// pipeline, without `rt_capabilities`. Reaching any bindless helper that does
+    /// a `physical_load` therefore builds fine in this test but fails at runtime
+    /// with "using physical_load requires ... PhysicalStorageBufferAddresses".
+    fn assert_no_physical_storage_buffer(file: &str, spv: &[u32]) {
+        const OP_CAPABILITY: u32 = 17;
+        const CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
+        let mut i = 5; // skip the SPIR-V header
+        while i < spv.len() {
+            let (opcode, word_count) = (spv[i] & 0xffff, (spv[i] >> 16) as usize);
+            assert!(word_count > 0, "{file}: malformed SPIR-V");
+            // Capabilities are all declared up front; stop at the first non-capability.
+            if opcode != OP_CAPABILITY {
+                break;
+            }
+            assert!(
+                spv[i + 1] != CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES,
+                "{file}: reaches a `physical_load` buffer-device-address helper \
+                 (e.g. `load_material_bindless` / `alpha_test` / `resolve_ray_hit_full`), \
+                 but it is built as a plain wgpu compute pipeline which has no \
+                 PhysicalStorageBufferAddresses capability"
+            );
+            i += word_count;
+        }
+    }
+
     fn assert_no_runtime_descriptor_array(file: &str, spv: &[u32]) {
         const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
         const OP_TYPE_POINTER: u32 = 32;
@@ -1653,7 +1681,12 @@ mod tests {
             ),
         ] {
             match try_compile_rt_wgsl(source, file, &[]) {
-                Ok(spv) => assert_no_runtime_descriptor_array(file, &spv),
+                Ok(spv) => {
+                    assert_no_runtime_descriptor_array(file, &spv);
+                    if file == "restir_spatial.wgsl" {
+                        assert_no_physical_storage_buffer(file, &spv);
+                    }
+                }
                 Err(e) => panic!("{file}: {e}"),
             }
         }

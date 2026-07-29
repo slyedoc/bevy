@@ -75,7 +75,7 @@ use bevy_render::{
         Buffer, ComputePassDescriptor, CreateTlasDescriptor, PipelineCache, RawBufferVec,
         ShaderType, Tlas, UniformBuffer,
     },
-    renderer::{raw_vulkan_init::AdditionalVulkanFeatures, RenderContext, RenderDevice, RenderQueue},
+    renderer::{RenderContext, RenderDevice, RenderQueue},
 };
 use wgpu::hal::api::Vulkan as VkApi;
 use bytemuck::{Pod, Zeroable};
@@ -95,7 +95,7 @@ use crate::gpu::epoch_table::EpochTable;
 use super::blas_sharing::BlasSharing;
 use crate::pipelines::SolariPipelines;
 use crate::resource_manager::SolariResourceManager;
-use crate::gpu::extension::{ClusterExtensionFns, RayTracingPipelineFeature};
+use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 
 /// Virtual address space for the PTLAS storage buffer — 4 GB.
 /// Sparse-backed.
@@ -1046,14 +1046,9 @@ pub fn dispatch_ptlas(
     hair_instances: Option<Res<crate::hair::HairInstances>>,
     hair_write: Option<Res<crate::hair::ptlas_hair::HairPtlasWrite>>,
     tess_write: Option<Res<crate::geometry::tess_displace::TessPtlasWrite>>,
-    additional: Res<AdditionalVulkanFeatures>,
     render_queue: Res<RenderQueue>,
     mut ctx: RenderContext,
 ) {
-    // The shading path is the RT pipeline (`vkCmdTraceRays`), so the post-build
-    // barrier must publish AS writes to `RAY_TRACING_SHADER_KHR` — but only when
-    // that feature is enabled (else the stage flag is illegal → device lost).
-    let rt_pipeline = additional.has::<RayTracingPipelineFeature>();
     let (Some(allocator), Some(fns), Some(resources), Some(instances)) = (
         allocator,
         fns,
@@ -1328,19 +1323,21 @@ pub fn dispatch_ptlas(
     // SAFETY: encoder is open and Vulkan-backed; partitioned-AS
     // function table is loaded.
     unsafe {
-        // PRE-build barrier: SHADER_WRITE → AS_BUILD_INPUT_READ so
-        // the build sees the fill-compute's freshly-written
-        // WriteInstanceData records. (Compute → build; no RT stage needed.)
-        crate::gpu::extension::cmd_global_as_barrier(&mut build_encoder, &render_device, false);
+        // PRE-build seam: the build sees the fill-compute's freshly-written
+        // WriteInstanceData records, and the previous build's `src` PTLAS bytes.
+        crate::gpu::extension::cmd_as_seam(
+            &mut build_encoder,
+            &render_device,
+            AsSeams::COMPUTE_TO_BUILD_INPUT | AsSeams::BUILD_TO_BUILD_INPUT,
+        );
         crate::gpu::extension::cmd_build_partitioned_acceleration_structures(
             &mut build_encoder,
             &fns,
             &build_info,
         );
-        // POST-build barrier: AS_WRITE → RAY_TRACING_SHADER_READ so the RT-pipeline
-        // trace sees fresh PTLAS contents. Without the RT stage here, the trace
-        // races the build and reads an empty AS → every ray misses.
-        crate::gpu::extension::cmd_global_as_barrier(&mut build_encoder, &render_device, rt_pipeline);
+        // POST-build seam: the trace sees fresh PTLAS contents. Without it the
+        // trace races the build and reads an empty AS → every ray misses.
+        crate::gpu::extension::cmd_as_seam(&mut build_encoder, &render_device, AsSeams::BUILD_TO_TRACE);
     }
     ctx.add_command_buffer(build_encoder.finish());
 

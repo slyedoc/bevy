@@ -37,7 +37,7 @@ use range_alloc::RangeAllocator;
 use wgpu::CommandEncoderDescriptor;
 
 use crate::gpu::allocator::{Allocator, MemoryLocation, SparseBuffer};
-use crate::gpu::extension::ClusterExtensionFns;
+use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 use crate::gpu::retire::GpuRetire;
 use super::mesh_manager::OmmUploadData;
 use super::{Cluster, ClusterIndex, ClusterMesh, ClusterMeshManager};
@@ -771,9 +771,9 @@ impl ClasArena {
         // created. We do NOT touch this encoder via wgpu commands
         // afterward — wgpu refuses to mix raw + high-level encoding.
         unsafe {
-            // Input barrier: the build reads staged `write_buffer` bytes by device
+            // Input seam: the build reads staged `write_buffer` bytes by device
             // address (untracked) — nothing else orders TRANSFER_WRITE → AS_BUILD.
-            crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
+            crate::gpu::extension::cmd_as_seam(&mut encoder, &render_device, AsSeams::UPLOAD_TO_BUILD_INPUT);
             // Build the opacity micro-map FIRST, then barrier so the cluster
             // build (which references it via `opacity_micromap_array`) sees the
             // finished data. Same encoder/submit → ordered before the CLAS build.
@@ -795,23 +795,24 @@ impl ClasArena {
                         device_address: b.scratch_addr,
                     });
                 crate::gpu::extension::cmd_build_micromaps(&mut encoder, fns, &build_info);
-                crate::gpu::extension::cmd_micromap_barrier(&mut encoder, &render_device);
+                crate::gpu::extension::cmd_as_seam(
+                    &mut encoder,
+                    &render_device,
+                    AsSeams::MICROMAP_TO_BUILD_INPUT,
+                );
             }
             crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
                 &mut encoder,
                 fns,
                 &cmd_info,
             );
-            // AS_WRITE → TRANSFER_READ + SHADER_READ barrier so the
-            // follow-up `copy_buffer_to_buffer` (and later selector
-            // reads of `cluster_clas_addresses`) sees the freshly
-            // written per-cluster CLAS device addresses.
-            // wgpu's tracker can't insert this because the build
-            // happened via raw VK on a buffer wgpu only sees as
-            // STORAGE.
-            crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
+            // AS_WRITE → TRANSFER_READ seam so the follow-up
+            // `copy_buffer_to_buffer` sees the freshly written per-cluster CLAS
+            // device addresses. wgpu's tracker can't insert this because the
+            // build happened via raw VK on a buffer wgpu only sees as STORAGE.
+            crate::gpu::extension::cmd_as_seam(&mut encoder, &render_device, AsSeams::BUILD_TO_TRANSFER);
         }
-        // No CPU wait: the trailing global AS barrier + queue submission order
+        // No CPU wait: the trailing seam + queue submission order
         // make the build's dst_addresses visible to the copy below.
         render_queue.submit([encoder.finish()]);
 

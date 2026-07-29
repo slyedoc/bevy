@@ -57,11 +57,11 @@ pub struct PartitionedAccelerationStructureFeature;
 pub struct LinearSweptSpheresFeature;
 
 /// Marker registered in [`AdditionalVulkanFeatures`] when
-/// `VK_KHR_ray_tracing_pipeline` is enabled on the device. The
-/// RT-pipeline shading path (raygen / closest-hit / miss / any-hit +
-/// SBT + `cmd_trace_rays`) gates on
-/// `additional_features.has::<RayTracingPipelineFeature>()`; on an
-/// adapter without it, only the inline-`rayQuery` compute path runs.
+/// `VK_KHR_ray_tracing_pipeline` is enabled on the device. REQUIRED: shading is
+/// the RT-pipeline path (raygen / closest-hit / miss / any-hit + SBT +
+/// `cmd_trace_rays`), so its absence disables solari entirely (see
+/// `init_allocator`). That in turn makes `RAY_TRACING_SHADER_KHR` always a legal
+/// barrier stage — see [`seam_masks`].
 pub struct RayTracingPipelineFeature;
 
 /// Marker registered when `VK_NV_ray_tracing_invocation_reorder` is enabled —
@@ -156,6 +156,21 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
             let phd_features = instance.get_physical_device_features(physical_device);
             if phd_features.sparse_binding != 0 {
                 args.device_features.core_mut().sparse_binding = vk::TRUE;
+            }
+
+            // `synchronization2` — every AS barrier in the crate is a
+            // `VkMemoryBarrier2`, whose per-barrier src/dst stage+access pairs are
+            // what let a seam name its real producer and consumer instead of the
+            // union of both. Mandatory in Vulkan 1.3; any adapter below that also
+            // fails the cluster-AS probes below, so there is no legacy path.
+            let api_version = instance
+                .get_physical_device_properties(physical_device)
+                .api_version;
+            if api_version >= vk::API_VERSION_1_3 {
+                let features = Box::leak(Box::new(
+                    vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true),
+                ));
+                *args.create_info = core::mem::take(args.create_info).push(features);
             }
 
             // NOTE: do NOT enable `vulkanMemoryModelDeviceScope`. Naga's
@@ -509,10 +524,12 @@ pub fn report_queue_checkpoints(queue: vk::Queue) {
 
 /// Checkpoint marker base for cluster-AS ops: `0x1000 + op_type` —
 /// 0x1000=move, 0x1001=BLAS-from-CLAS, 0x1002=direct CLAS build,
-/// 0x1003=template build, 0x1004=instantiate. PTLAS = 0x2000, OMM = 0x3000.
+/// 0x1003=template build, 0x1004=instantiate. PTLAS = 0x2000, OMM = 0x3000,
+/// standard KHR BLAS = 0x4000.
 pub const CKPT_CLUSTER_OP_BASE: usize = 0x1000;
 pub const CKPT_PTLAS: usize = 0x2000;
 pub const CKPT_MICROMAP: usize = 0x3000;
+pub const CKPT_BLAS_KHR: usize = 0x4000;
 
 /// Declared buffer access for a raw-VK op — invisible to wgpu's tracker, so
 /// [`validate_raw_access`] checks it instead under `SolariSettings::validate`:
@@ -535,6 +552,7 @@ pub(crate) fn latch_validate(on: bool) {
 pub fn solari_validate_enabled() -> bool {
     VALIDATE.get().copied().unwrap_or(false)
 }
+
 
 /// An uncommitted range consumed by a raw op is a future device-lost — log it
 /// with the op + buffer named, BEFORE the GPU faults on an anonymous VA.
@@ -601,68 +619,182 @@ pub unsafe fn cmd_build_cluster_acceleration_structures_indirect(
     }
 }
 
-/// Insert a kitchen-sink memory barrier covering raw-VK AS / scratch /
-/// compute writes that wgpu's tracker doesn't see. Use after raw-VK
-/// AS builds + compute writes to make the produced data visible to
-/// subsequent traversals + AS-build inputs.
+bitflags::bitflags! {
+    /// The hazards a barrier breaks, at a wgpu↔raw-VK seam. Compose the ones a
+    /// site actually has; [`seam_masks`] unions their stage/access contributions.
+    ///
+    /// Raw AS builds address memory by `VkDeviceAddress`, so wgpu's tracker sees
+    /// none of these dependencies and every one of them is stated here by hand.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AsSeams: u16 {
+        /// `write_buffer` / copy staged the build's inputs.
+        const UPLOAD_TO_BUILD_INPUT = 1 << 0;
+        /// A compute pass wrote the build's descriptors / args / counts.
+        const COMPUTE_TO_BUILD_INPUT = 1 << 1;
+        /// An earlier AS build produced this build's input (CLAS → BLAS → TLAS).
+        const BUILD_TO_BUILD_INPUT = 1 << 2;
+        /// Driver-written addresses / sizes are about to be copied out.
+        const BUILD_TO_TRANSFER = 1 << 3;
+        /// Publish freshly built AS bytes to traversal.
+        const BUILD_TO_TRACE = 1 << 4;
+        /// An in-place rewrite at stable addresses vs. a still-in-flight trace.
+        /// Write-after-read: an execution dependency, no source access.
+        const TRACE_TO_BUILD_WAR = 1 << 5;
+        /// An opacity micromap build feeding the CLAS build that references it.
+        const MICROMAP_TO_BUILD_INPUT = 1 << 6;
+        /// Trace output consumed by a later compute / blit pass.
+        const TRACE_TO_COMPUTE = 1 << 7;
+    }
+}
+
+/// The four masks a seam set resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeamMasks {
+    pub src_stage: vk::PipelineStageFlags2,
+    pub src_access: vk::AccessFlags2,
+    pub dst_stage: vk::PipelineStageFlags2,
+    pub dst_access: vk::AccessFlags2,
+}
+
+/// Resolve `seams` to its stage/access masks. Pure — no device, no encoder — so
+/// the mapping is unit-testable without an adapter.
+///
+/// Every stage named here is unconditionally legal: `init_allocator` refuses to
+/// initialize solari unless the cluster-AS, opacity-micromap AND ray-tracing-pipeline
+/// features are all present, and every seam site bails without the
+/// [`Allocator`](crate::gpu::allocator::Allocator) that gate guards. So there is no
+/// feature bool to thread — naming `RAY_TRACING_SHADER_KHR` without the feature
+/// (`VUID-vkCmdPipelineBarrier-dstStageMask-07949`) is unreachable by construction.
+pub fn seam_masks(seams: AsSeams) -> SeamMasks {
+    use vk::AccessFlags2 as A;
+    use vk::PipelineStageFlags2 as S;
+
+    // Both traversal consumers: the RT pipeline (`vkCmdTraceRays`) for shading, and
+    // inline `rayQuery` from compute (ReSTIR spatial reuse, the batch ray-query
+    // service). They run against the same AS, so a publish must cover both.
+    let trace_stage = S::RAY_TRACING_SHADER_KHR | S::COMPUTE_SHADER;
+
+    let mut m = SeamMasks {
+        src_stage: S::NONE,
+        src_access: A::NONE,
+        dst_stage: S::NONE,
+        dst_access: A::NONE,
+    };
+    let mut add = |src_stage, src_access, dst_stage, dst_access| {
+        m.src_stage |= src_stage;
+        m.src_access |= src_access;
+        m.dst_stage |= dst_stage;
+        m.dst_access |= dst_access;
+    };
+
+    if seams.contains(AsSeams::UPLOAD_TO_BUILD_INPUT) {
+        add(
+            S::COPY,
+            A::TRANSFER_WRITE,
+            S::ACCELERATION_STRUCTURE_BUILD_KHR | S::MICROMAP_BUILD_EXT,
+            A::ACCELERATION_STRUCTURE_READ_KHR | A::MICROMAP_READ_EXT,
+        );
+    }
+    if seams.contains(AsSeams::COMPUTE_TO_BUILD_INPUT) {
+        add(
+            S::COMPUTE_SHADER,
+            A::SHADER_WRITE,
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::ACCELERATION_STRUCTURE_READ_KHR,
+        );
+    }
+    if seams.contains(AsSeams::BUILD_TO_BUILD_INPUT) {
+        add(
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::ACCELERATION_STRUCTURE_WRITE_KHR,
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::ACCELERATION_STRUCTURE_READ_KHR,
+        );
+    }
+    if seams.contains(AsSeams::BUILD_TO_TRANSFER) {
+        add(
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::ACCELERATION_STRUCTURE_WRITE_KHR,
+            S::COPY,
+            A::TRANSFER_READ,
+        );
+    }
+    if seams.contains(AsSeams::BUILD_TO_TRACE) {
+        add(
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::ACCELERATION_STRUCTURE_WRITE_KHR,
+            trace_stage,
+            A::ACCELERATION_STRUCTURE_READ_KHR | A::SHADER_READ,
+        );
+    }
+    if seams.contains(AsSeams::TRACE_TO_BUILD_WAR) {
+        // Write-after-read needs only an execution dependency: the read must
+        // finish before the write starts. No source access mask, no cache flush.
+        add(
+            trace_stage,
+            A::NONE,
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::ACCELERATION_STRUCTURE_WRITE_KHR,
+        );
+    }
+    if seams.contains(AsSeams::MICROMAP_TO_BUILD_INPUT) {
+        add(
+            S::MICROMAP_BUILD_EXT,
+            A::MICROMAP_WRITE_EXT,
+            S::ACCELERATION_STRUCTURE_BUILD_KHR,
+            A::ACCELERATION_STRUCTURE_READ_KHR,
+        );
+    }
+    if seams.contains(AsSeams::TRACE_TO_COMPUTE) {
+        add(
+            trace_stage,
+            A::SHADER_WRITE,
+            S::COMPUTE_SHADER,
+            A::SHADER_READ,
+        );
+    }
+    m
+}
+
+/// Record a seam barrier against a raw command buffer.
 ///
 /// # Safety
 ///
-/// Caller must hold an open Vulkan-backed encoder and pass the
-/// matching Vulkan-backed `RenderDevice`.
-pub unsafe fn cmd_global_as_barrier(
+/// `cb` must be an open command buffer allocated from `device`.
+pub unsafe fn cmd_as_seam_raw(device: &ash::Device, cb: vk::CommandBuffer, seams: AsSeams) {
+    // Raw `vkCmdPipelineBarrier2` — invisible to wgpu's profiler. Span it so the
+    // AS-build barriers show on the Tracy CPU timeline.
+    let _span = tracing::info_span!("vk.as_seam").entered();
+    let m = seam_masks(seams);
+    let barriers = [vk::MemoryBarrier2::default()
+        .src_stage_mask(m.src_stage)
+        .src_access_mask(m.src_access)
+        .dst_stage_mask(m.dst_stage)
+        .dst_access_mask(m.dst_access)];
+    let info = vk::DependencyInfo::default().memory_barriers(&barriers);
+    unsafe { device.cmd_pipeline_barrier2(cb, &info) };
+}
+
+/// Record a seam barrier against the Vulkan command buffer underlying `encoder`.
+///
+/// # Safety
+///
+/// Caller must hold an open Vulkan-backed encoder and pass the matching
+/// Vulkan-backed `RenderDevice`.
+pub unsafe fn cmd_as_seam(
     encoder: &mut wgpu::CommandEncoder,
     render_device: &RenderDevice,
-    rt_pipeline: bool,
+    seams: AsSeams,
 ) {
-    // Raw `vkCmdPipelineBarrier` — invisible to wgpu's profiler. Span
-    // it so the AS-build barriers show on the Tracy CPU timeline.
-    let _span = tracing::info_span!("vk.as_barrier").entered();
-    let src_access = vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR
-        | vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
-        | vk::AccessFlags::SHADER_WRITE
-        | vk::AccessFlags::SHADER_READ
-        | vk::AccessFlags::TRANSFER_WRITE;
-    let dst_access = src_access | vk::AccessFlags::MEMORY_READ;
-    // The shading path traverses the freshly-built AS in the ray-tracing-pipeline
-    // stage (`vkCmdTraceRays`), so the post-build barrier MUST make AS writes
-    // visible to `RAY_TRACING_SHADER_KHR` — otherwise the trace races the build
-    // and reads an empty AS (every ray misses). That stage is only legal when the
-    // `rayTracingPipeline` feature is enabled; including it without the feature
-    // trips VUID-vkCmdPipelineBarrier-dstStageMask-07949 (ERROR_DEVICE_LOST on
-    // NV), hence the gate. `COMPUTE_SHADER` stays for the AS-pass compute that
-    // also reads/writes these buffers (selector, fill, etc.).
-    let rt_stage = if rt_pipeline {
-        vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR
-    } else {
-        vk::PipelineStageFlags::empty()
-    };
-    let src_stage = vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
-        | vk::PipelineStageFlags::COMPUTE_SHADER
-        | vk::PipelineStageFlags::TRANSFER
-        | rt_stage;
-    let dst_stage = src_stage;
     unsafe {
         let hal_device = render_device
             .wgpu_device()
             .as_hal::<VkApi>()
-            .expect("cmd_global_as_barrier requires Vulkan backend");
+            .expect("cmd_as_seam requires Vulkan backend");
         let raw_device = hal_device.raw_device();
         encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
-            let hal_encoder =
-                hal_encoder.expect("cmd_global_as_barrier requires Vulkan backend");
-            let command_buffer = hal_encoder.raw_handle();
-            raw_device.cmd_pipeline_barrier(
-                command_buffer,
-                src_stage,
-                dst_stage,
-                vk::DependencyFlags::empty(),
-                &[vk::MemoryBarrier::default()
-                    .src_access_mask(src_access)
-                    .dst_access_mask(dst_access)],
-                &[],
-                &[],
-            );
+            let hal_encoder = hal_encoder.expect("cmd_as_seam requires Vulkan backend");
+            cmd_as_seam_raw(raw_device, hal_encoder.raw_handle(), seams);
         });
     }
 }
@@ -698,56 +830,14 @@ pub unsafe fn cmd_build_acceleration_structures(
             let hal_encoder = hal_encoder
                 .expect("cmd_build_acceleration_structures requires Vulkan backend");
             let command_buffer = hal_encoder.raw_handle();
+            if let Some(ck) = &fns.checkpoints {
+                (ck.fp().cmd_set_checkpoint_nv)(command_buffer, CKPT_BLAS_KHR as *const _);
+            }
             // One build-geometry-info, one slice of range infos for it.
             as_fns.cmd_build_acceleration_structures(
                 command_buffer,
                 core::slice::from_ref(build_info),
                 &[Some(range_infos)],
-            );
-        });
-    }
-}
-
-/// Barrier making a freshly-built opacity micro-map (`MICROMAP_BUILD_EXT` /
-/// `MICROMAP_WRITE_EXT`) visible to the cluster/AS build that references it
-/// (`ACCELERATION_STRUCTURE_BUILD_KHR` / `ACCELERATION_STRUCTURE_READ_KHR`) and
-/// to later traversals (`MEMORY_READ`). Emit between `cmd_build_micromaps` and
-/// the CLAS build in the same encoder.
-///
-/// # Safety
-///
-/// Caller must hold an open Vulkan-backed encoder and pass the matching device.
-pub unsafe fn cmd_micromap_barrier(
-    encoder: &mut wgpu::CommandEncoder,
-    render_device: &RenderDevice,
-) {
-    let _span = tracing::info_span!("vk.micromap_barrier").entered();
-    unsafe {
-        let hal_device = render_device
-            .wgpu_device()
-            .as_hal::<VkApi>()
-            .expect("cmd_micromap_barrier requires Vulkan backend");
-        let raw_device = hal_device.raw_device();
-        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
-            let hal_encoder =
-                hal_encoder.expect("cmd_micromap_barrier requires Vulkan backend");
-            let command_buffer = hal_encoder.raw_handle();
-            // Legacy sync (sync2 isn't enabled): a micro-map build executes in the
-            // ACCELERATION_STRUCTURE_BUILD stage with AS-write access in the
-            // legacy fallback mapping (there is no legacy MICROMAP stage/access).
-            raw_device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                vk::DependencyFlags::empty(),
-                &[vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
-                    .dst_access_mask(
-                        vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
-                            | vk::AccessFlags::MEMORY_READ,
-                    )],
-                &[],
-                &[],
             );
         });
     }
@@ -828,5 +918,68 @@ pub unsafe fn cmd_build_partitioned_acceleration_structures(
                 command_buffer, build_info,
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every representable seam set, so the invariants below are exhaustive
+    /// rather than sampled.
+    fn all_sets() -> impl Iterator<Item = AsSeams> {
+        (0..=u16::MAX).filter_map(AsSeams::from_bits)
+    }
+
+    #[test]
+    fn war_seam_orders_trace_before_build() {
+        let m = seam_masks(AsSeams::TRACE_TO_BUILD_WAR);
+        assert!(m
+            .src_stage
+            .contains(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR));
+        assert!(m
+            .dst_access
+            .contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR));
+        // Write-after-read is an execution dependency; flushing a source cache
+        // would be meaningless here and the reader wrote nothing.
+        assert_eq!(m.src_access, vk::AccessFlags2::NONE);
+    }
+
+    #[test]
+    fn publish_seam_puts_the_trace_on_the_consuming_side() {
+        let m = seam_masks(AsSeams::BUILD_TO_TRACE);
+        let rt = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
+        assert!(m.dst_stage.contains(rt));
+        assert!(!m.src_stage.contains(rt));
+        assert!(m
+            .src_access
+            .contains(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR));
+    }
+
+    #[test]
+    fn composition_is_the_field_wise_union() {
+        for a in all_sets() {
+            for b in [
+                AsSeams::UPLOAD_TO_BUILD_INPUT,
+                AsSeams::BUILD_TO_TRACE,
+                AsSeams::TRACE_TO_BUILD_WAR,
+                AsSeams::MICROMAP_TO_BUILD_INPUT,
+            ] {
+                let (ma, mb, mu) = (seam_masks(a), seam_masks(b), seam_masks(a | b));
+                assert_eq!(mu.src_stage, ma.src_stage | mb.src_stage);
+                assert_eq!(mu.src_access, ma.src_access | mb.src_access);
+                assert_eq!(mu.dst_stage, ma.dst_stage | mb.dst_stage);
+                assert_eq!(mu.dst_access, ma.dst_access | mb.dst_access);
+            }
+        }
+    }
+
+    #[test]
+    fn every_non_empty_seam_set_produces_a_dependency() {
+        for seams in all_sets().filter(|s| !s.is_empty()) {
+            let m = seam_masks(seams);
+            assert_ne!(m.src_stage, vk::PipelineStageFlags2::NONE, "{seams:?}");
+            assert_ne!(m.dst_stage, vk::PipelineStageFlags2::NONE, "{seams:?}");
+        }
     }
 }

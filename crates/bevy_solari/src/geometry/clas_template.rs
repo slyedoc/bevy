@@ -27,7 +27,7 @@ use wgpu::CommandEncoderDescriptor;
 use super::clas_arena::{CLAS_SCRATCH_ALIGN, CLAS_STORAGE_ALIGN, CLUSTER_CLAS_ADDRESSES_VIRTUAL_BYTES};
 use super::{Cluster, ClusterBloatAabb, ClusterIndex, ClusterMesh, ClusterMeshManager};
 use crate::gpu::allocator::{Allocator, MemoryLocation, SparseBuffer};
-use crate::gpu::extension::ClusterExtensionFns;
+use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 use crate::gpu::retire::GpuRetire;
 
 /// Virtual address space reserved for the template-CLAS storage arena —
@@ -382,13 +382,13 @@ impl ClusterTemplateArena {
         unsafe {
             // Input barrier: the build reads staged `write_buffer` bytes by device
             // address (untracked) — nothing else orders TRANSFER_WRITE → AS_BUILD.
-            crate::gpu::extension::cmd_global_as_barrier(&mut encoder, render_device, false);
+            crate::gpu::extension::cmd_as_seam(&mut encoder, render_device, AsSeams::UPLOAD_TO_BUILD_INPUT);
             crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
                 &mut encoder,
                 fns,
                 &cmd_info,
             );
-            crate::gpu::extension::cmd_global_as_barrier(&mut encoder, render_device, false);
+            crate::gpu::extension::cmd_as_seam(&mut encoder, render_device, AsSeams::BUILD_TO_TRANSFER);
         }
         // No CPU wait: trailing global AS barrier + submission order make the
         // template addresses visible to the copy.

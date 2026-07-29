@@ -18,7 +18,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::CommandEncoderDescriptor;
 
 use crate::gpu::allocator::{Allocator, MemoryLocation};
-use crate::gpu::extension::ClusterExtensionFns;
+use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 use super::tess_table_data as table;
 
 /// One subdivision pattern's slice into the shared vertex / triangle pools.
@@ -421,11 +421,14 @@ impl TessellationTable {
             label: Some("tess_table.template_build"),
         });
         // SAFETY: fns loaded; encoder Vulkan-backed; descriptors reference live buffers.
+        // Leading seam: the descriptors + count staged by `write_buffer` above are
+        // transfer writes the build reads as AS input.
         unsafe {
+            crate::gpu::extension::cmd_as_seam(&mut encoder, render_device, AsSeams::UPLOAD_TO_BUILD_INPUT);
             crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
                 &mut encoder, fns, &cmd,
             );
-            crate::gpu::extension::cmd_global_as_barrier(&mut encoder, render_device, false);
+            crate::gpu::extension::cmd_as_seam(&mut encoder, render_device, AsSeams::BUILD_TO_TRANSFER);
         }
         let addresses = submit_and_read_u64(render_device, render_queue, encoder, &dst_addresses, count);
 

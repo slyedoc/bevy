@@ -132,6 +132,7 @@ serde_json = { version = "1.0.140", optional = true }
 # The camera config wire format (--camera RON round-trip, debug tooling).
 serde = { version = "1", features = ["derive"], optional = true }
 ron = { version = "0.12", optional = true }
+bitflags = { version = "2" }
 bytemuck = { version = "1" }
 # Harness dumps (`SolariFreezeDiff`): the accumulated output buffer is written
 # as OpenEXR for offline FLIP/RMSE grading.

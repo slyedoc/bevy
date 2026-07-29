@@ -350,18 +350,6 @@ fn offset_ray_origin(p: vec3<f32>, geometric_normal: vec3<f32>) -> vec3<f32> {
 
 const RAY_NO_CULL = 0xFFu;
 
-// Per-view RT cull mask (the camera's `RenderLayers` → low 8 bits). `trace_ray`
-// passes it as the ray `cullMask`, so the hardware skips any instance whose
-// `mask` shares no bit — the RT analog of render layers, free during traversal.
-// Per-view, so each compute entry seeds it via `set_view_cull_mask` from its
-// `solari_view` uniform. Defaults to no-cull so a pass that forgets to seed it
-// still renders everything (never a black screen) rather than nothing.
-var<private> view_cull_mask: u32 = RAY_NO_CULL;
-
-fn set_view_cull_mask(mask: u32) {
-    view_cull_mask = mask;
-}
-
 // Per-view floating-origin delta (`origin_now − origin_prev`), seeded by entries
 // that consume `previous_frame_world_position` (the opaque chit). The tess
 // branches synthesize a STATIC previous position from the current one, which
@@ -373,25 +361,7 @@ fn set_reproj_origin_delta(delta: vec3<f32>) {
     reproj_origin_delta = delta;
 }
 
-fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
-    let ray = RayDesc(ray_flag, view_cull_mask, ray_t_min, ray_t_max, ray_origin, ray_direction);
-    var rq: ray_query;
-    rayQueryInitialize(&rq, tlas, ray);
-    // Opaque instances commit in hardware and never enter this loop; only
-    // alpha-masked instances (PTLAS `FORCE_NO_OPAQUE`) surface candidates.
-    // Confirming only mask-passing candidates makes cutouts (foliage,
-    // fences) hold for primary, bounce, AND shadow rays alike.
-    while rayQueryProceed(&rq) {
-        let candidate = rayQueryGetCandidateIntersection(&rq);
-        if candidate.kind == RAY_QUERY_INTERSECTION_TRIANGLE && alpha_test(candidate) {
-            rayQueryConfirmIntersection(&rq);
-        }
-    }
-    return rayQueryGetCommittedIntersection(&rq);
-}
-
-// Mask-test core, addressable from both the inline rayQuery candidate
-// (`alpha_test`) and the RT-pipeline any-hit shader (`ahit_alpha`): base-color
+// Mask-test core for the RT-pipeline any-hit shader (`ahit_alpha`): base-color
 // texture alpha at the hit UV against the material's cutoff. `true` = keep the hit
 // (solid texel), `false` = cut it (a hole the ray passes through). No texture =
 // solid (alpha 1). The base-color FACTOR's alpha is not applied (the binder stores
@@ -415,11 +385,6 @@ fn alpha_passes(material_id: u32, cluster_index: u32, primitive_index: u32, bary
     let uv = mat3x2(uv0, uv1, uv2) * barycentrics;
     let alpha = textureSampleLevel(textures[texture_id], samplers[texture_id], uv, 0.0).a;
     return alpha >= material.alpha_mask;
-}
-
-// Mask test for an inline rayQuery candidate triangle.
-fn alpha_test(hit: RayIntersection) -> bool {
-    return alpha_passes(material_ids[hit.instance_index], hit.geometry_index, hit.primitive_index, hit.barycentrics);
 }
 
 // A `partial_lod` at or below this means "sample mip 0" — used by callers that

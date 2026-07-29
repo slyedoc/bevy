@@ -354,10 +354,8 @@ impl Plugin for HairPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<HairAsset>();
         app.init_asset_loader::<HairLoader>();
-        // The Chiang fiber BSDF (`bevy_solari::hair`) + the scene-integrated hair
-        // shading shared by the pathtracer and the realtime path (`bevy_solari::hair_shade`).
+        // The Chiang fiber BSDF (`bevy_solari::hair`), imported by `chit_hair`.
         bevy_shader::load_shader_library!(app, "hair.wgsl");
-        bevy_shader::load_shader_library!(app, "hair_shade.wgsl");
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;

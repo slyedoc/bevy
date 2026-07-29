@@ -45,7 +45,7 @@ use crate::instance::InstanceManager;
 
 use crate::gpu::allocator::{Allocator, SparseBuffer};
 use super::blas_sharing::BlasSharing;
-use crate::gpu::extension::{ClusterExtensionFns, RayTracingPipelineFeature};
+use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 use super::selector::Selector;
 
 /// Address alignment for a per-bucket BLAS region. Vulkan requires
@@ -145,7 +145,6 @@ pub fn dispatch_blas_rebuild(
     pipelines: Res<crate::pipelines::SolariPipelines>,
     scene_bind_group: Res<crate::bindings::ClusterSceneBindGroup>,
     view_query: bevy_ecs::system::Query<&ViewUniformOffset, bevy_ecs::query::With<ExtractedCamera>>,
-    additional: Res<bevy_render::renderer::raw_vulkan_init::AdditionalVulkanFeatures>,
     mut ctx: RenderContext,
 ) {
     let (
@@ -292,26 +291,31 @@ pub fn dispatch_blas_rebuild(
     // wgpu encoder is open and Vulkan-backed; descriptor strides +
     // addresses point at live buffers committed this frame.
     unsafe {
-        // PRE-build barrier: the sharing + selector compute wrote
+        // PRE-build seam: the sharing + selector compute wrote
         // `geometry_dst_addresses`, `dirty_build_count`, `args_buf`, and
-        // `selected_clas_refs`. A global barrier (submission-order
-        // dependency on the same queue) makes those visible as build input.
-        // Includes the RT stage (when the feature is on): buckets rebuild IN
-        // PLACE at stable pool addresses, and for live re-instantiated
-        // geometry (procedural grow-in-place) that happens every frame while
-        // the previous frame's trace may still be walking the old BLAS bytes
-        // — a WAR hazard the AS/compute-only stages don't order.
-        let rt_pipeline = additional.has::<RayTracingPipelineFeature>();
-        crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, rt_pipeline);
+        // `selected_clas_refs`. `TRACE_TO_BUILD_WAR` because buckets rebuild IN
+        // PLACE at stable pool addresses: for live re-instantiated geometry
+        // (procedural grow-in-place) that happens every frame while the previous
+        // frame's trace may still be walking those BLAS bytes.
+        crate::gpu::extension::cmd_as_seam(
+            &mut encoder,
+            &render_device,
+            AsSeams::COMPUTE_TO_BUILD_INPUT
+                | AsSeams::BUILD_TO_BUILD_INPUT
+                | AsSeams::TRACE_TO_BUILD_WAR,
+        );
         crate::gpu::extension::cmd_build_cluster_acceleration_structures_indirect(
             &mut encoder,
             &fns,
             &cmd_info,
         );
-        // POST-build barrier: BUILD → SHADER_READ + BUILD_INPUT_READ so
-        // the PTLAS fill compute sees fresh BLAS addresses and the PTLAS
-        // build sees fresh BLAS payload bytes.
-        crate::gpu::extension::cmd_global_as_barrier(&mut encoder, &render_device, false);
+        // POST-build seam: the PTLAS fill compute sees fresh BLAS addresses and
+        // the PTLAS build sees fresh BLAS payload bytes.
+        crate::gpu::extension::cmd_as_seam(
+            &mut encoder,
+            &render_device,
+            AsSeams::BUILD_TO_BUILD_INPUT | AsSeams::BUILD_TO_TRACE,
+        );
     }
     ctx.add_command_buffer(encoder.finish());
 

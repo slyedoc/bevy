@@ -22,13 +22,13 @@
 //!   3. The USER's fill system (also `SolariProceduralSystems::Fill`, after
 //!      `drain_pending_procedural`): drains its assets from `ProceduralFillQueue`,
 //!      dispatches its generation compute writing the reserved vertex ranges
-//!      (encoder submitted immediately, NOT deferred), then pushes the asset ids
-//!      into `ProceduralInstantiateQueue`.
+//!      (either through `RenderContext` or its own submit), then pushes the asset
+//!      ids into `ProceduralInstantiateQueue`.
 //!   4. `instantiate_procedural` (Instantiate set): CPU-writes the per-cluster
 //!      `InstantiateClusterInfoNV` descriptors (template addresses are CPU-known
 //!      from the one-time set build), records one `INSTANTIATE_TRIANGLE_CLUSTER`
-//!      op per mesh into per-mesh CLAS slabs, submits, and reports the mesh
-//!      ready through `ProceduralReadyChannel`.
+//!      op per mesh into per-mesh CLAS slabs, hands them to the shared render
+//!      context, and reports the mesh ready through `ProceduralReadyChannel`.
 #![allow(unsafe_code, reason = "raw-VK cluster-AS template instantiate")]
 
 use ash::vk::{self, TaggedStructure};
@@ -41,7 +41,7 @@ use bevy_math::Vec3;
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     render_resource::Buffer,
-    renderer::{RenderDevice, RenderQueue},
+    renderer::{RenderContext, RenderDevice, RenderQueue},
 };
 use core::ops::Range;
 use range_alloc::RangeAllocator;
@@ -55,10 +55,9 @@ use super::{Cluster, ClusterIndex, ClusterMesh, ClusterMeshManager};
 use crate::gpu::allocator::{Allocator, MemoryLocation, SparseBuffer};
 use crate::gpu::retire::GpuRetire;
 use crate::gpu::extension::{
-    cmd_build_cluster_acceleration_structures_indirect, cmd_global_as_barrier,
-    ClusterExtensionFns, RayTracingPipelineFeature,
+    cmd_as_seam, cmd_build_cluster_acceleration_structures_indirect, AsSeams,
+    ClusterExtensionFns,
 };
-use bevy_render::renderer::raw_vulkan_init::AdditionalVulkanFeatures;
 
 /// Virtual address space reserved for the procedural CLAS slab arena — 8 GB,
 /// sparse-backed (only committed pages cost memory). Slabs are fixed-size per
@@ -132,7 +131,7 @@ pub struct ProceduralPendingUpload {
 /// System sets for the procedural flow, chained in the `RenderGraph` schedule
 /// before `SolariClusterSystems::Scatter`: `Reserve` publishes this frame's
 /// reserved meshes (+ builds missing template sets), USER fill systems go in
-/// `Fill` (dispatch generation compute, submit immediately, push to
+/// `Fill` (dispatch generation compute, push to
 /// [`ProceduralInstantiateQueue`]), `Instantiate` builds their CLAS.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SolariProceduralSystems {
@@ -626,10 +625,12 @@ impl ProceduralClusters {
         };
         // SAFETY: fn table loaded; encoder open + Vulkan-backed; descriptor
         // strides/addresses reference the buffers created above; no wgpu
-        // commands touch this encoder afterward.
+        // commands touch this encoder afterward. Leading seam: those descriptors
+        // are `write_buffer` transfer writes the build reads.
         unsafe {
+            cmd_as_seam(&mut encoder, render_device, AsSeams::UPLOAD_TO_BUILD_INPUT);
             cmd_build_cluster_acceleration_structures_indirect(&mut encoder, fns, &cmd);
-            cmd_global_as_barrier(&mut encoder, render_device, false);
+            cmd_as_seam(&mut encoder, render_device, AsSeams::BUILD_TO_TRANSFER);
         }
         render_queue.submit([encoder.finish()]);
 
@@ -853,7 +854,7 @@ pub fn instantiate_procedural(
     mut retire: ResMut<GpuRetire>,
     ready: Res<ProceduralReadyChannel>,
     sharing: Option<Res<crate::accel::blas_sharing::BlasSharing>>,
-    additional: Res<AdditionalVulkanFeatures>,
+    mut ctx: RenderContext,
 ) {
     if queue.0.is_empty() {
         return;
@@ -1089,18 +1090,18 @@ pub fn instantiate_procedural(
     // no wgpu commands touch this encoder afterward.
     unsafe {
         // Make the fill dispatches' vertex-pool writes (earlier submits this
-        // frame) visible to the AS-build stage — AND order any still-in-flight
-        // trace (previous frame's `vkCmdTraceRays`, RT stage) BEFORE the slab
-        // rewrite. A RE-instantiate overwrites CLAS bytes a live mesh's rays
-        // may still be walking; without the RT stage in the barrier that WAR
-        // hazard reads mid-build garbage → wild-address MMU fault in traversal
-        // (first hit by flora's grow-in-place re-instantiate; the planet crate
-        // only ever instantiates never-traced memory, which is why `false`
-        // survived there). The RT stage flag is gated on the feature being
-        // enabled — including it without `rayTracingPipeline` is itself a
-        // device-lost (VUID-vkCmdPipelineBarrier-dstStageMask-07949).
-        let rt_pipeline = additional.has::<RayTracingPipelineFeature>();
-        cmd_global_as_barrier(&mut encoder, &render_device, rt_pipeline);
+        // frame) visible to the AS-build stage, and order any still-in-flight
+        // trace BEFORE the slab rewrite: a RE-instantiate overwrites CLAS bytes
+        // a live mesh's rays may still be walking, and that WAR hazard reads
+        // mid-build garbage → wild-address MMU fault in traversal (first hit by
+        // flora's grow-in-place re-instantiate).
+        cmd_as_seam(
+            &mut encoder,
+            &render_device,
+            AsSeams::UPLOAD_TO_BUILD_INPUT
+                | AsSeams::BUILD_TO_BUILD_INPUT
+                | AsSeams::TRACE_TO_BUILD_WAR,
+        );
         for ((i, op), &dst_offset) in ops.iter().enumerate().zip(&dst_offsets) {
             let tset = &procedural.templates[&op.key_band];
             let op_input = vk::ClusterAccelerationStructureOpInputNV {
@@ -1143,16 +1144,25 @@ pub fn instantiate_procedural(
                 _marker: core::marker::PhantomData,
             };
             cmd_build_cluster_acceleration_structures_indirect(&mut encoder, &fns, &cmd);
-            // One barrier per op: the driver appears to need the hazard break
+            // One seam per op: the driver appears to need the hazard break
             // even across disjoint scratch/dst regions.
-            cmd_global_as_barrier(&mut encoder, &render_device, false);
+            cmd_as_seam(
+                &mut encoder,
+                &render_device,
+                AsSeams::BUILD_TO_BUILD_INPUT | AsSeams::BUILD_TO_TRACE,
+            );
         }
     }
-    render_queue.submit([encoder.finish()]);
+    // Handed to the shared context rather than submitted here: a direct submit
+    // from a system inside `RenderGraphSystems::Render` lands on the queue ahead
+    // of every ctx-recorded buffer of the same frame, including the user `Fill`
+    // dispatch this build reads. `add_command_buffer` flushes the pending ctx
+    // segment first, so the `Reserve → Fill → Instantiate` chain implies GPU order.
+    ctx.add_command_buffer(encoder.finish());
 
     // GPU copy: dst addresses → the global per-cluster CLAS address table (the
     // same slots the direct build fills). Separate wgpu encoder — the trailing
-    // barrier above covers AS-write → TRANSFER-read across the submits.
+    // seam above covers AS-write → TRANSFER-read.
     let mut copy_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("procedural.instantiate.copy_addresses"),
     });
@@ -1165,7 +1175,7 @@ pub fn instantiate_procedural(
             (op.cluster_count as u64) * 8,
         );
     }
-    render_queue.submit([copy_encoder.finish()]);
+    ctx.add_command_buffer(copy_encoder.finish());
 
     tracing::debug!(
         "procedural: batch src 0x{src_infos_addr:x}+{desc_bytes_len} scratch 0x{scratch_base:x} dst 0x{dst_addresses_addr:x}+{}",
