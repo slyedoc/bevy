@@ -161,7 +161,11 @@ fn instantiate(@builtin(global_invocation_id) gid: vec3<u32>) {
         let rec = block_base + w;
         let b = rec * 8u;
         instantiate_args[b + 0u] = 0u; // cluster_id_offset
-        instantiate_args[b + 1u] = 0u; // geometry_index_offset_and_reserved (keep template's baked id)
+        // geometry_index_offset (24 bits) + reserved(8)=0: templates bake a
+        // MESH-LOCAL geometry index (a global one blows up their encoding — see
+        // `clas_template`), so re-add the mesh's cluster base here to land the
+        // global id the inline ray-query path reads back.
+        instantiate_args[b + 1u] = lod.cluster_base & 0x00FFFFFFu;
         instantiate_args[b + 2u] = template_addr.x; // cluster_template_address lo
         instantiate_args[b + 3u] = template_addr.y; // hi
         instantiate_args[b + 4u] = vaddr.x; // vertex_buffer.address lo

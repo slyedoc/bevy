@@ -206,8 +206,17 @@ impl ClusterTemplateArena {
                     ),
                     base_geometry_index_and_geometry_flags:
                         vk::ClusterAccelerationStructureGeometryIndexAndGeometryFlagsNV {
+                            // MESH-LOCAL geometry index — the instantiate re-adds
+                            // `cluster_base` as its `geometry_index_offset`, so the
+                            // instantiated CLAS still carries the global id the
+                            // ray-query path reads. Baking the global id here instead
+                            // forces `max_geometry_index_value` up to this mesh's
+                            // highest global cluster id, and past a few thousand the
+                            // driver's template encoding makes every INSTANTIATE from
+                            // it produce a CLAS that faults traversal (see
+                            // `zero/docs/solari_animated_crash.md`).
                             geometry_index_and_geometry_flags: vk::Packed24_5_3::new(
-                                global_id,
+                                local_id as u32,
                                 OPAQUE_GEOMETRY_FLAG,
                             ),
                         },
@@ -270,11 +279,15 @@ impl ClusterTemplateArena {
         });
         render_queue.write_buffer(&count_buf, 0, &(cluster_count as u32).to_le_bytes());
 
+        // Mesh-local geometry indices (see the descriptor above): the declared max
+        // is this mesh's cluster count, NOT its highest global cluster id. Templates
+        // built with a large max instantiate into corrupt CLASes.
+        let max_geometry_index = (cluster_count as u32).saturating_sub(1);
         // 3. Build-shape size query.
         let mut triangle_input =
             vk::ClusterAccelerationStructureTriangleClusterInputNV::default()
                 .vertex_format(vk::Format::R32G32B32_SFLOAT)
-                .max_geometry_index_value(max_global_cluster_id)
+                .max_geometry_index_value(max_geometry_index)
                 .max_cluster_unique_geometry_count(1)
                 .max_cluster_triangle_count(max_tris)
                 .max_cluster_vertex_count(max_verts)
