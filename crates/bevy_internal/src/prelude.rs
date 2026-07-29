@@ -114,3 +114,7 @@ pub use crate::picking::prelude::*;
 #[doc(hidden)]
 #[cfg(feature = "bevy_clipboard")]
 pub use crate::clipboard::prelude::*;
+
+#[doc(hidden)]
+#[cfg(feature = "bevy_solari")]
+pub use crate::solari::prelude::*;
