@@ -49,9 +49,11 @@ use crate::transform::{LocalRSColumn, LocalTranslationColumn, ParentColumn, Tran
 
 /// Max concurrent animated instances per frame. Deform / instantiate / BLAS
 /// pools are sized for this; overflow falls back to the static (rest-pose) path.
-pub const MAX_ANIMATED_INSTANCES: u32 = 8;
+/// A make_human character is 8 instances (one per part), so this is 4 characters.
+pub const MAX_ANIMATED_INSTANCES: u32 = 32;
 /// Max vertices per animated mesh — the per-slot stride of the deform pool.
-pub const MAX_VERTS_PER_ANIMATED_MESH: u32 = 65536;
+/// Sized for a make_human skin (measured 114871 verts / 1296 clusters).
+pub const MAX_VERTS_PER_ANIMATED_MESH: u32 = 131072;
 
 const WORKGROUP_SIZE: u32 = 64;
 
