@@ -190,6 +190,9 @@ impl Plugin for DefaultInspectorWidgetsPlugin {
         register!(usize);
         register!(bool);
 
+        // Every card the inspector builds reads its collapsed state from here.
+        app.init_resource::<crate::collapse::InspectorCollapsed>();
+
         // Keep open widgets in sync when their source values change elsewhere.
         app.add_systems(Update, crate::sync::sync_inspector_widgets);
     }

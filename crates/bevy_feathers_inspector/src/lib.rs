@@ -14,6 +14,10 @@
 //! on real edits. Per-field configuration reuses native `#[reflect(@...)]` attributes: a numeric
 //! range gives a bounded slider, and the [`ReadOnly`]/[`Hidden`] markers control fields.
 //!
+//! Every card — a component section, or a nested struct/enum/list field — has a disclosure chevron
+//! that hides its body, so a deep component can be narrowed to the part you care about. See
+//! [`InspectorCollapsed`].
+//!
 //! ## Warning: Experimental!
 //! Like `bevy_feathers` itself, this crate is early and will change in breaking ways.
 
@@ -21,6 +25,7 @@ extern crate alloc;
 
 pub mod attributes;
 pub mod binding;
+pub mod collapse;
 pub mod entry;
 pub mod enums;
 pub mod lists;
@@ -33,6 +38,7 @@ pub use attributes::{FieldCtx, Hidden, ReadOnly};
 pub use binding::{
     inspector_writeback_bool, inspector_writeback_slider, InspectorBinding, InspectorRoot,
 };
+pub use collapse::InspectorCollapsed;
 pub use entry::{
     build_component_inspector, build_entity_inspector, build_resource_inspector,
     find_ancestor_panel, rebuild_panel, BuildComponentInspector, BuildEntityInspector,

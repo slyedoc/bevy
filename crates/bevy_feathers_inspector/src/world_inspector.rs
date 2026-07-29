@@ -131,6 +131,8 @@ impl<F: QueryFilter + Send + Sync + 'static> Plugin for WorldInspectorPlugin<F> 
     fn build(&self, app: &mut bevy_app::App) {
         app.init_resource::<WorldInspectorState>();
         app.init_resource::<WorldInspectorCache>();
+        // The component cards this panel embeds are collapsible on their own.
+        app.init_resource::<crate::collapse::InspectorCollapsed>();
         app.insert_resource(WorldInspectorConfig {
             toggle_key: self.toggle_key,
         });

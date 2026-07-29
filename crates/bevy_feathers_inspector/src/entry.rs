@@ -17,6 +17,7 @@ use bevy_scene::Scene;
 
 use crate::attributes::FieldCtx;
 use crate::binding::InspectorRoot;
+use crate::collapse::InspectorCollapsed;
 use crate::recurse::{build_value, group_card, BuildCx};
 
 /// Marks a panel entity built by the inspector, recording what it inspects so structural edits can
@@ -82,7 +83,7 @@ pub(crate) fn entity_component_sections(
         };
         let name = registration.type_info().ty().short_path();
         let root = InspectorRoot::Component { entity, type_id };
-        sections.push(section_for(registry, root, name, reflected));
+        sections.push(section_for(world, registry, root, name, reflected));
     }
     sections
 }
@@ -121,7 +122,7 @@ pub(crate) fn component_section(
     let reflected = reflect_component.reflect(world.get_entity(target).ok()?)?;
     let name = registration.type_info().ty().short_path();
     let root = InspectorRoot::Component { entity: target, type_id };
-    Some(section_for(registry, root, name, reflected))
+    Some(section_for(world, registry, root, name, reflected))
 }
 
 /// (Re)build a single-resource inspector as the sole child of `panel`.
@@ -159,6 +160,7 @@ pub(crate) fn resource_section(
     let reflected = reflect_component.reflect(world.entity(resource_entity))?;
     let name = registration.type_info().ty().short_path();
     Some(section_for(
+        world,
         registry,
         InspectorRoot::Resource { type_id },
         name,
@@ -168,14 +170,19 @@ pub(crate) fn resource_section(
 
 /// Build one titled section (a boxed scene) for a reflected value reachable from `root`.
 pub(crate) fn section_for(
+    world: &World,
     registry: &bevy_reflect::TypeRegistry,
     root: InspectorRoot,
     name: &str,
     reflected: &dyn Reflect,
 ) -> Box<dyn Scene> {
-    let cx = BuildCx { registry, root };
+    let cx = BuildCx {
+        registry,
+        root,
+        collapsed: world.resource::<InspectorCollapsed>(),
+    };
     let body = build_value(&cx, "", reflected.as_partial_reflect(), &FieldCtx::default());
-    Box::new(group_card(name, body))
+    Box::new(group_card(&cx, "", name, body))
 }
 
 /// Rebuild a panel according to what its [`InspectorPanel`] records.

@@ -75,7 +75,7 @@ pub(crate) fn reflect_to_bool(value: &dyn PartialReflect) -> Option<bool> {
 }
 
 /// Identifies the reflected value that an inspector widget edits.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum InspectorRoot {
     /// A component on a specific entity.
     Component {

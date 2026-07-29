@@ -11,13 +11,14 @@ use bevy_reflect::tuple_struct::TupleStruct;
 use bevy_reflect::{ParsedPath, PartialReflect, ReflectRef, TypeRegistry};
 use bevy_scene::prelude::*;
 use bevy_scene::Scene;
-use bevy_ui::{percent, px, AlignItems, Display, FlexDirection, Node};
+use bevy_ui::{percent, px, AlignItems, Display, FlexDirection, JustifyContent, Node};
 
 use bevy_feathers::containers::{group, group_body, group_header};
 use bevy_feathers::display::{label, label_dim};
 
 use crate::attributes::FieldCtx;
 use crate::binding::InspectorRoot;
+use crate::collapse::{collapse_toggle, CollapseBody, CollapseGroup, InspectorCollapsed};
 use crate::enums::build_enum;
 use crate::lists::build_list;
 use crate::widget::ReflectInspectorWidget;
@@ -28,6 +29,8 @@ pub struct BuildCx<'a> {
     pub registry: &'a TypeRegistry,
     /// The reflected value this subtree edits.
     pub root: InspectorRoot,
+    /// Which cards under this root are collapsed.
+    pub collapsed: &'a InspectorCollapsed,
 }
 
 /// Build an editing scene for `value`, reachable from `cx.root` via the reflection path `path`.
@@ -130,7 +133,7 @@ pub(crate) fn field_entry(
     let compound = is_compound(cx, child, field);
     let widget = build_value(cx, path, child, field);
     if compound {
-        Box::new(group_card(name, widget))
+        Box::new(group_card(cx, path, name, widget))
     } else {
         Box::new(field_row(name, widget))
     }
@@ -206,17 +209,42 @@ pub fn column(rows: Vec<Box<dyn Scene>>) -> impl Scene {
 }
 
 /// A titled feathers `group` card wrapping a body scene, filling its width.
-pub(crate) fn group_card(title: &str, body: Box<dyn Scene>) -> impl Scene {
-    let header: Vec<Box<dyn Scene>> = vec![Box::new(label(title.to_string()))];
+///
+/// The header carries a disclosure chevron that hides the body; `path` keys that state so it
+/// survives panel rebuilds. See [`collapse`](crate::collapse).
+pub(crate) fn group_card(
+    cx: &BuildCx,
+    path: &str,
+    title: &str,
+    body: Box<dyn Scene>,
+) -> impl Scene {
+    let collapsed = cx.collapsed.is_collapsed(&cx.root, path);
+    let body_display = if collapsed {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    let header: Vec<Box<dyn Scene>> = vec![
+        collapse_toggle(&cx.root, path, collapsed),
+        Box::new(label(title.to_string())),
+    ];
     let content: Vec<Box<dyn Scene>> = vec![body];
     bsn! {
         group()
+        CollapseGroup
         Node { width: percent(100) }
         Children [
-            (group_header() Children [ {header} ]),
+            (
+                group_header()
+                // The chevron and the title read as one unit, so override the header's
+                // space-between default.
+                Node { justify_content: JustifyContent::Start, column_gap: px(6) }
+                Children [ {header} ]
+            ),
             (
                 group_body()
-                Node { width: percent(100) }
+                CollapseBody
+                Node { width: percent(100), display: {body_display} }
                 Children [ {content} ]
             ),
         ]
