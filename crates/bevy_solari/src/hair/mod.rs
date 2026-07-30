@@ -1,7 +1,8 @@
 //! Ray-traced hair via NV linear swept spheres (`VK_NV_ray_tracing_linear_swept_spheres`).
 //!
-//! A [`Hair`] component references a [`HairAsset`] (strands of control points +
-//! radii). The asset is uploaded and built into one linear-swept-sphere BLAS by
+//! A [`HairMesh3d`] component references a [`HairAsset`] (strands of control
+//! points + radii), paired with a [`HairMaterial3d`] fiber appearance. The asset
+//! is uploaded and built into one linear-swept-sphere BLAS by
 //! [`manager`]; each hair entity becomes a PTLAS instance referencing that BLAS
 //! (see [`ptlas_hair`]); ray hits on hair shade with a Chiang fiber BSDF
 //! (`hair.wgsl`), reconstructing the fiber tangent + surface point from the hit
@@ -21,14 +22,18 @@ pub use loader::HairLoader;
 pub use manager::HairManager;
 
 use bevy_app::{App, Plugin};
-use bevy_asset::{AssetApp, AssetId, Handle};
+use bevy_asset::{Asset, AssetApp, AssetId, Assets, Handle};
+use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     component::Component,
+    prelude::ReflectComponent,
     resource::Resource,
     schedule::IntoScheduleConfigs,
     system::{Commands, Query, Res, ResMut},
+    template::FromTemplate,
 };
 use bevy_math::Vec3;
+use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_render::{
     render_resource::{RawBufferVec, ShaderType, StorageBuffer},
     renderer::{RenderDevice, RenderGraph, RenderQueue},
@@ -37,6 +42,7 @@ use bevy_render::{
 };
 use bevy_transform::components::Transform;
 use bytemuck::{Pod, Zeroable};
+use derive_more::derive::From;
 
 use crate::ecs_gpu::GpuSlot;
 use crate::material::material_slots::MaterialSlots;
@@ -48,23 +54,33 @@ use crate::{SolariClusterSystems, SolariSetup};
 /// not as an opaque [`StandardSolariMaterial`] surface. Mirrors WGSL `HAIR_MATERIAL_NONE`.
 pub const HAIR_MATERIAL_NONE: u32 = 0xFFFF_FFFF;
 
-/// A hair/fur groom on an entity. The entity's [`GlobalTransform`] places the
+/// A hair/fur groom on an entity. The entity's `GlobalTransform` places the
 /// groom in the world; the [`HairAsset`] supplies the strand geometry.
-#[derive(Component, Clone, Debug)]
-#[require(Transform, SyncToRenderWorld)]
-pub struct Hair {
-    /// The strand geometry.
-    pub asset: Handle<HairAsset>,
-    /// Fiber shading parameters.
-    pub material: HairMaterial,
-}
+///
+/// Pairs with [`HairMaterial3d`] (required, so a groom with no explicit material
+/// resolves to the default [`HairMaterial`]) — the swept-sphere counterpart to
+/// [`RaytracingMesh3d`](crate::bindings::RaytracingMesh3d) + `SolariMaterial3d`.
+#[derive(
+    Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From,
+)]
+#[reflect(Component, Default, Clone, PartialEq)]
+#[require(HairMaterial3d, Transform, SyncToRenderWorld)]
+pub struct HairMesh3d(pub Handle<HairAsset>);
+
+/// Component holding the [`HairMaterial`] handle for a [`HairMesh3d`] groom — the
+/// fiber appearance the Chiang BSDF shades its hits with.
+#[derive(
+    Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From,
+)]
+#[reflect(Component, Default, Clone, PartialEq)]
+pub struct HairMaterial3d(pub Handle<HairMaterial>);
 
 /// Branches/twigs (or any opaque swept-sphere geometry) rendered as ray-traced
-/// linear swept spheres — the **same** LSS geometry as [`Hair`], but shaded as an
+/// linear swept spheres — the **same** LSS geometry as [`HairMesh3d`], but shaded as an
 /// opaque BRDF surface with a normal [`StandardSolariMaterial`] (bark/wood) and the
 /// round-cone surface normal, instead of the fiber BSDF. The entity's
-/// [`GlobalTransform`] places it; the [`HairAsset`] supplies the strands (each a
-/// node polyline with per-point radii). Blackwell-only, like [`Hair`].
+/// `GlobalTransform` places it; the [`HairAsset`] supplies the strands (each a
+/// node polyline with per-point radii). Blackwell-only, like [`HairMesh3d`].
 #[derive(Component, Clone, Debug)]
 #[require(Transform, SyncToRenderWorld)]
 pub struct SolariBranches {
@@ -78,7 +94,10 @@ pub struct SolariBranches {
 /// RTXCR rather than an arbitrary RGB color: the two natural pigments span every
 /// human hair color, with an optional artistic dye on top. The BSDF absorption
 /// `σa` is derived from these via [`melanin_absorption`].
-#[derive(Clone, Copy, Debug)]
+///
+/// Referenced by [`HairMaterial3d`].
+#[derive(Asset, Clone, Copy, Debug, Reflect)]
+#[reflect(Default, Clone)]
 pub struct HairMaterial {
     /// Overall melanin amount (0 = platinum/white → 1 = black).
     pub melanin: f32,
@@ -189,7 +208,7 @@ pub struct GpuHairInstance {
 pub struct ExtractedHairInstance {
     pub transform_slot: u32,
     pub asset: AssetId<HairAsset>,
-    /// Fiber appearance (used only for [`Hair`]; ignored when `surface` is set).
+    /// Fiber appearance (used only for [`HairMesh3d`]; ignored when `surface` is set).
     pub material: HairMaterial,
     /// Opaque surface material for [`SolariBranches`] (`None` = fiber hair).
     pub surface: Option<AssetId<StandardSolariMaterial>>,
@@ -248,16 +267,23 @@ pub fn init_hair_instances(mut commands: Commands) {
 /// PTLAS-write pass and shading read. Entities without a slot yet (first frame,
 /// before `PostUpdate` assigns it) are skipped.
 pub fn extract_hair_instances(
-    hair: Extract<Query<(&GpuSlot<TransformGraph>, &Hair)>>,
+    hair: Extract<Query<(&GpuSlot<TransformGraph>, &HairMesh3d, &HairMaterial3d)>>,
     branches: Extract<Query<(&GpuSlot<TransformGraph>, &SolariBranches)>>,
+    materials: Extract<Res<Assets<HairMaterial>>>,
     mut extracted: ResMut<ExtractedHairInstances>,
 ) {
     extracted.0.clear();
-    for (slot, hair) in &hair {
+    for (slot, mesh, material) in &hair {
+        // The fiber params are read out of the asset here (they end up inline in
+        // the `GpuHairInstance`); a groom whose material hasn't loaded yet waits
+        // for a later frame rather than flashing the default brown.
+        let Some(material) = materials.get(&material.0) else {
+            continue;
+        };
         extracted.0.push(ExtractedHairInstance {
             transform_slot: slot.index(),
-            asset: hair.asset.id(),
-            material: hair.material,
+            asset: mesh.id(),
+            material: *material,
             surface: None,
         });
     }
@@ -345,15 +371,30 @@ pub fn prepare_hair_instances(
     instances.params.write_buffer(&render_device, &render_queue);
 }
 
-/// Registers the [`HairAsset`], the [`Hair`] component, the geometry manager
-/// (arenas + LSS BLAS builds), instance extraction/prep, and the PTLAS hair
-/// injection. Added by [`crate::SolariPlugin`].
+/// Registers the [`HairAsset`] + [`HairMaterial`] assets, their components, the
+/// geometry manager (arenas + LSS BLAS builds), instance extraction/prep, and the
+/// PTLAS hair injection. Added by [`crate::SolariPlugin`].
 pub struct HairPlugin;
 
 impl Plugin for HairPlugin {
     fn build(&self, app: &mut App) {
-        app.init_asset::<HairAsset>();
-        app.init_asset_loader::<HairLoader>();
+        app.init_asset::<HairAsset>()
+            .init_asset_loader::<HairLoader>()
+            .init_asset::<HairMaterial>()
+            // `ReflectAsset` on `HairMaterial` + `ReflectHandle` on its handle, so
+            // `.bsn` scenes can define hair materials inline (as
+            // `StandardSolariMaterial` does).
+            .register_asset_reflect::<HairMaterial>()
+            .register_type::<HairMaterial>()
+            .register_type::<HairMesh3d>()
+            .register_type::<HairMaterial3d>();
+        // A groom with no explicit `HairMaterial3d` gets the default handle
+        // (`HairMesh3d` requires the component), so seed a material there —
+        // mirroring how `StandardSolariMaterialPlugin` seeds its default.
+        app.world_mut()
+            .resource_mut::<Assets<HairMaterial>>()
+            .insert(&Handle::<HairMaterial>::default(), HairMaterial::default())
+            .unwrap();
         // The Chiang fiber BSDF (`bevy_solari::hair`), imported by `chit_hair`.
         bevy_shader::load_shader_library!(app, "hair.wgsl");
 

@@ -187,7 +187,9 @@ pub mod prelude {
         bindings::SolariPortal,
         gpu::rt_pipeline::{SolariAnyHitDef, SolariHitGroupDef},
         geometry::ClusterMesh,
-        hair::{Hair, HairAsset, HairMaterial, HairStrand, SolariBranches},
+        hair::{
+            HairAsset, HairMaterial, HairMaterial3d, HairMesh3d, HairStrand, SolariBranches,
+        },
         lights::SolariDirectionLight,
         material::{
             SolariChitRegistryAppExt, SolariHitGroup, SolariHitGroupClass, SolariHitGroupPlugin,

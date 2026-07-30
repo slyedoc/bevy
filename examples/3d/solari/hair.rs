@@ -28,10 +28,7 @@ use bevy::{
         FeathersPlugins,
     },
     prelude::*,
-    solari::{
-        hair::{hair_absorption_to_color, melanin_absorption},
-        prelude::*,
-    },
+    solari::hair::{hair_absorption_to_color, melanin_absorption},
     ui_widgets::{slider_self_update, SliderPrecision, SliderValue},
 };
 use std::f32::consts::FRAC_PI_2;
@@ -148,6 +145,7 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut hair_assets: ResMut<Assets<HairAsset>>,
+    mut hair_materials: ResMut<Assets<HairMaterial>>,
 ) {
     // Ground plane — a regular `Mesh3d`; the `convert_*` systems bake it to a
     // `ClusterMesh` / `StandardSolariMaterial`. Gives the path tracer a surface for the
@@ -177,10 +175,8 @@ fn setup_scene(
         ),
     };
     commands.spawn((
-        Hair {
-            asset: hair,
-            material: HairAppearance::default().material(),
-        },
+        HairMesh3d(hair),
+        HairMaterial3d(hair_materials.add(HairAppearance::default().material())),
         transform,
     ));
 }
@@ -278,7 +274,8 @@ fn read_hair_sliders(
 fn sync_hair_appearance(
     appearance: Res<HairAppearance>,
     mut swatches: Query<&mut ColorSwatchValue, With<FeathersColorSwatch>>,
-    mut hair: Query<&mut Hair>,
+    hair: Query<&HairMaterial3d>,
+    mut hair_materials: ResMut<Assets<HairMaterial>>,
     mut resets: Query<&mut CameraReset, With<SolariCamera>>,
 ) {
     if !appearance.is_changed() {
@@ -291,8 +288,10 @@ fn sync_hair_appearance(
         swatch.0 = Color::srgb(rc.x, rc.y, rc.z);
     }
     let material = a.material();
-    for mut h in &mut hair {
-        h.material = material;
+    for h in &hair {
+        if let Some(mut m) = hair_materials.get_mut(&h.0) {
+            *m = material;
+        }
     }
     for mut reset in &mut resets {
         reset.history = true;
