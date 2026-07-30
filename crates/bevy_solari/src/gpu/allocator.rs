@@ -467,8 +467,10 @@ impl Allocator {
 
         // Crash forensics: an Aftermath dump names only a faulting GPU VA —
         // this line is the map from that VA back to a buffer. Grep the run
-        // log for the range containing the fault address.
-        tracing::info!(
+        // log for the range containing the fault address. Debug-gated, like
+        // the per-frame address-taking below: raise
+        // `bevy_solari::gpu::allocator` to `debug` when triaging a dump.
+        tracing::debug!(
             "sparse buffer {label}: va 0x{address:x}..0x{:x} ({} MiB virtual)",
             address + virtual_size,
             virtual_size >> 20,
