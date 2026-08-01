@@ -37,7 +37,9 @@ pub use bind_groups::{
     ClusterSceneBindGroupLayout,
 };
 pub use binder::{prepare_raytracing_scene_bindings, RaytracingSceneBindings};
-pub(crate) use binder::{GPU_MATERIAL_SIZE, MAX_TEXTURE_COUNT};
+pub(crate) use binder::GPU_MATERIAL_SIZE;
+#[cfg(test)]
+pub(crate) use binder::MAX_TEXTURE_COUNT;
 pub use extract::SolariMaterialAssets;
 pub use fog_volume::{SolariFogVolume, SolariFogVolumes, SolariFogVolumesTablePlugin};
 pub use portal::{SolariPortal, SolariPortals, SolariPortalsTablePlugin};
@@ -60,7 +62,6 @@ pub fn register_scene_shaders(app: &mut App) {
     load_shader_library!(app, "brdf.wgsl");
     load_shader_library!(app, "raytracing_scene_bindings.wgsl");
     load_shader_library!(app, "sampling.wgsl");
-    load_shader_library!(app, "light_sampling.wgsl");
 }
 
 /// Bindings domain plugin: the WGSL libraries, the cluster scene bind

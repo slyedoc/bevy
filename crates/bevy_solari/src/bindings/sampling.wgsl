@@ -1,12 +1,10 @@
-enable wgpu_ray_query;
-
 #define_import_path bevy_solari::sampling
 
 #import bevy_solari::pbr::D_GGX
-#import bevy_solari::pbr::{rand_f, rand_vec2f, rand_u, rand_range_u}
-#import bevy_render::maths::{PI_2, orthonormalize}
+#import bevy_solari::pbr::rand_vec2f
+#import bevy_render::maths::PI_2
 #import bevy_render::utils::octahedral_decode_signed
-#import bevy_solari::scene_bindings::{RAY_T_MIN, RAY_T_MAX, light_sources, active_light_list, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, resolve_ray_hit_full, offset_ray_origin, load_material_bindless, material_ids, ResolvedRayHitFull, ResolvedMaterial, MIRROR_ROUGHNESS_THRESHOLD, clusters, instance_cluster_ranges}
+#import bevy_solari::scene_bindings::{RAY_T_MIN, ResolvedMaterial, MIRROR_ROUGHNESS_THRESHOLD}
 
 fn power_heuristic(f: f32, g: f32) -> f32 {
     return balance_heuristic(f * f, g * g);
@@ -89,11 +87,6 @@ fn isnan(x: f32) -> bool {
 }
 
 const NULL_LIGHT_ID = 0xFFFFFFFFu;
-
-struct LightSample {
-    light_id: u32,
-    seed: u32,
-}
 
 // One ReSTIR DI reservoir (32 B). Two slots per pixel, INTERLEAVED by frame
 // parity (`pixel*2 + (frame&1)` = current, `pixel*2 + (1-(frame&1))` = previous)
@@ -226,16 +219,6 @@ struct StoredLight {
                                         // naga paths lay out the tail fields differently)
 }
 
-fn pack_stored_light(r: ResolvedLightSample, f: vec3<f32>, phat: f32) -> StoredLight {
-    return StoredLight(
-        r.world_position.x, r.world_position.y, r.world_position.z, r.world_position.w,
-        r.world_normal.x, r.world_normal.y, r.world_normal.z,
-        r.radiance.x, r.radiance.y, r.radiance.z,
-        r.inverse_pdf,
-        f.x, f.y, f.z, phat, 0.0,
-    );
-}
-
 fn unpack_stored_light(s: StoredLight) -> ResolvedLightSample {
     return ResolvedLightSample(
         vec4<f32>(s.px, s.py, s.pz, s.pw),
@@ -256,69 +239,11 @@ struct LightContribution {
     pdf_solid: f32,
 }
 
-struct GenerateRandomLightSampleResult {
-    light_sample: LightSample,
-    resolved_light_sample: ResolvedLightSample,
-}
-
-/// Number of active emissive-mesh lights (the `active_light_list` header).
-fn emissive_light_count() -> u32 {
-    return active_light_list[0];
-}
-
 // Rec. 709 luminance — the CPU flux basis (`prepare_light_sources`) uses the
 // same coefficients; the two MUST stay identical or the pick pdf de-mirrors.
 fn pick_luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
-
-struct WeightedPick {
-    index: u32,
-    prob: f32,
-}
-
-/// Power-weighted emissive pick: binary-search the normalized flux CDF appended
-/// (as f32 bits) after the slot lists in `active_light_list`, followed by the
-/// total flux (0 = uniform-pick sentinel, see `SolariUniformLights`).
-fn pick_emissive_weighted(
-    emissive_count: u32,
-    directional_count: u32,
-    rng: ptr<function, u32>,
-) -> WeightedPick {
-    let cdf_base = 2u + emissive_count + directional_count;
-    let total_flux = bitcast<f32>(active_light_list[cdf_base + emissive_count]);
-    if total_flux <= 0.0 {
-        return WeightedPick(rand_range_u(emissive_count, rng), 1.0 / f32(emissive_count));
-    }
-    let u = rand_f(rng);
-    var lo = 0u;
-    var hi = emissive_count - 1u;
-    while lo < hi {
-        let mid = (lo + hi) >> 1u;
-        if u < bitcast<f32>(active_light_list[cdf_base + mid]) {
-            hi = mid;
-        } else {
-            lo = mid + 1u;
-        }
-    }
-    let c1 = bitcast<f32>(active_light_list[cdf_base + lo]);
-    var c0 = 0.0;
-    if lo > 0u {
-        c0 = bitcast<f32>(active_light_list[cdf_base + lo - 1u]);
-    }
-    return WeightedPick(lo, max(c1 - c0, 1e-9));
-}
-
-/// Number of active directional lights (the `active_light_list` header).
-fn directional_light_count() -> u32 {
-    return active_light_list[1];
-}
-
-
-
-
-
-
 
 fn calculate_resolved_light_contribution(resolved_light_sample: ResolvedLightSample, ray_origin: vec3<f32>, origin_world_normal: vec3<f32>) -> LightContribution {
     let ray = resolved_light_sample.world_position.xyz - (resolved_light_sample.world_position.w * ray_origin);
@@ -340,12 +265,4 @@ fn calculate_resolved_light_contribution(resolved_light_sample: ResolvedLightSam
     let pdf_solid = pdf_area * light_distance_squared / max(cos_theta_light, 1e-4);
 
     return LightContribution(radiance, resolved_light_sample.inverse_pdf, wi, resolved_light_sample.world_position.w == 1.0, pdf_solid);
-}
-
-// https://www.realtimerendering.com/raytracinggems/unofficial_RayTracingGems_v1.9.pdf#0004286901.INDD%3ASec22%3A297
-fn triangle_barycentrics(seed: u32) -> vec3<f32> {
-    var rng = seed;
-    var barycentrics = rand_vec2f(&rng);
-    if barycentrics.x + barycentrics.y > 1.0 { barycentrics = 1.0 - barycentrics; }
-    return vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
 }

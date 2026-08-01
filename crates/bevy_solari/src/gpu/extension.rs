@@ -159,19 +159,10 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
             }
 
             // `synchronization2` — every AS barrier in the crate is a
-            // `VkMemoryBarrier2`, whose per-barrier src/dst stage+access pairs are
-            // what let a seam name its real producer and consumer instead of the
-            // union of both. Mandatory in Vulkan 1.3; any adapter below that also
-            // fails the cluster-AS probes below, so there is no legacy path.
-            let api_version = instance
-                .get_physical_device_properties(physical_device)
-                .api_version;
-            if api_version >= vk::API_VERSION_1_3 {
-                let features = Box::leak(Box::new(
-                    vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true),
-                ));
-                *args.create_info = core::mem::take(args.create_info).push(features);
-            }
+            // `VkMemoryBarrier2`. The wgpu-hal fork enables the feature (and
+            // extension) whenever the device supports it; chaining it here too
+            // would duplicate the struct in the pNext chain
+            // (VUID-VkDeviceCreateInfo-sType-unique).
 
             // NOTE: do NOT enable `vulkanMemoryModelDeviceScope`. Naga's
             // SPIR-V emits Vulkan memory model + Device-scope atomics

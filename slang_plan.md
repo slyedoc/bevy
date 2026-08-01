@@ -13,8 +13,9 @@ fork-per-NV-extension treadmill.
   upstream releases; bump deliberately, re-run every certification below.
 - Compile pattern: **precompiled `.spv` checked in next to its `.slang`**, regen
   command in each file header, `include_bytes!` + passthrough/raw module create.
-  `spirv-val` after every regen. Build-system integration is deliberately
-  deferred until the libslang step (below).
+  `spirv-val` after every regen. The libslang FFI (`gpu/slang.rs`) exists for
+  the runtime-composed stages; moving precompiled blobs to build.rs compilation
+  remains optional/deliberate.
 - Device features: everything arrives via `SolariInitPlugin`'s raw_vulkan_init
   callback + `SolariPlugin::required_wgpu_features` (incl. `PASSTHROUGH_SHADERS`).
   This IS the device-ownership story — do **not** build a `device_from_raw` path.
@@ -27,10 +28,11 @@ fork-per-NV-extension treadmill.
 | `miss_shadow`, `ahit_alpha`, `chit_portal` | Slang `.spv`, WGSL deleted (live-validated RTX 5090) |
 | `scene_resolve.slang` | DONE — full shared resolve module (bindings, Material/Cluster mirrors, fetch+full resolve, tess paths, deform, hair/LSS, alpha test, pack/unpack helpers); every mirror offset-diffed vs naga dumps |
 | `brdf.slang` / `sampling.slang` / `hair.slang` | DONE — full BRDF stack (GGX VNDF, DFG LUT, glass), light sampling + ReSTIR structs (strides 32/48/64 verified), Chiang fiber BSDF |
-| `chit_glass`, `chit_hair`, `chit_opaque` | DONE — Slang `.spv`, WGSL deleted; compile-validated (spirv-val + offset diffs), **awaiting live validation** |
-| `raygen` | DONE — Slang, two variants (`raygen.spv` + `raygen_clock.spv`, selected by `shader_clock_available()`); SER via `ReorderThread` (NV flavor, `-capability spvShaderInvocationReorderNV`), inline coopvec NRC query; **awaiting live validation** |
-| `SolariChitSource::{Wgsl, SpirV}` | per-stage migration enum on the hit-group registry (zero's registrars migrate on touch) |
-| `rt_payload.slang` | shared payload module (+ RtCamera/Mat4 mirror) — see LAW 1; still binding: naga `miss.wgsl` reads the payload |
+| `chit_glass`, `chit_hair`, `chit_opaque` | DONE — Slang `.spv`, WGSL deleted; live-validated RTX 5090 |
+| `raygen` | DONE — Slang, two variants (`raygen.spv` + `raygen_clock.spv`, selected by `shader_clock_available()`); SER via `ReorderThread` (NV flavor, `-capability spvShaderInvocationReorderNV`), inline coopvec NRC query; live-validated RTX 5090 |
+| `SolariChitSource::{Slang, SpirV}` | hit-group registry sources: precompiled SPIR-V or Slang source compiled at build via libslang (downstream extension point) |
+| `miss` + custom sky | DONE — miss.slang runtime-compiled via `gpu/slang.rs` (libslang `sp*` FFI); `SolariSky::Shader` = user Slang module source; live-validated RTX 5090 (see §5) |
+| `rt_payload.slang` | shared payload module (+ RtCamera/Mat4 mirror); every payload-carrying stage is Slang now — LAW 1 is historical unless a non-Slang stage returns |
 
 Port findings (2026-08-01):
 - `SOLARI_DLSS` was already unconditionally true in `try_compile_rt_wgsl` (the
@@ -127,23 +129,65 @@ Still unvalidated: ahit_alpha on a non-OMM cutout asset, a DLSS-RR-active run
 tess smooth/facet branches, portals (pre-session validation stands), ReSTIR
 spatial mode.
 
-### 5. `miss` + custom sky — the libslang step
-`miss.wgsl` composes the runtime-swappable `custom_sky` module → needs
-runtime compilation. Bindgen the minimal slang C API (global session, load
-module from source string, compose, entry-point code) — ~5 entry points,
-pinned to /mnt/code/f/slang. The slang-rs crate is not production-grade
-(0.1.0, FFI bugs); own the surface. This also unlocks deleting the regen
-commands in favor of build.rs compilation if desired.
-`SolariSky::Shader` user modules become Slang modules implementing an `ISky`
-interface — nicer than naga_oil text splicing.
+### 5. `miss` + custom sky — the libslang step — DONE (2026-08-01)
+`gpu/slang.rs` owns the FFI: NOT the COM API (vtable-offset counting) — the
+deprecated `sp*` compile-request API is still exported as plain C symbols
+(`spCreateSession`/`spCreateCompileRequest`/`spAddSearchPath`/
+`spAddTranslationUnitSourceString`/`spAddEntryPoint`/`spCompile`/
+`spGetEntryPointCode`, ~12 total), dlopen'd via libloading from
+`$SLANG_DIR/lib/libslang.so` (default /mnt/code/f/slang). Sessions are not
+thread-safe → all use serialized under one mutex. Module composition writes
+the `(name, source)` set to a per-compile temp dir on the search path —
+identical semantics to the CLI, and the FFI output disassembles IDENTICAL
+to `slangc miss.slang -target spirv` (verified). The slang-rs crate was
+skipped as planned (not production-grade).
 
-### 6. NRC endgame: TrainingOptimal outer-product
-When the NRC dispatch path owns raw command encoding: swap the dz-store in
-`nrc_train.slang`'s `evalBwd` for `coopVecOuterProductAccumulate` /
-`coopVecReduceSumAccumulate` (TrainingOptimal layout), add
-`vkConvertCooperativeVectorMatrixNV` (device cmd) to convert grads for adam,
-delete `mm_tn`/`bias_grad` and the acts/dz buffers → 16→~4 dispatches.
-The gym must grow the convert step to keep certifying.
+- miss.wgsl + custom_sky.wgsl → miss.slang (runtime-compiled at pipeline
+  build, the ONE non-precompiled stage) + custom_sky.slang. WGSL deleted;
+  `rt_payload.wgsl` shrank to an RtCamera mirror for `restir_spatial`.
+- `SolariSky::Shader` now carries a Slang module SOURCE string
+  (`Cow<'static, str>`, was `Handle<Shader>` WGSL): define
+  `public float3 sample_custom_sky(float3 ray_direction)`. Mutating the
+  component hot-swaps (generation bump → pipeline rebuild). No `ISky`
+  interface needed — a plain module function is the whole contract.
+- `SolariChitSource::Wgsl` → `SolariChitSource::Slang` (downstream chits =
+  Slang source, compiled with the built-in module set `rt_payload`/
+  `scene_resolve`/`brdf`/`sampling`/`hair` + the group's
+  `composable_modules`, now `(module_name, slang_source)` pairs).
+  Registration validates by fully compiling the chit.
+- naga/naga_oil in `gpu/rt_pipeline.rs` is now `#[cfg(test)]`-only (backs the
+  headless `restir_spatial` check). ZERO runtime naga in the RT path → the
+  §7 fork rebase is unblocked.
+- Validated: `rt_shaders_compile` compiles miss via the FFI with the default
+  AND a user-replacement sky; live solari_tessellation renders the
+  procedural gradient, and a `SolariSky::Shader` magenta test module
+  end-to-end (RTX 5090).
+
+### 6. NRC endgame: TrainingOptimal outer-product — DONE (2026-08-01)
+`nrc_train.slang`'s `evalBwd` now outer-product-accumulates dW
+(`coopVecOuterProductAccumulate(x, g16, dw_opt, l*opt_size, 0,
+TrainingOptimal, Float32)` — f16 inputs, f32 accumulation, [in×out]
+orientation matching adam) and reduce-sum-accumulates db (f32 CoopVec —
+f16 accumulation would overflow at ±3.2e4-clamped dz). `mm_tn`/`bias_grad`
+kernels + the acts[1..]/dz stores DELETED (acts is now just the encoded
+batch); 16 dispatches → encode+learn+adam×2 + 2 clears + one
+vkCmdConvertCooperativeVectorMatrixNV (all 6 layers in one cmd, own
+encoder + sync2 CONVERT-stage barriers, `ctx.add_command_buffer` between
+the wgpu passes). Host-side size query at init (TrainingOptimal block =
+16384 B/layer on the 5090 — same as row-major). Gym: full certification
+holds (gradcheck worst 0.545 — IDENTICAL to the mm_tn baseline), training
+**774 → 2906 steps/s (3.75×)**; production render-graph run loss-parity
+with the old chain. Debug lessons (cost this session):
+- wgpu-hal only gave AS-related buffers `SHADER_DEVICE_ADDRESS`; fork
+  commit adds it to all storage buffers when BDA is enabled (else
+  vkGetBufferDeviceAddress on wgpu buffers is bogus → the convert silently
+  writes nowhere). BDA rides the EXPERIMENTAL_RAY_QUERY feature — the gym
+  now requests it.
+- **LAW 9: wgpu lazily ZERO-INITIALIZES a buffer at its first TRACKED
+  use.** A buffer written ONLY by raw (untracked) commands gets wiped by
+  the zero-init the moment a tracked command first touches it (adam's
+  read, a readback copy). Mark such buffers initialized with one tracked
+  `write_buffer` at creation.
 
 ### 7. Cleanup / fork shrink checklist (after 0, 5, 6)
 - ~~`nrc_infer_coopvec`/`nrc_query_infer`/`nrc_encode_records` → Slang~~ DONE
@@ -162,8 +206,28 @@ The gym must grow the convert step to keep certifying.
 - `restir_spatial`/`rt_camera`/`gizmo_depth`/`blit` + transform/tess/accel
   compute: **leave on WGSL** (stock-naga compatible; no fork features). Migrate
   only if/when phase-E (own swapchain) lands.
-- Then: rebase the wgpu fork dropping naga RT/SER/coopvec commits; the
-  remaining fork = hal extension plumbing + queue-sync micro-surface.
+- ~~Then: rebase the wgpu fork dropping naga RT/SER/coopvec commits~~ DONE
+  (2026-08-01): branch **solari-slang** (worktree /mnt/code/f/wgpu-slang) =
+  solari-rt-naga with `naga/` RESET TO STOCK v29.0.3 (one commit, no history
+  surgery; −3,373 lines) + the FUnordNotEqual NaN-guard fix cherry-picked +
+  3 small core/hal/bridge fixups (shader-io builtin arms, fork-only spv
+  option, bridge coopvec cap). naga_oil patch → stock (worktree
+  /mnt/code/f/naga_oil-slang @ the wgpu-29 update commit; the fork existed
+  only for fork-naga IR arms). Bevy-side prerequisites: light_sampling.wgsl
+  + hair.wgsl DELETED (no importers left); raytracing_scene_bindings.wgsl
+  1121→68 lines (restir's view of set 0: tlas + DFG LUT + ResolvedMaterial +
+  ray constants + offset_ray_origin; the physical_load resolve half lives in
+  scene_resolve.slang); sampling.wgsl light-pick half deleted; test composer
+  = restir's closure only, caps = RAY_QUERY | SHADER_FLOAT16_IN_FLOAT32
+  (stock naga gates unpack2x16float behind the latter). Remaining fork diff
+  vs upstream v29.0.3 = ash-master forward-port, raw handle accessors +
+  BindGroup/BGL as_hal, Tlas::from_hal, Queue::{as_hal_locked,
+  add_wait_semaphore}, keep_bind_group_alive, coopvec/coopmat + VMM
+  device-feature enablement (the wgpu EXPERIMENTAL_COOPERATIVE_* features
+  stay REQUESTED — hal's mapping is what enables VK_NV_cooperative_vector +
+  vulkanMemoryModel for the passthrough kernels), Aftermath opt-in.
+  Validated: 12/12 tests, tessellation live run (identical frame, NRC loss
+  parity), gym full certification (774 steps/s, coopvec parity 0.000).
 - `rt_shaders_compile` keeps covering both: WGSL composes, `.spv` blobs get
   magic/alignment checks; consider asserting Law-2 offsets mechanically.
 

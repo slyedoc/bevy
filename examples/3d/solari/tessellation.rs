@@ -130,12 +130,11 @@ fn setup_scene(
 
     commands.spawn((
         Camera3d::default(),
-        //CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),   
         Transform::from_xyz(3.0, 2.5, 2.0)
             .looking_at(Vec3::new(0.0, 1.0, -12.0).to_precision(), Vec3::Y),
         Hdr,
         Msaa::Off,
-        SolariCamera::default(),        
+        SolariCamera::default(),
         SolariSky::Procedural,
         FreeCamera {
             walk_speed: 5.0,

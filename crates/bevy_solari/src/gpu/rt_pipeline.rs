@@ -2,10 +2,9 @@
 // shader binding table + cmd_trace_rays), the multi-material SBT shading path.
 // Self-contained: builds its own descriptor set layout, pool, sets, pipeline
 // layout, pipeline, and SBT in raw `ash` — no wgpu-hal accessor additions. The
-// WGSL ray-tracing-stage shaders are compiled to SPIR-V through the re-exported
-// `wgpu::naga` (whose WGSL frontend + SPIR-V backend support RayGeneration /
-// ClosestHit / AnyHit / Miss stages), then handed to
-// `vkCreateRayTracingPipelinesKHR`.
+// RT-stage shaders are all Slang: precompiled SPIR-V blobs, except the primary
+// miss (and any downstream `SolariChitSource::Slang` closest-hit), compiled at
+// build via `gpu/slang.rs`, then handed to `vkCreateRayTracingPipelinesKHR`.
 //
 // Mirrors `gpu/allocator.rs`'s raw-VK style; gated on the
 // `RayTracingPipelineFeature` device feature.
@@ -16,6 +15,7 @@ use ash::vk::{self, TaggedStructure};
 use bevy_ecs::component::Component;
 use bevy_ecs::resource::Resource;
 use core::ffi::CStr;
+#[cfg(test)]
 use wgpu::naga;
 
 use super::allocator::Allocator;
@@ -166,12 +166,17 @@ pub struct RtGeometryAddresses {
     pub animated_table: u64,
 }
 
-/// Closest-hit stage source. Ported stages carry Slang-precompiled SPIR-V
-/// (the regen command lives in each `.slang` header); WGSL stages compose
-/// their runtime modules through the naga path until their port lands.
+/// Closest-hit stage source. The built-in stages carry Slang-precompiled
+/// SPIR-V (the regen command lives in each `.slang` header); downstream chits
+/// may instead ship Slang source, compiled at pipeline build via `gpu/slang.rs`
+/// with the built-in module set (`scene_resolve`/`brdf`/`sampling`/…) importable.
 #[derive(Clone)]
 pub enum SolariChitSource {
-    Wgsl {
+    /// Slang source compiled at pipeline build. `entry` is the entry function's
+    /// name in `source` (the compiled `OpEntryPoint` is `"main"`, like every
+    /// slangc-built stage). May `import` the built-in modules and the group's
+    /// [`composable_modules`](SolariHitGroupDef::composable_modules).
+    Slang {
         source: &'static str,
         file: &'static str,
         entry: &'static str,
@@ -188,12 +193,13 @@ pub struct SolariHitGroupDef {
     pub label: &'static str,
     pub closest_hit: SolariChitSource,
     pub any_hit: Option<SolariAnyHitDef>,
-    /// Extra `(file_path, source)` naga_oil modules composed into this group's
-    /// chit/any-hit alongside the built-in `bevy_solari::*` set — lets a downstream
-    /// crate `#import` its own shared WGSL (e.g. a terrain function used by both a
-    /// compute pass and a closest-hit) without forking. Registered in slice order
-    /// AFTER the built-ins, so they may import `bevy_solari::*` and each other
-    /// (dependencies first). Scoped to this group: other groups never see them.
+    /// Extra `(module_name, source)` Slang modules importable by this group's
+    /// [`SolariChitSource::Slang`] closest-hit alongside the built-in set — lets
+    /// a downstream crate `import` its own shared Slang (e.g. a terrain function
+    /// used by both a compute pass and a closest-hit) without forking. They may
+    /// import the built-ins and each other. Scoped to this group: other groups
+    /// never see them. Unused by a `SpirV` closest-hit (precompiled stages
+    /// resolve imports at regen time).
     pub composable_modules: &'static [(&'static str, &'static str)],
 }
 
@@ -216,15 +222,15 @@ pub struct SolariHitGroupRegistry {
 impl SolariHitGroupRegistry {
     /// Append a hit group; returns its SBT class (its index).
     ///
-    /// The group's `composable_modules` are validated eagerly (composed against the
-    /// built-in module set) so a broken user module is reported at registration —
-    /// at pipeline-build time a compose failure in ANY group aborts the whole RT
-    /// pipeline, which is far harder to attribute.
+    /// A `Slang` closest-hit is compiled eagerly (with its `composable_modules`)
+    /// so a broken user shader is reported at registration — at pipeline-build
+    /// time a compile failure in ANY group aborts the whole RT pipeline, which
+    /// is far harder to attribute.
     pub fn register(&mut self, group: SolariHitGroupDef) -> u32 {
-        if !group.composable_modules.is_empty() {
-            if let Err(e) = validate_composable_modules(group.composable_modules) {
+        if matches!(group.closest_hit, SolariChitSource::Slang { .. }) {
+            if let Err(e) = compile_slang_chit(&group) {
                 bevy_log::error!(
-                    "rt_pipeline: hit group '{}': composable module failed to compose: {e}. \
+                    "rt_pipeline: hit group '{}': closest-hit failed to compile: {e}. \
                      The RT pipeline will fail to build until this is fixed.",
                     group.label
                 );
@@ -236,260 +242,70 @@ impl SolariHitGroupRegistry {
     }
 }
 
-/// A raw host-visible buffer kept with its memory + mapping, for the SBT and the
-/// camera UBO (which `Allocator::create_buffer` can't expose — it hides the
-/// `VkDeviceMemory`).
-struct MappedBuffer {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    mapped: *mut u8,
-    size: u64,
-    device_address: vk::DeviceAddress,
+/// Ray payload / hit-attribute sizes shared by every pipeline library and the
+/// linked pipeline (`VkRayTracingPipelineInterfaceCreateInfoKHR`, mandatory
+/// once stages live in libraries, and required to agree across the link).
+/// Payload: `RtPayload` (rt_payload.slang) is 128 B under std430 (vec3 slots
+/// pad to 16 B), plus headroom for a couple of future fields. Attributes:
+/// triangle/LSS barycentrics, two floats.
+const MAX_RAY_PAYLOAD_SIZE: u32 = 160;
+const MAX_HIT_ATTRIBUTE_SIZE: u32 = 8;
+
+/// One cached `VK_KHR_pipeline_library` compile (a stage subset of the RT
+/// pipeline) plus the shader modules it references.
+struct RtLibrary {
+    pipeline: vk::Pipeline,
+    modules: Vec<vk::ShaderModule>,
 }
 
-/// Render-world resource owning the **view-independent** ray-tracing pipeline +
-/// SBT + the set-1 descriptor *layout* and the shared env sampler. The per-view
-/// resources (set-1 descriptor set, camera UBO, output-buffer binding, env cube)
-/// live in [`RtViewBindings`], a component, so multiple views (split-screen) each
-/// trace into their own output with their own camera/env.
-///
-/// Built lazily once the scene layouts and materials exist; `RayTracingPipelineFeature`
-/// is a hard requirement, so absence here only ever means "not built yet".
+/// Render-world cache of RT pipeline LIBRARIES, living across [`RtPipeline`]
+/// rebuilds so each rebuild recompiles only what changed and RELINKS the
+/// rest: a custom-sky swap recompiles the primary-miss library alone; a new
+/// registry hit group compiles just its own library; SBT growth or material
+/// class churn relinks with zero shader compiles. Also owns the shared
+/// set-1 descriptor layout + pipeline layout every library and every linked
+/// pipeline is built against — the cache is recreated wholesale when either
+/// wgpu-owned raw set layout changes (the dispatch compares
+/// [`Self::layout_key`]).
 #[derive(Resource)]
-pub struct RtPipeline {
+pub struct RtLibraryCache {
     device: ash::Device,
     rt: khr::ray_tracing_pipeline::Device,
-
-    pipeline: vk::Pipeline,
+    /// The wgpu-owned scene (set 0) + columns (set 2) raw layouts the shared
+    /// pipeline layout bakes in; a handle change invalidates the whole cache.
+    layout_key: (vk::DescriptorSetLayout, vk::DescriptorSetLayout),
     pipeline_layout: vk::PipelineLayout,
     descriptor_set_layout: vk::DescriptorSetLayout,
-
-    sbt: MappedBuffer,
-    raygen_region: vk::StridedDeviceAddressRegionKHR,
-    miss_region: vk::StridedDeviceAddressRegionKHR,
-    hit_region: vk::StridedDeviceAddressRegionKHR,
-    callable_region: vk::StridedDeviceAddressRegionKHR,
-    /// Number of per-material hit records the SBT holds. An instance routes to
-    /// record = its material slot, so once the live material count exceeds this
-    /// the pipeline must be rebuilt (the dispatch checks [`Self::capacity`]).
-    record_capacity: u32,
-
-    /// Per-material-slot SBT hit-group class the records were baked with (0 =
-    /// opaque, 1 = glass, …; see `material::material_sbt_class`). Each record's
-    /// shader handle is `handle(2 + class)`, so a material changing class (glass
-    /// loading/unloading, a live edit) needs the records rebuilt — the handle is
-    /// baked, unlike the per-frame GPU `FORCE_NO_OPAQUE` flag. The dispatch
-    /// compares this via [`Self::classes_changed`].
-    material_classes: Vec<u32>,
-
-    /// Generation of the `bevy_solari::custom_sky` module source the primary miss
-    /// shader was composed with. `SolariSky::Shader` swaps the module at runtime;
-    /// the composed SPIR-V is baked, so a source change needs a pipeline rebuild —
-    /// the dispatch compares this against [`SolariCustomSky`](crate::render::sky::SolariCustomSky).
-    custom_sky_generation: u64,
-
-    /// Shader modules retained for the pipeline's lifetime (destroyed on drop).
-    modules: Vec<vk::ShaderModule>,
-
-    /// Keeps the `VkDevice` alive until this drops. The cloned `ash::Device`
-    /// above is a bare handle + fn table with NO ownership: at app teardown the
-    /// render world drops resources in arbitrary order, and if wgpu destroys the
-    /// device first, [`Drop`]'s raw destroys segfault against a dead device. The
-    /// allocator transitively holds wgpu's queue → device, so holding it pins
-    /// the device across our Drop.
+    raygen: Option<RtLibrary>,
+    /// Composed with the `custom_sky` module; the key is the module source's
+    /// generation, so a sky swap rebuilds exactly this library.
+    miss: Option<(u64, RtLibrary)>,
+    miss_shadow: Option<RtLibrary>,
+    /// Index-aligned with [`SolariHitGroupRegistry::groups`], which is
+    /// append-only — existing entries never change identity, so cached
+    /// libraries stay valid and only NEW registry entries compile.
+    hit_groups: Vec<RtLibrary>,
+    /// See the twin field on [`RtPipeline`].
     _device_keepalive: Allocator,
 }
 
-// SAFETY: all fields are plain Vulkan handles owned by this resource; the only
-// interior raw pointers (host-visible mappings) moved to RtViewBindings. Used
-// solely from the single render-schedule dispatch system.
-unsafe impl Send for RtPipeline {}
-unsafe impl Sync for RtPipeline {}
+// SAFETY: plain Vulkan handles; used solely from the single render-schedule
+// dispatch system.
+unsafe impl Send for RtLibraryCache {}
+unsafe impl Sync for RtLibraryCache {}
 
-/// Per-view ray-tracing resources: the set-1 descriptor set (output buffer @0,
-/// camera UBO @1, env cube @2, env sampler @3), the camera UBO it points at, and
-/// the env image to transition around the trace. One per [`SolariCamera`] view,
-/// so split-screen views don't share an output buffer or camera. Built from
-/// [`RtPipeline::create_view_bindings`]; rebuilt when the view's output buffer is
-/// reallocated (viewport resize).
-#[derive(Component)]
-pub struct RtViewBindings {
-    device: ash::Device,
-    descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
-    /// Bindless geometry addresses (set 1, binding 4); refreshed per frame via the
-    /// mapping (`set_geometry_addresses`). Not ringed: the addresses are stable
-    /// (stable-address `RawTraceBindable` buffers), so an in-flight overwrite writes
-    /// identical bytes — benign, unlike the per-frame-varying camera.
-    geometry: MappedBuffer,
-    /// This view's own linear env-cube sampler (destroyed on drop). Owned here, not
-    /// on `RtPipeline`, so the per-view set survives a pipeline rebuild — the set
-    /// is compatible-by-content with the rebuilt set-1 layout and references
-    /// nothing the rebuilt pipeline owns.
-    env_map_sampler: vk::Sampler,
-    /// `Some` ⇒ the env cube is the storage atmosphere cube (GENERAL); transition
-    /// it around each trace. `None` ⇒ already a read-optimal wgpu-sampled texture.
-    env_map_image: Option<vk::Image>,
-    /// The output `VkBuffer` baked into binding 0. The dispatch rebuilds this
-    /// component if the view's output buffer changes (resize) — the descriptor is
-    /// written once and never updated (updating an in-flight set device-losts).
-    output_buffer: vk::Buffer,
-    /// The env cube view baked into binding 2, for the same rebuild check: a
-    /// skybox that finishes loading (or is swapped) changes the view, and the
-    /// baked-once set would otherwise sample the stale cube forever.
-    env_map_view: vk::ImageView,
-    /// Keeps the `VkDevice` alive until this drops — see the twin field on
-    /// [`RtPipeline`]; without it, teardown drop order decides whether [`Drop`]'s
-    /// raw destroys run against a dead device.
-    _device_keepalive: Allocator,
-}
-
-// SAFETY: the host-visible geometry-address mapping is written only from the single
-// render-schedule dispatch (via `&self` + coherent memory), never shared across
-// threads. All other fields are plain Vulkan handles.
-unsafe impl Send for RtViewBindings {}
-unsafe impl Sync for RtViewBindings {}
-
-impl RtPipeline {
-    /// Build the RT pipeline (raygen + miss + opaque/glass/hair closest-hit).
-    /// `scene_layout` / `columns_layout` are the raw `VkDescriptorSetLayout`s of
-    /// wgpu's raytracing scene bind group (set 0) and scene-columns bind group
-    /// (set 2) — obtained via `BindGroupLayout::as_hal().raw_handle()` — so the
-    /// pipeline layout is compatible with the wgpu bind groups bound at trace
-    /// time. Built lazily (see the dispatch) once those bind groups exist.
-    /// Returns `None` if SPIR-V compilation or any Vulkan step fails (logged).
+impl RtLibraryCache {
+    /// Build the shared set-1 descriptor layout + pipeline layout. Libraries
+    /// compile lazily via the `ensure_*` methods on first pipeline build.
     pub fn new(
         allocator: &Allocator,
         scene_layout: vk::DescriptorSetLayout,
         columns_layout: vk::DescriptorSetLayout,
-        material_classes: &[u32],
-        hit_groups: &[SolariHitGroupDef],
-        custom_sky: (&str, u64),
     ) -> Option<Self> {
-        let (custom_sky_source, custom_sky_generation) = custom_sky;
-        // One hit record per material slot; `material_classes[slot]` selects the
-        // record's hit-group handle (opaque/glass/hair).
-        let material_count = material_classes.len() as u32;
         let device = allocator.device().clone();
-        let instance = allocator.instance();
-        let physical_device = allocator.physical_device();
-
         // SAFETY: instance + device are live; loading the RT-pipeline function
         // table is valid because the extension was enabled at device creation.
-        let rt = khr::ray_tracing_pipeline::Device::load(instance, &device);
-
-        // Pipeline properties (SBT alignment), queried via the properties2 chain.
-        let mut rt_props = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
-        let mut props2 = vk::PhysicalDeviceProperties2::default().push(&mut rt_props);
-        // SAFETY: physical_device valid; props2 chain well-formed.
-        unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
-        let handle_size = rt_props.shader_group_handle_size as u64;
-        let handle_align = rt_props.shader_group_handle_alignment as u64;
-        let base_align = rt_props.shader_group_base_alignment as u64;
-
-        // --- Shaders: WGSL -> SPIR-V -> VkShaderModule -------------------------
-        // Fixed general programs (raygen + the two miss shaders); every closest-hit
-        // ("hit group", + optional any-hit) comes from `hit_groups` (the registry), so
-        // adding a surface shader needs no edit here — Solari's own opaque/glass/hair/
-        // portal register the same way as any downstream material (see SolariPlugin).
-        // Slang-precompiled raygen (regen commands in raygen.slang): the
-        // `SOLARI_SHADER_CLOCK` variant carries the cost-heatmap clock reads,
-        // legal only when the device enabled `VK_KHR_shader_clock`.
-        let raygen_spv: &'static [u8] = if crate::gpu::extension::shader_clock_available() {
-            include_bytes!("../render/rt_pipeline/raygen_clock.spv")
-        } else {
-            include_bytes!("../render/rt_pipeline/raygen.spv")
-        };
-        let raygen_mod = create_shader_module(&device, &spirv_words(raygen_spv))?;
-        let miss_mod = create_shader_module(
-            &device,
-            &compile_rt_wgsl(
-                include_str!("../render/rt_pipeline/miss.wgsl"),
-                "miss.wgsl",
-                // The swappable `bevy_solari::custom_sky` module (`SolariSky::Shader`);
-                // defaults to the built-in procedural gradient.
-                &[("custom_sky.wgsl", custom_sky_source)],
-            )?,
-        )?;
-        // Slang-precompiled (see miss_shadow.slang for the regen command); the
-        // payload contract with the WGSL chits is struct layout only — naga
-        // emits no payload Location decorations, linkage is the trace operand.
-        let miss_shadow_mod = create_shader_module(
-            &device,
-            &spirv_words(include_bytes!("../render/rt_pipeline/miss_shadow.spv")),
-        )?;
-
-        // Stage table: (flags, module, entry). Fixed stages first (raygen 0, primary
-        // miss 1, shadow miss 2), then each hit group's chit (+ any-hit). Entry names
-        // are `&'static`; CString'd just before pipeline create (kept alive there).
-        let mut modules = vec![raygen_mod, miss_mod, miss_shadow_mod];
-        let mut stage_specs: Vec<(vk::ShaderStageFlags, vk::ShaderModule, &'static str)> = vec![
-            // slangc names every entry point "main"
-            (vk::ShaderStageFlags::RAYGEN_KHR, raygen_mod, "main"),
-            (vk::ShaderStageFlags::MISS_KHR, miss_mod, "miss_primary"),
-            // slangc names every entry point "main"
-            (vk::ShaderStageFlags::MISS_KHR, miss_shadow_mod, "main"),
-        ];
-        // Per hit group: compile chit (+ any-hit), recording their stage indices.
-        let mut hit_group_stages: Vec<(u32, Option<u32>)> = Vec::with_capacity(hit_groups.len());
-        for hg in hit_groups {
-            let (chit_mod, chit_entry) = match &hg.closest_hit {
-                SolariChitSource::Wgsl { source, file, entry } => (
-                    create_shader_module(
-                        &device,
-                        &compile_rt_wgsl(source, file, hg.composable_modules)?,
-                    )?,
-                    *entry,
-                ),
-                SolariChitSource::SpirV(bytes) => {
-                    (create_shader_module(&device, &spirv_words(bytes))?, "main")
-                }
-            };
-            let chit_stage = stage_specs.len() as u32;
-            modules.push(chit_mod);
-            stage_specs.push((vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, chit_entry));
-            let any_hit_stage = if let Some(ah) = &hg.any_hit {
-                let ah_mod = create_shader_module(&device, &spirv_words(ah.spirv))?;
-                let s = stage_specs.len() as u32;
-                modules.push(ah_mod);
-                stage_specs.push((vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, ah.entry));
-                Some(s)
-            } else {
-                None
-            };
-            hit_group_stages.push((chit_stage, any_hit_stage));
-        }
-
-        // CStrings outlive the stage create-infos (which hold raw ptrs) until create.
-        let entry_cstrings: Vec<std::ffi::CString> = stage_specs
-            .iter()
-            .map(|(_, _, e)| std::ffi::CString::new(*e).expect("shader entry name has interior NUL"))
-            .collect();
-        let stages: Vec<vk::PipelineShaderStageCreateInfo> = stage_specs
-            .iter()
-            .zip(entry_cstrings.iter())
-            .map(|((flags, module, _), name)| shader_stage(*flags, *module, name.as_c_str()))
-            .collect();
-
-        // Groups: raygen (0), primary miss (1), one hit group per registry entry (its
-        // index = its SBT class; class c -> group 2+c -> handle(2+c)), shadow miss LAST.
-        let mut groups = vec![general_group(0), general_group(1)];
-        for (chit, any_hit) in &hit_group_stages {
-            groups.push(match any_hit {
-                Some(a) => hit_group_with_any_hit(*chit, *a),
-                None => hit_group(*chit),
-            });
-        }
-        let shadow_miss_group = groups.len() as u32; // = 2 + hit_groups.len()
-        groups.push(general_group(2)); // shadow miss (miss index 1)
-        let group_count = groups.len() as u32;
-        // The hair hit group's SBT handle index, for the reserved hair record below.
-        let hair_group = hit_groups
-            .iter()
-            .position(|g| g.label == "hair")
-            .map_or(2u32, |i| 2 + i as u32);
-        // Max valid SBT class (registry index); out-of-range material classes fall back.
-        let max_class = (hit_groups.len() as u32).saturating_sub(1);
+        let rt = khr::ray_tracing_pipeline::Device::load(allocator.instance(), &device);
 
         // --- Descriptor set layout (set 1: output + camera) --------------------
         // TLAS is NOT here — it comes from the scene bind group (set 0). raygen
@@ -575,57 +391,529 @@ impl RtPipeline {
         let set_layouts = [scene_layout, descriptor_set_layout, columns_layout];
         let layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
         // SAFETY: well-formed; device live; the scene/columns layouts outlive this
-        // pipeline (owned by wgpu's bind-group-layout cache).
+        // cache (owned by wgpu's bind-group-layout cache; the dispatch recreates
+        // the cache when they change).
         let pipeline_layout = match unsafe { device.create_pipeline_layout(&layout_info, None) } {
             Ok(l) => l,
             Err(e) => {
                 bevy_log::error!("rt_pipeline: create_pipeline_layout failed: {e:?}");
+                // SAFETY: just created above; nothing references it yet.
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
                 return None;
             }
         };
 
-        // --- Ray-tracing pipeline ---------------------------------------------
-        // Opt into NV cluster acceleration structures so `@builtin(cluster_id)`
-        // (ClusterIDNV) is valid in the hit shaders. ash doesn't register this
-        // struct as a RayTracingPipelineCreateInfoKHR extender (no typed
-        // `push_next`), so chain it via raw `p_next`. `cluster_info` must outlive
-        // the create call below.
+        Some(Self {
+            device,
+            rt,
+            layout_key: (scene_layout, columns_layout),
+            pipeline_layout,
+            descriptor_set_layout,
+            raygen: None,
+            miss: None,
+            miss_shadow: None,
+            hit_groups: Vec::new(),
+            _device_keepalive: allocator.clone(),
+        })
+    }
+
+    /// The wgpu raw layouts this cache's pipeline layout was built against;
+    /// the dispatch recreates the cache when they no longer match.
+    pub fn layout_key(&self) -> (vk::DescriptorSetLayout, vk::DescriptorSetLayout) {
+        self.layout_key
+    }
+
+    /// Compile one library: `stages` + `groups` against the shared layout,
+    /// with the shared ray interface. Every library (and the link) opts into
+    /// cluster acceleration structures and opacity micromaps — these must
+    /// agree across the whole linked pipeline.
+    fn create_library(
+        &self,
+        stages: &[vk::PipelineShaderStageCreateInfo],
+        groups: &[vk::RayTracingShaderGroupCreateInfoKHR],
+        modules: Vec<vk::ShaderModule>,
+    ) -> Option<RtLibrary> {
         let cluster_info =
             vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV::default()
                 .allow_cluster_acceleration_structure(true);
+        let interface = vk::RayTracingPipelineInterfaceCreateInfoKHR::default()
+            .max_pipeline_ray_payload_size(MAX_RAY_PAYLOAD_SIZE)
+            .max_pipeline_ray_hit_attribute_size(MAX_HIT_ATTRIBUTE_SIZE);
+        let mut info = vk::RayTracingPipelineCreateInfoKHR::default()
+            .flags(
+                vk::PipelineCreateFlags::LIBRARY_KHR
+                    | vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT,
+            )
+            .stages(stages)
+            .groups(groups)
+            // Depth 2: raygen's hit object executes the closest-hit (1), which
+            // traces a NEE shadow ray (2). Must agree with the link.
+            .max_pipeline_ray_recursion_depth(2)
+            .library_interface(&interface)
+            .layout(self.pipeline_layout);
+        // ash doesn't register the cluster struct as an extender (no typed
+        // `push_next`); chain it via raw `p_next`. It outlives the call.
+        info.p_next =
+            (&cluster_info as *const vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV)
+                .cast();
+        // SAFETY: stages/groups reference live modules; layout live.
+        match unsafe {
+            self.rt.create_ray_tracing_pipelines(
+                vk::DeferredOperationKHR::null(),
+                vk::PipelineCache::null(),
+                &[info],
+                None,
+            )
+        } {
+            Ok(p) => Some(RtLibrary {
+                pipeline: p.into_iter().next()?,
+                modules,
+            }),
+            Err(e) => {
+                bevy_log::error!("rt_pipeline: library compile failed: {:?}", e.1);
+                for m in modules {
+                    // SAFETY: modules were created for this library; nothing
+                    // else references them.
+                    unsafe { self.device.destroy_shader_module(m, None) };
+                }
+                None
+            }
+        }
+    }
+
+    fn destroy_library(&self, lib: RtLibrary) {
+        // The linked pipeline that referenced this library is already gone (the
+        // dispatch removes RtPipeline before rebuilding); drain in-flight work
+        // then destroy.
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe {
+            self.device.destroy_pipeline(lib.pipeline, None);
+            for m in lib.modules {
+                self.device.destroy_shader_module(m, None);
+            }
+        }
+    }
+
+    /// Raygen library (static per app run — the shader-clock variant choice
+    /// is fixed at device creation).
+    fn ensure_raygen(&mut self) -> Option<()> {
+        if self.raygen.is_some() {
+            return Some(());
+        }
+        // Slang-precompiled raygen (regen commands in raygen.slang): the
+        // `SOLARI_SHADER_CLOCK` variant carries the cost-heatmap clock reads,
+        // legal only when the device enabled `VK_KHR_shader_clock`.
+        let raygen_spv: &'static [u8] = if crate::gpu::extension::shader_clock_available() {
+            include_bytes!("../render/rt_pipeline/raygen_clock.spv")
+        } else {
+            include_bytes!("../render/rt_pipeline/raygen.spv")
+        };
+        let module = create_shader_module(&self.device, &spirv_words(raygen_spv))?;
+        let lib = self.create_library(
+            &[shader_stage(vk::ShaderStageFlags::RAYGEN_KHR, module, c"main")],
+            &[general_group(0)],
+            vec![module],
+        )?;
+        self.raygen = Some(lib);
+        Some(())
+    }
+
+    /// Primary-miss library — the one stage compiled at BUILD time: it
+    /// composes the swappable `custom_sky` module (`SolariSky::Shader`;
+    /// defaults to the built-in procedural gradient), so its SPIR-V can't be
+    /// checked in. A generation change rebuilds exactly this library.
+    fn ensure_miss(&mut self, custom_sky: (&str, u64)) -> Option<()> {
+        let (custom_sky_source, generation) = custom_sky;
+        if matches!(&self.miss, Some((cached, _)) if *cached == generation) {
+            return Some(());
+        }
+        let miss_spv = crate::gpu::slang::compile_rt_slang(
+            "miss.slang",
+            include_str!("../render/rt_pipeline/miss.slang"),
+            "miss_primary",
+            crate::gpu::slang::SlangRtStage::Miss,
+            &[
+                (
+                    "rt_payload",
+                    include_str!("../render/rt_pipeline/rt_payload.slang"),
+                ),
+                ("custom_sky", custom_sky_source),
+            ],
+        )
+        .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
+        .ok()?;
+        let module = create_shader_module(&self.device, &miss_spv)?;
+        let lib = self.create_library(
+            &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"main")],
+            &[general_group(0)],
+            vec![module],
+        )?;
+        if let Some((_, old)) = self.miss.take() {
+            self.destroy_library(old);
+        }
+        self.miss = Some((generation, lib));
+        Some(())
+    }
+
+    /// Shadow-miss library (Slang-precompiled, static).
+    fn ensure_shadow(&mut self) -> Option<()> {
+        if self.miss_shadow.is_some() {
+            return Some(());
+        }
+        // Slang-precompiled (see miss_shadow.slang for the regen command).
+        let module = create_shader_module(
+            &self.device,
+            &spirv_words(include_bytes!("../render/rt_pipeline/miss_shadow.spv")),
+        )?;
+        let lib = self.create_library(
+            &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"main")],
+            &[general_group(0)],
+            vec![module],
+        )?;
+        self.miss_shadow = Some(lib);
+        Some(())
+    }
+
+    /// One library per registry hit group (chit + optional any-hit). The
+    /// registry is append-only, so only entries past the cached count compile.
+    fn ensure_hit_groups(&mut self, hit_groups: &[SolariHitGroupDef]) -> Option<()> {
+        for hg in &hit_groups[self.hit_groups.len()..] {
+            let chit_mod = match &hg.closest_hit {
+                SolariChitSource::Slang { .. } => {
+                    let spv = compile_slang_chit(hg)
+                        .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
+                        .ok()?;
+                    create_shader_module(&self.device, &spv)?
+                }
+                SolariChitSource::SpirV(bytes) => {
+                    create_shader_module(&self.device, &spirv_words(bytes))?
+                }
+            };
+            let lib = if let Some(ah) = &hg.any_hit {
+                let ah_mod = create_shader_module(&self.device, &spirv_words(ah.spirv))?;
+                let entry = std::ffi::CString::new(ah.entry)
+                    .expect("shader entry name has interior NUL");
+                self.create_library(
+                    &[
+                        shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, c"main"),
+                        shader_stage(vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, entry.as_c_str()),
+                    ],
+                    &[hit_group_with_any_hit(0, 1)],
+                    vec![chit_mod, ah_mod],
+                )?
+            } else {
+                self.create_library(
+                    &[shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, c"main")],
+                    &[hit_group(0)],
+                    vec![chit_mod],
+                )?
+            };
+            self.hit_groups.push(lib);
+        }
+        Some(())
+    }
+
+    /// Link the cached libraries into an executable pipeline. Group numbering
+    /// is the concatenation of the libraries' groups in list order — raygen
+    /// (0), primary miss (1), hit groups (2..), shadow miss last — matching
+    /// the SBT layout [`RtPipeline::new`] bakes.
+    fn link(&self) -> Option<vk::Pipeline> {
+        let mut libs: Vec<vk::Pipeline> =
+            Vec::with_capacity(3 + self.hit_groups.len());
+        libs.push(self.raygen.as_ref()?.pipeline);
+        libs.push(self.miss.as_ref()?.1.pipeline);
+        libs.extend(self.hit_groups.iter().map(|l| l.pipeline));
+        libs.push(self.miss_shadow.as_ref()?.pipeline);
+
+        let cluster_info =
+            vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV::default()
+                .allow_cluster_acceleration_structure(true);
+        let library_info = vk::PipelineLibraryCreateInfoKHR::default().libraries(&libs);
+        let interface = vk::RayTracingPipelineInterfaceCreateInfoKHR::default()
+            .max_pipeline_ray_payload_size(MAX_RAY_PAYLOAD_SIZE)
+            .max_pipeline_ray_hit_attribute_size(MAX_HIT_ATTRIBUTE_SIZE);
         // Opt into opacity micromaps. Unlike ray queries (which honor OMM straight
         // from the AS), a ray-tracing *pipeline* ignores opacity micromaps entirely
         // unless created with this flag — the driver invokes the any-hit shader on
         // every micro-triangle as if no OMM were present. OMM is a required
         // extension (solari disables without it), so the flag is unconditional.
-        let pipeline_flags = vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT;
-        let mut pipeline_info = vk::RayTracingPipelineCreateInfoKHR::default()
-            .flags(pipeline_flags)
-            .stages(&stages)
-            .groups(&groups)
-            // Depth 2: raygen's hit object executes the closest-hit (1), which
-            // traces a NEE shadow ray (2). Shadow rays skip the closest-hit, so the
-            // chain bottoms out there.
+        //
+        // Dynamic stack size: the driver's DEFAULT stack for a pipeline linked
+        // from libraries is unreliable (computed per library, not across the
+        // link), and an undersized stack corrupts payload/local spills with no
+        // validation error. The dispatch sets an explicit size (queried per
+        // group) via `vkCmdSetRayTracingPipelineStackSizeKHR` — which requires
+        // opting into the dynamic state here.
+        let dynamic_states = [vk::DynamicState::RAY_TRACING_PIPELINE_STACK_SIZE_KHR];
+        let dynamic_info =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let mut info = vk::RayTracingPipelineCreateInfoKHR::default()
+            .flags(vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT)
             .max_pipeline_ray_recursion_depth(2)
-            .layout(pipeline_layout);
-        pipeline_info.p_next =
+            .library_info(&library_info)
+            .library_interface(&interface)
+            .dynamic_state(&dynamic_info)
+            .layout(self.pipeline_layout);
+        info.p_next =
             (&cluster_info as *const vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV)
                 .cast();
-        // SAFETY: stages/groups reference live modules; layout live.
-        let pipeline = match unsafe {
-            rt.create_ray_tracing_pipelines(
+        // SAFETY: libraries + layout live (owned by this cache).
+        match unsafe {
+            self.rt.create_ray_tracing_pipelines(
                 vk::DeferredOperationKHR::null(),
                 vk::PipelineCache::null(),
-                &[pipeline_info],
+                &[info],
                 None,
             )
         } {
-            Ok(p) => p.into_iter().next()?,
+            Ok(p) => p.into_iter().next(),
             Err(e) => {
-                bevy_log::error!("rt_pipeline: vkCreateRayTracingPipelinesKHR failed: {:?}", e.1);
-                return None;
+                bevy_log::error!("rt_pipeline: pipeline link failed: {:?}", e.1);
+                None
             }
+        }
+    }
+}
+
+impl Drop for RtLibraryCache {
+    fn drop(&mut self) {
+        // In-flight traces may still reference the layouts; drain first.
+        self._device_keepalive.quiesce_before_raw_destroy();
+        let libs = self
+            .raygen
+            .take()
+            .into_iter()
+            .chain(self.miss.take().map(|(_, l)| l))
+            .chain(self.miss_shadow.take())
+            .chain(std::mem::take(&mut self.hit_groups));
+        for lib in libs {
+            // SAFETY: quiesced above; handles exclusively owned here.
+            unsafe {
+                self.device.destroy_pipeline(lib.pipeline, None);
+                for m in lib.modules {
+                    self.device.destroy_shader_module(m, None);
+                }
+            }
+        }
+        // SAFETY: the set-1 layout outlives the per-view pools/sets allocated
+        // from it (destroying a layout with live sets is legal), and those
+        // sets drop with their RtViewBindings.
+        unsafe {
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+        }
+    }
+}
+
+/// A raw host-visible buffer kept with its memory + mapping, for the SBT and the
+/// camera UBO (which `Allocator::create_buffer` can't expose — it hides the
+/// `VkDeviceMemory`).
+struct MappedBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut u8,
+    size: u64,
+    device_address: vk::DeviceAddress,
+}
+
+/// Render-world resource owning the **view-independent** ray-tracing pipeline +
+/// SBT + the set-1 descriptor *layout* and the shared env sampler. The per-view
+/// resources (set-1 descriptor set, camera UBO, output-buffer binding, env cube)
+/// live in [`RtViewBindings`], a component, so multiple views (split-screen) each
+/// trace into their own output with their own camera/env.
+///
+/// Built lazily once the scene layouts and materials exist; `RayTracingPipelineFeature`
+/// is a hard requirement, so absence here only ever means "not built yet".
+#[derive(Resource)]
+pub struct RtPipeline {
+    device: ash::Device,
+    rt: khr::ray_tracing_pipeline::Device,
+
+    pipeline: vk::Pipeline,
+    /// Handle COPIES of the shared layouts [`RtLibraryCache`] owns (the cache
+    /// outlives every linked pipeline; a wgpu layout change recreates both).
+    pipeline_layout: vk::PipelineLayout,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+
+    sbt: MappedBuffer,
+    raygen_region: vk::StridedDeviceAddressRegionKHR,
+    miss_region: vk::StridedDeviceAddressRegionKHR,
+    hit_region: vk::StridedDeviceAddressRegionKHR,
+    callable_region: vk::StridedDeviceAddressRegionKHR,
+    /// Number of per-material hit records the SBT holds. An instance routes to
+    /// record = its material slot, so once the live material count exceeds this
+    /// the pipeline must be rebuilt (the dispatch checks [`Self::capacity`]).
+    record_capacity: u32,
+
+    /// Per-material-slot SBT hit-group class the records were baked with (0 =
+    /// opaque, 1 = glass, …; see `material::material_sbt_class`). Each record's
+    /// shader handle is `handle(2 + class)`, so a material changing class (glass
+    /// loading/unloading, a live edit) needs the records rebuilt — the handle is
+    /// baked, unlike the per-frame GPU `FORCE_NO_OPAQUE` flag. The dispatch
+    /// compares this via [`Self::classes_changed`].
+    material_classes: Vec<u32>,
+
+    /// Generation of the `bevy_solari::custom_sky` module source the primary miss
+    /// shader was composed with. `SolariSky::Shader` swaps the module at runtime;
+    /// the composed SPIR-V is baked, so a source change needs a pipeline rebuild —
+    /// the dispatch compares this against [`SolariCustomSky`](crate::render::sky::SolariCustomSky).
+    custom_sky_generation: u64,
+
+    /// Explicit pipeline stack size (bytes), queried per group from the linked
+    /// pipeline and set dynamically at trace time — the driver default is
+    /// unreliable for library-linked pipelines.
+    stack_size: u32,
+
+    /// Keeps the `VkDevice` alive until this drops. The cloned `ash::Device`
+    /// above is a bare handle + fn table with NO ownership: at app teardown the
+    /// render world drops resources in arbitrary order, and if wgpu destroys the
+    /// device first, [`Drop`]'s raw destroys segfault against a dead device. The
+    /// allocator transitively holds wgpu's queue → device, so holding it pins
+    /// the device across our Drop.
+    _device_keepalive: Allocator,
+}
+
+// SAFETY: all fields are plain Vulkan handles owned by this resource; the only
+// interior raw pointers (host-visible mappings) moved to RtViewBindings. Used
+// solely from the single render-schedule dispatch system.
+unsafe impl Send for RtPipeline {}
+unsafe impl Sync for RtPipeline {}
+
+/// Per-view ray-tracing resources: the set-1 descriptor set (output buffer @0,
+/// camera UBO @1, env cube @2, env sampler @3), the camera UBO it points at, and
+/// the env image to transition around the trace. One per [`SolariCamera`] view,
+/// so split-screen views don't share an output buffer or camera. Built from
+/// [`RtPipeline::create_view_bindings`]; rebuilt when the view's output buffer is
+/// reallocated (viewport resize).
+#[derive(Component)]
+pub struct RtViewBindings {
+    device: ash::Device,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    /// Bindless geometry addresses (set 1, binding 4); refreshed per frame via the
+    /// mapping (`set_geometry_addresses`). Not ringed: the addresses are stable
+    /// (stable-address `RawTraceBindable` buffers), so an in-flight overwrite writes
+    /// identical bytes — benign, unlike the per-frame-varying camera.
+    geometry: MappedBuffer,
+    /// This view's own linear env-cube sampler (destroyed on drop). Owned here, not
+    /// on `RtPipeline`, so the per-view set survives a pipeline rebuild — the set
+    /// is compatible-by-content with the rebuilt set-1 layout and references
+    /// nothing the rebuilt pipeline owns.
+    env_map_sampler: vk::Sampler,
+    /// `Some` ⇒ the env cube is the storage atmosphere cube (GENERAL); transition
+    /// it around each trace. `None` ⇒ already a read-optimal wgpu-sampled texture.
+    env_map_image: Option<vk::Image>,
+    /// The output `VkBuffer` baked into binding 0. The dispatch rebuilds this
+    /// component if the view's output buffer changes (resize) — the descriptor is
+    /// written once and never updated (updating an in-flight set device-losts).
+    output_buffer: vk::Buffer,
+    /// The env cube view baked into binding 2, for the same rebuild check: a
+    /// skybox that finishes loading (or is swapped) changes the view, and the
+    /// baked-once set would otherwise sample the stale cube forever.
+    env_map_view: vk::ImageView,
+    /// Keeps the `VkDevice` alive until this drops — see the twin field on
+    /// [`RtPipeline`]; without it, teardown drop order decides whether [`Drop`]'s
+    /// raw destroys run against a dead device.
+    _device_keepalive: Allocator,
+}
+
+// SAFETY: the host-visible geometry-address mapping is written only from the single
+// render-schedule dispatch (via `&self` + coherent memory), never shared across
+// threads. All other fields are plain Vulkan handles.
+unsafe impl Send for RtViewBindings {}
+unsafe impl Sync for RtViewBindings {}
+
+impl RtPipeline {
+    /// Build the RT pipeline (raygen + miss + opaque/glass/hair closest-hit)
+    /// by LINKING the per-stage libraries cached in `libraries` — only stages
+    /// the cache hasn't seen (a new sky generation, a newly registered hit
+    /// group) compile; everything else relinks. The cache also owns the
+    /// shared pipeline layout (compatible with the wgpu scene/columns bind
+    /// groups bound at trace time). Built lazily (see the dispatch) once
+    /// those bind groups exist. Returns `None` if SPIR-V compilation or any
+    /// Vulkan step fails (logged).
+    pub fn new(
+        allocator: &Allocator,
+        libraries: &mut RtLibraryCache,
+        material_classes: &[u32],
+        hit_groups: &[SolariHitGroupDef],
+        custom_sky: (&str, u64),
+    ) -> Option<Self> {
+        let custom_sky_generation = custom_sky.1;
+        // One hit record per material slot; `material_classes[slot]` selects the
+        // record's hit-group handle (opaque/glass/hair).
+        let material_count = material_classes.len() as u32;
+        let device = allocator.device().clone();
+        let instance = allocator.instance();
+        let physical_device = allocator.physical_device();
+
+        // SAFETY: instance + device are live; loading the RT-pipeline function
+        // table is valid because the extension was enabled at device creation.
+        let rt = khr::ray_tracing_pipeline::Device::load(instance, &device);
+
+        // Pipeline properties (SBT alignment), queried via the properties2 chain.
+        let mut rt_props = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push(&mut rt_props);
+        // SAFETY: physical_device valid; props2 chain well-formed.
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+        let handle_size = rt_props.shader_group_handle_size as u64;
+        let handle_align = rt_props.shader_group_handle_alignment as u64;
+        let base_align = rt_props.shader_group_base_alignment as u64;
+
+        // --- Stage libraries (cached) + link -----------------------------------
+        // Fixed general programs (raygen + the two miss shaders); every closest-hit
+        // ("hit group", + optional any-hit) comes from `hit_groups` (the registry), so
+        // adding a surface shader needs no edit here — Solari's own opaque/glass/hair/
+        // portal register the same way as any downstream material (see SolariPlugin).
+        libraries.ensure_raygen()?;
+        libraries.ensure_miss(custom_sky)?;
+        libraries.ensure_shadow()?;
+        libraries.ensure_hit_groups(hit_groups)?;
+        let pipeline = libraries.link()?;
+
+        // Explicit pipeline stack size (spec formula for recursion depth 2, no
+        // intersection/callable stages). The driver's DEFAULT stack for a
+        // pipeline linked from LIBRARIES is unreliable — an undersized stack
+        // corrupts payload/local spills with no validation error — so query
+        // the per-group stack sizes from the linked pipeline and set the size
+        // dynamically at trace time.
+        let group_stack = |group: u32, ty: vk::ShaderGroupShaderKHR| -> u64 {
+            // SAFETY: pipeline live; `group` is within the linked group range.
+            unsafe { rt.get_ray_tracing_shader_group_stack_size(pipeline, group, ty) }
         };
+        let shadow_group = 2 + hit_groups.len() as u32;
+        let raygen_stack = group_stack(0, vk::ShaderGroupShaderKHR::GENERAL);
+        let miss_stack = group_stack(1, vk::ShaderGroupShaderKHR::GENERAL)
+            .max(group_stack(shadow_group, vk::ShaderGroupShaderKHR::GENERAL));
+        let mut chit_stack = 0u64;
+        let mut any_hit_stack = 0u64;
+        for (i, hg) in hit_groups.iter().enumerate() {
+            let g = 2 + i as u32;
+            chit_stack = chit_stack.max(group_stack(g, vk::ShaderGroupShaderKHR::CLOSEST_HIT));
+            if hg.any_hit.is_some() {
+                any_hit_stack =
+                    any_hit_stack.max(group_stack(g, vk::ShaderGroupShaderKHR::ANY_HIT));
+            }
+        }
+        // rayGen + depth×max(chit + anyHit, miss): slightly conservative vs the
+        // spec's exact expression (folds the any-hit into every level).
+        let stack_size = (raygen_stack + 2 * (chit_stack + any_hit_stack).max(miss_stack)) as u32;
+
+        // Linked group numbering (see `RtLibraryCache::link`): raygen (0), primary
+        // miss (1), one hit group per registry entry (its index = its SBT class;
+        // class c -> group 2+c -> handle(2+c)), shadow miss LAST.
+        let shadow_miss_group = 2 + hit_groups.len() as u32;
+        let group_count = shadow_miss_group + 1;
+        // The hair hit group's SBT handle index, for the reserved hair record below.
+        let hair_group = hit_groups
+            .iter()
+            .position(|g| g.label == "hair")
+            .map_or(2u32, |i| 2 + i as u32);
+        // Max valid SBT class (registry index); out-of-range material classes fall back.
+        let max_class = (hit_groups.len() as u32).saturating_sub(1);
 
         // The set-1 descriptor set + camera UBO + env binding are per-view, built
         // lazily in `create_view_bindings` (one per `SolariCamera`).
@@ -754,8 +1042,8 @@ impl RtPipeline {
             device,
             rt,
             pipeline,
-            pipeline_layout,
-            descriptor_set_layout,
+            pipeline_layout: libraries.pipeline_layout,
+            descriptor_set_layout: libraries.descriptor_set_layout,
             sbt,
             raygen_region,
             miss_region,
@@ -764,7 +1052,7 @@ impl RtPipeline {
             record_capacity,
             material_classes: material_classes.to_vec(),
             custom_sky_generation,
-            modules,
+            stack_size,
             _device_keepalive: allocator.clone(),
         };
         Some(out)
@@ -1167,6 +1455,11 @@ impl RtPipeline {
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 self.pipeline,
             );
+            // The linked pipeline opts into the dynamic stack-size state (see
+            // `RtLibraryCache::link`); the queried-per-group size replaces the
+            // driver default, which is unreliable across library boundaries.
+            self.rt
+                .cmd_set_ray_tracing_pipeline_stack_size(command_buffer, self.stack_size);
             self.device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
@@ -1281,65 +1574,81 @@ impl Drop for RtPipeline {
     fn drop(&mut self) {
         // In-flight traces may still reference the pipeline/SBT; drain first.
         self._device_keepalive.quiesce_before_raw_destroy();
-        // SAFETY: all handles were created by this resource; the queue is
-        // drained and the device alive (keepalive). The set-1 layout outlives
-        // the per-view pools/sets allocated from it (destroying a layout with
-        // live sets is legal), and those sets drop with their RtViewBindings.
+        // SAFETY: the linked pipeline + SBT were created by this resource; the
+        // queue is drained and the device alive (keepalive). The layouts and
+        // stage libraries belong to `RtLibraryCache` and survive the rebuild.
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-            for m in &self.modules {
-                self.device.destroy_shader_module(*m, None);
-            }
             self.device.destroy_buffer(self.sbt.buffer, None);
             self.device.free_memory(self.sbt.memory, None);
         }
     }
 }
 
-/// naga capabilities the RT shaders need — RT (query/pipeline/vertex-return) plus
-/// the material texture/sampler binding arrays (indexed non-uniformly by material
-/// id) the imported scene bindings carry. Used by BOTH the composer and the
-/// post-compose validator, so they can't drift.
-fn rt_capabilities() -> naga::valid::Capabilities {
-    naga::valid::Capabilities::RAY_QUERY
-        | naga::valid::Capabilities::RAY_HIT_VERTEX_POSITION
-        | naga::valid::Capabilities::RAY_TRACING_PIPELINE
-        | naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY
-        | naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY_NON_UNIFORM_INDEXING
-        // 64-bit ints for buffer-device-address arithmetic in the bindless
-        // geometry path (`physical_load<T>(addr: u64)`).
-        | naga::valid::Capabilities::SHADER_INT64
-        // f64 for planet-scale domain math in user composable modules
-        // (SHADER_F64 is a required solari device feature post-transform_f64).
-        | naga::valid::Capabilities::FLOAT64
-        // f16 pack/unpack builtins (planet erosion maps decode 4×f16 texels).
-        | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
-        // True f16 + cooperative vectors: NRC inline inference in raygen.
-        | naga::valid::Capabilities::SHADER_FLOAT16
-        | naga::valid::Capabilities::COOPERATIVE_VECTOR
+/// The built-in Slang modules importable by runtime-compiled RT stages
+/// (`import scene_resolve;` etc.) — the same set the precompiled stages resolve
+/// as files beside them at regen time.
+const RT_SLANG_MODULES: &[(&str, &str)] = &[
+    (
+        "rt_payload",
+        include_str!("../render/rt_pipeline/rt_payload.slang"),
+    ),
+    (
+        "scene_resolve",
+        include_str!("../render/rt_pipeline/scene_resolve.slang"),
+    ),
+    ("brdf", include_str!("../render/rt_pipeline/brdf.slang")),
+    (
+        "sampling",
+        include_str!("../render/rt_pipeline/sampling.slang"),
+    ),
+    ("hair", include_str!("../render/rt_pipeline/hair.slang")),
+];
+
+/// Compile a [`SolariChitSource::Slang`] closest-hit with the built-in module
+/// set plus the group's own `composable_modules` importable. Shared by eager
+/// registration validation and the pipeline build.
+fn compile_slang_chit(group: &SolariHitGroupDef) -> Result<Vec<u32>, String> {
+    let SolariChitSource::Slang { source, file, entry } = &group.closest_hit else {
+        unreachable!("compile_slang_chit called on a precompiled closest-hit");
+    };
+    let mut modules = RT_SLANG_MODULES.to_vec();
+    modules.extend_from_slice(group.composable_modules);
+    crate::gpu::slang::compile_rt_slang(
+        file,
+        source,
+        entry,
+        crate::gpu::slang::SlangRtStage::ClosestHit,
+        &modules,
+    )
 }
 
-/// Build a naga_oil composer pre-loaded with the built-in importable modules the RT
-/// shaders may `#import`, then any `extra_modules` (`(file_path, source)`, registered
-/// in slice order so later entries may import earlier ones and the built-ins).
-/// `None` when a module fails to compose (logged).
-fn rt_composer(
-    extra_modules: &[(&str, &str)],
-) -> Option<naga_oil::compose::Composer> {
+/// naga capabilities the WGSL RT-adjacent shaders need — used only by the
+/// headless `rt_shaders_compile` validation of the remaining stock-naga WGSL
+/// (`restir_spatial`, which traces inline ray queries); every runtime RT stage
+/// is Slang.
+#[cfg(test)]
+fn rt_capabilities() -> naga::valid::Capabilities {
+    // Ray queries for the inline visibility traces; f16-in-f32 for the
+    // `pack2x16float`/`unpack2x16float` G-buffer codecs. The runtime compile
+    // gets both from the device features via the wgpu pipeline cache.
+    naga::valid::Capabilities::RAY_QUERY
+        | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+}
+
+/// Build a naga_oil composer pre-loaded with the built-in importable modules the
+/// remaining WGSL passes may `#import` — test-only: it backs the headless
+/// `rt_shaders_compile` check of `restir_spatial` (whose runtime compile goes
+/// through the wgpu `PipelineCache`).
+#[cfg(test)]
+fn rt_composer() -> Option<naga_oil::compose::Composer> {
     use naga_oil::compose::{ComposableModuleDescriptor, Composer};
 
-    // Compose via naga_oil so the RT shaders can `#import` solari's scene-binding
-    // / BRDF / sampling modules (raw `naga::parse_str` can't resolve `#import`).
-    // Register the importable modules (solari + the self-contained bevy_render
-    // helpers); naga_oil pulls in only what each shader actually imports, roughly
-    // leaf-first so each module's deps are present when it's added.
-    // Composer validates the composed module, so it needs the same RT
-    // capabilities as the spv backend (the modules use `acceleration_structure`
-    // / ray-query / SER). `with_capabilities` purges modules, so set it first.
+    // Compose via naga_oil so the WGSL passes can `#import` solari's
+    // scene-binding / BRDF / sampling modules (raw `naga::parse_str` can't
+    // resolve `#import`). Composer validates the composed module, so it needs
+    // the same capabilities as the spv backend (ray query, binding arrays).
+    // `with_capabilities` purges modules, so set it first.
     let mut composer = Composer::default().with_capabilities(rt_capabilities());
     macro_rules! register {
         ($path:expr, $source:expr) => {
@@ -1357,66 +1666,27 @@ fn rt_composer(
         };
     }
     // Registered leaf-first: naga_oil resolves each module's `#import`s at
-    // add-time, so every dependency must already be registered.
+    // add-time, so every dependency must already be registered. This is
+    // `restir_spatial`'s import closure.
     register!("../../../bevy_render/src/maths.wgsl"); // bevy_render::maths (leaf)
     register!("../../../bevy_render/src/utils.wgsl"); // bevy_render::utils (leaf)
     register!("../render/rt_pipeline/rt_payload.wgsl"); // bevy_solari::rt_payload (leaf)
-    register!("../render/atmosphere.wgsl"); // bevy_solari::atmosphere (leaf)
-    register!("../instance/instance_mask.wgsl"); // bevy_solari::instance_mask (leaf)
     register!("../bindings/pbr.wgsl"); // -> maths
-    register!("../bindings/cluster_bindings.wgsl"); // -> utils
-    register!("../bindings/raytracing_scene_bindings.wgsl"); // -> pbr, atmosphere, utils
+    register!("../bindings/raytracing_scene_bindings.wgsl"); // (leaf)
     register!("../bindings/sampling.wgsl"); // -> pbr, scene_bindings, maths
-    register!("../bindings/light_sampling.wgsl"); // -> pbr, sampling, scene_bindings
     register!("../bindings/brdf.wgsl"); // -> pbr, sampling, scene_bindings, maths
-    register!("../hair/hair.wgsl"); // bevy_solari::hair (Chiang fiber BSDF) -> pbr
-    // Downstream modules (a hit group's `composable_modules`), after the built-ins
-    // so they can import them.
-    for (path, source) in extra_modules {
-        register!(*path, *source);
-    }
     Some(composer)
 }
 
-/// Registration-time check that a hit group's extra modules compose against the
-/// built-in set — surfaces "module X won't parse / imports something unregistered"
-/// at `register_solari_chit` time instead of as an opaque whole-pipeline build
-/// failure. Composition errors inside are logged by `rt_composer` itself.
-fn validate_composable_modules(modules: &[(&str, &str)]) -> Result<(), &'static str> {
-    match rt_composer(modules) {
-        Some(_) => Ok(()),
-        None => Err("see preceding rt_pipeline compose error"),
-    }
-}
-
-/// Compile a WGSL ray-tracing-stage shader to SPIR-V (1.4, RT capabilities) via
-/// the re-exported naga, with the group's extra composable modules (if any)
-/// available for `#import`. Returns `None` on parse/validate/emit failure (logged).
-fn compile_rt_wgsl(
-    source: &str,
-    file_path: &str,
-    extra_modules: &[(&str, &str)],
-) -> Option<Vec<u32>> {
-    match try_compile_rt_wgsl(source, file_path, extra_modules) {
-        Ok(spv) => Some(spv),
-        Err(e) => {
-            bevy_log::error!("rt_pipeline: {file_path}: {e}");
-            None
-        }
-    }
-}
-
-/// [`compile_rt_wgsl`] with the failure as a value — the headless shader test
-/// asserts on it, so shader edits fail at `cargo test` with the real error.
-fn try_compile_rt_wgsl(
-    source: &str,
-    file_path: &str,
-    extra_modules: &[(&str, &str)],
-) -> Result<Vec<u32>, String> {
+/// Test-only compose→validate→SPIR-V of a WGSL shader (see [`rt_composer`]) —
+/// the headless shader test asserts on the failure value, so shader edits fail
+/// at `cargo test` with the real error.
+#[cfg(test)]
+fn try_compile_rt_wgsl(source: &str, file_path: &str) -> Result<Vec<u32>, String> {
     use naga_oil::compose::{NagaModuleDescriptor, ShaderDefValue};
 
     let mut composer =
-        rt_composer(extra_modules).ok_or_else(|| "composable module registration failed".to_string())?;
+        rt_composer().ok_or_else(|| "composable module registration failed".to_string())?;
 
     // Shader-def axes for the RT shaders. This is the "pipeline key": each def is a
     // compile-out feature axis the raygen/chits can `#ifdef` on. Keep the axes few
@@ -1689,7 +1959,7 @@ mod tests {
                 include_str!("../render/rt_pipeline/restir_spatial.wgsl"),
             ),
         ] {
-            match try_compile_rt_wgsl(source, file, &[]) {
+            match try_compile_rt_wgsl(source, file) {
                 Ok(spv) => {
                     assert_no_runtime_descriptor_array(file, &spv);
                     if file == "restir_spatial.wgsl" {
@@ -1700,18 +1970,32 @@ mod tests {
             }
         }
 
-        // The primary miss composes the swappable `custom_sky` module (default =
-        // the built-in procedural gradient), so it compiles with that extra.
-        match try_compile_rt_wgsl(
-            include_str!("../render/rt_pipeline/miss.wgsl"),
-            "miss.wgsl",
-            &[(
-                "custom_sky.wgsl",
-                include_str!("../render/rt_pipeline/custom_sky.wgsl"),
-            )],
-        ) {
-            Ok(spv) => assert_no_runtime_descriptor_array("miss.wgsl", &spv),
-            Err(e) => panic!("miss.wgsl: {e}"),
+        // The primary miss composes the swappable `custom_sky` module through
+        // libslang at pipeline build (the one runtime-compiled stage). Compile
+        // it here with the default procedural sky AND a user-style replacement
+        // — the `SolariSky::Shader` path — so both stay proven headlessly.
+        // (Needs the pinned Slang toolchain — see `gpu/slang.rs`.)
+        for custom_sky in [
+            crate::render::sky::DEFAULT_CUSTOM_SKY,
+            "module custom_sky;\n\
+             public float3 sample_custom_sky(float3 ray_direction)\n\
+             { return float3(0.5, 0.6, 1.0) * 4000.0; }\n",
+        ] {
+            let spv = crate::gpu::slang::compile_rt_slang(
+                "miss.slang",
+                include_str!("../render/rt_pipeline/miss.slang"),
+                "miss_primary",
+                crate::gpu::slang::SlangRtStage::Miss,
+                &[
+                    (
+                        "rt_payload",
+                        include_str!("../render/rt_pipeline/rt_payload.slang"),
+                    ),
+                    ("custom_sky", custom_sky),
+                ],
+            )
+            .unwrap_or_else(|e| panic!("miss.slang: {e}"));
+            assert_no_runtime_descriptor_array("miss.slang", &spv);
         }
 
         // Slang-precompiled stages: sanity-check the embedded blobs (magic +

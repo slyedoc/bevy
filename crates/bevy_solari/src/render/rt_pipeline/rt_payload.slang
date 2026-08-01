@@ -1,35 +1,55 @@
-// Slang mirror of the ray payload in rt_payload.wgsl. The payload crosses the
-// naga/Slang stage boundary, and the driver maps it MEMBER-WISE between each
-// module's own view of the struct — so the member SHAPE must match the WGSL
-// declaration exactly (same count, same types, same order). A byte-compatible
-// but reshaped struct (e.g. scalarized vec3s) silently drops every write on
-// SER-executed hits. Do not add, split, or reorder members here without the
-// same change in rt_payload.wgsl.
+// Shared ray-payload + camera types for the RT-pipeline shaders. Every stage
+// that carries a payload is Slang and imports these definitions, so payload
+// layout agreement is by construction. (Historical Law 1 — the driver maps
+// payloads MEMBER-WISE between stages, so a reshaped mirror silently drops
+// writes on SER-executed hits — still applies if a non-Slang stage ever
+// carries the payload again.)
 module rt_payload;
 
-// MUST MATCH RtPayload in rt_payload.wgsl member-for-member.
+// Per-bounce path state carried across the trace. raygen owns the bounce loop;
+// a hit shader fills `emitted` + (if continuing) `attenuation` and the next
+// ray, and threads the RNG back out. `anyhit_count` MUST stay the first field:
+// `ahit_alpha` aliases the payload's first word (it runs for both `RtPayload`
+// and `ShadowPayload` rays).
 public struct RtPayload
 {
+    // Any-hit invocation counter for the OMM-effectiveness debug heatmap.
+    // raygen resets it before each trace and sums across bounces.
     public uint anyhit_count;
-    public float3 emitted;
+    public float3 emitted;      // radiance contributed at this vertex (sky at miss)
+    // The mis-weighted emission part of `emitted` (zero from miss/glass; raygen
+    // clears it per bounce). At bounce 1 this is the pixel's DI-by-MIS term.
     public float3 emissive_mis;
-    public float3 attenuation;
+    public float3 attenuation;  // throughput multiplier for the next segment
     public float3 next_origin;
     public float3 next_direction;
-    public uint bounce;
-    public uint rng;
+    public uint bounce;         // 1 = continue, 0 = terminate (miss / absorb)
+    public uint rng;            // PCG state, advanced by the hit shader's sampling
+    // pdf of the BRDF sample that generated the ray INTO this vertex (0 on the
+    // primary ray). Threaded out by a hit shader so the NEXT vertex can
+    // MIS-weight its emissive against next-event estimation.
     public float p_bounce;
+    // Geometry-debug views (cluster / triangle color): global cluster id +
+    // cluster-local primitive index of the hit; raygen captures them on the
+    // PRIMARY hit. `hit_cluster` carries a sentinel when the primary ray missed.
     public uint hit_cluster;
     public uint hit_primitive;
+    // Normal-facing debug view: primary hit's SHADING normal (pre-bend, world
+    // space) and GEOMETRIC normal, oct-packed — raygen tells a back-wound
+    // triangle (red) from a merely bad vertex normal (yellow).
     public uint hit_normal_oct;
     public uint hit_geo_normal_oct;
+    // NRC: packed surface material at the hit (r5g6b5 base color, metallic8,
+    // roughness8); 0xffffffff = no material (miss / non-opaque chit).
     public uint hit_material;
+    // Pixel index (row-major `y*width + x`) on the PRIMARY bounce, sentinel
+    // after. The DLSS guides + ReSTIR reservoir writes both key off it.
     public uint gbuffer_pixel;
 }
 
-// MUST MATCH ShadowPayload in rt_payload.wgsl: two u32 words. The first word
-// mirrors `RtPayload.anyhit_count` so `ahit_alpha`'s single-word alias targets
-// the counter whichever ray type invoked it.
+// Shadow-ray payload: two u32 words. The first word mirrors
+// `RtPayload.anyhit_count` so `ahit_alpha`'s single-word alias targets the
+// counter whichever ray type invoked it.
 public struct ShadowPayload
 {
     public uint anyhit_count;
@@ -56,8 +76,9 @@ public float4 mat4_mul(Mat4 m, float4 v)
     return m.c0 * v.x + m.c1 * v.y + m.c2 * v.z + m.c3 * v.w;
 }
 
-// Mirrors `RtCamera` in rt_payload.wgsl (std140: matrices @0/64/128/192,
-// vec4s @256..368, world_from_view @384, vec4s @448..512).
+// The camera UBO layout the CPU writes (std140: matrices @0/64/128/192, vec4s
+// @256..368, world_from_view @384, vec4s @448..512). rt_payload.wgsl mirrors
+// this for the remaining wgpu compute passes — keep them field-for-field.
 public struct RtCamera
 {
     public Mat4 inverse_view_proj;

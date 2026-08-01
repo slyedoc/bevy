@@ -2,31 +2,30 @@
 //!
 //! [`SolariSky`] is one component covering every way a ray miss can be shaded:
 //! the camera's clear color, an environment cubemap, the built-in procedural
-//! gradient, or a user WGSL module. Solari ignores the raster `Skybox`
+//! gradient, or a user Slang module. Solari ignores the raster `Skybox`
 //! component entirely.
 //!
-//! The `Procedural`/`Shader` modes compose a `bevy_solari::custom_sky` naga_oil
-//! module into the primary-miss stage. The module source lives in
-//! [`SolariCustomSky`]; swapping it (a [`SolariSky::Shader`] handle loading or
-//! its asset being hot-reloaded) bumps the generation, and the RT dispatch
-//! rebuilds the pipeline — the composed SPIR-V is baked into the `VkPipeline`.
+//! The `Procedural`/`Shader` modes compose a `custom_sky` Slang module into the
+//! primary-miss stage (compiled at pipeline build via `gpu/slang.rs`). The
+//! module source lives in [`SolariCustomSky`]; swapping it (mutating a
+//! [`SolariSky::Shader`] component) bumps the generation, and the RT dispatch
+//! rebuilds the pipeline — the compiled SPIR-V is baked into the `VkPipeline`.
 
 use alloc::borrow::Cow;
-use bevy_asset::{Assets, Handle};
+use bevy_asset::Handle;
 use bevy_ecs::{
     component::Component,
     reflect::ReflectComponent,
     resource::Resource,
-    system::{Local, Query, Res, ResMut},
+    system::{Local, Query, ResMut},
 };
 use bevy_image::Image;
 use bevy_log::warn;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::Extract;
-use bevy_shader::{Shader, Source};
 
-/// The default `bevy_solari::custom_sky` module: the built-in procedural gradient.
-pub const DEFAULT_CUSTOM_SKY: &str = include_str!("rt_pipeline/custom_sky.wgsl");
+/// The default `custom_sky` module: the built-in procedural gradient.
+pub const DEFAULT_CUSTOM_SKY: &str = include_str!("rt_pipeline/custom_sky.slang");
 
 /// How rays that miss all geometry are shaded (the background and environment
 /// lighting) for a [`SolariCamera`](super::SolariCamera).
@@ -51,16 +50,17 @@ pub enum SolariSky {
     Procedural,
     /// A custom sky shader, replacing the built-in procedural module.
     ///
-    /// The shader must declare `#define_import_path bevy_solari::custom_sky` and
-    /// define `fn sample_custom_sky(ray_direction: vec3<f32>) -> vec3<f32>`,
-    /// returning radiance in physical light units (cd/m²). It composes into the
-    /// primary-miss stage only, so keep it self-contained (no scene-binding
-    /// imports). The module is app-global: one custom sky shader at a time.
-    Shader(Handle<Shader>),
+    /// The source is a self-contained Slang module defining
+    /// `public float3 sample_custom_sky(float3 ray_direction)`, returning
+    /// radiance in physical light units (cd/m²). It composes into the
+    /// primary-miss stage only, so keep it free of scene-binding imports.
+    /// The module is app-global: one custom sky shader at a time. Mutating
+    /// the source hot-swaps the sky (the RT pipeline rebuilds).
+    Shader(Cow<'static, str>),
 }
 
 /// Render-world view marker: this camera's misses evaluate the composed
-/// `bevy_solari::custom_sky` module ([`SolariSky::Procedural`] / [`SolariSky::Shader`]).
+/// `custom_sky` module ([`SolariSky::Procedural`] / [`SolariSky::Shader`]).
 /// The dispatch encodes it as a negative sky brightness in `RtCamera.sky.x`.
 #[derive(Component, Clone, Copy)]
 pub struct SolariViewSkyShader;
@@ -71,8 +71,8 @@ pub struct SolariViewSkyShader;
 #[derive(Component, Clone, Copy)]
 pub struct SolariViewClearColor(pub bevy_math::Vec3);
 
-/// Render-world resource: the live `bevy_solari::custom_sky` module source the
-/// RT pipeline composes into the primary miss shader. `generation` changes with
+/// Render-world resource: the live `custom_sky` Slang module source the RT
+/// pipeline compiles into the primary miss shader. `generation` changes with
 /// the source; [`RtPipeline`](crate::gpu::rt_pipeline::RtPipeline) bakes the
 /// generation it was built with, and the dispatch rebuilds on mismatch.
 #[derive(Resource)]
@@ -90,38 +90,26 @@ impl Default for SolariCustomSky {
     }
 }
 
-/// `ExtractSchedule`: mirror the first [`SolariSky::Shader`] camera's shader asset
-/// into [`SolariCustomSky`], restoring the built-in gradient when no camera uses
-/// one. Compares sources, so a hot-reloaded shader asset re-installs itself.
+/// `ExtractSchedule`: mirror the first [`SolariSky::Shader`] camera's module
+/// source into [`SolariCustomSky`], restoring the built-in gradient when no
+/// camera uses one. Compares sources, so mutating the component re-installs it.
 pub fn extract_solari_custom_sky(
     skies: Extract<Query<&SolariSky>>,
-    shaders: Extract<Res<Assets<Shader>>>,
     mut custom_sky: ResMut<SolariCustomSky>,
     mut warned: Local<bool>,
 ) {
     let user_shader = skies.iter().find_map(|sky| match sky {
-        SolariSky::Shader(handle) => Some(handle),
+        SolariSky::Shader(source) => Some(source),
         _ => None,
     });
 
     match user_shader {
-        Some(handle) => {
-            // Keep the current module (default or previous) until the asset loads.
-            let Some(shader) = shaders.get(handle) else {
-                return;
-            };
-            let Source::Wgsl(source) = &shader.source else {
-                if !*warned {
-                    warn!("Custom sky shader `{}` must be WGSL.", shader.path);
-                    *warned = true;
-                }
-                return;
-            };
-            if !source.contains("bevy_solari::custom_sky") {
+        Some(source) => {
+            if !source.contains("sample_custom_sky") {
                 if !*warned {
                     warn!(
-                        "Custom sky shader `{}` must declare `#define_import_path bevy_solari::custom_sky`.",
-                        shader.path
+                        "Custom sky module must define \
+                         `public float3 sample_custom_sky(float3 ray_direction)`."
                     );
                     *warned = true;
                 }

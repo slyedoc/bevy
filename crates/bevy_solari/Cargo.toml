@@ -124,6 +124,10 @@ clap = { version = "4", features = ["derive"], optional = true }
 # naga::parse_str can't resolve `#import`). Patched to the SER-aware fork.
 naga_oil = { version = "0.22", default-features = false }
 naga = { version = "29", features = ["wgsl-in", "spv-out"] }
+# Runtime Slang→SPIR-V for the RT stages that compose runtime-swappable
+# modules (the primary miss's custom sky, downstream Slang closest-hits):
+# libslang.so is dlopen'd from the pinned toolchain (see `gpu/slang.rs`).
+libloading = "0.8"
 # DLSS Ray Reconstruction for the `restir` path — used directly (not via
 # bevy_anti_alias's `Dlss` component) so the self-contained RT path needs no
 # raster prepass.

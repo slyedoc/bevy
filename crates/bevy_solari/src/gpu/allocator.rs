@@ -524,7 +524,7 @@ impl Allocator {
         SubmitAddr(addr)
     }
 
-    fn find_memory_type(
+    pub(crate) fn find_memory_type(
         &self,
         type_bits: u32,
         required_props: vk::MemoryPropertyFlags,

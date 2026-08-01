@@ -40,9 +40,8 @@ use crate::ecs_gpu::{GpuSlot, SceneColumns};
 use crate::geometry::ClusterMeshManager;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::rt_pipeline::{
-    RtCamera, RtGeometryAddresses, RtPipeline, RtViewBindings, SolariAnyHitDef, SolariChitSource,
-    SolariHitGroupDef,
-    SolariHitGroupRegistry,
+    RtCamera, RtGeometryAddresses, RtLibraryCache, RtPipeline, RtViewBindings, SolariAnyHitDef,
+    SolariChitSource, SolariHitGroupDef, SolariHitGroupRegistry,
 };
 use crate::gpu::RawTraceBindable;
 use crate::material::{material_sbt_class, MaterialSlots, MaterialTraversalFlags};
@@ -1165,6 +1164,7 @@ pub(crate) fn rt_pipeline(
         Option<Res<crate::geometry::tess_classify::TessClassify>>,
         Option<Res<SolariHitGroupRegistry>>,
         Option<Res<crate::accel::deform::Deform>>,
+        Option<ResMut<RtLibraryCache>>,
     ),
     materials: RtMaterials,
     // Tupled: baked sky cube + atmosphere GPU state (sky_frame quat) +
@@ -1210,7 +1210,8 @@ pub(crate) fn rt_pipeline(
         ptlas,
     ) = render_res;
     let (mut frame_counter, mut settle_frames) = counters;
-    let (cluster_mesh_manager, tess_classify, hit_group_registry, deform) = geometry_res;
+    let (cluster_mesh_manager, tess_classify, hit_group_registry, deform, library_cache) =
+        geometry_res;
     let (atmosphere_sky, atmosphere_gpu, atmosphere_volumes, custom_sky) = atmosphere_res;
     let view_entity = view.entity();
     let (
@@ -1314,15 +1315,37 @@ pub(crate) fn rt_pipeline(
                 raw_bgl(&pipeline_cache, columns_layout_desc),
                 hit_group_registry.as_deref(),
             ) {
+                // Get-or-recreate the stage-library cache: it lives across
+                // pipeline rebuilds (a sky/material change relinks cached
+                // libraries instead of recompiling every stage), but its
+                // shared pipeline layout bakes in the wgpu raw layouts, so a
+                // layout handle change starts a fresh cache (the stale one is
+                // dropped when `insert_resource` overwrites it).
+                let mut fresh_cache = None;
+                let cache: &mut RtLibraryCache = match library_cache {
+                    Some(cache) if cache.layout_key() == (scene_layout, columns_layout) => {
+                        cache.into_inner()
+                    }
+                    _ => {
+                        fresh_cache =
+                            RtLibraryCache::new(allocator, scene_layout, columns_layout);
+                        match fresh_cache.as_mut() {
+                            Some(cache) => cache,
+                            None => return,
+                        }
+                    }
+                };
                 if let Some(built) = RtPipeline::new(
                     allocator,
-                    scene_layout,
-                    columns_layout,
+                    cache,
                     &material_classes,
                     &registry.groups,
                     (&custom_sky.source, custom_sky.generation),
                 ) {
                     commands.insert_resource(built);
+                }
+                if let Some(fresh) = fresh_cache {
+                    commands.insert_resource(fresh);
                 }
             }
         }
@@ -2067,7 +2090,7 @@ pub(crate) fn rt_pipeline(
                 && (*frame_counter).is_multiple_of(nrc_cfg.train_interval.max(1))
             {
                 let _ = crate::nrc::dispatch_training(
-                    ctx.command_encoder(),
+                    &mut ctx,
                     nrc_bufs,
                     nrc_pipelines,
                     &render_device,

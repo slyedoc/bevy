@@ -5,8 +5,8 @@
 //! is uploaded and built into one linear-swept-sphere BLAS by
 //! [`manager`]; each hair entity becomes a PTLAS instance referencing that BLAS
 //! (see [`ptlas_hair`]); ray hits on hair shade with a Chiang fiber BSDF
-//! (`hair.wgsl`), reconstructing the fiber tangent + surface point from the hit
-//! segment's two endpoints (`segments` arena).
+//! (`hair.slang`), reconstructing the fiber tangent + surface point from the
+//! hit segment's two endpoints (`segments` arena).
 //!
 //! Blackwell-only (4th-gen RT cores). On any other adapter the extension isn't
 //! advertised, the [`HairManager`] is never inserted, and every hair system
@@ -395,9 +395,6 @@ impl Plugin for HairPlugin {
             .resource_mut::<Assets<HairMaterial>>()
             .insert(&Handle::<HairMaterial>::default(), HairMaterial::default())
             .unwrap();
-        // The Chiang fiber BSDF (`bevy_solari::hair`), imported by `chit_hair`.
-        bevy_shader::load_shader_library!(app, "hair.wgsl");
-
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
