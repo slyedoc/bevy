@@ -1,10 +1,10 @@
-// NRC fused training kernel: forward + relative-L2 loss + full dZ backward
-// chain in one dispatch (one thread = one sample), replacing the tiled
-// coopmat mm_nn/bias_act/loss_grad/mm_nt/relu_bwd ladder. The dW/db
-// reductions stay on the coopmat kernels (nrc_mlp.slang mm_tn/bias_grad):
-// coopVecOuterProductAccumulate needs the TrainingOptimal opaque layout,
-// whose gradient read-back requires vkConvertCooperativeVectorMatrixNV —
-// adopted when the NRC dispatch path owns a raw device.
+// NRC fused training kernel: forward + relative-L2 loss + full backward in
+// one dispatch (one thread = one sample). The dW/db reductions happen HERE
+// too: each layer's backward outer-product-accumulates dz ⊗ x into the
+// TrainingOptimal-layout gradient buffer and reduce-sum-accumulates dz into
+// the bias gradients — no dZ/activation stores, no separate reduction
+// kernels. The dispatch chain then runs vkCmdConvertCooperativeVectorMatrixNV
+// per layer to convert the opaque-layout dW to the row-major f32 adam reads.
 //
 // Weights are the TRANSPOSED mirror ([out x in] row-major per layer, the
 // same buffer coopvec inference reads); the backward W^T·dZ product reads
@@ -31,9 +31,8 @@ static const int LAYERS = 6;
 static const int OUT_CH = 3;
 static const float REL_EPS = 0.01;
 
-// acts[l] = layer-l INPUT activations, f16 [LAYERS][batch][WIDTH]:
-// [0] is the encoded batch (read); [1..5] are written for the dW reduction.
-[[vk::binding(0, 0)]] RWByteAddressBuffer acts;
+// The encoded batch, f16 [batch][WIDTH] (read-only here; written by encode).
+[[vk::binding(0, 0)]] ByteAddressBuffer acts;
 // w16_t: [out x in] row-major f16 per layer.
 [[vk::binding(1, 0)]] ByteAddressBuffer weights_t;
 // b16: f16 bias mirror, [LAYERS][WIDTH].
@@ -44,21 +43,27 @@ static const float REL_EPS = 0.01;
 [[vk::binding(4, 0)]] RWByteAddressBuffer preds;
 // [batch] per-sample relative-L2.
 [[vk::binding(5, 0)]] RWByteAddressBuffer loss_out;
-// dZ = dL/d(pre-activation), f16 [LAYERS][batch][WIDTH].
-[[vk::binding(6, 0)]] RWByteAddressBuffer dz;
+// dW accumulator: [LAYERS] TrainingOptimal-layout f32 blocks of
+// `params.opt_size` bytes each (opaque device layout; sized by the host
+// vkConvertCooperativeVectorMatrixNV query). Cleared each step; the
+// outer-product accumulate is atomic across all samples.
+[[vk::binding(6, 0)]] RWByteAddressBuffer dw_opt;
+// db accumulator: f32 [LAYERS][WIDTH]. Cleared each step.
+[[vk::binding(7, 0)]] RWByteAddressBuffer db;
 
 struct TrainParams
 {
     uint batch;
     float loss_scale;
-    uint pad_a;
+    // Bytes per layer's TrainingOptimal dW block (host convert query).
+    uint opt_size;
     uint pad_b;
 }
-[[vk::binding(7, 0)]] ConstantBuffer<TrainParams> params;
+[[vk::binding(8, 0)]] ConstantBuffer<TrainParams> params;
 // >= WIDTH f32 zeros. A zero CoopVec is LOADED, not splat-constructed:
 // the splat lowers to OpCompositeConstructReplicateEXT, and the device
 // won't have VK_EXT_shader_replicated_composites enabled.
-[[vk::binding(8, 0)]] ByteAddressBuffer zeros_buf;
+[[vk::binding(9, 0)]] ByteAddressBuffer zeros_buf;
 
 typealias HVec = CoopVec<half, WIDTH>;
 
@@ -134,8 +139,6 @@ struct Layer
             [ForceUnroll]
             for (int i = 0; i < WIDTH; i++)
                 o[i] = max(o[i], 0.0h);
-            // The dW reduction (mm_tn) reads next layer's input from global.
-            o.store(acts, ((layer + 1) * params.batch + sample) * WIDTH * 2);
         }
         return { o };
     }
@@ -157,12 +160,28 @@ struct Layer
             for (int i = 0; i < WIDTH; i++)
                 g[i] = pre[i] > 0.0h ? g[i] : 0.0;
         }
-        // The coopmat dW reduction reads f16 dZ — quantize once, at the store.
+        // The dW accumulate takes f16 dZ — quantize once, here (the same
+        // f16-products-summed-in-f32 numerics the coopmat reduction had).
         var g16 = HVec.load(zeros_buf, 0);
         [ForceUnroll]
         for (int i = 0; i < WIDTH; i++)
             g16[i] = half(g[i]);
-        g16.store(dz, (layer * params.batch + sample) * WIDTH * 2);
+        // dW[i][j] += x[i] * dz[j] — [in x out], matching the row-major f32
+        // gradient adam consumes after the per-layer layout convert.
+        coopVecOuterProductAccumulate(
+            input.p.data,
+            g16,
+            dw_opt,
+            layer * params.opt_size,
+            0,
+            CoopVecMatrixLayout.TrainingOptimal,
+            CoopVecComponentType.Float32);
+        // db[j] += dz[j], f32 accumulation.
+        var g32 = CoopVec<float, WIDTH>.load(zeros_buf, 0);
+        [ForceUnroll]
+        for (int i = 0; i < WIDTH; i++)
+            g32[i] = g[i];
+        coopVecReduceSumAccumulate(g32, db, layer * WIDTH * 4);
         // dX = W^T · dZ, scalar f32: dx[i] = sum_j W[j,i] * dz[j] over the
         // [out x in] row-major mirror.
         MLGrad dxv;

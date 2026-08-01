@@ -13,11 +13,12 @@
 #![allow(unsafe_code)]
 
 use argh::FromArgs;
+use ash::vk;
 use half::f16;
 use std::time::Instant;
+use wgpu::hal::api::Vulkan as VkApi;
 
 const WIDTH: usize = 64;
-const TILE: u32 = 16;
 const LAYERS: usize = 6;
 const OUT_CH: usize = 3;
 const REL_EPS: f32 = 0.01;
@@ -50,19 +51,6 @@ struct Args {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct MmDims {
-    m: u32,
-    n: u32,
-    k: u32,
-    a_off: u32,
-    b_off: u32,
-    c_off: u32,
-    pad_a: u32,
-    pad_b: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct EwParams {
     batch: u32,
     layer_off: u32,
@@ -76,7 +64,7 @@ struct EwParams {
 struct LearnParams {
     batch: u32,
     loss_scale: f32,
-    pad_a: u32,
+    opt_size: u32,
     pad_b: u32,
 }
 
@@ -120,22 +108,23 @@ struct Gym {
     batch: u32,
     loss_scale: f32,
     lr: f32,
+    // VK_NV_cooperative_vector: the per-layer TrainingOptimal→RowMajor dW
+    // conversion is a raw device command (same recipe as production nrc).
+    coopvec_fns: ash::nv::cooperative_vector::Device,
+    raw_device: ash::Device,
+    opt_size: u32,
 }
 
 struct Pipelines {
     learn: wgpu::ComputePipeline,
-    mm_tn: wgpu::ComputePipeline,
-    bias_grad: wgpu::ComputePipeline,
     adam: wgpu::ComputePipeline,
     gym_gen: wgpu::ComputePipeline,
     infer_coopvec: wgpu::ComputePipeline,
 }
 
 struct Buffers {
-    // [LAYERS][batch][WIDTH] f16 layer-input activations; [0] = encoded batch
+    // [batch][WIDTH] f16 encoded batch (the network input activations)
     acts: wgpu::Buffer,
-    // [LAYERS][batch][WIDTH] f16 dZ recorded by the fused kernel
-    dz: wgpu::Buffer,
     preds: wgpu::Buffer,
     targets: wgpu::Buffer,
     loss: wgpu::Buffer,
@@ -156,16 +145,17 @@ struct Buffers {
     ema_b: wgpu::Buffer,
     ema_wt16: wgpu::Buffer,
     ema_b16: wgpu::Buffer,
-    dw_ubo: Vec<wgpu::Buffer>,
-    bg_ubo: Vec<wgpu::Buffer>,
+    // [LAYERS] TrainingOptimal-layout dW accumulator blocks + the device
+    // addresses the raw convert reads/writes through.
+    dw_opt: wgpu::Buffer,
+    dw_opt_addr: u64,
+    dw_addr: u64,
     learn_ubo: wgpu::Buffer,
     ew_ubo: wgpu::Buffer,
     adam_w_ubo: wgpu::Buffer,
     adam_b_ubo: wgpu::Buffer,
     gen_ubo: wgpu::Buffer,
     learn_bg: wgpu::BindGroup,
-    dw_bg: Vec<wgpu::BindGroup>,
-    bias_grad_bg: Vec<wgpu::BindGroup>,
     adam_w_bg: wgpu::BindGroup,
     adam_b_bg: wgpu::BindGroup,
     gen_bg: wgpu::BindGroup,
@@ -209,8 +199,15 @@ async fn run(args: Args) {
                 required_features: wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
                     | wgpu::Features::EXPERIMENTAL_COOPERATIVE_VECTOR
                     | wgpu::Features::SHADER_F16
-                    | wgpu::Features::PASSTHROUGH_SHADERS,
-                required_limits: wgpu::Limits::default(),
+                    | wgpu::Features::PASSTHROUGH_SHADERS
+                    // Pulls in VK_KHR_buffer_device_address, which the raw dW
+                    // layout-convert needs to address wgpu-created buffers.
+                    | wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+                required_limits: wgpu::Limits {
+                    // the fused training kernel binds 9 storage buffers
+                    max_storage_buffers_per_shader_stage: 16,
+                    ..Default::default()
+                },
                 experimental_features: wgpu::ExperimentalFeatures::enabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
@@ -219,16 +216,60 @@ async fn run(args: Args) {
             .expect("device")
     };
 
+    // Raw handles for the dW layout conversion + the host size query for one
+    // layer's opaque TrainingOptimal block (`dst_data` null = size only).
+    let (coopvec_fns, raw_device, opt_size) = unsafe {
+        let hal_device = device
+            .as_hal::<VkApi>()
+            .expect("nrc gym requires the Vulkan backend");
+        let fns = ash::nv::cooperative_vector::Device::load(
+            hal_device.shared_instance().raw_instance(),
+            hal_device.raw_device(),
+        );
+        let mut dst_size: usize = 0;
+        let mut info = vk::ConvertCooperativeVectorMatrixInfoNV::default()
+            .src_size(WIDTH * WIDTH * 4)
+            .src_data(vk::DeviceOrHostAddressConstKHR {
+                host_address: core::ptr::null(),
+            })
+            .dst_data(vk::DeviceOrHostAddressKHR {
+                host_address: core::ptr::null_mut(),
+            })
+            .src_component_type(vk::ComponentTypeKHR::FLOAT32)
+            .dst_component_type(vk::ComponentTypeKHR::FLOAT32)
+            .num_rows(WIDTH as u32)
+            .num_columns(WIDTH as u32)
+            .src_layout(vk::CooperativeVectorMatrixLayoutNV::ROW_MAJOR)
+            .src_stride(WIDTH * 4)
+            .dst_layout(vk::CooperativeVectorMatrixLayoutNV::TRAINING_OPTIMAL)
+            .dst_stride(0);
+        info.p_dst_size = &mut dst_size;
+        fns.convert_cooperative_vector_matrix(&info)
+            .expect("vkConvertCooperativeVectorMatrixNV size query failed");
+        (fns, hal_device.raw_device().clone(), dst_size as u32)
+    };
+    println!("dW TrainingOptimal block: {opt_size} B/layer (row-major {} B)", WIDTH * WIDTH * 4);
+
     let mut gym = Gym {
         pipelines: build_pipelines(&device),
-        bufs: build_buffers(&device, args.batch),
+        bufs: build_buffers(&device, args.batch, opt_size),
         device,
         queue,
         batch: args.batch,
         loss_scale: args.loss_scale,
         lr: args.lr,
+        coopvec_fns,
+        raw_device,
+        opt_size,
     };
     build_bind_groups(&mut gym);
+
+    // Mark dw initialized with a tracked write: wgpu lazily ZERO-INITIALIZES
+    // a buffer at its first tracked use, and dw is only ever written by the
+    // raw (untracked) layout convert — without this, the first tracked read
+    // (adam / the certification readback) would wipe the converted gradients.
+    gym.queue
+        .write_buffer(&gym.bufs.dw, 0, &vec![0u8; W_TOTAL * 4]);
 
     let (master_w, master_b) = init_weights(args.seed);
     gym.queue
@@ -328,32 +369,17 @@ fn build_pipelines(device: &wgpu::Device) -> Pipelines {
             "nrc_learn",
             include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_train.spv"),
             &[
-                storage(0, false), // acts
+                storage(0, true),  // acts (encoded batch)
                 storage(1, true),  // weights_t
                 storage(2, true),  // biases
                 storage(3, true),  // targets
                 storage(4, false), // preds
                 storage(5, false), // loss
-                storage(6, false), // dz
-                uniform(7),
-                storage(8, true), // zeros16
+                storage(6, false), // dw_opt
+                storage(7, false), // db
+                uniform(8),
+                storage(9, true), // zeros16
             ],
-        ),
-        mm_tn: make(
-            "mm_tn",
-            include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_mm_tn.spv"),
-            &[
-                storage(0, true),
-                storage(1, true),
-                storage(2, false),
-                storage(3, true),
-                uniform(4),
-            ],
-        ),
-        bias_grad: make(
-            "bias_grad",
-            include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_bias_grad.spv"),
-            &[storage(0, true), storage(1, false), uniform(2)],
         ),
         adam: make(
             "adam",
@@ -389,7 +415,7 @@ fn build_pipelines(device: &wgpu::Device) -> Pipelines {
     }
 }
 
-fn build_buffers(device: &wgpu::Device, batch: u32) -> Buffers {
+fn build_buffers(device: &wgpu::Device, batch: u32, opt_size: u32) -> Buffers {
     let b = batch as u64;
     let storage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
@@ -402,26 +428,26 @@ fn build_buffers(device: &wgpu::Device, batch: u32) -> Buffers {
             mapped_at_creation: false,
         })
     };
-    let mk_ubo = |label: &str, data: &[u8]| mk(label, data.len() as u64, uniform);
-    let dw_ubo = (0..LAYERS)
-        .map(|l| {
-            mk_ubo(
-                &format!("dw_ubo{l}"),
-                bytemuck::bytes_of(&MmDims::default()),
-            )
-        })
-        .collect();
-    let bg_ubo = (0..LAYERS)
-        .map(|l| {
-            mk_ubo(
-                &format!("bg_ubo{l}"),
-                bytemuck::bytes_of(&MmDims::default()),
-            )
-        })
-        .collect();
+    // wgpu-hal creates every storage buffer with SHADER_DEVICE_ADDRESS, so
+    // the raw convert can address these directly. (64 B convert alignment is
+    // satisfied here only by driver tolerance — see heap_plan.md findings;
+    // dedicated raw allocations are the strict fix.)
+    let dw_opt = mk("dw_opt", LAYERS as u64 * opt_size as u64, storage);
+    let dw = mk("dw", W_TOTAL as u64 * 4, storage);
+    let device_address = |buf: &wgpu::Buffer| unsafe {
+        let raw = buf
+            .as_hal::<VkApi>()
+            .expect("vulkan backend")
+            .raw_handle();
+        let hal_device = device.as_hal::<VkApi>().expect("vulkan backend");
+        hal_device
+            .raw_device()
+            .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(raw))
+    };
+    let dw_opt_addr = device_address(&dw_opt);
+    let dw_addr = device_address(&dw);
     Buffers {
-        acts: mk("acts", LAYERS as u64 * b * WIDTH as u64 * 2, storage),
-        dz: mk("dz", LAYERS as u64 * b * WIDTH as u64 * 2, storage),
+        acts: mk("acts", b * WIDTH as u64 * 2, storage),
         preds: mk("preds", b * WIDTH as u64 * 4, storage),
         targets: mk("targets", b * 16, storage),
         loss: mk("loss", b * 4, storage),
@@ -432,7 +458,7 @@ fn build_buffers(device: &wgpu::Device, batch: u32) -> Buffers {
         preds16: mk("preds16", b * WIDTH as u64 * 2, storage),
         master_w: mk("master_w", W_TOTAL as u64 * 4, storage),
         master_b: mk("master_b", B_TOTAL as u64 * 4, storage),
-        dw: mk("dw", W_TOTAL as u64 * 4, storage),
+        dw,
         db: mk("db", B_TOTAL as u64 * 4, storage),
         m_w: mk("m_w", W_TOTAL as u64 * 4, storage),
         v_w: mk("v_w", W_TOTAL as u64 * 4, storage),
@@ -442,16 +468,15 @@ fn build_buffers(device: &wgpu::Device, batch: u32) -> Buffers {
         ema_b: mk("ema_b", B_TOTAL as u64 * 4, storage),
         ema_wt16: mk("ema_wt16", W_TOTAL as u64 * 2, storage),
         ema_b16: mk("ema_b16", B_TOTAL as u64 * 2, storage),
-        dw_ubo,
-        bg_ubo,
+        dw_opt,
+        dw_opt_addr,
+        dw_addr,
         learn_ubo: mk("learn_ubo", 16, uniform),
         ew_ubo: mk("ew_ubo", 16, uniform),
         adam_w_ubo: mk("adam_w_ubo", 48, uniform),
         adam_b_ubo: mk("adam_b_ubo", 48, uniform),
         gen_ubo: mk("gen_ubo", 16, uniform),
         learn_bg: placeholder_bg(device),
-        dw_bg: vec![],
-        bias_grad_bg: vec![],
         adam_w_bg: placeholder_bg(device),
         adam_b_bg: placeholder_bg(device),
         gen_bg: placeholder_bg(device),
@@ -469,12 +494,6 @@ fn placeholder_bg(device: &wgpu::Device) -> wgpu::BindGroup {
         layout: &layout,
         entries: &[],
     })
-}
-
-impl Default for MmDims {
-    fn default() -> Self {
-        bytemuck::Zeroable::zeroed()
-    }
 }
 
 fn bg(
@@ -502,41 +521,13 @@ fn build_bind_groups(gym: &mut Gym) {
     let q = &gym.queue;
     let p = &gym.pipelines;
     let bufs = &gym.bufs;
-    let layer_elems = (batch as usize * WIDTH) as u32;
-
-    for l in 0..LAYERS {
-        // dW_l = act_l^T · dZ_l: both operands live in the packed
-        // [LAYERS][batch][WIDTH] buffers, selected by element offset.
-        q.write_buffer(
-            &bufs.dw_ubo[l],
-            0,
-            bytemuck::bytes_of(&MmDims {
-                m: WIDTH as u32,
-                n: WIDTH as u32,
-                k: batch,
-                a_off: l as u32 * layer_elems,
-                b_off: l as u32 * layer_elems,
-                c_off: (l * W_ELEMS) as u32,
-                ..Default::default()
-            }),
-        );
-        q.write_buffer(
-            &bufs.bg_ubo[l],
-            0,
-            bytemuck::bytes_of(&MmDims {
-                k: batch,
-                c_off: (l * WIDTH) as u32,
-                ..Default::default()
-            }),
-        );
-    }
     q.write_buffer(
         &bufs.learn_ubo,
         0,
         bytemuck::bytes_of(&LearnParams {
             batch,
             loss_scale: gym.loss_scale,
-            pad_a: 0,
+            opt_size: gym.opt_size,
             pad_b: 0,
         }),
     );
@@ -561,47 +552,13 @@ fn build_bind_groups(gym: &mut Gym) {
             (3, bufs.targets.as_entire_binding()),
             (4, bufs.preds.as_entire_binding()),
             (5, bufs.loss.as_entire_binding()),
-            (6, bufs.dz.as_entire_binding()),
-            (7, bufs.learn_ubo.as_entire_binding()),
+            (6, bufs.dw_opt.as_entire_binding()),
+            (7, bufs.db.as_entire_binding()),
+            (8, bufs.learn_ubo.as_entire_binding()),
             // f32 zeros reinterpreted: all-zero bytes are all-zero f16s
-            (8, bufs.zeros.as_entire_binding()),
+            (9, bufs.zeros.as_entire_binding()),
         ],
     );
-    let mut dw_bg = vec![];
-    let mut bias_grad_bg = vec![];
-    for l in 0..LAYERS {
-        dw_bg.push(bg(
-            d,
-            &p.mm_tn,
-            &[
-                (0, bufs.acts.as_entire_binding()),
-                (1, bufs.dz.as_entire_binding()),
-                (2, bufs.dw.as_entire_binding()),
-                (3, bufs.zeros.as_entire_binding()),
-                (4, bufs.dw_ubo[l].as_entire_binding()),
-            ],
-        ));
-        // bias_grad has no element-offset field for dz — bind the layer's dZ
-        // slice (512 KiB stride keeps any offset alignment).
-        bias_grad_bg.push(bg(
-            d,
-            &p.bias_grad,
-            &[
-                (
-                    0,
-                    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &bufs.dz,
-                        offset: (l * batch as usize * WIDTH * 2) as u64,
-                        size: Some(
-                            std::num::NonZeroU64::new(batch as u64 * WIDTH as u64 * 2).unwrap(),
-                        ),
-                    }),
-                ),
-                (1, bufs.db.as_entire_binding()),
-                (2, bufs.bg_ubo[l].as_entire_binding()),
-            ],
-        ));
-    }
     let adam_w_bg = bg(
         d,
         &p.adam,
@@ -655,8 +612,6 @@ fn build_bind_groups(gym: &mut Gym) {
 
     let bufs = &mut gym.bufs;
     bufs.learn_bg = learn_bg;
-    bufs.dw_bg = dw_bg;
-    bufs.bias_grad_bg = bias_grad_bg;
     bufs.adam_w_bg = adam_w_bg;
     bufs.adam_b_bg = adam_b_bg;
     bufs.gen_bg = gen_bg;
@@ -715,9 +670,18 @@ fn run_step(gym: &Gym, step: u32, train: bool) {
             }),
         );
     }
+    // Three command buffers: wgpu-core panics if one encoder mixes wgpu
+    // passes with raw `as_hal_mut`, so the raw dW layout conversion sits in
+    // its own encoder between the training pass and adam (single queue —
+    // submission order is execution order; memory visibility comes from the
+    // raw sync2 barriers around the converts).
     let mut encoder = gym
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    // The gradient accumulators start at zero every step (the fused kernel's
+    // outer-product/reduce-sum accumulates are additive).
+    encoder.clear_buffer(&gym.bufs.dw_opt, 0, None);
+    encoder.clear_buffer(&gym.bufs.db, 0, None);
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
@@ -726,28 +690,79 @@ fn run_step(gym: &Gym, step: u32, train: bool) {
         pass.set_pipeline(&gym.pipelines.gym_gen);
         pass.set_bind_group(0, &gym.bufs.gen_bg, &[]);
         pass.dispatch_workgroups(gym.batch.div_ceil(64), 1, 1);
-        // fused forward + loss + dZ chain
+        // fused forward + loss + backward incl. the dW/db accumulates
         pass.set_pipeline(&gym.pipelines.learn);
         pass.set_bind_group(0, &gym.bufs.learn_bg, &[]);
         pass.dispatch_workgroups(gym.batch.div_ceil(64), 1, 1);
-        // dW/db reductions over the recorded activations/dZ
-        for l in 0..LAYERS {
-            pass.set_pipeline(&gym.pipelines.mm_tn);
-            pass.set_bind_group(0, &gym.bufs.dw_bg[l], &[]);
-            pass.dispatch_workgroups(WIDTH as u32 / TILE, WIDTH as u32 / TILE, 1);
-            pass.set_pipeline(&gym.pipelines.bias_grad);
-            pass.set_bind_group(0, &gym.bufs.bias_grad_bg[l], &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-        if train {
-            pass.set_pipeline(&gym.pipelines.adam);
-            pass.set_bind_group(0, &gym.bufs.adam_w_bg, &[]);
-            pass.dispatch_workgroups((W_TOTAL as u32).div_ceil(64), 1, 1);
-            pass.set_bind_group(0, &gym.bufs.adam_b_bg, &[]);
-            pass.dispatch_workgroups((B_TOTAL as u32).div_ceil(64), 1, 1);
-        }
     }
-    gym.queue.submit(Some(encoder.finish()));
+
+    let mut conv_encoder = gym
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dw_convert"),
+        });
+    unsafe {
+        conv_encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let cb = hal_encoder.expect("vulkan backend").raw_handle();
+            let dev = &gym.raw_device;
+            let pre = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::CONVERT_COOPERATIVE_VECTOR_MATRIX_NV)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&pre));
+            let opt_size = gym.opt_size as usize;
+            let row_bytes = W_ELEMS * 4;
+            let mut dst_sizes = [row_bytes; LAYERS];
+            let infos: Vec<vk::ConvertCooperativeVectorMatrixInfoNV> = (0..LAYERS)
+                .map(|l| {
+                    let mut info = vk::ConvertCooperativeVectorMatrixInfoNV::default()
+                        .src_size(opt_size)
+                        .src_data(vk::DeviceOrHostAddressConstKHR {
+                            device_address: gym.bufs.dw_opt_addr + (l * opt_size) as u64,
+                        })
+                        .dst_data(vk::DeviceOrHostAddressKHR {
+                            device_address: gym.bufs.dw_addr + (l * row_bytes) as u64,
+                        })
+                        .src_component_type(vk::ComponentTypeKHR::FLOAT32)
+                        .dst_component_type(vk::ComponentTypeKHR::FLOAT32)
+                        .num_rows(WIDTH as u32)
+                        .num_columns(WIDTH as u32)
+                        .src_layout(vk::CooperativeVectorMatrixLayoutNV::TRAINING_OPTIMAL)
+                        .src_stride(0)
+                        .dst_layout(vk::CooperativeVectorMatrixLayoutNV::ROW_MAJOR)
+                        .dst_stride(WIDTH * 4);
+                    info.p_dst_size = &mut dst_sizes[l];
+                    info
+                })
+                .collect();
+            gym.coopvec_fns.cmd_convert_cooperative_vector_matrix(cb, &infos);
+            let post = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::CONVERT_COOPERATIVE_VECTOR_MATRIX_NV)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::COPY,
+                )
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::TRANSFER_READ)];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&post));
+        });
+    }
+
+    let mut post_encoder = gym
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    if train {
+        let mut pass = post_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&gym.pipelines.adam);
+        pass.set_bind_group(0, &gym.bufs.adam_w_bg, &[]);
+        pass.dispatch_workgroups((W_TOTAL as u32).div_ceil(64), 1, 1);
+        pass.set_bind_group(0, &gym.bufs.adam_b_bg, &[]);
+        pass.dispatch_workgroups((B_TOTAL as u32).div_ceil(64), 1, 1);
+    }
+    gym.queue.submit([encoder.finish(), conv_encoder.finish(), post_encoder.finish()]);
 }
 
 async fn read_buffer(gym: &Gym, buffer: &wgpu::Buffer, size: u64) -> Vec<u8> {
