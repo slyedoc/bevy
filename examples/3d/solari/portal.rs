@@ -17,8 +17,7 @@ use bevy::{
     diagnostic::FrameTimeDiagnosticsPlugin,
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     math::Affine3A,
-    prelude::*,
-    solari::prelude::*,
+    prelude::*,    
 };
 use std::f32::consts::{FRAC_PI_2, PI};
 
@@ -76,7 +75,7 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut solari_materials: ResMut<Assets<StandardSolariMaterial>>,
-    portal_class: Res<bevy::solari::SolariHitGroupClass<bevy::solari::PortalSurface>>,
+    portal_class: Res<SolariHitGroupClass<PortalSurface>>,
 ) {
     // ── Two portals, FACING EACH OTHER ─────────────────────────────────────
     //

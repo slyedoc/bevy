@@ -166,14 +166,27 @@ pub struct RtGeometryAddresses {
     pub animated_table: u64,
 }
 
-/// One RT closest-hit program; its registry index is its SBT class. WGSL is `&'static`
-/// (usually `include_str!`) so downstream crates register without forking.
+/// Closest-hit stage source. Ported stages carry Slang-precompiled SPIR-V
+/// (the regen command lives in each `.slang` header); WGSL stages compose
+/// their runtime modules through the naga path until their port lands.
+#[derive(Clone)]
+pub enum SolariChitSource {
+    Wgsl {
+        source: &'static str,
+        file: &'static str,
+        entry: &'static str,
+    },
+    /// Slang-precompiled SPIR-V words (entry point "main").
+    SpirV(&'static [u8]),
+}
+
+/// One RT closest-hit program; its registry index is its SBT class. Sources are
+/// `&'static` (usually `include_str!`/`include_bytes!`) so downstream crates
+/// register without forking.
 #[derive(Clone)]
 pub struct SolariHitGroupDef {
     pub label: &'static str,
-    pub closest_hit_wgsl: &'static str,
-    pub closest_hit_file: &'static str,
-    pub closest_hit_entry: &'static str,
+    pub closest_hit: SolariChitSource,
     pub any_hit: Option<SolariAnyHitDef>,
     /// Extra `(file_path, source)` naga_oil modules composed into this group's
     /// chit/any-hit alongside the built-in `bevy_solari::*` set — lets a downstream
@@ -185,10 +198,12 @@ pub struct SolariHitGroupDef {
 }
 
 /// An any-hit program attached to a [`SolariHitGroupDef`] (alpha cutout, etc.).
+/// Any-hits are Slang-precompiled SPIR-V (see `ahit_alpha.slang` — the regen
+/// command is in its header): they never compose runtime modules, so nothing
+/// needs the WGSL composer here.
 #[derive(Clone)]
 pub struct SolariAnyHitDef {
-    pub wgsl: &'static str,
-    pub file: &'static str,
+    pub spirv: &'static [u8],
     pub entry: &'static str,
 }
 
@@ -391,9 +406,12 @@ impl RtPipeline {
                 &[("custom_sky.wgsl", custom_sky_source)],
             )?,
         )?;
+        // Slang-precompiled (see miss_shadow.slang for the regen command); the
+        // payload contract with the WGSL chits is struct layout only — naga
+        // emits no payload Location decorations, linkage is the trace operand.
         let miss_shadow_mod = create_shader_module(
             &device,
-            &compile_rt_wgsl(include_str!("../render/rt_pipeline/miss_shadow.wgsl"), "miss_shadow.wgsl", &[])?,
+            &spirv_words(include_bytes!("../render/rt_pipeline/miss_shadow.spv")),
         )?;
 
         // Stage table: (flags, module, entry). Fixed stages first (raygen 0, primary
@@ -403,23 +421,29 @@ impl RtPipeline {
         let mut stage_specs: Vec<(vk::ShaderStageFlags, vk::ShaderModule, &'static str)> = vec![
             (vk::ShaderStageFlags::RAYGEN_KHR, raygen_mod, "raygen"),
             (vk::ShaderStageFlags::MISS_KHR, miss_mod, "miss_primary"),
-            (vk::ShaderStageFlags::MISS_KHR, miss_shadow_mod, "miss_shadow"),
+            // slangc names every entry point "main"
+            (vk::ShaderStageFlags::MISS_KHR, miss_shadow_mod, "main"),
         ];
         // Per hit group: compile chit (+ any-hit), recording their stage indices.
         let mut hit_group_stages: Vec<(u32, Option<u32>)> = Vec::with_capacity(hit_groups.len());
         for hg in hit_groups {
-            let chit_mod = create_shader_module(
-                &device,
-                &compile_rt_wgsl(hg.closest_hit_wgsl, hg.closest_hit_file, hg.composable_modules)?,
-            )?;
+            let (chit_mod, chit_entry) = match &hg.closest_hit {
+                SolariChitSource::Wgsl { source, file, entry } => (
+                    create_shader_module(
+                        &device,
+                        &compile_rt_wgsl(source, file, hg.composable_modules)?,
+                    )?,
+                    *entry,
+                ),
+                SolariChitSource::SpirV(bytes) => {
+                    (create_shader_module(&device, &spirv_words(bytes))?, "main")
+                }
+            };
             let chit_stage = stage_specs.len() as u32;
             modules.push(chit_mod);
-            stage_specs.push((vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, hg.closest_hit_entry));
+            stage_specs.push((vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, chit_entry));
             let any_hit_stage = if let Some(ah) = &hg.any_hit {
-                let ah_mod = create_shader_module(
-                    &device,
-                    &compile_rt_wgsl(ah.wgsl, ah.file, hg.composable_modules)?,
-                )?;
+                let ah_mod = create_shader_module(&device, &spirv_words(ah.spirv))?;
                 let s = stage_specs.len() as u32;
                 modules.push(ah_mod);
                 stage_specs.push((vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, ah.entry));
@@ -1453,6 +1477,13 @@ fn try_compile_rt_wgsl(
         .map_err(|e| format!("SPIR-V emit failed: {e:?}"))
 }
 
+/// Byte-align an embedded Slang-precompiled SPIR-V blob into words
+/// (`include_bytes!` carries no u32 alignment guarantee).
+fn spirv_words(bytes: &'static [u8]) -> Vec<u32> {
+    debug_assert_eq!(bytes.len() % 4, 0, "SPIR-V blob length not word-aligned");
+    bytemuck::pod_collect_to_vec(bytes)
+}
+
 fn create_shader_module(device: &ash::Device, spv: &[u32]) -> Option<vk::ShaderModule> {
     let info = vk::ShaderModuleCreateInfo::default().code(spv);
     // SAFETY: spv is valid SPIR-V words from naga; device live.
@@ -1650,10 +1681,6 @@ mod tests {
                 include_str!("../render/rt_pipeline/raygen.wgsl"),
             ),
             (
-                "miss_shadow.wgsl",
-                include_str!("../render/rt_pipeline/miss_shadow.wgsl"),
-            ),
-            (
                 "chit_opaque.wgsl",
                 include_str!("../render/rt_pipeline/chit_opaque.wgsl"),
             ),
@@ -1664,14 +1691,6 @@ mod tests {
             (
                 "chit_hair.wgsl",
                 include_str!("../render/rt_pipeline/chit_hair.wgsl"),
-            ),
-            (
-                "chit_portal.wgsl",
-                include_str!("../render/rt_pipeline/chit_portal.wgsl"),
-            ),
-            (
-                "ahit_alpha.wgsl",
-                include_str!("../render/rt_pipeline/ahit_alpha.wgsl"),
             ),
             // The wgpu spatial pass — composed via PipelineCache at runtime, but
             // its imports are all registered here too, so validate it headlessly.
@@ -1703,6 +1722,29 @@ mod tests {
         ) {
             Ok(spv) => assert_no_runtime_descriptor_array("miss.wgsl", &spv),
             Err(e) => panic!("miss.wgsl: {e}"),
+        }
+
+        // Slang-precompiled stages: sanity-check the embedded blobs (magic +
+        // word alignment). The binding/layout cross-checks against the WGSL
+        // stages (Cluster stride 48, Material field offsets, payload words)
+        // happen at regen time — see the .slang headers.
+        for (file, blob) in [
+            (
+                "miss_shadow.spv",
+                include_bytes!("../render/rt_pipeline/miss_shadow.spv").as_slice(),
+            ),
+            (
+                "ahit_alpha.spv",
+                include_bytes!("../render/rt_pipeline/ahit_alpha.spv").as_slice(),
+            ),
+            (
+                "chit_portal.spv",
+                include_bytes!("../render/rt_pipeline/chit_portal.spv").as_slice(),
+            ),
+        ] {
+            assert!(blob.len() % 4 == 0 && blob.len() > 20, "{file}: truncated");
+            let magic = u32::from_le_bytes(blob[0..4].try_into().unwrap());
+            assert_eq!(magic, 0x0723_0203, "{file}: not SPIR-V");
         }
     }
 }

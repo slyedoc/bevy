@@ -1,4 +1,6 @@
-// NRC MLP kernels.
+// NRC MLP kernels (the fused forward/loss/backward lives in
+// nrc_train.slang; these are the coopmat dW/db reductions, adam, the
+// batched coopvec inference, and the record encode).
 // Convention: every matrix is ROW-major. Plain products use the T-suffixed
 // coop builtins; a transposed operand falls out of the unsuffixed
 // (column-major) load of the same row-major data — no transpose kernels.
@@ -34,34 +36,6 @@ struct MmDims {
 @group(0) @binding(3) var<storage, read> zero_tile: array<f32>;
 @group(0) @binding(4) var<uniform> dims: MmDims;
 
-// C[m×n] = A[m×k] · B[k×n], all row-major
-@compute @workgroup_size(64, 1, 1)
-fn mm_nn(@builtin(workgroup_id) wg: vec3<u32>) {
-    let row = wg.x * TILE;
-    let col = wg.y * TILE;
-    var acc = coopLoadT<coop_mat16x16<f32, C>>(&zero_tile[0], TILE);
-    for (var k = 0u; k < dims.k; k += TILE) {
-        let a = coopLoadT<coop_mat16x16<f16, A>>(&mat_a[dims.a_off + row * dims.k + k], dims.k);
-        let b = coopLoadT<coop_mat16x16<f16, B>>(&mat_b[dims.b_off + k * dims.n + col], dims.n);
-        acc = coopMultiplyAdd(a, b, acc);
-    }
-    coopStoreT(acc, &mat_c[dims.c_off + row * dims.n + col], dims.n);
-}
-
-// C[m×n] = A[m×k] · Bᵀ, B stored row-major [n×k]
-@compute @workgroup_size(64, 1, 1)
-fn mm_nt(@builtin(workgroup_id) wg: vec3<u32>) {
-    let row = wg.x * TILE;
-    let col = wg.y * TILE;
-    var acc = coopLoadT<coop_mat16x16<f32, C>>(&zero_tile[0], TILE);
-    for (var k = 0u; k < dims.k; k += TILE) {
-        let a = coopLoadT<coop_mat16x16<f16, A>>(&mat_a[dims.a_off + row * dims.k + k], dims.k);
-        let b = coopLoad<coop_mat16x16<f16, B>>(&mat_b[dims.b_off + col * dims.k + k], dims.k);
-        acc = coopMultiplyAdd(a, b, acc);
-    }
-    coopStoreT(acc, &mat_c[dims.c_off + row * dims.n + col], dims.n);
-}
-
 // C[m×n] = Aᵀ · B[k×n], A stored row-major [k×m]
 @compute @workgroup_size(64, 1, 1)
 fn mm_tn(@builtin(workgroup_id) wg: vec3<u32>) {
@@ -85,77 +59,9 @@ struct EwParams {
     loss_scale: f32,
 }
 
-@group(0) @binding(5) var<storage, read_write> pre_act: array<f32>;
 @group(0) @binding(6) var<storage, read_write> act_out: array<f16>;
-@group(0) @binding(7) var<storage, read> bias_vec: array<f32>;
 @group(0) @binding(8) var<uniform> ew: EwParams;
-@group(0) @binding(9) var<storage, read> targets: array<f32>;
-@group(0) @binding(10) var<storage, read_write> loss_out: array<f32>;
-@group(0) @binding(11) var<storage, read_write> grad_out: array<f16>;
 @group(0) @binding(12) var<storage, read> act_mask: array<f16>;
-
-// pre_act += bias, optional ReLU; result kept f32 in-place and cast to f16
-@compute @workgroup_size(64, 1, 1)
-fn bias_act(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= ew.batch * WIDTH { return; }
-    var v = pre_act[idx] + bias_vec[ew.layer_off + idx % WIDTH];
-    if ew.relu == 1u { v = max(v, 0.0); }
-    pre_act[idx] = v;
-    act_out[idx] = f16(v);
-}
-
-// relative-L2 loss on the first OUT_CH columns of the prediction buffer;
-// writes the (loss-scaled) output-layer gradient and a per-sample loss.
-// The denominator is the PREDICTION LUMINANCE, shared by all channels (paper
-// §4): a per-channel denominator gives each output neuron its own effective
-// learning rate, and the channels decouple into init-dependent equilibria
-// (seed-dependent color tint on an achromatic scene).
-// 1/batch is deliberately NOT folded in here: it would underflow f16
-// gradients; Adam divides it out via inv_grad_scale instead.
-@compute @workgroup_size(64, 1, 1)
-fn loss_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let sample = gid.x;
-    if sample >= ew.batch { return; }
-    var loss = 0.0;
-    var weight = targets[sample * 4u + 3u];
-    // A non-finite prediction must contribute EXACTLY zero (0*NaN = NaN —
-    // the weight alone can't save the sum), or one bad sample kills the net.
-    for (var c = 0u; c < OUT_CH; c += 1u) {
-        let pred = pre_act[sample * WIDTH + c];
-        if pred != pred || abs(pred) > 6.0e4 {
-            weight = 0.0;
-        }
-    }
-    let lum = 0.2126 * pre_act[sample * WIDTH]
-        + 0.7152 * pre_act[sample * WIDTH + 1u]
-        + 0.0722 * pre_act[sample * WIDTH + 2u];
-    let denom = lum * lum + REL_EPS;
-    for (var c = 0u; c < WIDTH; c += 1u) {
-        let idx = sample * WIDTH + c;
-        if c < OUT_CH && weight > 0.0 {
-            let pred = pre_act[idx];
-            let diff = pred - targets[sample * 4u + c];
-            loss += weight * diff * diff / denom;
-            // relative-L2's gradient explodes for dim predictions of bright
-            // targets (2·diff/ε) — clamp inside f16 range or dW goes inf and
-            // adam turns inf−inf into permanent NaN weights
-            let g = clamp(weight * ew.loss_scale * 2.0 * diff / denom, -3.2e4, 3.2e4);
-            grad_out[idx] = f16(g);
-        } else {
-            grad_out[idx] = 0.0h;
-        }
-    }
-    loss_out[sample] = loss;
-}
-
-// dZ = dA ⊙ 1[act > 0]; f32 grad scratch in, f16 coop operand out
-@compute @workgroup_size(64, 1, 1)
-fn relu_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= ew.batch * WIDTH { return; }
-    act_out[idx] = f16(pre_act[idx] * select(0.0, 1.0, act_mask[idx] > 0.0h));
-}
 
 // db[j] = Σ_batch dZ[·,j]; one thread per column, dims.k = batch
 @compute @workgroup_size(64, 1, 1)

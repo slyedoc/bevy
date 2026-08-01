@@ -81,7 +81,9 @@ use crate::transform::SolariTransformPlugin;
 #[cfg(feature = "bevy_solari_debug")]
 use crate::debug::SolariDebugPlugin;
 
-pub use crate::gpu::rt_pipeline::{SolariAnyHitDef, SolariHitGroupDef, SolariHitGroupRegistry};
+pub use crate::gpu::rt_pipeline::{
+    SolariAnyHitDef, SolariChitSource, SolariHitGroupDef, SolariHitGroupRegistry,
+};
 pub use crate::material::{
     SolariChitRegistryAppExt, SolariHitGroup, SolariHitGroupClass, SolariHitGroupPlugin,
 };
@@ -216,6 +218,7 @@ pub mod prelude {
         },
         transform::{NoGpuGlobalTransformReadback, SolariGpuFrame, TransformStatic},
         SolariInitPlugin, SolariPlugin, SolariSettings,
+        PortalSurface,
     };
 
     #[cfg(feature = "bevy_solari_debug")]
@@ -384,5 +387,8 @@ impl SolariPlugin {
             | WgpuFeatures::SHADER_F16
             | WgpuFeatures::EXPERIMENTAL_COOPERATIVE_MATRIX
             | WgpuFeatures::EXPERIMENTAL_COOPERATIVE_VECTOR
+            // The fused NRC training kernel is Slang-compiled SPIR-V loaded
+            // through the passthrough shader path (nrc/nrc_train.slang).
+            | WgpuFeatures::PASSTHROUGH_SHADERS
     }
 }

@@ -1,14 +1,17 @@
 //! Neural Radiance Cache: a small MLP trained online to predict cached
 //! radiance at GI path terminations.
 //!
-//! Training runs on the render graph as a coopmat compute chain (encode
-//! records → fwd → loss → bwd → adam, dispatched after the trace each
-//! frame); raygen writes one training record per rotating pixel
-//! subset. GI paths terminate into the cache by appending queries that the
-//! `nrc_query_infer` pass batch-evaluates (coherent coopvec against the
-//! transposed f16 weight mirror adam maintains) and composites into the
-//! output buffer; training paths and [`SolariNrc::inline_coopvec`] query
-//! inline in raygen instead.
+//! Training runs on the render graph as a hybrid chain (encode records →
+//! fused forward+loss+dZ → dW/db reductions → adam, dispatched after the
+//! trace each frame); raygen writes one training record per rotating pixel
+//! subset. The fused kernel is Slang-compiled SPIR-V (`nrc_train.slang`,
+//! passthrough-loaded): one thread evaluates the whole coopvec MLP, seeds
+//! the loss gradient, and back-propagates the per-layer dZ that the coopmat
+//! `mm_tn`/`bias_grad` kernels reduce into dW/db. GI paths terminate into
+//! the cache by appending queries that the `nrc_query_infer` pass
+//! batch-evaluates (coherent coopvec against the transposed f16 weight
+//! mirror adam maintains) and composites into the output buffer; training
+//! paths and [`SolariNrc::inline_coopvec`] query inline in raygen instead.
 
 use bevy_asset::{load_embedded_asset, AssetServer};
 use bevy_ecs::prelude::*;
@@ -107,15 +110,6 @@ struct MmDims {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct EwParams {
-    batch: u32,
-    layer_off: u32,
-    relu: u32,
-    loss_scale: f32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct AdamParams {
     count: u32,
     step: u32,
@@ -140,23 +134,29 @@ struct NrcTrainParams {
     pad_b: u32,
 }
 
-/// Bind-group layouts + queued pipelines for the training kernels.
+// MUST MATCH TrainParams in nrc_train.slang.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LearnParams {
+    batch: u32,
+    loss_scale: f32,
+    pad_a: u32,
+    pad_b: u32,
+}
+
+/// Bind-group layouts + queued pipelines for the training kernels. The
+/// fused `learn` kernel is passthrough SPIR-V with an explicit layout, so
+/// it is created eagerly instead of queued on the [`PipelineCache`].
 #[derive(Resource)]
 pub struct NrcPipelines {
     mm_layout: BindGroupLayoutDescriptor,
-    bias_layout: BindGroupLayoutDescriptor,
-    loss_layout: BindGroupLayoutDescriptor,
-    relu_layout: BindGroupLayoutDescriptor,
     bias_grad_layout: BindGroupLayoutDescriptor,
     adam_layout: BindGroupLayoutDescriptor,
     encode_layout: BindGroupLayoutDescriptor,
     infer_layout: BindGroupLayoutDescriptor,
-    pub mm_nn: CachedComputePipelineId,
-    pub mm_nt: CachedComputePipelineId,
+    learn_layout: bevy_render::render_resource::BindGroupLayout,
+    learn: bevy_render::render_resource::ComputePipeline,
     pub mm_tn: CachedComputePipelineId,
-    pub bias_act: CachedComputePipelineId,
-    pub loss_grad: CachedComputePipelineId,
-    pub relu_bwd: CachedComputePipelineId,
     pub bias_grad: CachedComputePipelineId,
     pub adam: CachedComputePipelineId,
     pub encode_records: CachedComputePipelineId,
@@ -178,10 +178,14 @@ pub struct NrcBuffers {
     pub records_raw: vk::Buffer,
     // training-only (plain wgpu)
     w16: Buffer,
-    act: Vec<Buffer>,
-    pre: Buffer,
-    dz_a: Buffer,
-    dz_b: Buffer,
+    /// f16 `[LAYERS][batch][WIDTH]` layer-input activations: `[0]` is the
+    /// encoded batch, `[1..]` are recorded by the fused kernel for `mm_tn`.
+    acts: Buffer,
+    /// f16 `[LAYERS][batch][WIDTH]` dZ recorded by the fused kernel.
+    dz: Buffer,
+    /// f32 `[batch][WIDTH]` fused-forward predictions (debug visibility;
+    /// the fused kernel writes them unconditionally).
+    preds: Buffer,
     targets: Buffer,
     loss: Buffer,
     loss_staging: Buffer,
@@ -198,13 +202,9 @@ pub struct NrcBuffers {
     ema_b: Buffer,
     weights_t_ema: Buffer,
     bias16_ema: Buffer,
-    fwd_ubo: Vec<Buffer>,
     dw_ubo: Vec<Buffer>,
-    dx_ubo: Vec<Buffer>,
     bg_ubo: Vec<Buffer>,
-    bias_ubo: Vec<Buffer>,
-    loss_ubo: Buffer,
-    relu_ubo: Buffer,
+    learn_ubo: Buffer,
     adam_w_ubo: Buffer,
     adam_b_ubo: Buffer,
     train_ubo: Buffer,
@@ -218,12 +218,8 @@ pub struct NrcBuffers {
 }
 
 struct NrcBindGroups {
-    fwd: Vec<BindGroup>,
-    bias: Vec<BindGroup>,
-    loss: BindGroup,
+    learn: BindGroup,
     dw: Vec<BindGroup>,
-    dx: Vec<BindGroup>,
-    relu: Vec<BindGroup>,
     bias_grad: Vec<BindGroup>,
     adam_w: BindGroup,
     adam_b: BindGroup,
@@ -231,10 +227,12 @@ struct NrcBindGroups {
 }
 
 /// `RenderStartup`: layouts + pipeline queueing (no scene deps — queue now).
+#[allow(unsafe_code)]
 pub fn init_nrc_pipelines(
     mut commands: Commands,
     pipeline_cache: Res<PipelineCache>,
     asset_server: Res<AssetServer>,
+    render_device: Res<RenderDevice>,
     mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
 ) {
     let mm_layout = BindGroupLayoutDescriptor::new(
@@ -247,43 +245,6 @@ pub fn init_nrc_pipelines(
                 (2, storage_buffer_sized(false, None)),
                 (3, storage_buffer_read_only_sized(false, None)),
                 (4, uniform_buffer_sized(false, None)),
-            ),
-        ),
-    );
-    let bias_layout = BindGroupLayoutDescriptor::new(
-        "nrc_bias_layout",
-        &BindGroupLayoutEntries::with_indices(
-            ShaderStages::COMPUTE,
-            (
-                (5, storage_buffer_sized(false, None)),
-                (6, storage_buffer_sized(false, None)),
-                (7, storage_buffer_read_only_sized(false, None)),
-                (8, uniform_buffer_sized(false, None)),
-            ),
-        ),
-    );
-    let loss_layout = BindGroupLayoutDescriptor::new(
-        "nrc_loss_layout",
-        &BindGroupLayoutEntries::with_indices(
-            ShaderStages::COMPUTE,
-            (
-                (5, storage_buffer_sized(false, None)),
-                (8, uniform_buffer_sized(false, None)),
-                (9, storage_buffer_read_only_sized(false, None)),
-                (10, storage_buffer_sized(false, None)),
-                (11, storage_buffer_sized(false, None)),
-            ),
-        ),
-    );
-    let relu_layout = BindGroupLayoutDescriptor::new(
-        "nrc_relu_layout",
-        &BindGroupLayoutEntries::with_indices(
-            ShaderStages::COMPUTE,
-            (
-                (5, storage_buffer_sized(false, None)),
-                (6, storage_buffer_sized(false, None)),
-                (8, uniform_buffer_sized(false, None)),
-                (12, storage_buffer_read_only_sized(false, None)),
             ),
         ),
     );
@@ -354,23 +315,13 @@ pub fn init_nrc_pipelines(
             constants: vec![],
         })
     };
-    let mm_nn = queue("nrc_mm_nn", "mm_nn", &mm_layout);
-    let mm_nt = queue("nrc_mm_nt", "mm_nt", &mm_layout);
     let mm_tn = queue("nrc_mm_tn", "mm_tn", &mm_layout);
-    let bias_act = queue("nrc_bias_act", "bias_act", &bias_layout);
-    let loss_grad = queue("nrc_loss_grad", "loss_grad", &loss_layout);
-    let relu_bwd = queue("nrc_relu_bwd", "relu_bwd", &relu_layout);
     let bias_grad = queue("nrc_bias_grad", "bias_grad", &bias_grad_layout);
     let adam = queue("nrc_adam", "adam", &adam_layout);
     let encode_records = queue("nrc_encode_records", "nrc_encode_records", &encode_layout);
     let query_infer = queue("nrc_query_infer", "nrc_query_infer", &infer_layout);
     for (name, id) in [
-        ("nrc_mm_nn", mm_nn),
-        ("nrc_mm_nt", mm_nt),
         ("nrc_mm_tn", mm_tn),
-        ("nrc_bias_act", bias_act),
-        ("nrc_loss_grad", loss_grad),
-        ("nrc_relu_bwd", relu_bwd),
         ("nrc_bias_grad", bias_grad),
         ("nrc_adam", adam),
         ("nrc_encode_records", encode_records),
@@ -378,21 +329,78 @@ pub fn init_nrc_pipelines(
     ] {
         registry.register(name, id);
     }
+
+    // The fused forward+loss+dZ kernel: Slang-compiled SPIR-V loaded through
+    // the passthrough path (no naga reflection), so the bind group layout is
+    // spelled out to match the [[vk::binding]] table in nrc_train.slang.
+    let storage_entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let learn_layout = render_device.create_bind_group_layout(
+        "nrc_learn_layout",
+        &[
+            storage_entry(0, false), // acts
+            storage_entry(1, true),  // weights_t (live mirror)
+            storage_entry(2, true),  // bias16 (live mirror)
+            storage_entry(3, true),  // targets
+            storage_entry(4, false), // preds
+            storage_entry(5, false), // loss
+            storage_entry(6, false), // dz
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            storage_entry(8, true), // zeros (f16 view)
+        ],
+    );
+    let spv = wgpu::util::make_spirv_raw(include_bytes!("nrc_train.spv"));
+    // SAFETY: nrc_train.spv is compiled from nrc_train.slang in-tree and
+    // spirv-val-validated (regen command in its header); the explicit layout
+    // above matches its binding table.
+    let learn_module = unsafe {
+        render_device.wgpu_device().create_shader_module_passthrough(
+            wgpu::ShaderModuleDescriptorPassthrough {
+                spirv: Some(spv),
+                ..Default::default()
+            },
+        )
+    };
+    let learn_pl = render_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("nrc_learn_pl"),
+        bind_group_layouts: &[Some(&learn_layout)],
+        immediate_size: 0,
+    });
+    let learn = render_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("nrc_learn"),
+        layout: Some(&learn_pl),
+        module: &learn_module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
     commands.insert_resource(NrcPipelines {
         mm_layout,
-        bias_layout,
-        loss_layout,
-        relu_layout,
         bias_grad_layout,
         adam_layout,
         encode_layout,
         infer_layout,
-        mm_nn,
-        mm_nt,
+        learn_layout,
+        learn,
         mm_tn,
-        bias_act,
-        loss_grad,
-        relu_bwd,
         bias_grad,
         adam,
         encode_records,
@@ -504,29 +512,16 @@ pub fn init_nrc_buffers(
     );
 
     let width = NRC_WIDTH as u64;
-    let act = (0..NRC_LAYERS)
-        .map(|_| mk("nrc_act", batch * width * 2, storage))
-        .collect();
+    let layers = NRC_LAYERS as u64;
     let mk_ubo = |label: &'static str, size: u64| mk(label, size, uniform);
-    let fwd_ubo: Vec<Buffer> = (0..NRC_LAYERS).map(|_| mk_ubo("nrc_fwd_ubo", 32)).collect();
     let dw_ubo: Vec<Buffer> = (0..NRC_LAYERS).map(|_| mk_ubo("nrc_dw_ubo", 32)).collect();
-    let dx_ubo: Vec<Buffer> = (1..NRC_LAYERS).map(|_| mk_ubo("nrc_dx_ubo", 32)).collect();
     let bg_ubo: Vec<Buffer> = (0..NRC_LAYERS).map(|_| mk_ubo("nrc_bg_ubo", 32)).collect();
-    let bias_ubo: Vec<Buffer> = (0..NRC_LAYERS).map(|_| mk_ubo("nrc_bias_ubo", 16)).collect();
 
     let batch_u = NRC_RECORD_CAP as u32;
+    let layer_elems = batch_u * NRC_WIDTH as u32;
     for l in 0..NRC_LAYERS {
-        render_queue.write_buffer(
-            &fwd_ubo[l],
-            0,
-            bytemuck::bytes_of(&MmDims {
-                m: batch_u,
-                n: NRC_WIDTH as u32,
-                k: NRC_WIDTH as u32,
-                b_off: (l * NRC_W_ELEMS) as u32,
-                ..bytemuck::Zeroable::zeroed()
-            }),
-        );
+        // dW_l = act_l^T · dZ_l: both operands live in the packed
+        // [LAYERS][batch][WIDTH] buffers, selected by element offset.
         render_queue.write_buffer(
             &dw_ubo[l],
             0,
@@ -534,6 +529,8 @@ pub fn init_nrc_buffers(
                 m: NRC_WIDTH as u32,
                 n: NRC_WIDTH as u32,
                 k: batch_u,
+                a_off: l as u32 * layer_elems,
+                b_off: l as u32 * layer_elems,
                 c_off: (l * NRC_W_ELEMS) as u32,
                 ..bytemuck::Zeroable::zeroed()
             }),
@@ -547,39 +544,7 @@ pub fn init_nrc_buffers(
                 ..bytemuck::Zeroable::zeroed()
             }),
         );
-        render_queue.write_buffer(
-            &bias_ubo[l],
-            0,
-            bytemuck::bytes_of(&EwParams {
-                batch: batch_u,
-                layer_off: (l * NRC_WIDTH) as u32,
-                relu: if l < NRC_LAYERS - 1 { 1 } else { 0 },
-                loss_scale: 0.0,
-            }),
-        );
-        if l >= 1 {
-            render_queue.write_buffer(
-                &dx_ubo[l - 1],
-                0,
-                bytemuck::bytes_of(&MmDims {
-                    m: batch_u,
-                    n: NRC_WIDTH as u32,
-                    k: NRC_WIDTH as u32,
-                    b_off: (l * NRC_W_ELEMS) as u32,
-                    ..bytemuck::Zeroable::zeroed()
-                }),
-            );
-        }
     }
-    let relu_ubo = mk_ubo("nrc_relu_ubo", 16);
-    render_queue.write_buffer(
-        &relu_ubo,
-        0,
-        bytemuck::bytes_of(&EwParams {
-            batch: batch_u,
-            ..bytemuck::Zeroable::zeroed()
-        }),
-    );
 
     commands.insert_resource(NrcBuffers {
         weights_t,
@@ -591,10 +556,9 @@ pub fn init_nrc_buffers(
         records,
         records_raw,
         w16,
-        act,
-        pre: mk("nrc_pre", batch * width * 4, storage),
-        dz_a: mk("nrc_dz_a", batch * width * 2, storage),
-        dz_b: mk("nrc_dz_b", batch * width * 2, storage),
+        acts: mk("nrc_acts", layers * batch * width * 2, storage),
+        dz: mk("nrc_dz", layers * batch * width * 2, storage),
+        preds: mk("nrc_preds", batch * width * 4, storage),
         targets: mk("nrc_targets", batch * 16, storage),
         loss: mk("nrc_loss", batch * 4, storage),
         loss_staging: mk(
@@ -616,13 +580,9 @@ pub fn init_nrc_buffers(
         ema_b: mk("nrc_ema_b", (NRC_B_TOTAL * 4) as u64, storage),
         weights_t_ema,
         bias16_ema,
-        fwd_ubo,
         dw_ubo,
-        dx_ubo,
         bg_ubo,
-        bias_ubo,
-        loss_ubo: mk_ubo("nrc_loss_ubo", 16),
-        relu_ubo,
+        learn_ubo: mk_ubo("nrc_learn_ubo", 16),
         adam_w_ubo: mk_ubo("nrc_adam_w_ubo", 48),
         adam_b_ubo: mk_ubo("nrc_adam_b_ubo", 48),
         train_ubo: mk_ubo("nrc_train_ubo", 16),
@@ -634,110 +594,65 @@ pub fn init_nrc_buffers(
     });
 }
 
-fn dz_cur(bufs: &NrcBuffers, layer: usize) -> &Buffer {
-    if layer % 2 == 1 { &bufs.dz_a } else { &bufs.dz_b }
-}
-fn dz_next(bufs: &NrcBuffers, layer: usize) -> &Buffer {
-    if layer % 2 == 1 { &bufs.dz_b } else { &bufs.dz_a }
-}
-
 fn build_bind_groups(
     bufs: &NrcBuffers,
     pipelines: &NrcPipelines,
     device: &RenderDevice,
     cache: &PipelineCache,
 ) -> NrcBindGroups {
-    let mut fwd = vec![];
-    let mut bias = vec![];
+    let batch = NRC_RECORD_CAP as u64;
+    let layer_bytes = batch * NRC_WIDTH as u64 * 2;
     let mut dw = vec![];
-    let mut dx = vec![];
-    let mut relu = vec![];
     let mut bias_grad = vec![];
     for l in 0..NRC_LAYERS {
-        fwd.push(device.create_bind_group(
-            "nrc_fwd",
-            &cache.get_bind_group_layout(&pipelines.mm_layout),
-            &BindGroupEntries::with_indices((
-                (0, bufs.act[l].as_entire_binding()),
-                (1, bufs.w16.as_entire_binding()),
-                (2, bufs.pre.as_entire_binding()),
-                (3, bufs.zeros.as_entire_binding()),
-                (4, bufs.fwd_ubo[l].as_entire_binding()),
-            )),
-        ));
-        // output layer's f16 activation write is dead — point it at dz scratch
-        let act_target = if l < NRC_LAYERS - 1 { &bufs.act[l + 1] } else { &bufs.dz_b };
-        bias.push(device.create_bind_group(
-            "nrc_bias",
-            &cache.get_bind_group_layout(&pipelines.bias_layout),
-            &BindGroupEntries::with_indices((
-                (5, bufs.pre.as_entire_binding()),
-                (6, act_target.as_entire_binding()),
-                (7, bufs.master_b.as_entire_binding()),
-                (8, bufs.bias_ubo[l].as_entire_binding()),
-            )),
-        ));
         dw.push(device.create_bind_group(
             "nrc_dw",
             &cache.get_bind_group_layout(&pipelines.mm_layout),
             &BindGroupEntries::with_indices((
-                (0, bufs.act[l].as_entire_binding()),
-                (1, dz_cur(bufs, l).as_entire_binding()),
+                (0, bufs.acts.as_entire_binding()),
+                (1, bufs.dz.as_entire_binding()),
                 (2, bufs.dw.as_entire_binding()),
                 (3, bufs.zeros.as_entire_binding()),
                 (4, bufs.dw_ubo[l].as_entire_binding()),
             )),
         ));
+        // bias_grad has no element-offset field for act_mask — bind the
+        // layer's dZ slice (the 2 MiB layer stride keeps any offset alignment).
         bias_grad.push(device.create_bind_group(
             "nrc_bias_grad",
             &cache.get_bind_group_layout(&pipelines.bias_grad_layout),
             &BindGroupEntries::with_indices((
                 (2, bufs.db.as_entire_binding()),
                 (4, bufs.bg_ubo[l].as_entire_binding()),
-                (12, dz_cur(bufs, l).as_entire_binding()),
+                (
+                    12,
+                    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &bufs.dz,
+                        offset: l as u64 * layer_bytes,
+                        size: Some(std::num::NonZeroU64::new(layer_bytes).unwrap()),
+                    }),
+                ),
             )),
         ));
-        if l >= 1 {
-            dx.push(device.create_bind_group(
-                "nrc_dx",
-                &cache.get_bind_group_layout(&pipelines.mm_layout),
-                &BindGroupEntries::with_indices((
-                    (0, dz_cur(bufs, l).as_entire_binding()),
-                    (1, bufs.w16.as_entire_binding()),
-                    (2, bufs.pre.as_entire_binding()),
-                    (3, bufs.zeros.as_entire_binding()),
-                    (4, bufs.dx_ubo[l - 1].as_entire_binding()),
-                )),
-            ));
-            relu.push(device.create_bind_group(
-                "nrc_relu",
-                &cache.get_bind_group_layout(&pipelines.relu_layout),
-                &BindGroupEntries::with_indices((
-                    (5, bufs.pre.as_entire_binding()),
-                    (6, dz_next(bufs, l).as_entire_binding()),
-                    (8, bufs.relu_ubo.as_entire_binding()),
-                    (12, bufs.act[l].as_entire_binding()),
-                )),
-            ));
-        }
     }
     NrcBindGroups {
-        fwd,
-        bias,
-        loss: device.create_bind_group(
-            "nrc_loss",
-            &cache.get_bind_group_layout(&pipelines.loss_layout),
+        learn: device.create_bind_group(
+            "nrc_learn",
+            &pipelines.learn_layout,
             &BindGroupEntries::with_indices((
-                (5, bufs.pre.as_entire_binding()),
-                (8, bufs.loss_ubo.as_entire_binding()),
-                (9, bufs.targets.as_entire_binding()),
-                (10, bufs.loss.as_entire_binding()),
-                (11, bufs.dz_a.as_entire_binding()),
+                (0, bufs.acts.as_entire_binding()),
+                (1, bufs.weights_t.as_entire_binding()),
+                (2, bufs.bias16.as_entire_binding()),
+                (3, bufs.targets.as_entire_binding()),
+                (4, bufs.preds.as_entire_binding()),
+                (5, bufs.loss.as_entire_binding()),
+                (6, bufs.dz.as_entire_binding()),
+                (7, bufs.learn_ubo.as_entire_binding()),
+                // f32 zeros reinterpreted: all-zero bytes are all-zero f16s
+                (8, bufs.zeros.as_entire_binding()),
             )),
         ),
         dw,
-        dx,
-        relu,
         bias_grad,
         adam_w: device.create_bind_group(
             "nrc_adam_w",
@@ -773,7 +688,7 @@ fn build_bind_groups(
             "nrc_encode",
             &cache.get_bind_group_layout(&pipelines.encode_layout),
             &BindGroupEntries::with_indices((
-                (6, bufs.act[0].as_entire_binding()),
+                (6, bufs.acts.as_entire_binding()),
                 (19, bufs.train_ubo.as_entire_binding()),
                 (20, bufs.targets.as_entire_binding()),
                 (22, bufs.records.as_entire_binding()),
@@ -858,14 +773,9 @@ pub fn dispatch_training(
     queue: &RenderQueue,
     nrc: &SolariNrc,
 ) -> bool {
-    let Some((mm_nn, mm_nt, mm_tn, bias_act, loss_grad, relu_bwd, bias_grad, adam, encode)) = (|| {
+    let Some((mm_tn, bias_grad, adam, encode)) = (|| {
         Some((
-            cache.get_compute_pipeline(pipelines.mm_nn)?,
-            cache.get_compute_pipeline(pipelines.mm_nt)?,
             cache.get_compute_pipeline(pipelines.mm_tn)?,
-            cache.get_compute_pipeline(pipelines.bias_act)?,
-            cache.get_compute_pipeline(pipelines.loss_grad)?,
-            cache.get_compute_pipeline(pipelines.relu_bwd)?,
             cache.get_compute_pipeline(pipelines.bias_grad)?,
             cache.get_compute_pipeline(pipelines.adam)?,
             cache.get_compute_pipeline(pipelines.encode_records)?,
@@ -891,13 +801,13 @@ pub fn dispatch_training(
         }),
     );
     queue.write_buffer(
-        &bufs.loss_ubo,
+        &bufs.learn_ubo,
         0,
-        bytemuck::bytes_of(&EwParams {
+        bytemuck::bytes_of(&LearnParams {
             batch,
-            layer_off: 0,
-            relu: 0,
             loss_scale: nrc.loss_scale,
+            pad_a: 0,
+            pad_b: 0,
         }),
     );
     queue.write_buffer(
@@ -947,32 +857,18 @@ pub fn dispatch_training(
         pass.set_pipeline(encode);
         pass.set_bind_group(0, &groups.encode, &[]);
         pass.dispatch_workgroups(batch.div_ceil(64), 1, 1);
-        for l in 0..NRC_LAYERS {
-            pass.set_pipeline(mm_nn);
-            pass.set_bind_group(0, &groups.fwd[l], &[]);
-            pass.dispatch_workgroups(batch / 16, width / 16, 1);
-            pass.set_pipeline(bias_act);
-            pass.set_bind_group(0, &groups.bias[l], &[]);
-            pass.dispatch_workgroups(batch, 1, 1);
-        }
-        pass.set_pipeline(loss_grad);
-        pass.set_bind_group(0, &groups.loss, &[]);
+        // fused forward + loss + dZ chain (nrc_train.slang)
+        pass.set_pipeline(&pipelines.learn);
+        pass.set_bind_group(0, &groups.learn, &[]);
         pass.dispatch_workgroups(batch.div_ceil(64), 1, 1);
-        for l in (0..NRC_LAYERS).rev() {
+        // dW/db reductions over the recorded activations/dZ
+        for l in 0..NRC_LAYERS {
             pass.set_pipeline(mm_tn);
             pass.set_bind_group(0, &groups.dw[l], &[]);
             pass.dispatch_workgroups(width / 16, width / 16, 1);
             pass.set_pipeline(bias_grad);
             pass.set_bind_group(0, &groups.bias_grad[l], &[]);
             pass.dispatch_workgroups(1, 1, 1);
-            if l >= 1 {
-                pass.set_pipeline(mm_nt);
-                pass.set_bind_group(0, &groups.dx[l - 1], &[]);
-                pass.dispatch_workgroups(batch / 16, width / 16, 1);
-                pass.set_pipeline(relu_bwd);
-                pass.set_bind_group(0, &groups.relu[l - 1], &[]);
-                pass.dispatch_workgroups(batch, 1, 1);
-            }
         }
         pass.set_pipeline(adam);
         pass.set_bind_group(0, &groups.adam_w, &[]);

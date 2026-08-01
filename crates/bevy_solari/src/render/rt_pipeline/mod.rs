@@ -40,7 +40,8 @@ use crate::ecs_gpu::{GpuSlot, SceneColumns};
 use crate::geometry::ClusterMeshManager;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::rt_pipeline::{
-    RtCamera, RtGeometryAddresses, RtPipeline, RtViewBindings, SolariAnyHitDef, SolariHitGroupDef,
+    RtCamera, RtGeometryAddresses, RtPipeline, RtViewBindings, SolariAnyHitDef, SolariChitSource,
+    SolariHitGroupDef,
     SolariHitGroupRegistry,
 };
 use crate::gpu::RawTraceBindable;
@@ -1074,13 +1075,14 @@ impl crate::SolariHitGroup for OpaqueSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "opaque",
-            closest_hit_wgsl: include_str!("chit_opaque.wgsl"),
-            closest_hit_file: "chit_opaque.wgsl",
-            closest_hit_entry: "chit_opaque",
+            closest_hit: SolariChitSource::Wgsl {
+                source: include_str!("chit_opaque.wgsl"),
+                file: "chit_opaque.wgsl",
+                entry: "chit_opaque",
+            },
             any_hit: Some(SolariAnyHitDef {
-                wgsl: include_str!("ahit_alpha.wgsl"),
-                file: "ahit_alpha.wgsl",
-                entry: "ahit_alpha",
+                spirv: include_bytes!("ahit_alpha.spv"),
+                entry: "main",
             }),
             composable_modules: &[],
         }
@@ -1094,9 +1096,11 @@ impl crate::SolariHitGroup for GlassSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "glass",
-            closest_hit_wgsl: include_str!("chit_glass.wgsl"),
-            closest_hit_file: "chit_glass.wgsl",
-            closest_hit_entry: "chit_glass",
+            closest_hit: SolariChitSource::Wgsl {
+                source: include_str!("chit_glass.wgsl"),
+                file: "chit_glass.wgsl",
+                entry: "chit_glass",
+            },
             any_hit: None,
             composable_modules: &[],
         }
@@ -1110,9 +1114,11 @@ impl crate::SolariHitGroup for HairSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "hair",
-            closest_hit_wgsl: include_str!("chit_hair.wgsl"),
-            closest_hit_file: "chit_hair.wgsl",
-            closest_hit_entry: "chit_hair",
+            closest_hit: SolariChitSource::Wgsl {
+                source: include_str!("chit_hair.wgsl"),
+                file: "chit_hair.wgsl",
+                entry: "chit_hair",
+            },
             any_hit: None,
             composable_modules: &[],
         }
@@ -1126,9 +1132,7 @@ impl crate::SolariHitGroup for PortalSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "portal",
-            closest_hit_wgsl: include_str!("chit_portal.wgsl"),
-            closest_hit_file: "chit_portal.wgsl",
-            closest_hit_entry: "chit_portal",
+            closest_hit: SolariChitSource::SpirV(include_bytes!("chit_portal.spv")),
             any_hit: None,
             composable_modules: &[],
         }
