@@ -6,7 +6,7 @@
 //!
 //! The training step is hybrid: a fused Slang kernel (nrc_train.slang,
 //! shipped as passthrough SPIR-V) runs forward + loss + the whole dZ
-//! backward chain in one dispatch, and the coopmat kernels (nrc_mlp.wgsl)
+//! backward chain in one dispatch, and the coopmat kernels (nrc_mlp.slang)
 //! reduce dW/db from the recorded activations/dZ before adam.
 
 // passthrough shader modules and ExperimentalFeatures are unsafe wgpu APIs
@@ -219,18 +219,8 @@ async fn run(args: Args) {
             .expect("device")
     };
 
-    let shader_src = format!(
-        "{}\n{}",
-        include_str!("../../../crates/bevy_solari/src/nrc/nrc_mlp.wgsl"),
-        include_str!("nrc_gym.wgsl")
-    );
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("nrc kernels"),
-        source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-    });
-
     let mut gym = Gym {
-        pipelines: build_pipelines(&device, &module),
+        pipelines: build_pipelines(&device),
         bufs: build_buffers(&device, args.batch),
         device,
         queue,
@@ -282,30 +272,11 @@ fn init_weights(seed: u64) -> (Vec<f32>, Vec<f32>) {
     (w, vec![0.0; B_TOTAL])
 }
 
-fn build_pipelines(device: &wgpu::Device, module: &wgpu::ShaderModule) -> Pipelines {
-    let make = |entry: &str| {
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(entry),
-            layout: None,
-            module,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
-            cache: None,
-        })
-    };
-
-    // The fused Slang kernel arrives as passthrough SPIR-V: no naga
-    // reflection, so the bind group layout is spelled out to match the
-    // [[vk::binding]] table in nrc_train.slang.
-    let spv = wgpu::util::make_spirv_raw(include_bytes!(
-        "../../../crates/bevy_solari/src/nrc/nrc_train.spv"
-    ));
-    let learn_module = unsafe {
-        device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
-            spirv: Some(spv),
-            ..Default::default()
-        })
-    };
+fn build_pipelines(device: &wgpu::Device) -> Pipelines {
+    // Every kernel is Slang-precompiled passthrough SPIR-V (nrc_train.slang +
+    // nrc_mlp.slang + nrc_gym_gen.slang — regen commands in their headers):
+    // no naga reflection, so each bind group layout is spelled out to match
+    // its kernel's [[vk::binding]] table.
     let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -316,50 +287,105 @@ fn build_pipelines(device: &wgpu::Device, module: &wgpu::ShaderModule) -> Pipeli
         },
         count: None,
     };
-    let learn_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("nrc_learn_layout"),
-        entries: &[
-            storage(0, false), // acts
-            storage(1, true),  // weights_t
-            storage(2, true),  // biases
-            storage(3, true),  // targets
-            storage(4, false), // preds
-            storage(5, false), // loss
-            storage(6, false), // dz
-            wgpu::BindGroupLayoutEntry {
-                binding: 7,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            storage(8, true), // zeros16
-        ],
-    });
-    let learn_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("nrc_learn_pl"),
-        bind_group_layouts: &[Some(&learn_bgl)],
-        immediate_size: 0,
-    });
-    let learn = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("nrc_learn"),
-        layout: Some(&learn_pl),
-        module: &learn_module,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
+    let uniform = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let make = |label: &str, spv_bytes: &[u8], entries: &[wgpu::BindGroupLayoutEntry]| {
+        let module = unsafe {
+            device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+                spirv: Some(wgpu::util::make_spirv_raw(spv_bytes)),
+                ..Default::default()
+            })
+        };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries,
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(label),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
 
     Pipelines {
-        learn,
-        mm_tn: make("mm_tn"),
-        bias_grad: make("bias_grad"),
-        adam: make("adam"),
-        gym_gen: make("gym_gen"),
-        infer_coopvec: make("nrc_infer_coopvec"),
+        learn: make(
+            "nrc_learn",
+            include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_train.spv"),
+            &[
+                storage(0, false), // acts
+                storage(1, true),  // weights_t
+                storage(2, true),  // biases
+                storage(3, true),  // targets
+                storage(4, false), // preds
+                storage(5, false), // loss
+                storage(6, false), // dz
+                uniform(7),
+                storage(8, true), // zeros16
+            ],
+        ),
+        mm_tn: make(
+            "mm_tn",
+            include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_mm_tn.spv"),
+            &[
+                storage(0, true),
+                storage(1, true),
+                storage(2, false),
+                storage(3, true),
+                uniform(4),
+            ],
+        ),
+        bias_grad: make(
+            "bias_grad",
+            include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_bias_grad.spv"),
+            &[storage(0, true), storage(1, false), uniform(2)],
+        ),
+        adam: make(
+            "adam",
+            include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_adam.spv"),
+            &[
+                storage(0, false), // master
+                storage(1, true),  // grad_in
+                storage(2, false), // moment_m
+                storage(3, false), // moment_v
+                storage(4, false), // mirror_f16
+                storage(5, false), // mirror_alt
+                storage(6, false), // ema_master
+                storage(7, false), // mirror_ema
+                uniform(8),        // adam_u
+            ],
+        ),
+        gym_gen: make(
+            "gym_gen",
+            include_bytes!("nrc_gym_gen.spv"),
+            &[storage(0, false), storage(1, false), uniform(2)],
+        ),
+        infer_coopvec: make(
+            "nrc_infer_coopvec",
+            include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_infer_coopvec.spv"),
+            &[
+                storage(0, true),  // inputs
+                storage(1, true),  // weights_t
+                storage(2, true),  // biases
+                storage(3, false), // preds_out
+                uniform(4),        // ew
+            ],
+        ),
     }
 }
 
@@ -555,16 +581,14 @@ fn build_bind_groups(gym: &mut Gym) {
                 (4, bufs.dw_ubo[l].as_entire_binding()),
             ],
         ));
-        // bias_grad has no element-offset field for act_mask — bind the
-        // layer's dZ slice (512 KiB stride keeps any offset alignment).
+        // bias_grad has no element-offset field for dz — bind the layer's dZ
+        // slice (512 KiB stride keeps any offset alignment).
         bias_grad_bg.push(bg(
             d,
             &p.bias_grad,
             &[
-                (2, bufs.db.as_entire_binding()),
-                (4, bufs.bg_ubo[l].as_entire_binding()),
                 (
-                    12,
+                    0,
                     wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &bufs.dz,
                         offset: (l * batch as usize * WIDTH * 2) as u64,
@@ -573,6 +597,8 @@ fn build_bind_groups(gym: &mut Gym) {
                         ),
                     }),
                 ),
+                (1, bufs.db.as_entire_binding()),
+                (2, bufs.bg_ubo[l].as_entire_binding()),
             ],
         ));
     }
@@ -580,30 +606,30 @@ fn build_bind_groups(gym: &mut Gym) {
         d,
         &p.adam,
         &[
-            (13, bufs.master_w.as_entire_binding()),
-            (14, bufs.dw.as_entire_binding()),
-            (15, bufs.m_w.as_entire_binding()),
-            (16, bufs.v_w.as_entire_binding()),
-            (17, bufs.w16.as_entire_binding()),
-            (18, bufs.adam_w_ubo.as_entire_binding()),
-            (21, bufs.w16_t.as_entire_binding()),
-            (23, bufs.ema_w.as_entire_binding()),
-            (24, bufs.ema_wt16.as_entire_binding()),
+            (0, bufs.master_w.as_entire_binding()),
+            (1, bufs.dw.as_entire_binding()),
+            (2, bufs.m_w.as_entire_binding()),
+            (3, bufs.v_w.as_entire_binding()),
+            (4, bufs.w16.as_entire_binding()),
+            (5, bufs.w16_t.as_entire_binding()),
+            (6, bufs.ema_w.as_entire_binding()),
+            (7, bufs.ema_wt16.as_entire_binding()),
+            (8, bufs.adam_w_ubo.as_entire_binding()),
         ],
     );
     let adam_b_bg = bg(
         d,
         &p.adam,
         &[
-            (13, bufs.master_b.as_entire_binding()),
-            (14, bufs.db.as_entire_binding()),
-            (15, bufs.m_b.as_entire_binding()),
-            (16, bufs.v_b.as_entire_binding()),
-            (17, bufs.b16.as_entire_binding()),
-            (18, bufs.adam_b_ubo.as_entire_binding()),
-            (21, bufs.w16_t.as_entire_binding()),
-            (23, bufs.ema_b.as_entire_binding()),
-            (24, bufs.ema_b16.as_entire_binding()),
+            (0, bufs.master_b.as_entire_binding()),
+            (1, bufs.db.as_entire_binding()),
+            (2, bufs.m_b.as_entire_binding()),
+            (3, bufs.v_b.as_entire_binding()),
+            (4, bufs.b16.as_entire_binding()),
+            (5, bufs.w16_t.as_entire_binding()),
+            (6, bufs.ema_b.as_entire_binding()),
+            (7, bufs.ema_b16.as_entire_binding()),
+            (8, bufs.adam_b_ubo.as_entire_binding()),
         ],
     );
     let infer_bg = bg(
@@ -612,18 +638,18 @@ fn build_bind_groups(gym: &mut Gym) {
         &[
             (0, bufs.acts.as_entire_binding()),
             (1, bufs.w16_t.as_entire_binding()),
-            (6, bufs.preds16.as_entire_binding()),
-            (8, bufs.ew_ubo.as_entire_binding()),
-            (12, bufs.b16.as_entire_binding()),
+            (2, bufs.b16.as_entire_binding()),
+            (3, bufs.preds16.as_entire_binding()),
+            (4, bufs.ew_ubo.as_entire_binding()),
         ],
     );
     let gen_bg = bg(
         d,
         &p.gym_gen,
         &[
-            (6, bufs.acts.as_entire_binding()),
-            (20, bufs.targets.as_entire_binding()),
-            (23, bufs.gen_ubo.as_entire_binding()),
+            (0, bufs.acts.as_entire_binding()),
+            (1, bufs.targets.as_entire_binding()),
+            (2, bufs.gen_ubo.as_entire_binding()),
         ],
     );
 

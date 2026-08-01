@@ -144,7 +144,7 @@ fn spatial(@builtin(global_invocation_id) gid: vec3<u32>) {
 // sample loop and cost ~90 ms/frame there (raygen is past a register cliff:
 // its live-across-trace state makes any composite local spill, and holding
 // the merge state in scalars blows register allocation instead — see the
-// bit-5 comment in raygen.wgsl). In a compute pass the same logic is normal
+// bit-5 comment in raygen.slang). In a compute pass the same logic is normal
 // cheap code. Raygen now only exports the canonical sample (registers ->
 // fields) with `surf_view_z` as a has-surface sentinel; this pass fills the
 // generating-surface fields from the chit's SurfaceGbuf, temporally merges

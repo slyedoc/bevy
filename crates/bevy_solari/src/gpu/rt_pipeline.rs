@@ -392,10 +392,15 @@ impl RtPipeline {
         // ("hit group", + optional any-hit) comes from `hit_groups` (the registry), so
         // adding a surface shader needs no edit here — Solari's own opaque/glass/hair/
         // portal register the same way as any downstream material (see SolariPlugin).
-        let raygen_mod = create_shader_module(
-            &device,
-            &compile_rt_wgsl(include_str!("../render/rt_pipeline/raygen.wgsl"), "raygen.wgsl", &[])?,
-        )?;
+        // Slang-precompiled raygen (regen commands in raygen.slang): the
+        // `SOLARI_SHADER_CLOCK` variant carries the cost-heatmap clock reads,
+        // legal only when the device enabled `VK_KHR_shader_clock`.
+        let raygen_spv: &'static [u8] = if crate::gpu::extension::shader_clock_available() {
+            include_bytes!("../render/rt_pipeline/raygen_clock.spv")
+        } else {
+            include_bytes!("../render/rt_pipeline/raygen.spv")
+        };
+        let raygen_mod = create_shader_module(&device, &spirv_words(raygen_spv))?;
         let miss_mod = create_shader_module(
             &device,
             &compile_rt_wgsl(
@@ -419,7 +424,8 @@ impl RtPipeline {
         // are `&'static`; CString'd just before pipeline create (kept alive there).
         let mut modules = vec![raygen_mod, miss_mod, miss_shadow_mod];
         let mut stage_specs: Vec<(vk::ShaderStageFlags, vk::ShaderModule, &'static str)> = vec![
-            (vk::ShaderStageFlags::RAYGEN_KHR, raygen_mod, "raygen"),
+            // slangc names every entry point "main"
+            (vk::ShaderStageFlags::RAYGEN_KHR, raygen_mod, "main"),
             (vk::ShaderStageFlags::MISS_KHR, miss_mod, "miss_primary"),
             // slangc names every entry point "main"
             (vk::ShaderStageFlags::MISS_KHR, miss_shadow_mod, "main"),
@@ -1676,22 +1682,6 @@ mod tests {
     #[test]
     fn rt_shaders_compile() {
         for (file, source) in [
-            (
-                "raygen.wgsl",
-                include_str!("../render/rt_pipeline/raygen.wgsl"),
-            ),
-            (
-                "chit_opaque.wgsl",
-                include_str!("../render/rt_pipeline/chit_opaque.wgsl"),
-            ),
-            (
-                "chit_glass.wgsl",
-                include_str!("../render/rt_pipeline/chit_glass.wgsl"),
-            ),
-            (
-                "chit_hair.wgsl",
-                include_str!("../render/rt_pipeline/chit_hair.wgsl"),
-            ),
             // The wgpu spatial pass — composed via PipelineCache at runtime, but
             // its imports are all registered here too, so validate it headlessly.
             (
@@ -1740,6 +1730,26 @@ mod tests {
             (
                 "chit_portal.spv",
                 include_bytes!("../render/rt_pipeline/chit_portal.spv").as_slice(),
+            ),
+            (
+                "chit_glass.spv",
+                include_bytes!("../render/rt_pipeline/chit_glass.spv").as_slice(),
+            ),
+            (
+                "chit_hair.spv",
+                include_bytes!("../render/rt_pipeline/chit_hair.spv").as_slice(),
+            ),
+            (
+                "chit_opaque.spv",
+                include_bytes!("../render/rt_pipeline/chit_opaque.spv").as_slice(),
+            ),
+            (
+                "raygen.spv",
+                include_bytes!("../render/rt_pipeline/raygen.spv").as_slice(),
+            ),
+            (
+                "raygen_clock.spv",
+                include_bytes!("../render/rt_pipeline/raygen_clock.spv").as_slice(),
             ),
         ] {
             assert!(blob.len() % 4 == 0 && blob.len() > 20, "{file}: truncated");

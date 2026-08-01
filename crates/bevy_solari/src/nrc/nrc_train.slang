@@ -1,7 +1,7 @@
 // NRC fused training kernel: forward + relative-L2 loss + full dZ backward
 // chain in one dispatch (one thread = one sample), replacing the tiled
 // coopmat mm_nn/bias_act/loss_grad/mm_nt/relu_bwd ladder. The dW/db
-// reductions stay on the coopmat kernels (nrc_mlp.wgsl mm_tn/bias_grad):
+// reductions stay on the coopmat kernels (nrc_mlp.slang mm_tn/bias_grad):
 // coopVecOuterProductAccumulate needs the TrainingOptimal opaque layout,
 // whose gradient read-back requires vkConvertCooperativeVectorMatrixNV —
 // adopted when the NRC dispatch path owns a raw device.
@@ -213,7 +213,7 @@ void learn_gradient(uint tid: SV_DispatchThreadID)
     for (int i = 0; i < WIDTH; i++)
         preds.Store<float>((sample * WIDTH + i) * 4, float(out.data[i]));
 
-    // Loss + output-layer gradient seed, numerics per nrc_mlp.wgsl loss_grad.
+    // Loss + output-layer gradient seed, numerics per nrc_mlp.slang loss_grad.
     var weight = targets.Load<float>((sample * 4 + 3) * 4);
     [ForceUnroll]
     for (int c = 0; c < OUT_CH; c++)

@@ -1075,11 +1075,7 @@ impl crate::SolariHitGroup for OpaqueSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "opaque",
-            closest_hit: SolariChitSource::Wgsl {
-                source: include_str!("chit_opaque.wgsl"),
-                file: "chit_opaque.wgsl",
-                entry: "chit_opaque",
-            },
+            closest_hit: SolariChitSource::SpirV(include_bytes!("chit_opaque.spv")),
             any_hit: Some(SolariAnyHitDef {
                 spirv: include_bytes!("ahit_alpha.spv"),
                 entry: "main",
@@ -1096,11 +1092,7 @@ impl crate::SolariHitGroup for GlassSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "glass",
-            closest_hit: SolariChitSource::Wgsl {
-                source: include_str!("chit_glass.wgsl"),
-                file: "chit_glass.wgsl",
-                entry: "chit_glass",
-            },
+            closest_hit: SolariChitSource::SpirV(include_bytes!("chit_glass.spv")),
             any_hit: None,
             composable_modules: &[],
         }
@@ -1114,11 +1106,7 @@ impl crate::SolariHitGroup for HairSurface {
     fn hit_group() -> SolariHitGroupDef {
         SolariHitGroupDef {
             label: "hair",
-            closest_hit: SolariChitSource::Wgsl {
-                source: include_str!("chit_hair.wgsl"),
-                file: "chit_hair.wgsl",
-                entry: "chit_hair",
-            },
+            closest_hit: SolariChitSource::SpirV(include_bytes!("chit_hair.spv")),
             any_hit: None,
             composable_modules: &[],
         }
@@ -1913,7 +1901,7 @@ pub(crate) fn rt_pipeline(
         // GI reservoir finalize (phase 1): whenever the GI ReSTIR arm is on
         // (estimator bit 5), the temporal merge + reservoir shade run HERE —
         // raygen only exports the canonical sample (its sample loop is past a
-        // register cliff; see raygen.wgsl's bit-5 comment). Must run before
+        // register cliff; see raygen.slang's bit-5 comment). Must run before
         // the spatial dispatch so neighbors read merged chains.
         let gi_finalize = restir_rt.is_some_and(|rt| rt.gi)
             || reference.is_some_and(SolariReference::gi_restir);
@@ -2051,7 +2039,6 @@ pub(crate) fn rt_pipeline(
                 ctx.command_encoder(),
                 nrc_bufs,
                 nrc_pipelines,
-                &pipeline_cache,
                 &render_device,
                 &render_queue,
                 &output.nrc_queries,
@@ -2083,7 +2070,6 @@ pub(crate) fn rt_pipeline(
                     ctx.command_encoder(),
                     nrc_bufs,
                     nrc_pipelines,
-                    &pipeline_cache,
                     &render_device,
                     &render_queue,
                     nrc_cfg,

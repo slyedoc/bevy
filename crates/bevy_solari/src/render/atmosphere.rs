@@ -257,7 +257,7 @@ pub struct SolariAtmosphereVolume {
     pub mie_phase_g: f32,
 }
 
-/// GPU record (mirrors `raygen.wgsl::AtmoVolume`; scalar layout after the
+/// GPU record (mirrors `raygen.slang::AtmoVolume`; scalar layout after the
 /// leading vec3s). `center` is the shell center relative to the PRIMARY
 /// camera in world METERS — an f64 subtraction on the CPU, so the huge
 /// absolute translations never reach f32.
@@ -277,7 +277,7 @@ struct GpuAtmosphereVolume {
     pad_c: f32,
 }
 
-/// Header + fixed-slot array (mirrors `raygen.wgsl::AtmoVolumes`).
+/// Header + fixed-slot array (mirrors `raygen.slang::AtmoVolumes`).
 #[derive(Clone, Copy, Default, PartialEq, ShaderType)]
 struct GpuAtmosphereVolumes {
     sun_direction: Vec3,
@@ -294,7 +294,7 @@ pub const MAX_ATMOSPHERE_VOLUMES: usize = 4;
 // Transmittance LUT: T(radius, sun-zenith cosine) per volume, baked by
 // `atmosphere_lut_bake.wgsl` into the SAME device-address buffer after the
 // header+volumes block — the march does one bilinear buffer lookup per step
-// instead of an inner sun integral. Layout constants mirror `raygen.wgsl` /
+// instead of an inner sun integral. Layout constants mirror `raygen.slang` /
 // the bake shader.
 pub const ATMO_LUT_W: u32 = 256; // mu = cos(zenith) axis
 pub const ATMO_LUT_H: u32 = 64; // radius axis (bottom→top)

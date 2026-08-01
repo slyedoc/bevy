@@ -13,15 +13,11 @@
 //! mirror adam maintains) and composites into the output buffer; training
 //! paths and [`SolariNrc::inline_coopvec`] query inline in raygen instead.
 
-use bevy_asset::{load_embedded_asset, AssetServer};
 use bevy_ecs::prelude::*;
 use bevy_render::{
     extract_resource::ExtractResource,
     render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        Buffer, BufferUsages, CachedComputePipelineId, ComputePassDescriptor,
-        ComputePipelineDescriptor, PipelineCache, ShaderStages,
+        BindGroup, BindGroupEntries, Buffer, BufferUsages, ComputePassDescriptor, ShaderStages,
     },
     renderer::{RenderDevice, RenderQueue},
 };
@@ -35,13 +31,13 @@ pub const NRC_LAYERS: usize = 6;
 pub const NRC_W_ELEMS: usize = NRC_WIDTH * NRC_WIDTH;
 pub const NRC_W_TOTAL: usize = NRC_LAYERS * NRC_W_ELEMS;
 pub const NRC_B_TOTAL: usize = NRC_LAYERS * NRC_WIDTH;
-/// Training records per frame; must match `NRC_RECORD_CAP` in raygen.wgsl.
+/// Training records per frame; must match `NRC_RECORD_CAP` in raygen.slang.
 pub const NRC_RECORD_CAP: usize = 16384;
-/// Bytes per `NrcRecord` (5 × vec4<f32>), must match raygen.wgsl/nrc_mlp.wgsl.
+/// Bytes per `NrcRecord` (5 × vec4<f32>), must match raygen.slang/nrc_mlp.slang.
 pub const NRC_RECORD_SIZE: usize = 80;
 /// Bytes per termination query (3 × vec4<u32>); the per-view ring is sized to
 /// the viewport (one query per pixel per frame) plus a 16-byte count header.
-/// Must match `NrcQueryGpu`/`NrcQueryBuf` in raygen.wgsl and nrc_mlp.wgsl.
+/// Must match `NrcQueryGpu`/`NrcQueryBuf` in raygen.slang and nrc_mlp.slang.
 pub const NRC_QUERY_SIZE: usize = 48;
 /// Bytes per record in the loss-readback staging buffer: 4 loss + 16 target.
 const LOSS_STAGING_BYTES_PER_RECORD: u64 = 20;
@@ -144,23 +140,24 @@ struct LearnParams {
     pad_b: u32,
 }
 
-/// Bind-group layouts + queued pipelines for the training kernels. The
-/// fused `learn` kernel is passthrough SPIR-V with an explicit layout, so
-/// it is created eagerly instead of queued on the [`PipelineCache`].
+/// Bind-group layouts + pipelines for the training kernels. Every kernel is
+/// Slang-compiled passthrough SPIR-V (nrc_train.slang + nrc_mlp.slang — regen
+/// commands in their headers) with an explicit layout, created eagerly: no
+/// naga reflection, nothing queued on the `PipelineCache`.
 #[derive(Resource)]
 pub struct NrcPipelines {
-    mm_layout: BindGroupLayoutDescriptor,
-    bias_grad_layout: BindGroupLayoutDescriptor,
-    adam_layout: BindGroupLayoutDescriptor,
-    encode_layout: BindGroupLayoutDescriptor,
-    infer_layout: BindGroupLayoutDescriptor,
+    mm_layout: bevy_render::render_resource::BindGroupLayout,
+    bias_grad_layout: bevy_render::render_resource::BindGroupLayout,
+    adam_layout: bevy_render::render_resource::BindGroupLayout,
+    encode_layout: bevy_render::render_resource::BindGroupLayout,
+    infer_layout: bevy_render::render_resource::BindGroupLayout,
     learn_layout: bevy_render::render_resource::BindGroupLayout,
     learn: bevy_render::render_resource::ComputePipeline,
-    pub mm_tn: CachedComputePipelineId,
-    pub bias_grad: CachedComputePipelineId,
-    pub adam: CachedComputePipelineId,
-    pub encode_records: CachedComputePipelineId,
-    pub query_infer: CachedComputePipelineId,
+    pub mm_tn: bevy_render::render_resource::ComputePipeline,
+    pub bias_grad: bevy_render::render_resource::ComputePipeline,
+    pub adam: bevy_render::render_resource::ComputePipeline,
+    pub encode_records: bevy_render::render_resource::ComputePipeline,
+    pub query_infer: bevy_render::render_resource::ComputePipeline,
 }
 
 /// All NRC GPU state. Weights/optimizer are global (one cache per app);
@@ -226,113 +223,12 @@ struct NrcBindGroups {
     encode: BindGroup,
 }
 
-/// `RenderStartup`: layouts + pipeline queueing (no scene deps — queue now).
+/// `RenderStartup`: explicit layouts + eager passthrough pipelines. Every
+/// kernel is Slang-precompiled SPIR-V (no naga reflection), so each bind
+/// group layout is spelled out to match the `[[vk::binding]]` tables in
+/// nrc_train.slang / nrc_mlp.slang.
 #[allow(unsafe_code)]
-pub fn init_nrc_pipelines(
-    mut commands: Commands,
-    pipeline_cache: Res<PipelineCache>,
-    asset_server: Res<AssetServer>,
-    render_device: Res<RenderDevice>,
-    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
-) {
-    let mm_layout = BindGroupLayoutDescriptor::new(
-        "nrc_mm_layout",
-        &BindGroupLayoutEntries::with_indices(
-            ShaderStages::COMPUTE,
-            (
-                (0, storage_buffer_read_only_sized(false, None)),
-                (1, storage_buffer_read_only_sized(false, None)),
-                (2, storage_buffer_sized(false, None)),
-                (3, storage_buffer_read_only_sized(false, None)),
-                (4, uniform_buffer_sized(false, None)),
-            ),
-        ),
-    );
-    let bias_grad_layout = BindGroupLayoutDescriptor::new(
-        "nrc_bias_grad_layout",
-        &BindGroupLayoutEntries::with_indices(
-            ShaderStages::COMPUTE,
-            (
-                (2, storage_buffer_sized(false, None)),
-                (4, uniform_buffer_sized(false, None)),
-                (12, storage_buffer_read_only_sized(false, None)),
-            ),
-        ),
-    );
-    let adam_layout = BindGroupLayoutDescriptor::new(
-        "nrc_adam_layout",
-        &BindGroupLayoutEntries::with_indices(
-            ShaderStages::COMPUTE,
-            (
-                (13, storage_buffer_sized(false, None)),
-                (14, storage_buffer_read_only_sized(false, None)),
-                (15, storage_buffer_sized(false, None)),
-                (16, storage_buffer_sized(false, None)),
-                (17, storage_buffer_sized(false, None)),
-                (18, uniform_buffer_sized(false, None)),
-                (21, storage_buffer_sized(false, None)),
-                (23, storage_buffer_sized(false, None)),
-                (24, storage_buffer_sized(false, None)),
-            ),
-        ),
-    );
-    let infer_layout = BindGroupLayoutDescriptor::new(
-        "nrc_infer_layout",
-        &BindGroupLayoutEntries::with_indices(
-            ShaderStages::COMPUTE,
-            (
-                (1, storage_buffer_read_only_sized(false, None)),  // weights_t (mat_b)
-                (12, storage_buffer_read_only_sized(false, None)), // bias16 (act_mask)
-                (26, storage_buffer_read_only_sized(false, None)), // queries
-                (27, storage_buffer_sized(false, None)),           // out_radiance
-                (28, uniform_buffer_sized(false, None)),           // qparams
-            ),
-        ),
-    );
-    let encode_layout = BindGroupLayoutDescriptor::new(
-        "nrc_encode_layout",
-        &BindGroupLayoutEntries::with_indices(
-            ShaderStages::COMPUTE,
-            (
-                (6, storage_buffer_sized(false, None)),
-                (19, uniform_buffer_sized(false, None)),
-                (20, storage_buffer_sized(false, None)),
-                (22, storage_buffer_read_only_sized(false, None)),
-            ),
-        ),
-    );
-
-    let shader = load_embedded_asset!(asset_server.as_ref(), "nrc_mlp.wgsl");
-    let queue = |label: &'static str, entry: &'static str, layout: &BindGroupLayoutDescriptor| {
-        pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some(label.into()),
-            layout: vec![layout.clone()],
-            shader: shader.clone(),
-            shader_defs: vec![],
-            entry_point: Some(entry.into()),
-            immediate_size: 0,
-            zero_initialize_workgroup_memory: false,
-            constants: vec![],
-        })
-    };
-    let mm_tn = queue("nrc_mm_tn", "mm_tn", &mm_layout);
-    let bias_grad = queue("nrc_bias_grad", "bias_grad", &bias_grad_layout);
-    let adam = queue("nrc_adam", "adam", &adam_layout);
-    let encode_records = queue("nrc_encode_records", "nrc_encode_records", &encode_layout);
-    let query_infer = queue("nrc_query_infer", "nrc_query_infer", &infer_layout);
-    for (name, id) in [
-        ("nrc_mm_tn", mm_tn),
-        ("nrc_bias_grad", bias_grad),
-        ("nrc_adam", adam),
-        ("nrc_encode_records", encode_records),
-        ("nrc_query_infer", query_infer),
-    ] {
-        registry.register(name, id);
-    }
-
-    // The fused forward+loss+dZ kernel: Slang-compiled SPIR-V loaded through
-    // the passthrough path (no naga reflection), so the bind group layout is
-    // spelled out to match the [[vk::binding]] table in nrc_train.slang.
+pub fn init_nrc_pipelines(mut commands: Commands, render_device: Res<RenderDevice>) {
     let storage_entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: ShaderStages::COMPUTE,
@@ -343,6 +239,72 @@ pub fn init_nrc_pipelines(
         },
         count: None,
     };
+    let uniform_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+
+    let mm_layout = render_device.create_bind_group_layout(
+        "nrc_mm_layout",
+        &[
+            storage_entry(0, true),  // mat_a
+            storage_entry(1, true),  // mat_b
+            storage_entry(2, false), // mat_c
+            storage_entry(3, true),  // zero_tile
+            uniform_entry(4),        // dims
+        ],
+    );
+    // Passthrough SPIR-V bindings must be contiguous from 0 per kernel:
+    // wgpu-hal's Vulkan backend numbers descriptor bindings sequentially by
+    // layout-entry order, ignoring sparse wgpu binding numbers — a sparse
+    // table silently desyncs the blob's [[vk::binding]] slots.
+    let bias_grad_layout = render_device.create_bind_group_layout(
+        "nrc_bias_grad_layout",
+        &[
+            storage_entry(0, true),  // dz (layer slice)
+            storage_entry(1, false), // db_out
+            uniform_entry(2),        // dims
+        ],
+    );
+    let adam_layout = render_device.create_bind_group_layout(
+        "nrc_adam_layout",
+        &[
+            storage_entry(0, false), // master
+            storage_entry(1, true),  // grad_in
+            storage_entry(2, false), // moment_m
+            storage_entry(3, false), // moment_v
+            storage_entry(4, false), // mirror_f16
+            storage_entry(5, false), // mirror_alt
+            storage_entry(6, false), // ema_master
+            storage_entry(7, false), // mirror_ema
+            uniform_entry(8),        // adam_u
+        ],
+    );
+    let infer_layout = render_device.create_bind_group_layout(
+        "nrc_infer_layout",
+        &[
+            storage_entry(0, true),  // weights_t
+            storage_entry(1, true),  // biases
+            storage_entry(2, true),  // queries
+            storage_entry(3, false), // out_radiance
+            uniform_entry(4),        // qparams
+        ],
+    );
+    let encode_layout = render_device.create_bind_group_layout(
+        "nrc_encode_layout",
+        &[
+            storage_entry(0, true),  // records
+            storage_entry(1, false), // act_out
+            storage_entry(2, false), // targets_out
+            uniform_entry(3),        // train_params
+        ],
+    );
     let learn_layout = render_device.create_bind_group_layout(
         "nrc_learn_layout",
         &[
@@ -353,44 +315,59 @@ pub fn init_nrc_pipelines(
             storage_entry(4, false), // preds
             storage_entry(5, false), // loss
             storage_entry(6, false), // dz
-            wgpu::BindGroupLayoutEntry {
-                binding: 7,
-                visibility: ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            storage_entry(8, true), // zeros (f16 view)
+            uniform_entry(7),        // params
+            storage_entry(8, true),  // zeros (f16 view)
         ],
     );
-    let spv = wgpu::util::make_spirv_raw(include_bytes!("nrc_train.spv"));
-    // SAFETY: nrc_train.spv is compiled from nrc_train.slang in-tree and
-    // spirv-val-validated (regen command in its header); the explicit layout
-    // above matches its binding table.
-    let learn_module = unsafe {
-        render_device.wgpu_device().create_shader_module_passthrough(
-            wgpu::ShaderModuleDescriptorPassthrough {
-                spirv: Some(spv),
-                ..Default::default()
-            },
-        )
+
+    // SAFETY (all blobs): compiled from the in-tree .slang sources and
+    // spirv-val-validated (regen commands in their headers); each explicit
+    // layout above matches its kernel's binding table.
+    let make = |label: &'static str,
+                spv_bytes: &'static [u8],
+                layout: &bevy_render::render_resource::BindGroupLayout| {
+        let spv = wgpu::util::make_spirv_raw(spv_bytes);
+        let module = unsafe {
+            render_device.wgpu_device().create_shader_module_passthrough(
+                wgpu::ShaderModuleDescriptorPassthrough {
+                    spirv: Some(spv),
+                    ..Default::default()
+                },
+            )
+        };
+        let pl = render_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(label),
+            bind_group_layouts: &[Some(layout)],
+            immediate_size: 0,
+        });
+        render_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
     };
-    let learn_pl = render_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("nrc_learn_pl"),
-        bind_group_layouts: &[Some(&learn_layout)],
-        immediate_size: 0,
-    });
-    let learn = render_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("nrc_learn"),
-        layout: Some(&learn_pl),
-        module: &learn_module,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
+
+    let learn = make("nrc_learn", include_bytes!("nrc_train.spv"), &learn_layout);
+    let mm_tn = make("nrc_mm_tn", include_bytes!("nrc_mm_tn.spv"), &mm_layout);
+    let bias_grad = make(
+        "nrc_bias_grad",
+        include_bytes!("nrc_bias_grad.spv"),
+        &bias_grad_layout,
+    );
+    let adam = make("nrc_adam", include_bytes!("nrc_adam.spv"), &adam_layout);
+    let encode_records = make(
+        "nrc_encode_records",
+        include_bytes!("nrc_encode_records.spv"),
+        &encode_layout,
+    );
+    let query_infer = make(
+        "nrc_query_infer",
+        include_bytes!("nrc_query_infer.spv"),
+        &infer_layout,
+    );
 
     commands.insert_resource(NrcPipelines {
         mm_layout,
@@ -598,7 +575,6 @@ fn build_bind_groups(
     bufs: &NrcBuffers,
     pipelines: &NrcPipelines,
     device: &RenderDevice,
-    cache: &PipelineCache,
 ) -> NrcBindGroups {
     let batch = NRC_RECORD_CAP as u64;
     let layer_bytes = batch * NRC_WIDTH as u64 * 2;
@@ -607,7 +583,7 @@ fn build_bind_groups(
     for l in 0..NRC_LAYERS {
         dw.push(device.create_bind_group(
             "nrc_dw",
-            &cache.get_bind_group_layout(&pipelines.mm_layout),
+            &pipelines.mm_layout,
             &BindGroupEntries::with_indices((
                 (0, bufs.acts.as_entire_binding()),
                 (1, bufs.dz.as_entire_binding()),
@@ -616,22 +592,22 @@ fn build_bind_groups(
                 (4, bufs.dw_ubo[l].as_entire_binding()),
             )),
         ));
-        // bias_grad has no element-offset field for act_mask — bind the
-        // layer's dZ slice (the 2 MiB layer stride keeps any offset alignment).
+        // bias_grad has no element-offset field for dz — bind the layer's dZ
+        // slice (the 2 MiB layer stride keeps any offset alignment).
         bias_grad.push(device.create_bind_group(
             "nrc_bias_grad",
-            &cache.get_bind_group_layout(&pipelines.bias_grad_layout),
+            &pipelines.bias_grad_layout,
             &BindGroupEntries::with_indices((
-                (2, bufs.db.as_entire_binding()),
-                (4, bufs.bg_ubo[l].as_entire_binding()),
                 (
-                    12,
+                    0,
                     wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &bufs.dz,
                         offset: l as u64 * layer_bytes,
                         size: Some(std::num::NonZeroU64::new(layer_bytes).unwrap()),
                     }),
                 ),
+                (1, bufs.db.as_entire_binding()),
+                (2, bufs.bg_ubo[l].as_entire_binding()),
             )),
         ));
     }
@@ -656,42 +632,42 @@ fn build_bind_groups(
         bias_grad,
         adam_w: device.create_bind_group(
             "nrc_adam_w",
-            &cache.get_bind_group_layout(&pipelines.adam_layout),
+            &pipelines.adam_layout,
             &BindGroupEntries::with_indices((
-                (13, bufs.master_w.as_entire_binding()),
-                (14, bufs.dw.as_entire_binding()),
-                (15, bufs.m_w.as_entire_binding()),
-                (16, bufs.v_w.as_entire_binding()),
-                (17, bufs.w16.as_entire_binding()),
-                (18, bufs.adam_w_ubo.as_entire_binding()),
-                (21, bufs.weights_t.as_entire_binding()),
-                (23, bufs.ema_w.as_entire_binding()),
-                (24, bufs.weights_t_ema.as_entire_binding()),
+                (0, bufs.master_w.as_entire_binding()),
+                (1, bufs.dw.as_entire_binding()),
+                (2, bufs.m_w.as_entire_binding()),
+                (3, bufs.v_w.as_entire_binding()),
+                (4, bufs.w16.as_entire_binding()),
+                (5, bufs.weights_t.as_entire_binding()),
+                (6, bufs.ema_w.as_entire_binding()),
+                (7, bufs.weights_t_ema.as_entire_binding()),
+                (8, bufs.adam_w_ubo.as_entire_binding()),
             )),
         ),
         adam_b: device.create_bind_group(
             "nrc_adam_b",
-            &cache.get_bind_group_layout(&pipelines.adam_layout),
+            &pipelines.adam_layout,
             &BindGroupEntries::with_indices((
-                (13, bufs.master_b.as_entire_binding()),
-                (14, bufs.db.as_entire_binding()),
-                (15, bufs.m_b.as_entire_binding()),
-                (16, bufs.v_b.as_entire_binding()),
-                (17, bufs.bias16.as_entire_binding()),
-                (18, bufs.adam_b_ubo.as_entire_binding()),
-                (21, bufs.weights_t.as_entire_binding()),
-                (23, bufs.ema_b.as_entire_binding()),
-                (24, bufs.bias16_ema.as_entire_binding()),
+                (0, bufs.master_b.as_entire_binding()),
+                (1, bufs.db.as_entire_binding()),
+                (2, bufs.m_b.as_entire_binding()),
+                (3, bufs.v_b.as_entire_binding()),
+                (4, bufs.bias16.as_entire_binding()),
+                (5, bufs.weights_t.as_entire_binding()),
+                (6, bufs.ema_b.as_entire_binding()),
+                (7, bufs.bias16_ema.as_entire_binding()),
+                (8, bufs.adam_b_ubo.as_entire_binding()),
             )),
         ),
         encode: device.create_bind_group(
             "nrc_encode",
-            &cache.get_bind_group_layout(&pipelines.encode_layout),
+            &pipelines.encode_layout,
             &BindGroupEntries::with_indices((
-                (6, bufs.acts.as_entire_binding()),
-                (19, bufs.train_ubo.as_entire_binding()),
-                (20, bufs.targets.as_entire_binding()),
-                (22, bufs.records.as_entire_binding()),
+                (0, bufs.records.as_entire_binding()),
+                (1, bufs.acts.as_entire_binding()),
+                (2, bufs.targets.as_entire_binding()),
+                (3, bufs.train_ubo.as_entire_binding()),
             )),
         ),
     }
@@ -710,13 +686,12 @@ struct NrcQueryParams {
 /// the MLP for every query raygen appended this frame and add the
 /// de-factorized radiance into the per-pixel output buffer (`scale` pre-folds
 /// the raygen accumulation blend). Recorded on the ctx encoder AFTER the
-/// trace. Returns false when the pipeline isn't compiled yet.
+/// trace.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_nrc_query_infer(
     encoder: &mut wgpu::CommandEncoder,
     bufs: &NrcBuffers,
     pipelines: &NrcPipelines,
-    cache: &PipelineCache,
     device: &RenderDevice,
     queue: &RenderQueue,
     queries: &Buffer,
@@ -725,9 +700,7 @@ pub fn dispatch_nrc_query_infer(
     scale: f32,
     exposure: f32,
 ) -> bool {
-    let Some(infer) = cache.get_compute_pipeline(pipelines.query_infer) else {
-        return false;
-    };
+    let infer = &pipelines.query_infer;
     queue.write_buffer(
         &bufs.query_ubo,
         0,
@@ -740,13 +713,13 @@ pub fn dispatch_nrc_query_infer(
     );
     let bg = device.create_bind_group(
         "nrc_query_infer",
-        &cache.get_bind_group_layout(&pipelines.infer_layout),
+        &pipelines.infer_layout,
         &BindGroupEntries::with_indices((
-            (1, bufs.weights_t_ema.as_entire_binding()),
-            (12, bufs.bias16_ema.as_entire_binding()),
-            (26, queries.as_entire_binding()),
-            (27, output.as_entire_binding()),
-            (28, bufs.query_ubo.as_entire_binding()),
+            (0, bufs.weights_t_ema.as_entire_binding()),
+            (1, bufs.bias16_ema.as_entire_binding()),
+            (2, queries.as_entire_binding()),
+            (3, output.as_entire_binding()),
+            (4, bufs.query_ubo.as_entire_binding()),
         )),
     );
     let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -768,23 +741,18 @@ pub fn dispatch_training(
     encoder: &mut wgpu::CommandEncoder,
     bufs: &mut NrcBuffers,
     pipelines: &NrcPipelines,
-    cache: &PipelineCache,
     device: &RenderDevice,
     queue: &RenderQueue,
     nrc: &SolariNrc,
 ) -> bool {
-    let Some((mm_tn, bias_grad, adam, encode)) = (|| {
-        Some((
-            cache.get_compute_pipeline(pipelines.mm_tn)?,
-            cache.get_compute_pipeline(pipelines.bias_grad)?,
-            cache.get_compute_pipeline(pipelines.adam)?,
-            cache.get_compute_pipeline(pipelines.encode_records)?,
-        ))
-    })() else {
-        return false;
-    };
+    let (mm_tn, bias_grad, adam, encode) = (
+        &pipelines.mm_tn,
+        &pipelines.bias_grad,
+        &pipelines.adam,
+        &pipelines.encode_records,
+    );
     if bufs.groups.is_none() {
-        bufs.groups = Some(build_bind_groups(bufs, pipelines, device, cache));
+        bufs.groups = Some(build_bind_groups(bufs, pipelines, device));
     }
 
     bufs.step += 1;
