@@ -1165,6 +1165,7 @@ pub(crate) fn rt_pipeline(
         Option<Res<SolariHitGroupRegistry>>,
         Option<Res<crate::accel::deform::Deform>>,
         Option<ResMut<RtLibraryCache>>,
+        Option<Res<crate::gpu::binding_seam::BindingSeam>>,
     ),
     materials: RtMaterials,
     // Tupled: baked sky cube + atmosphere GPU state (sky_frame quat) +
@@ -1210,7 +1211,7 @@ pub(crate) fn rt_pipeline(
         ptlas,
     ) = render_res;
     let (mut frame_counter, mut settle_frames) = counters;
-    let (cluster_mesh_manager, tess_classify, hit_group_registry, deform, library_cache) =
+    let (cluster_mesh_manager, tess_classify, hit_group_registry, deform, library_cache, seam) =
         geometry_res;
     let (atmosphere_sky, atmosphere_gpu, atmosphere_volumes, custom_sky) = atmosphere_res;
     let view_entity = view.entity();
@@ -1439,6 +1440,7 @@ pub(crate) fn rt_pipeline(
                         (output.nrc_queries_raw, output.nrc_queries_size),
                         env_view,
                         environment_map_image,
+                        seam.as_deref(),
                     ) {
                         commands.entity(view_entity).insert(built);
                     }

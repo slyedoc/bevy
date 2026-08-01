@@ -56,6 +56,8 @@ pub enum HeapKind {
 pub enum HeapResource<'a> {
     /// `STORAGE_BUFFER` descriptor over `[address, address + size)`.
     Buffer { address: u64, size: u64 },
+    /// `UNIFORM_BUFFER` descriptor over `[address, address + size)`.
+    UniformBuffer { address: u64, size: u64 },
     /// `SAMPLED_IMAGE` descriptor.
     SampledImage {
         view: &'a vk::ImageViewCreateInfo<'a>,
@@ -73,7 +75,7 @@ pub enum HeapResource<'a> {
 impl HeapResource<'_> {
     fn kind(&self) -> HeapKind {
         match self {
-            HeapResource::Buffer { .. } => HeapKind::Buffer,
+            HeapResource::Buffer { .. } | HeapResource::UniformBuffer { .. } => HeapKind::Buffer,
             HeapResource::SampledImage { .. } | HeapResource::StorageImage { .. } => {
                 HeapKind::Image
             }
@@ -296,6 +298,20 @@ impl BindingSeam {
         self.inner.allocator.wgpu_buffer_device_address(buffer)
     }
 
+    /// Device address of a raw `VkBuffer` (created with
+    /// `SHADER_DEVICE_ADDRESS`, as every solari buffer is), for
+    /// [`HeapResource::Buffer`]/[`HeapResource::UniformBuffer`] descriptors.
+    pub fn raw_buffer_address(&self, buffer: vk::Buffer) -> u64 {
+        // SAFETY: the handle comes from a live solari-owned buffer created
+        // with SHADER_DEVICE_ADDRESS usage.
+        unsafe {
+            self.inner
+                .allocator
+                .device()
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        }
+    }
+
     /// Write one SBT record: the hit-group `handle`, then `fields` (the
     /// material's pointers / heap indices / constants).
     pub fn write_record(&self, slot: u32, handle: &[u8], fields: &[u8]) {
@@ -453,13 +469,19 @@ impl BindingSeam {
         dst.size = desc_size as usize;
 
         match resource {
-            HeapResource::Buffer { address, size } => {
+            HeapResource::Buffer { address, size }
+            | HeapResource::UniformBuffer { address, size } => {
                 let range = vk::DeviceAddressRangeEXT {
                     address: *address,
                     size: *size,
                 };
+                let ty = if matches!(resource, HeapResource::UniformBuffer { .. }) {
+                    vk::DescriptorType::UNIFORM_BUFFER
+                } else {
+                    vk::DescriptorType::STORAGE_BUFFER
+                };
                 let info = vk::ResourceDescriptorInfoEXT {
-                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    ty,
                     data: vk::ResourceDescriptorDataEXT {
                         p_address_range: &range,
                     },

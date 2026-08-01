@@ -814,10 +814,41 @@ pub struct RtViewBindings {
     /// skybox that finishes loading (or is swapped) changes the view, and the
     /// baked-once set would otherwise sample the stale cube forever.
     env_map_view: vk::ImageView,
+    /// Parallel descriptor-heap slots for this view's set-1 resources —
+    /// M2 staging: allocated alongside the classic descriptor set when the
+    /// [`BindingSeam`](crate::gpu::binding_seam::BindingSeam) exists, unread
+    /// until the heap-flagged pipeline flip consumes them as mapping targets.
+    #[expect(dead_code, reason = "M2 staging: read at the heap-pipeline flip")]
+    heap: Option<RtViewHeapSlots>,
     /// Keeps the `VkDevice` alive until this drops — see the twin field on
     /// [`RtPipeline`]; without it, teardown drop order decides whether [`Drop`]'s
     /// raw destroys run against a dead device.
     _device_keepalive: Allocator,
+}
+
+/// The set-1 resources as descriptor-heap slots (buffer-region indices, plus
+/// the env sampler in the sampler region). Slot order mirrors the set-1
+/// binding list: output, camera (uniform), geometry (uniform), the DLSS
+/// G-buffers, then reservoirs/surface/light_samples/gi_samples/nrc×4.
+/// The env-cube IMAGE slot arrives with the scene-set conversion (heap image
+/// descriptors are written from `ImageViewCreateInfo`, which needs the raw
+/// image + params plumbed from the caller).
+pub struct RtViewHeapSlots {
+    seam: crate::gpu::binding_seam::BindingSeam,
+    buffers: Vec<u32>,
+    env_sampler: u32,
+}
+
+impl Drop for RtViewHeapSlots {
+    fn drop(&mut self) {
+        use crate::gpu::binding_seam::HeapKind;
+        // The view's trace is drained by RtViewBindings' Drop (quiesce) before
+        // these slots recycle.
+        for &slot in &self.buffers {
+            self.seam.free_heap_index(HeapKind::Buffer, slot);
+        }
+        self.seam.free_heap_index(HeapKind::Sampler, self.env_sampler);
+    }
 }
 
 // SAFETY: the host-visible geometry-address mapping is written only from the single
@@ -1135,6 +1166,9 @@ impl RtPipeline {
         nrc_queries: (vk::Buffer, u64),
         env_map_view: vk::ImageView,
         env_map_image: Option<vk::Image>,
+        // When the binding seam exists, every set-1 resource also gets a
+        // descriptor-heap slot (M2 staging — see [`RtViewHeapSlots`]).
+        seam: Option<&crate::gpu::binding_seam::BindingSeam>,
     ) -> Option<RtViewBindings> {
         // One pool per view, sized for exactly this view's single set-1 set.
         let pool_sizes = [
@@ -1348,6 +1382,55 @@ impl RtPipeline {
         // SAFETY: targets the freshly-allocated set; buffers + image/sampler live.
         unsafe { self.device.update_descriptor_sets(&writes, &[]) };
 
+        // M2 staging: mirror every set-1 resource into the descriptor heap.
+        // Uniform vs storage matches the set-1 layout (camera + geometry are
+        // uniforms); slot order mirrors the binding list so the mapping table
+        // at the heap-pipeline flip reads straight off this Vec.
+        let heap = seam.map(|seam| {
+            use crate::gpu::binding_seam::HeapResource;
+            let storage = |buffer: vk::Buffer, size: u64| HeapResource::Buffer {
+                address: seam.raw_buffer_address(buffer),
+                size,
+            };
+            let mut resources = vec![
+                storage(output_buffer, output_size),
+                HeapResource::UniformBuffer {
+                    address: seam.raw_buffer_address(camera_buffer),
+                    size: size_of::<RtCamera>() as u64,
+                },
+                HeapResource::UniformBuffer {
+                    address: geometry.device_address,
+                    size: geometry.size,
+                },
+            ];
+            resources.extend(gbuffers.iter().map(|&(buf, size)| storage(buf, size)));
+            resources.extend(
+                [
+                    reservoirs,
+                    surface,
+                    light_samples,
+                    gi_samples,
+                    nrc_weights,
+                    nrc_bias,
+                    nrc_records,
+                    nrc_queries,
+                ]
+                .into_iter()
+                .map(|(buf, size)| storage(buf, size)),
+            );
+            let buffers = resources
+                .into_iter()
+                .map(|r| seam.alloc_heap_index(r))
+                .collect();
+            let env_sampler_slot =
+                seam.alloc_heap_index(HeapResource::Sampler(&sampler_info));
+            RtViewHeapSlots {
+                seam: seam.clone(),
+                buffers,
+                env_sampler: env_sampler_slot,
+            }
+        });
+
         Some(RtViewBindings {
             device: self.device.clone(),
             descriptor_pool,
@@ -1357,6 +1440,7 @@ impl RtPipeline {
             env_map_image,
             output_buffer,
             env_map_view,
+            heap,
             _device_keepalive: allocator.clone(),
         })
     }
