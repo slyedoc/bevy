@@ -44,6 +44,17 @@ pub struct RaytracingSceneBindings {
     /// via [`RawTraceBindable`](crate::gpu::RawTraceBindable), so it stays valid for
     /// any in-flight trace. `0` until the first bind-group build.
     pub materials_device_address: crate::gpu::allocator::StableAddr,
+    /// M2 staging: the scene set's BUFFER bindings mirrored as descriptor-heap
+    /// slots, refreshed every frame right after the bind group rebuild (the
+    /// tables may reallocate as they grow). Unread until the heap-pipeline
+    /// flip; textures/samplers/TLAS follow separately (heap image + sampler
+    /// descriptors are written from CREATE INFO, and the TLAS rides push data).
+    pub scene_heap: Option<SceneHeapSlots>,
+}
+
+/// `(set-0 binding index, heap buffer-region slot)` pairs, in binding order.
+pub struct SceneHeapSlots {
+    pub buffers: Vec<(u32, u32)>,
 }
 
 /// The scene's per-frame-rebuilt tables, on persistent **stable-address**
@@ -118,6 +129,7 @@ pub fn prepare_raytracing_scene_bindings(
     hair: HairSceneDeps,
     mut raytracing_scene_bindings: ResMut<RaytracingSceneBindings>,
     scene_buffers: Option<ResMut<SolariSceneBuffers>>,
+    seam: Option<Res<crate::gpu::binding_seam::BindingSeam>>,
 ) {
     raytracing_scene_bindings.bind_group = None;
 
@@ -378,12 +390,77 @@ pub fn prepare_raytracing_scene_bindings(
             // transform-table world buffer.
             hair_manager.segments.buffer().as_entire_binding(), // 9 hair_segments
             hair_instance_buffer.as_entire_binding(),       // 10 hair_instances
-            hair_params,                                    // 11 hair_params
+            hair_params.clone(),                            // 11 hair_params
             transform_propagate.current_world().as_entire_binding(), // 12 hair_world
             texture_arrays.as_slice(),                      // 13 texture_arrays
             &*array_sampler,                                // 14 texture_arrays_sampler
         )),
     ));
+
+    // M2 staging: mirror the scene set's buffer bindings into the descriptor
+    // heap, same cadence as the bind-group rebuild above (these tables can
+    // reallocate as they grow, so the descriptors are rewritten each frame —
+    // heap descriptor updates are plain host writes). First frame allocates
+    // the slots; afterwards the same slots are rewritten in place, so the
+    // flip's mapping table stays valid across scene growth.
+    if let Some(seam) = seam.as_deref() {
+        use crate::gpu::binding_seam::{HeapKind, HeapResource};
+        use bevy_render::render_resource::BindingResource;
+        let heap_resource = |res: BindingResource, uniform: bool| -> Option<HeapResource> {
+            let BindingResource::Buffer(b) = res else {
+                return None;
+            };
+            let address = seam.device_address(b.buffer).get() + b.offset;
+            let size = b
+                .size
+                .map(u64::from)
+                .unwrap_or(b.buffer.size() - b.offset);
+            Some(if uniform {
+                HeapResource::UniformBuffer { address, size }
+            } else {
+                HeapResource::Buffer { address, size }
+            })
+        };
+        let resources: Vec<(u32, HeapResource)> = [
+            (0, cluster_mesh_manager.indices.binding(), false),
+            (1, cluster_mesh_manager.clusters.binding(), false),
+            (5, light_sources.binding().unwrap(), false),
+            (8, active_light_list.binding().unwrap(), false),
+            (
+                9,
+                hair_manager.segments.buffer().as_entire_binding(),
+                false,
+            ),
+            (10, hair_instance_buffer.as_entire_binding(), false),
+            (11, hair_params, false),
+            (
+                12,
+                transform_propagate.current_world().as_entire_binding(),
+                false,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(binding, res, uniform)| Some((binding, heap_resource(res, uniform)?)))
+        .collect();
+        match &mut raytracing_scene_bindings.scene_heap {
+            Some(slots) => {
+                for ((binding, resource), &(slot_binding, slot)) in
+                    resources.into_iter().zip(&slots.buffers)
+                {
+                    debug_assert_eq!(binding, slot_binding);
+                    seam.rewrite_heap_index(HeapKind::Buffer, slot, resource);
+                }
+            }
+            none => {
+                *none = Some(SceneHeapSlots {
+                    buffers: resources
+                        .into_iter()
+                        .map(|(binding, r)| (binding, seam.alloc_heap_index(r)))
+                        .collect(),
+                });
+            }
+        }
+    }
 }
 
 impl RaytracingSceneBindings {
@@ -391,6 +468,7 @@ impl RaytracingSceneBindings {
         Self {
             bind_group: None,
             materials_device_address: Default::default(),
+            scene_heap: None,
             bind_group_layout: BindGroupLayoutDescriptor::new(
                 "raytracing_scene_bind_group_layout",
                 // `transforms` / `previous_frame_transforms` / `material_ids` /
