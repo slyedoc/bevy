@@ -763,6 +763,8 @@ tracing = { version = "0.1", default-features = false, optional = true }
 bevy_dylib = { path = "crates/bevy_dylib", version = "0.20.0-dev", default-features = false, optional = true }
 
 [dev-dependencies]
+# Raw VK for the NRC gym's dW layout conversion (vkCmdConvertCooperativeVectorMatrixNV).
+ash = { version = "0.38", features = ["provisional"] }
 rand = "0.10.0"
 chacha20 = { version = "0.10.0", default-features = false, features = ["rng"] }
 ron = "0.12"
@@ -1632,6 +1634,17 @@ name = "Solari (many lights stress test)"
 description = "400 emissive sphere lights over 8000 cubes — Bevy Solari scaling stress test, with the `SolariDebugPlugin` overlay."
 category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
+
+[[example]]
+name = "solari_heap_probe"
+path = "examples/3d/solari/heap_probe.rs"
+doc-scrape-examples = true
+
+[package.metadata.example.solari_heap_probe]
+name = "Solari (descriptor-heap probe)"
+description = "Minimal coopvec-over-descriptor-heap dispatch reproducer"
+category = "3D Rendering"
+wasm = false
 
 [[example]]
 name = "solari_nrc_gym"
@@ -5907,22 +5920,21 @@ description = "Demonstrates blending between multiple reflection probes"
 category = "3D Rendering"
 wasm = false
 
-# Patch wgpu (and friends) to slyedoc/wgpu#solari-rt-naga — solari-pt + naga
-# #9085 RT-pipeline SPIR-V backend (so naga can emit raygen/closest-hit/miss +
-# traceRay + ray-payload SPIR-V). The dependency #9450's wgpu RT-pipeline API
-# builds on; also unblocks bevy_solari's raw-VK RT pipeline.
+# Patch wgpu (and friends) to slyedoc/wgpu#solari-slang — the slimmed fork:
+# STOCK naga v29 (the RT/SER/coopvec naga surface retired; every RT stage and
+# NRC kernel is Slang-compiled SPIR-V) + the hal/core residue solari still
+# needs: ash-master forward-port, raw handle accessors, Tlas::from_hal,
+# Queue::{as_hal_locked, add_wait_semaphore}, keep_bind_group_alive, and the
+# VK_NV_cooperative_vector / memory-model device-extension enablement.
 [patch.crates-io]
-# Local checkout of slyedoc/wgpu#solari-rt-naga (matches zero's patch — fork
-# example runs and zero builds share one naga/wgpu tree).
-wgpu             = { path = "/mnt/code/f/wgpu/wgpu" }
-wgpu-core        = { path = "/mnt/code/f/wgpu/wgpu-core" }
-wgpu-hal         = { path = "/mnt/code/f/wgpu/wgpu-hal" }
-wgpu-types       = { path = "/mnt/code/f/wgpu/wgpu-types" }
-wgpu-naga-bridge = { path = "/mnt/code/f/wgpu/wgpu-naga-bridge" }
-naga             = { path = "/mnt/code/f/wgpu/naga" }
-# naga_oil matches naga's TypeInner exhaustively; the fork adds the SER
-# `HitObject` arm (and now cooperative vectors) so it compiles against the
-# naga RT/SER fork above.
-naga_oil         = { path = "/mnt/code/f/naga_oil" }
+wgpu             = { path = "/mnt/code/f/wgpu-slang/wgpu" }
+wgpu-core        = { path = "/mnt/code/f/wgpu-slang/wgpu-core" }
+wgpu-hal         = { path = "/mnt/code/f/wgpu-slang/wgpu-hal" }
+wgpu-types       = { path = "/mnt/code/f/wgpu-slang/wgpu-types" }
+wgpu-naga-bridge = { path = "/mnt/code/f/wgpu-slang/wgpu-naga-bridge" }
+naga             = { path = "/mnt/code/f/wgpu-slang/naga" }
+# Stock naga_oil (worktree pinned at the wgpu-29 update) — the fork arms for
+# the naga RT/SER/coopvec IR are no longer needed against stock naga.
+naga_oil         = { path = "/mnt/code/f/naga_oil-slang" }
 ash              = { git = "https://github.com/ash-rs/ash.git", branch = "master" }
 gpu-allocator    = { git = "https://github.com/slyedoc/gpu-allocator.git", branch = "ash-push-rename" }
