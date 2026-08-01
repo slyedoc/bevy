@@ -117,16 +117,19 @@ slang v2026.14.1:
 | heap `StructuredBuffer<T>.Handle` | ✓ | HANG (so + pipeline) |
 | BDA pointers | load/store: public `Ptr<T>` overloads; outer-product/reduce-sum: ACCESSIBLE `__coopVecOuterProductAccumulateFromPointer<T,M,N>(Ptr<void>, offset, a, b, layout, type, stride)` / `__coopVecReduceSumAccumulateFromPointer<T,N>(Ptr<void>, offset, v)`; **matMulAdd: buffers-only public API** (the internal impl HAS a `Ptr<T[]>` path — slang exposure gap, worth an upstream issue) | ✓ **verified correct** (`--mode ptr`) |
 
-DRIVER WALL №2 (2026-08-01, later same day — the BIG one): merely
-ENABLING `VK_EXT_descriptor_heap` (+ feature) at device creation makes
-RAY-TRACING pipelines execute with quad-scrambled shading (2×2
-checkerboard of misrouted payloads; accumulates to uniform grey; no VVL
-error; nothing needs to use a heap). Bisected across the fork ride-along
-set — descriptor_heap ALONE is guilty. The fork no longer auto-enables it,
-which means EVERY heap probe mode is dead until the probe can opt in on
-its own device (fork feature flag, see moonshot_plan.md). Retest BOTH
-walls on every driver bump: this file's probe for the coopvec wall,
-solari_tessellation for the RT-scramble wall.
+DRIVER WALL №2 (2026-08-01): on R595 (595.84), merely ENABLING
+`VK_EXT_descriptor_heap` (+ feature) at device creation made RAY-TRACING
+pipelines execute with quad-scrambled shading (2×2 checkerboard of
+misrouted payloads; accumulates to uniform grey; no VVL error; nothing
+needs to use a heap). Bisected across the fork ride-along set —
+descriptor_heap ALONE was guilty. **FIXED by R610 (610.43.02, retested
+same day: heap enabled + tessellation renders clean) — R610 is the
+driver FLOOR for the heap; the fork auto-enables it again.** Wall №1
+(coopvec × heap HANDLES) is NOT fixed by 610: `--mode so`/`pipeline`
+still hang; `--mode mapped` stays bit-exact and `--mode ptr` correct —
+DirectAccess remains dead, the mapping modes remain the path. Retest
+both walls on every driver bump: this file's probe for the coopvec
+wall, solari_tessellation for the RT-scramble wall.
 
 M0 UPDATE (2026-08-01, same day): the mapped row makes the "workable shape"
 below OBSOLETE — no static matmul set needed. Shaders keep classic
