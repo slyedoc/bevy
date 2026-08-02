@@ -532,7 +532,7 @@ impl RtLibraryCache {
         .ok()?;
         let module = create_shader_module(&self.device, &raygen_spv.spirv)?;
         let lib = self.create_library(
-            &[shader_stage(vk::ShaderStageFlags::RAYGEN_KHR, module, c"main")],
+            &[shader_stage(vk::ShaderStageFlags::RAYGEN_KHR, module, c"raygen")],
             &[general_group(0)],
             vec![module],
         )?;
@@ -563,7 +563,7 @@ impl RtLibraryCache {
         .ok()?;
         let module = create_shader_module(&self.device, &miss_spv.spirv)?;
         let lib = self.create_library(
-            &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"main")],
+            &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"miss_primary")],
             &[general_group(0)],
             vec![module],
         )?;
@@ -591,7 +591,7 @@ impl RtLibraryCache {
         .ok()?;
         let module = create_shader_module(&self.device, &shadow_spv.spirv)?;
         let lib = self.create_library(
-            &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"main")],
+            &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"miss_shadow")],
             &[general_group(0)],
             vec![module],
         )?;
@@ -614,19 +614,23 @@ impl RtLibraryCache {
                 create_shader_module(&self.device, &shader.spirv)
             };
             let chit_mod = compile(&hg.closest_hit)?;
+            let chit_name = std::ffi::CString::new(hg.closest_hit.entry)
+                .expect("shader entry name has interior NUL");
             let lib = if let Some(ah) = &hg.any_hit {
                 let ah_mod = compile(ah)?;
+                let ah_name = std::ffi::CString::new(ah.entry)
+                    .expect("shader entry name has interior NUL");
                 self.create_library(
                     &[
-                        shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, c"main"),
-                        shader_stage(vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, c"main"),
+                        shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, &chit_name),
+                        shader_stage(vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, &ah_name),
                     ],
                     &[hit_group_with_any_hit(0, 1)],
                     vec![chit_mod, ah_mod],
                 )?
             } else {
                 self.create_library(
-                    &[shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, c"main")],
+                    &[shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, &chit_name)],
                     &[hit_group(0)],
                     vec![chit_mod],
                 )?
@@ -1905,10 +1909,10 @@ mod tests {
         }
     }
 
-    /// Every pipeline stage is created with entry name `"main"` — assert the
-    /// compiled module's `OpEntryPoint` actually carries that name (the
-    /// compile path renames the entry function).
-    fn assert_entry_is_main(file: &str, spv: &[u32]) {
+    /// Pipeline stages are created with the REAL entry name as `pName` —
+    /// assert the compiled module's `OpEntryPoint` carries it (the compile
+    /// path renames the entry via `renameEntryPoint`).
+    fn assert_entry_named(file: &str, spv: &[u32], expected: &str) {
         let mut i = 5;
         while i < spv.len() {
             let word_count = (spv[i] >> 16) as usize;
@@ -1924,7 +1928,7 @@ mod tests {
                     .collect();
                 let name_end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 let name = String::from_utf8_lossy(&bytes[..name_end]).into_owned();
-                assert_eq!(name, "main", "{file}: OpEntryPoint is not named main");
+                assert_eq!(name, expected, "{file}: OpEntryPoint name mismatch");
                 return;
             }
             i += word_count;
@@ -2085,7 +2089,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{file}: {e}"));
             assert_no_runtime_descriptor_array(file, &spv.spirv);
             assert_bindings_mapped(file, &spv.spirv);
-            assert_entry_is_main(file, &spv.spirv);
+            assert_entry_named(file, &spv.spirv, entry);
             // Profiler attribution (Nsight): every stage must carry source-
             // level debug info with the source text embedded.
             let bytes: Vec<u8> = spv.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();

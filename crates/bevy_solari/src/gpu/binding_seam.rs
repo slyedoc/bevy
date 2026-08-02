@@ -630,6 +630,7 @@ impl BindingSeam {
     pub fn create_heap_compute_pipeline(
         &self,
         spirv: &[u32],
+        entry: &std::ffi::CStr,
         label: &str,
     ) -> Option<(vk::ShaderModule, vk::Pipeline)> {
         let device = self.inner.allocator.device();
@@ -655,7 +656,7 @@ impl BindingSeam {
         let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
-            .name(c"main");
+            .name(entry);
         stage.p_next =
             (&mapping_info as *const vk::ShaderDescriptorSetAndBindingMappingInfoEXT).cast();
         let mut info = vk::ComputePipelineCreateInfo::default().stage(stage);

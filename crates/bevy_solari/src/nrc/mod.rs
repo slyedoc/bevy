@@ -355,7 +355,8 @@ pub fn init_nrc_pipelines(
         )
         .map_err(|e| bevy_log::error!("nrc: {e}"))
         .ok()?;
-        let (module, pipeline) = seam.create_heap_compute_pipeline(&shader.spirv, label)?;
+        let entry_c = std::ffi::CString::new(entry).expect("entry name has interior NUL");
+        let (module, pipeline) = seam.create_heap_compute_pipeline(&shader.spirv, &entry_c, label)?;
         Some(NrcKernel {
             module,
             pipeline,

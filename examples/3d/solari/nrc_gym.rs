@@ -377,7 +377,7 @@ fn build_pipelines(device: &wgpu::Device) -> Pipelines {
             label: Some(label),
             layout: Some(&pl),
             module: &module,
-            entry_point: Some("main"),
+            entry_point: Some(entry),
             compilation_options: Default::default(),
             cache: None,
         })

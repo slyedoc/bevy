@@ -24,8 +24,11 @@ build. There are no precompiled `.spv` blobs anywhere.
   `ProgramLayout`; `SlangSession` is a typedef of `IGlobalSession`, so the
   C helpers take the COM pointer directly.
 - **Stages**: the entry stage comes from the `[shader("...")]` attribute
-  (there is no stage parameter). Entries are emitted as `OpEntryPoint
-  "main"` — asserted in `rt_shaders_compile`.
+  (there is no stage parameter). Entries keep their REAL names in
+  `OpEntryPoint` (`CompilerOptionName::VulkanUseEntryPointName = 52`;
+  `renameEntryPoint` does NOT affect the emitted name — dead end), and
+  pipeline stages pass the entry name as `pName`. Asserted in
+  `rt_shaders_compile`.
 - **Capabilities**: passed as target compiler options
   (`CompilerOptionName::Capability`, id via `spFindCapability`). Raygen pins
   `spvShaderInvocationReorderNV` + `spvCooperativeVectorNV` +
@@ -47,8 +50,10 @@ build. There are no precompiled `.spv` blobs anywhere.
 - **Disk cache**: `~/.cache/bevy_solari/slang/` — key = compiler build tag
   (`spGetBuildTagString`) + entry source + all module sources + defines +
   capabilities; the full key is stored in the file and byte-compared on
-  load (filename FNV hash is only a lookup hint). Warm startups compile
-  nothing. Format magic `SLN2`.
+  load (filename FNV hash is only a lookup hint), and a fixed-options
+  fingerprint (`CACHE_OPTIONS_TAG`) rides in the key so compiler-option
+  changes invalidate too. Warm startups compile nothing. Format magic
+  `SLN3`.
 - **Hot reload**: the `.slang` sources are `embedded_asset!`s
   (`src/gpu/slang_sources.rs`); asset events extract into the render-world
   `SlangSources` (the `PipelineCache` pattern); a generation bump drains
@@ -85,6 +90,7 @@ the `VK_KHR_pipeline_library` link.
 ### Ruled out
 
 - Missing SPIR-V debug info (present + verified; compute attributes).
+- Nsight version: reproduced identically on Nsight Graphics **2026.3**.
 - `VkDeviceDiagnosticsConfigCreateInfoNV` with `ENABLE_SHADER_DEBUG_INFO`
   (+resource tracking/checkpoints/error reporting) at device creation — the
   fork wires it behind `WGPU_AFTERMATH=1`. No change.
@@ -96,11 +102,12 @@ the `VK_KHR_pipeline_library` link.
 
 ### Leads for the next session (most promising first)
 
-1. **Nsight Graphics version.** Confirm the installed version and try the
-   newest. `NonSemantic.Shader.DebugInfo.100` support and VK RT coverage
-   in the shader profiler are both relatively recent; RT *library*
-   correlation may simply be newer than the installed tool (or genuinely
-   unsupported — the docs are silent on libraries).
+1. **Distinct entry-point names — IMPLEMENTED, awaiting a capture.** Every
+   stage now emits `OpEntryPoint` under its real name (raygen /
+   miss_primary / chit_opaque / …) instead of five libraries all exporting
+   `main`; stage `pName`s match. If the driver keyed per-pipeline debug
+   records by entry name, the collision is gone. The next Nsight capture
+   answers this.
 2. **Separate shader debug info via the Aftermath channel.** Nsight
    Graphics can load shader debug info from configured *search paths*
    (`.nvdbg` blobs) instead of relying on live driver metadata. With
@@ -111,15 +118,7 @@ the `VK_KHR_pipeline_library` link.
    aftermath-debug workflow), so most of the plumbing exists. This is the
    most likely "we're doing something wrong" fix: the driver may generate
    the metadata but Nsight may need to be *handed* it for linked pipelines.
-3. **Distinct entry-point names.** Every stage in every library is
-   `OpEntryPoint "main"`; the linked pipeline aggregates five+ libraries
-   all exporting `main`. If the driver/tool keys debug records by entry
-   name within the pipeline, they collide. Slang can keep original entry
-   names (skip the rename, or `IComponentType::renameEntryPoint`), with
-   the `VkPipelineShaderStageCreateInfo::pName` updated to match.
-   (Monolithic also has all-`main` stages and works, so this is a maybe —
-   but the library metadata path may differ.)
-4. **`vkSetDebugUtilsObjectNameEXT`** on the library pipelines, the linked
+3. **`vkSetDebugUtilsObjectNameEXT`** on the library pipelines, the linked
    pipeline, and the shader modules. Cheap, improves tool bookkeeping
    regardless, and some tools use object identity for correlation joins.
 5. **Library lifetime experiment.** The cache keeps the library pipelines

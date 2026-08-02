@@ -56,6 +56,11 @@ const COMPILER_OPTION_DEBUG_INFORMATION: i32 = 44;
 /// `CompilerOptionName::DebugInfoIncludeSource` — embed the source text into
 /// the debug info regardless of level.
 const COMPILER_OPTION_DEBUG_INFO_INCLUDE_SOURCE: i32 = 157;
+/// `CompilerOptionName::VulkanUseEntryPointName` — emit `OpEntryPoint` with
+/// the source entry name instead of `"main"`. Pipeline stages pass the real
+/// name as `pName`; distinct names also keep linked RT pipeline libraries'
+/// debug records from all colliding on `"main"`.
+const COMPILER_OPTION_VULKAN_USE_ENTRY_POINT_NAME: i32 = 52;
 /// `SLANG_DEBUG_INFO_LEVEL_MAXIMAL`.
 const DEBUG_INFO_LEVEL_MAXIMAL: i32 = 3;
 /// `CompilerOptionValueKind::Int`.
@@ -240,7 +245,8 @@ fn load_api() -> Result<Api, String> {
 ///
 /// `entry_source` is a module named after `entry_file`; `entry_name` is the
 /// entry function inside it, whose stage comes from its `[shader("...")]`
-/// attribute (the emitted `OpEntryPoint` is renamed `"main"`). `modules` are
+/// attribute. The emitted `OpEntryPoint` KEEPS `entry_name` (pipeline
+/// stages must pass it as `pName`). `modules` are
 /// `(module_name, source)` pairs made importable to the entry (and to each
 /// other, in any order). `defines` are `(key, value)` preprocessor defines
 /// (`slangc -D key=value`) — the compile-out feature axes like raygen's
@@ -338,6 +344,7 @@ fn compile_with_session(
         let mut target_options = vec![
             int_option(COMPILER_OPTION_DEBUG_INFORMATION, DEBUG_INFO_LEVEL_MAXIMAL),
             int_option(COMPILER_OPTION_DEBUG_INFO_INCLUDE_SOURCE, 1),
+            int_option(COMPILER_OPTION_VULKAN_USE_ENTRY_POINT_NAME, 1),
         ];
         let capability_entries: Vec<CompilerOptionEntry> = capabilities
             .iter()
@@ -643,7 +650,10 @@ unsafe fn blob_bytes<'a>(blob: *mut c_void) -> Option<&'a [u8]> {
 // never wrong shaders. All cache I/O is best-effort: any failure just
 // recompiles.
 
-const CACHE_MAGIC: u32 = u32::from_le_bytes(*b"SLN2");
+const CACHE_MAGIC: u32 = u32::from_le_bytes(*b"SLN3");
+/// Fingerprint of every fixed compiler option baked into a compile — part of
+/// the cache key, so changing an option (not just sources) invalidates.
+const CACHE_OPTIONS_TAG: &str = "g=max;src=1;epname=1";
 
 fn cache_key(
     build_tag: &str,
@@ -660,6 +670,7 @@ fn cache_key(
         key.extend_from_slice(s.as_bytes());
     };
     push(build_tag);
+    push(CACHE_OPTIONS_TAG);
     push(entry_file);
     push(entry_source);
     push(entry_name);
