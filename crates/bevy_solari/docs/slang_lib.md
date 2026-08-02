@@ -87,7 +87,7 @@ profiler attributes some shaders and not others. The evidence matrix
 Identical SPIR-V in every case. The correlation is lost specifically across
 the `VK_KHR_pipeline_library` link.
 
-### Ruled out
+### Ruled out (each verified by a bevy_city capture)
 
 - Missing SPIR-V debug info (present + verified; compute attributes).
 - Nsight version: reproduced identically on Nsight Graphics **2026.3**.
@@ -96,19 +96,25 @@ the `VK_KHR_pipeline_library` link.
   fork wires it behind `WGPU_AFTERMATH=1`. No change.
 - `VK_KHR_pipeline_executable_properties` +
   `CAPTURE_INTERNAL_REPRESENTATIONS` on libraries and link. No change.
+- **Distinct entry-point names.** Shipped permanently (see Current state):
+  `OpEntryPoint` carries raygen / miss_primary / chit_opaque / … with
+  matching stage `pName`s, so the linked pipeline no longer aggregates
+  five libraries all exporting `main`. Kept for its own sake — but
+  attribution did NOT change. The collision theory is dead.
 - Keeping monolithic permanently: a monolithic create costs **1.25s** (cold
   AND warm — the driver reuses nothing in-process) vs **7.5ms** for the
   library link. Every sky swap / hot reload / material rebuild would hitch.
 
 ### Leads for the next session (most promising first)
 
-1. **Distinct entry-point names — IMPLEMENTED, awaiting a capture.** Every
-   stage now emits `OpEntryPoint` under its real name (raygen /
-   miss_primary / chit_opaque / …) instead of five libraries all exporting
-   `main`; stage `pName`s match. If the driver keyed per-pipeline debug
-   records by entry name, the collision is gone. The next Nsight capture
-   answers this.
-2. **Separate shader debug info via the Aftermath channel.** Nsight
+Five configurations are now ruled out; everything host-controllable about
+the *content* of the modules and pipelines has been equalized between the
+working (monolithic) and broken (linked) shapes. What remains differs only
+in HOW the driver assembles the executable — which is why the remaining
+leads are about handing the tool metadata through side channels, or
+establishing that the gap is real and filing it.
+
+1. **Separate shader debug info via the Aftermath channel.** Nsight
    Graphics can load shader debug info from configured *search paths*
    (`.nvdbg` blobs) instead of relying on live driver metadata. With
    `ENABLE_SHADER_DEBUG_INFO` on (the `WGPU_AFTERMATH` path), the Aftermath
@@ -118,21 +124,21 @@ the `VK_KHR_pipeline_library` link.
    aftermath-debug workflow), so most of the plumbing exists. This is the
    most likely "we're doing something wrong" fix: the driver may generate
    the metadata but Nsight may need to be *handed* it for linked pipelines.
-3. **`vkSetDebugUtilsObjectNameEXT`** on the library pipelines, the linked
+2. **`vkSetDebugUtilsObjectNameEXT`** on the library pipelines, the linked
    pipeline, and the shader modules. Cheap, improves tool bookkeeping
    regardless, and some tools use object identity for correlation joins.
-5. **Library lifetime experiment.** The cache keeps the library pipelines
+3. **Library lifetime experiment.** The cache keeps the library pipelines
    alive alongside the linked pipeline. Try destroying them right after
    the link (spec-legal): if the driver's sample→pipeline mapping is
    confused by never-bound pipelines that own the SASS, this changes the
    picture.
-6. **Reference check.** Find any NVIDIA sample (nvpro-samples,
+4. **Reference check.** Find any NVIDIA sample (nvpro-samples,
    vk_mini_samples) that uses RT pipeline libraries AND demonstrates
    shader-profiler attribution. If none exists, that is soft evidence for
    a driver/tool gap → file the report. The repro here is minimal and
    airtight either way: same modules, monolithic attributes, linked
    doesn't.
-7. **Re-run the monolithic experiment** when needed: replace
+5. **Re-run the monolithic experiment** when needed: replace
    `RtLibraryCache::link` with a monolithic create over the cached
    libraries' `modules` (stages: raygen, miss, per-group chit[+ahit],
    shadow; groups in that order to keep the SBT layout; chain the mapping
