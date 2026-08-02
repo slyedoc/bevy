@@ -119,6 +119,41 @@ impl Plugin for SolarRenderPlugin {
                 ),
             );
 
+        // The `.slang` sources as embedded assets: with bevy_asset's
+        // `embedded_watcher` feature (the app's opt-in, as for bevy's own
+        // shaders), a saved edit fires an asset event and the RT stages hot
+        // reload; without it they're static embedded bytes.
+        {
+            use crate::gpu::slang_sources::{SlangSource, SlangSourceHandles, SlangSourceLoader};
+            use bevy_asset::{embedded_asset, load_embedded_asset, AssetApp};
+            app.init_asset::<SlangSource>()
+                .register_asset_loader(SlangSourceLoader);
+            // Both bevy macros take plain path literals, so the crate-relative
+            // path is spelled alongside its file-name key.
+            macro_rules! watched {
+                ($file:literal, $path:literal) => {{
+                    embedded_asset!(app, $path);
+                    ($file, load_embedded_asset!(app.world(), $path))
+                }};
+            }
+            let handles = SlangSourceHandles(vec![
+                watched!("raygen.slang", "rt_pipeline/raygen.slang"),
+                watched!("miss.slang", "rt_pipeline/miss.slang"),
+                watched!("miss_shadow.slang", "rt_pipeline/miss_shadow.slang"),
+                watched!("ahit_alpha.slang", "rt_pipeline/ahit_alpha.slang"),
+                watched!("chit_opaque.slang", "rt_pipeline/chit_opaque.slang"),
+                watched!("chit_glass.slang", "rt_pipeline/chit_glass.slang"),
+                watched!("chit_hair.slang", "rt_pipeline/chit_hair.slang"),
+                watched!("chit_portal.slang", "rt_pipeline/chit_portal.slang"),
+                watched!("rt_payload.slang", "rt_pipeline/rt_payload.slang"),
+                watched!("scene_resolve.slang", "rt_pipeline/scene_resolve.slang"),
+                watched!("brdf.slang", "rt_pipeline/brdf.slang"),
+                watched!("sampling.slang", "rt_pipeline/sampling.slang"),
+                watched!("hair.slang", "rt_pipeline/hair.slang"),
+            ]);
+            app.insert_resource(handles);
+        }
+
         let render_app = app.sub_app_mut(RenderApp);
         render_app
             // Empty; surfaces register into it (built-ins via `SolariPlugin`).
@@ -127,9 +162,8 @@ impl Plugin for SolarRenderPlugin {
             // The live shader-source registry: RT stages hot reload on edit.
             .init_resource::<crate::gpu::slang_sources::SlangSources>()
             .add_systems(
-                Render,
-                crate::gpu::slang_sources::poll_slang_sources
-                    .in_set(RenderSystems::PrepareResources),
+                ExtractSchedule,
+                crate::gpu::slang_sources::extract_slang_sources,
             )
             .add_systems(RenderStartup, rt_pipeline::init_rt_blit)
             .add_systems(RenderStartup, rt_pipeline::init_restir_spatial)

@@ -353,7 +353,6 @@ fn build_pipelines(device: &wgpu::Device) -> Pipelines {
             file,
             source,
             entry,
-            bevy::solari::gpu::slang::SlangRtStage::Compute,
             mlp,
             &[],
             &[],

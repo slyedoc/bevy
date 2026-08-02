@@ -307,13 +307,20 @@ Shipped:
   `next_multiple_of(64)` at the size query (production + gym), so every
   `vkCmdConvertCooperativeVectorMatrixNV` src/dst address is 64-B aligned
   (VUID 10084/10085).
-- Slang integration follow-ups (2026-08-02): **hot reload** — `SlangSources`
-  (gpu/slang_sources.rs) resolves every RT stage/module source from disk
-  when the checkout exists (embedded otherwise), polls mtimes per frame,
-  and a generation bump makes the dispatch drain + `invalidate_sources` the
-  library cache → next build recompiles from the live files (built-in hit
-  shaders included via the registry override in `compile_group_shader`;
-  downstream groups keep their registered source). **SPIR-V-derived
+- Slang integration follow-ups (2026-08-02): **hot reload, asset-server
+  driven** — the 13 `.slang` sources are `embedded_asset!`s loaded through
+  `SlangSourceLoader`; `extract_slang_sources` (ExtractSchedule, the
+  PipelineCache pattern) applies `AssetEvent`s into the render-world
+  `SlangSources`, whose generation bump makes the dispatch drain +
+  `invalidate_sources` the library cache → next build recompiles (built-in
+  hit shaders included via the registry override in
+  `compile_group_shader`; downstream groups keep their registered source).
+  Live editing requires the app to enable bevy_asset's `embedded_watcher`
+  feature (solari_files has it); without it the embedded bytes are static.
+  Trade vs the earlier mtime poll: no custom watcher, event-driven notify,
+  asset-pipeline composability — but a shader edited while the app was
+  CLOSED needs a re-save (or rebuild) to show up, since startup serves the
+  embedded bytes. **SPIR-V-derived
   mappings** — `create_heap_compute_pipeline` reads its binding list from
   the module's own decorations (`spirv_descriptor_bindings`), no
   hand-passed counts; `rt_shaders_compile` asserts every stage's declared
@@ -327,6 +334,20 @@ Shipped:
   parameter. `rt_shaders_compile` cross-checks reflection ⊇ the SPIR-V
   scan per stage (also proves GetBindingIndex/Space return the explicit
   [[vk::binding]] values).
+- Slang backend modernized (2026-08-02): gpu/slang.rs runs on the modern
+  COM API — IGlobalSession → ISession (per compile, targets/defines/
+  capabilities in the SessionDesc) → loadModuleFromSourceString (imports
+  resolve in-session with a fixpoint load; temp dirs GONE) → composite →
+  link → getEntryPointCode + getLayout (reflection via the non-deprecated
+  spReflection_* C fns). Vtable slots transcribed from the pinned slang.h
+  (IModule/IEntryPoint methods start at slot 17 — they extend
+  IComponentType's 3..=16). Entry stage now comes from [shader(...)]
+  attributes — the stage parameter and SlangRtStage are gone; entries are
+  still emitted as OpEntryPoint "main" (asserted in rt_shaders_compile).
+  Plus a verified-key disk cache (~/.cache/bevy_solari/slang, key = build
+  tag + all compile inputs, stored key byte-compared on load so hash
+  collisions degrade to misses): warm startups and the shader test suite
+  skip compilation entirely (12 tests: 1.67s → 0.25s).
 - Bistro-scale fixes (validated on bistro.bsn): seam `MAX_RECORDS`
   4096 → 16384 (2 MiB at the 128-B stride) — bistro's >3000 material slots
   plus the 1024-record headroom overflowed the table; the RT pipeline now

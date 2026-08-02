@@ -286,20 +286,12 @@ impl SolariHitGroupRegistry {
     /// time a compile failure in ANY group aborts the whole RT pipeline, which
     /// is far harder to attribute.
     pub fn register(&mut self, group: SolariHitGroupDef) -> u32 {
-        for (kind, shader, stage) in [
-            (
-                "closest-hit",
-                Some(&group.closest_hit),
-                crate::gpu::slang::SlangRtStage::ClosestHit,
-            ),
-            (
-                "any-hit",
-                group.any_hit.as_ref(),
-                crate::gpu::slang::SlangRtStage::AnyHit,
-            ),
+        for (kind, shader) in [
+            ("closest-hit", Some(&group.closest_hit)),
+            ("any-hit", group.any_hit.as_ref()),
         ] {
             let Some(shader) = shader else { continue };
-            if let Err(e) = compile_group_shader(&group, shader, stage, None) {
+            if let Err(e) = compile_group_shader(&group, shader, None) {
                 bevy_log::error!(
                     "rt_pipeline: hit group '{}': {kind} failed to compile: {e}. \
                      The RT pipeline will fail to build until this is fixed.",
@@ -532,7 +524,6 @@ impl RtLibraryCache {
             "raygen.slang",
             sources.source("raygen.slang"),
             "raygen",
-            crate::gpu::slang::SlangRtStage::RayGeneration,
             &rt_slang_modules(Some(sources)),
             defines,
             RAYGEN_CAPABILITIES,
@@ -561,7 +552,6 @@ impl RtLibraryCache {
             "miss.slang",
             sources.source("miss.slang"),
             "miss_primary",
-            crate::gpu::slang::SlangRtStage::Miss,
             &[
                 ("rt_payload", sources.source("rt_payload.slang")),
                 ("custom_sky", custom_sky_source),
@@ -593,7 +583,6 @@ impl RtLibraryCache {
             "miss_shadow.slang",
             sources.source("miss_shadow.slang"),
             "miss_shadow",
-            crate::gpu::slang::SlangRtStage::Miss,
             &[],
             &[],
             &[],
@@ -618,18 +607,15 @@ impl RtLibraryCache {
         hit_groups: &[SolariHitGroupDef],
     ) -> Option<()> {
         for hg in &hit_groups[self.hit_groups.len()..] {
-            let compile = |shader, stage| {
-                let shader = compile_group_shader(hg, shader, stage, Some(sources))
+            let compile = |shader| {
+                let shader = compile_group_shader(hg, shader, Some(sources))
                     .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
                     .ok()?;
                 create_shader_module(&self.device, &shader.spirv)
             };
-            let chit_mod = compile(
-                &hg.closest_hit,
-                crate::gpu::slang::SlangRtStage::ClosestHit,
-            )?;
+            let chit_mod = compile(&hg.closest_hit)?;
             let lib = if let Some(ah) = &hg.any_hit {
-                let ah_mod = compile(ah, crate::gpu::slang::SlangRtStage::AnyHit)?;
+                let ah_mod = compile(ah)?;
                 self.create_library(
                     &[
                         shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, c"main"),
@@ -1589,7 +1575,6 @@ fn rt_slang_modules(sources: Option<&SlangSources>) -> Vec<(&'static str, &'stat
 fn compile_group_shader(
     group: &SolariHitGroupDef,
     shader: &SolariRtShader,
-    stage: crate::gpu::slang::SlangRtStage,
     sources: Option<&SlangSources>,
 ) -> Result<crate::gpu::slang::CompiledShader, String> {
     let mut modules = rt_slang_modules(sources);
@@ -1599,7 +1584,6 @@ fn compile_group_shader(
         shader.file,
         live.unwrap_or(shader.source),
         shader.entry,
-        stage,
         &modules,
         &[],
         &[],
@@ -1916,6 +1900,33 @@ mod tests {
         }
     }
 
+    /// Every pipeline stage is created with entry name `"main"` — assert the
+    /// compiled module's `OpEntryPoint` actually carries that name (the
+    /// compile path renames the entry function).
+    fn assert_entry_is_main(file: &str, spv: &[u32]) {
+        let mut i = 5;
+        while i < spv.len() {
+            let word_count = (spv[i] >> 16) as usize;
+            if word_count == 0 || i + word_count > spv.len() {
+                break;
+            }
+            if spv[i] & 0xFFFF == 15 {
+                // OpEntryPoint: word 1 = execution model, 2 = entry id,
+                // 3.. = the literal name string.
+                let bytes: Vec<u8> = spv[i + 3..i + word_count]
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                let name_end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                let name = String::from_utf8_lossy(&bytes[..name_end]).into_owned();
+                assert_eq!(name, "main", "{file}: OpEntryPoint is not named main");
+                return;
+            }
+            i += word_count;
+        }
+        panic!("{file}: no OpEntryPoint found");
+    }
+
     fn assert_no_runtime_descriptor_array(file: &str, spv: &[u32]) {
         const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
         const OP_TYPE_POINTER: u32 = 32;
@@ -1982,7 +1993,6 @@ mod tests {
                 "miss.slang",
                 include_str!("../render/rt_pipeline/miss.slang"),
                 "miss_primary",
-                SlangRtStage::Miss,
                 &[
                     (
                         "rt_payload",
@@ -2005,15 +2015,13 @@ mod tests {
         // modules (Cluster stride, Material offsets, payload words) holds by
         // construction: one compiler compiles every module in a link.
         use super::{RAYGEN_CAPABILITIES, RT_SLANG_MODULES};
-        use crate::gpu::slang::SlangRtStage;
         let clock: &[(&str, &str)] = &[("SOLARI_SHADER_CLOCK", "1")];
         let no_caps: &[&str] = &[];
-        for (file, source, entry, stage, defines, caps) in [
+        for (file, source, entry, defines, caps) in [
             (
                 "raygen.slang",
                 include_str!("../render/rt_pipeline/raygen.slang"),
                 "raygen",
-                SlangRtStage::RayGeneration,
                 &[][..],
                 RAYGEN_CAPABILITIES,
             ),
@@ -2021,7 +2029,6 @@ mod tests {
                 "raygen.slang",
                 include_str!("../render/rt_pipeline/raygen.slang"),
                 "raygen",
-                SlangRtStage::RayGeneration,
                 clock,
                 RAYGEN_CAPABILITIES,
             ),
@@ -2029,7 +2036,6 @@ mod tests {
                 "miss_shadow.slang",
                 include_str!("../render/rt_pipeline/miss_shadow.slang"),
                 "miss_shadow",
-                SlangRtStage::Miss,
                 &[],
                 no_caps,
             ),
@@ -2037,7 +2043,6 @@ mod tests {
                 "ahit_alpha.slang",
                 include_str!("../render/rt_pipeline/ahit_alpha.slang"),
                 "ahit_alpha",
-                SlangRtStage::AnyHit,
                 &[],
                 no_caps,
             ),
@@ -2045,7 +2050,6 @@ mod tests {
                 "chit_opaque.slang",
                 include_str!("../render/rt_pipeline/chit_opaque.slang"),
                 "chit_opaque",
-                SlangRtStage::ClosestHit,
                 &[],
                 no_caps,
             ),
@@ -2053,7 +2057,6 @@ mod tests {
                 "chit_glass.slang",
                 include_str!("../render/rt_pipeline/chit_glass.slang"),
                 "chit_glass",
-                SlangRtStage::ClosestHit,
                 &[],
                 no_caps,
             ),
@@ -2061,7 +2064,6 @@ mod tests {
                 "chit_hair.slang",
                 include_str!("../render/rt_pipeline/chit_hair.slang"),
                 "chit_hair",
-                SlangRtStage::ClosestHit,
                 &[],
                 no_caps,
             ),
@@ -2069,16 +2071,16 @@ mod tests {
                 "chit_portal.slang",
                 include_str!("../render/rt_pipeline/chit_portal.slang"),
                 "chit_portal",
-                SlangRtStage::ClosestHit,
                 &[],
                 no_caps,
             ),
         ] {
             let spv =
-                crate::gpu::slang::compile_rt_slang(file, source, entry, stage, RT_SLANG_MODULES, defines, caps)
+                crate::gpu::slang::compile_rt_slang(file, source, entry, RT_SLANG_MODULES, defines, caps)
                     .unwrap_or_else(|e| panic!("{file}: {e}"));
             assert_no_runtime_descriptor_array(file, &spv.spirv);
             assert_bindings_mapped(file, &spv.spirv);
+            assert_entry_is_main(file, &spv.spirv);
             // Reflection is what dispatch tables are assembled from; every
             // binding surviving in the SPIR-V must appear there (the reverse
             // need not hold — reflection also lists DCE'd parameters).

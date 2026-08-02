@@ -349,7 +349,6 @@ pub fn init_nrc_pipelines(
             file,
             source,
             entry,
-            crate::gpu::slang::SlangRtStage::Compute,
             mlp,
             &[],
             &[],
