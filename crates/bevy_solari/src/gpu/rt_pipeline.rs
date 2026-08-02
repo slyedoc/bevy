@@ -1505,8 +1505,16 @@ impl Drop for RtPipeline {
 }
 
 /// Raygen's target capability atoms (`slangc -capability` equivalents) —
-/// see [`RtLibraryCache::ensure_raygen`].
-const RAYGEN_CAPABILITIES: &[&str] = &["spvShaderInvocationReorderNV"];
+/// see [`RtLibraryCache::ensure_raygen`]. Declaring any atom makes the set
+/// raygen's whole target profile, so it must cover everything the entry
+/// uses (clock + coopvec too) or slang warns "profile implicitly upgraded".
+/// Declaring clock support is fine for the non-clock variant — the set says
+/// what the target supports, not what the shader must use.
+const RAYGEN_CAPABILITIES: &[&str] = &[
+    "spvShaderInvocationReorderNV",
+    "spvCooperativeVectorNV",
+    "spvShaderClockKHR",
+];
 
 /// The built-in Slang modules importable by every RT stage
 /// (`import scene_resolve;` etc.).

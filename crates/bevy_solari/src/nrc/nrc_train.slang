@@ -111,6 +111,23 @@ struct MLVec : IDifferentiable
 {
     no_diff HVec data;
     typealias Differential = MLGrad;
+
+    // Explicit conformance: `data` is no_diff, so slang can only synthesize
+    // partial dzero/dadd — leaving the MLGrad temporaries uninitialized
+    // (E41016; benign here since every evalBwd overwrites its input
+    // differential wholesale, but defined is better than benign).
+    [Differentiable]
+    static Differential dzero() { return no_diff(MLGrad.zero()); }
+    [Differentiable]
+    static Differential dadd(Differential a, Differential b)
+    {
+        return MLGrad.dadd(a, b);
+    }
+    [Differentiable]
+    static Differential dmul<U : __BuiltinRealType>(U s, Differential d)
+    {
+        return MLGrad.dmul(s, d);
+    }
 }
 
 // One 64x64 feed-forward layer over the shared mirror buffers. All fields
