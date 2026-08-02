@@ -66,11 +66,17 @@ build. There are no precompiled `.spv` blobs anywhere.
   assembled by parameter *name* against the reflected layout
   (`NrcKernel::push_slots`) — nothing about kernel bindings is
   hand-maintained.
-- **RT pipeline shape**: per-stage `VK_KHR_pipeline_library` pipelines
-  cached in `RtLibraryCache` (raygen / miss keyed by sky generation /
-  shadow / per-hit-group), linked into the executable pipeline. All
-  layout-free (`DESCRIPTOR_HEAP_EXT` flags2), stages chained with the
-  shared descriptor-mapping table.
+- **RT pipeline shape**: compiled stages (shader modules + entry names)
+  cached in `RtShaderCache` (raygen / miss keyed by sky generation /
+  shadow / per-hit-group), assembled into ONE MONOLITHIC
+  `vkCreateRayTracingPipelinesKHR`. Layout-free (`DESCRIPTOR_HEAP_EXT`
+  flags2), stages chained with the shared descriptor-mapping table.
+  Monolithic on purpose: the `VK_KHR_pipeline_library` link shape loses all
+  Nsight shader-profiler attribution (the driver/tool gap below), so the
+  ~1.25s create is paid on every rebuild axis (sky swap, new hit group,
+  source edit) in exchange for per-line RT profiling. Switch back to
+  libraries+link (~7.5ms, shape in git history before the monolithic flip)
+  once the gap is fixed.
 
 ## The open problem: RT stages are Unattributed in Nsight
 
@@ -105,46 +111,93 @@ the `VK_KHR_pipeline_library` link.
   AND warm — the driver reuses nothing in-process) vs **7.5ms** for the
   library link. Every sky swap / hot reload / material rebuild would hitch.
 
-### Leads for the next session (most promising first)
+### Research conclusions (2026-08-02 deep dive)
 
-Five configurations are now ruled out; everything host-controllable about
-the *content* of the modules and pipelines has been equalized between the
-working (monolithic) and broken (linked) shapes. What remains differs only
-in HOW the driver assembles the executable — which is why the remaining
-leads are about handing the tool metadata through side channels, or
-establishing that the gap is real and filing it.
+A documentation/ecosystem sweep (Nsight Graphics docs + release notes,
+Aftermath SDK + samples, NVIDIA forums, GitHub, the DXR/PIX analogue)
+settled the remaining open questions. The verdict: **this is a driver/tool
+gap, not a missing host-side step.** Details:
 
-1. **Separate shader debug info via the Aftermath channel.** Nsight
-   Graphics can load shader debug info from configured *search paths*
-   (`.nvdbg` blobs) instead of relying on live driver metadata. With
-   `ENABLE_SHADER_DEBUG_INFO` on (the `WGPU_AFTERMATH` path), the Aftermath
-   SDK's `GetShaderDebugInfo` callback receives per-shader blobs — dump
-   them to a directory and point Nsight's shader debug info search path at
-   it. The zero project already integrates the Aftermath SDK (see the
-   aftermath-debug workflow), so most of the plumbing exists. This is the
-   most likely "we're doing something wrong" fix: the driver may generate
-   the metadata but Nsight may need to be *handed* it for linked pipelines.
-2. **`vkSetDebugUtilsObjectNameEXT`** on the library pipelines, the linked
-   pipeline, and the shader modules. Cheap, improves tool bookkeeping
-   regardless, and some tools use object identity for correlation joins.
-3. **Library lifetime experiment.** The cache keeps the library pipelines
-   alive alongside the linked pipeline. Try destroying them right after
-   the link (spec-legal): if the driver's sample→pipeline mapping is
-   confused by never-bound pipelines that own the SASS, this changes the
-   picture.
-4. **Reference check.** Find any NVIDIA sample (nvpro-samples,
-   vk_mini_samples) that uses RT pipeline libraries AND demonstrates
-   shader-profiler attribution. If none exists, that is soft evidence for
-   a driver/tool gap → file the report. The repro here is minimal and
-   airtight either way: same modules, monolithic attributes, linked
-   doesn't.
-5. **Re-run the monolithic experiment** when needed: replace
-   `RtLibraryCache::link` with a monolithic create over the cached
-   libraries' `modules` (stages: raygen, miss, per-group chit[+ahit],
-   shadow; groups in that order to keep the SBT layout; chain the mapping
-   table per stage; flags2 = OMM | DESCRIPTOR_HEAP, no LIBRARY bit, no
-   `library_info`/`library_interface`). The exact code shape exists in
-   this branch's reflog around `dab549340c`.
+- **How attribution actually works** (frames everything): correlation is
+  two-stage. Stage 1, SASS↔IL (SPIR-V), is produced by the *driver's*
+  shader compiler and consumed by the profiler directly from the driver at
+  trace time — the app cannot author or supply it. Stage 2, IL↔source,
+  comes from the NonSemantic debug info embedded in the SPIR-V — which we
+  already emit (and which is proven good by compute + monolithic). A
+  linked-only failure therefore lives in stage 1 / the sample→pipeline
+  join: the SASS was compiled at *library* create, the samples land on the
+  *linked* pipeline, and the driver/profiler interface fails to join them.
+- **The Aftermath `.nvdbg` channel is a dead end for the profiler.** The
+  `ENABLE_SHADER_DEBUG_INFO` → `shaderDebugInfoCb` → `shader-<id>.nvdbg`
+  → "NVIDIA Shader Debug Information" search-path flow exists solely for
+  the **crash-dump inspector** (mapping faulted-warp addresses). The
+  Shader Profiler docs never mention it, its options tab has no `.nvdbg`
+  knob, and NVIDIA's blog states the profiler gets SASS↔IL from the driver
+  during the trace. `WGPU_AFTERMATH` is irrelevant to attribution —
+  consistent with compute/monolithic attributing fine without it. (Since
+  R615 the driver embeds this info into crash dumps directly, phasing out
+  `.nvdbg` even for its real purpose.)
+- **Nobody has ever demonstrated linked-RT attribution.** Zero uses of
+  `VK_PIPELINE_CREATE_LIBRARY_BIT_KHR` for RT across nvpro-samples /
+  NVIDIAGameWorks / NVIDIA-RTX — every NVIDIA sample builds monolithic, so
+  the path likely has no internal QA coverage. Nsight release notes only
+  ever claimed *graphics* pipeline-library support (2022.3), never RT.
+  Nobody has filed this bug either — we would be first.
+- **Precedent says driver-fix-only.** Release notes document a prior R495
+  issue: "samples may not be attributed and will be classified as
+  'Unattributed'… addressed in a future driver release." A 2022 raygen-only
+  correlation loss was likewise fixed in-driver (512.95). 2025.1 known
+  issue: "the debug symbolic information provided by the driver is limited
+  for ray tracing shaders"; R575 improved it — RT symbolics were being
+  fixed branch-by-branch through 2025–2026.
+- **The API has no channel to pass anything.** `VkPipelineLibraryCreateInfoKHR`
+  is `libraryCount` + `pLibraries` with zero pNext extensibility, and the RT
+  create's allowed pNext chain (registry-verified) is flags2 / creation
+  feedback (output-only) / pipeline-binary / offline (SC) / robustness /
+  CLAS — no metadata channel. `LINK_TIME_OPTIMIZATION_BIT_EXT` and
+  `RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT` are graphics-pipeline-library
+  only (all VUs on `VkGraphicsPipelineCreateInfo`); the RT library design
+  never got a retain-info-across-the-link affordance. Carrying line tables
+  across the link is entirely the driver's job.
+- **The DXR analogue proves the intended design.** PIX keys attribution to
+  each *library's* shader binary (PDB hash), so `AddToStateObject` linking
+  is attribution-neutral by construction; nobody in DX land reports losing
+  correlation across links. The Vulkan equivalent requires the NV driver
+  to preserve module↔SASS tables through the link — exactly the
+  undocumented step that's failing.
+
+### Actionable next steps (ranked)
+
+1. **Read the Correlation column** in the Shader Pipelines view of a
+   linked-shape capture. It reports per-shader correlation success/failure
+   and its hover tooltip names the failing leg and the files consulted
+   (known strings: "HL: Unable to locate source referenced by debug line
+   tables", "IL: The driver only provided a high level line table").
+   Free, and it turns the bug report from speculation into an exact error
+   string.
+2. **Try an R615+ driver.** We're on R610 — one branch below a documented
+   rework of exactly this shader-debug-info plumbing, in a series where RT
+   symbolics fixes have landed branch-by-branch.
+3. Confirm the GPU Trace activity has **"Collect Shader Pipelines"** and
+   **"Collect External Shader Debug Info"** enabled (defaults, but they
+   gate the profiler's pipeline view).
+4. **File it.** The Shader Profiler docs explicitly instruct: for a high
+   quantity of Unattributed samples, "save this report to communicate this
+   issue to the Nsight Graphics team" (forums.developer.nvidia.com, Nsight
+   Graphics category). Attach both captures — monolithic (attributes) and
+   linked (doesn't) — same SPIR-V, plus the Correlation-column tooltip
+   text from step 1.
+5. ~~Profiling workaround: re-run monolithic~~ — **done, monolithic is now
+   the shipping shape** (`RtShaderCache::create`). The libraries+link code
+   lives in git history immediately before the flip; restore it when the
+   driver/tool gap is fixed to get the 7.5ms rebuild back.
+
+Dropped leads: Aftermath `.nvdbg` plumbing (crash-dump-only channel, see
+above); `vkSetDebugUtilsObjectNameEXT` (no tool uses object names for
+correlation joins per the docs — still nice for tool readability, but not
+an attribution fix); library-lifetime experiment (superseded by the
+two-stage model — the join failure is in driver metadata, not object
+liveness; cheap to try if filing stalls, but expectations are low).
 
 ### Numbers worth keeping
 

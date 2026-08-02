@@ -8,12 +8,12 @@
 // [`BindingSeam`](crate::gpu::binding_seam::BindingSeam)'s descriptor heap via
 // per-stage mapping tables ([`build_heap_mappings`]): scene set 0 and columns
 // set 2 at constant heap offsets (their slots are app-lifetime), the per-view
-// set 1 through push-data slot indices (one linked pipeline serves every
-// view), and the TLAS from a device address in push data (shader-side heap AS
-// access device-losts on current NVIDIA drivers). The trace binds the heaps +
+// set 1 through push-data slot indices (one pipeline serves every view), and
+// the TLAS from a device address in push data (shader-side heap AS access
+// device-losts on current NVIDIA drivers). The trace binds the heaps +
 // pushes 76 bytes; `VK_EXT_descriptor_heap` (NVIDIA R610+) is required.
 //
-// The RT-stage shaders are all Slang, compiled from source at library build
+// The RT-stage shaders are all Slang, compiled from source at pipeline build
 // via `gpu/slang.rs` (variant axes are preprocessor defines and swappable
 // modules), then handed to `vkCreateRayTracingPipelinesKHR`. Mirrors
 // `gpu/allocator.rs`'s raw-VK style; gated on the `RayTracingPipelineFeature`
@@ -93,8 +93,8 @@ const PUSH_DATA_SIZE: usize = PUSH_VIEW_SLOTS_OFFSET + (BINDING_NRC_QUERIES as u
 /// - The TLAS (0,4): a device address in push data (`PUSH_ADDRESS`) — the
 ///   PTLAS double-buffers, and shader-side heap AS access device-losts.
 /// - Set 1: heap indices read from push data (`HEAP_WITH_PUSH_INDEX`), so one
-///   linked pipeline serves every view and survives view rebuilds
-///   (resize/skybox swap) without relinking.
+///   pipeline serves every view and survives view rebuilds
+///   (resize/skybox swap) without a pipeline rebuild.
 ///
 /// [`SceneHeapSlots`]: crate::bindings::SceneHeapSlots
 /// [`SceneColumns::heap_slots`]: crate::ecs_gpu::SceneColumns
@@ -245,9 +245,9 @@ pub struct RtGeometryAddresses {
 }
 
 /// One Slang shader stage of a hit group, compiled at pipeline build via
-/// `gpu/slang.rs`. `entry` is the entry function's name in `source` (the
-/// compiled `OpEntryPoint` is renamed `"main"`). The source may `import` the
-/// built-in module set (`scene_resolve`/`brdf`/`sampling`/…) and its group's
+/// `gpu/slang.rs`. `entry` is the entry function's name in `source`, kept as
+/// the emitted `OpEntryPoint` name and the stage's `pName`. The source may
+/// `import` the built-in module set (`scene_resolve`/`brdf`/`sampling`/…) and its group's
 /// [`composable_modules`](SolariHitGroupDef::composable_modules). `&'static`
 /// (usually `include_str!`) so downstream crates register without forking.
 #[derive(Clone)]
@@ -305,49 +305,41 @@ impl SolariHitGroupRegistry {
     }
 }
 
-/// Ray payload / hit-attribute sizes shared by every pipeline library and the
-/// linked pipeline (`VkRayTracingPipelineInterfaceCreateInfoKHR`, mandatory
-/// once stages live in libraries, and required to agree across the link).
-/// Payload: `RtPayload` (rt_payload.slang) is 128 B under std430 (vec3 slots
-/// pad to 16 B), plus headroom for a couple of future fields. Attributes:
-/// triangle/LSS barycentrics, two floats.
-const MAX_RAY_PAYLOAD_SIZE: u32 = 160;
-const MAX_HIT_ATTRIBUTE_SIZE: u32 = 8;
-
-/// One cached `VK_KHR_pipeline_library` compile (a stage subset of the RT
-/// pipeline) plus the shader modules it references.
-struct RtLibrary {
-    pipeline: vk::Pipeline,
-    modules: Vec<vk::ShaderModule>,
+/// One cached stage-subset compile of the RT pipeline: each entry is a shader
+/// module + its entry-point name, assembled into the monolithic pipeline
+/// create. A hit group holds its closest-hit first, then the optional any-hit.
+struct RtStages {
+    stages: Vec<(vk::ShaderStageFlags, vk::ShaderModule, std::ffi::CString)>,
 }
 
-/// Render-world cache of RT pipeline LIBRARIES, living across [`RtPipeline`]
-/// rebuilds so each rebuild recompiles only what changed and RELINKS the
-/// rest: a custom-sky swap recompiles the primary-miss library alone; a new
-/// registry hit group compiles just its own library; SBT growth or material
-/// class churn relinks with zero shader compiles. Also owns the descriptor
-/// mapping table chained onto every stage — its constant-offset entries bake
-/// the scene/columns heap slots, which are allocated once and rewritten in
-/// place, so the table never goes stale and the cache is never invalidated.
+/// Render-world cache of compiled RT SHADER STAGES, living across
+/// [`RtPipeline`] rebuilds so each rebuild recompiles only what changed: a
+/// custom-sky swap recompiles the primary-miss module alone; a new registry
+/// hit group compiles just its own stages. Every rebuild then creates the
+/// executable pipeline MONOLITHICALLY from the cached modules (see
+/// [`create`](Self::create) for why not `VK_KHR_pipeline_library`). Also owns
+/// the descriptor mapping table chained onto every stage — its
+/// constant-offset entries bake the scene/columns heap slots, which are
+/// allocated once and rewritten in place, so the table never goes stale and
+/// the cache is never invalidated.
 #[derive(Resource)]
-pub struct RtLibraryCache {
+pub struct RtShaderCache {
     device: ash::Device,
     rt: khr::ray_tracing_pipeline::Device,
     /// The per-stage descriptor mapping table (see [`build_heap_mappings`]),
-    /// chained onto every library stage's create info — kept because library
-    /// compiles are lazy (a sky swap or new hit group compiles long after the
-    /// cache was created). The driver copies the mappings at create time.
+    /// chained onto every stage at pipeline create. The driver copies the
+    /// mappings at create time.
     heap_mappings: Vec<vk::DescriptorSetAndBindingMappingEXT<'static>>,
-    raygen: Option<RtLibrary>,
+    raygen: Option<RtStages>,
     /// Composed with the `custom_sky` module; the key is the module source's
-    /// generation, so a sky swap rebuilds exactly this library.
-    miss: Option<(u64, RtLibrary)>,
-    miss_shadow: Option<RtLibrary>,
+    /// generation, so a sky swap recompiles exactly this stage.
+    miss: Option<(u64, RtStages)>,
+    miss_shadow: Option<RtStages>,
     /// Index-aligned with [`SolariHitGroupRegistry::groups`], which is
     /// append-only — existing entries never change identity, so cached
-    /// libraries stay valid and only NEW registry entries compile.
-    hit_groups: Vec<RtLibrary>,
-    /// The [`SlangSources`] generation the cached libraries were compiled
+    /// stages stay valid and only NEW registry entries compile.
+    hit_groups: Vec<RtStages>,
+    /// The [`SlangSources`] generation the cached stages were compiled
     /// from; a mismatch means a shader file was edited — the dispatch calls
     /// [`invalidate_sources`](Self::invalidate_sources).
     sources_generation: u64,
@@ -357,12 +349,12 @@ pub struct RtLibraryCache {
 
 // SAFETY: plain Vulkan handles; used solely from the single render-schedule
 // dispatch system.
-unsafe impl Send for RtLibraryCache {}
-unsafe impl Sync for RtLibraryCache {}
+unsafe impl Send for RtShaderCache {}
+unsafe impl Sync for RtShaderCache {}
 
-impl RtLibraryCache {
-    /// Store the mapping table; libraries compile lazily via the `ensure_*`
-    /// methods on first pipeline build, each stage chained with the table.
+impl RtShaderCache {
+    /// Store the mapping table; stages compile lazily via the `ensure_*`
+    /// methods on first pipeline build.
     pub fn new(
         allocator: &Allocator,
         heap_mappings: Vec<vk::DescriptorSetAndBindingMappingEXT<'static>>,
@@ -385,124 +377,41 @@ impl RtLibraryCache {
         }
     }
 
-    /// The [`SlangSources`] generation the cached libraries came from.
+    /// The [`SlangSources`] generation the cached stages came from.
     pub fn sources_generation(&self) -> u64 {
         self.sources_generation
     }
 
-    /// Destroy every cached library: a source edit invalidates all compiled
+    /// Destroy every cached module: a source edit invalidates all compiled
     /// SPIR-V (the shared modules cross every stage). The next pipeline
     /// build recompiles from the live sources.
     pub fn invalidate_sources(&mut self, generation: u64) {
         self.sources_generation = generation;
-        let libraries: Vec<RtLibrary> = self
+        let stages: Vec<RtStages> = self
             .raygen
             .take()
             .into_iter()
-            .chain(self.miss.take().map(|(_, lib)| lib))
+            .chain(self.miss.take().map(|(_, s)| s))
             .chain(self.miss_shadow.take())
             .chain(std::mem::take(&mut self.hit_groups))
             .collect();
-        for lib in libraries {
-            self.destroy_library(lib);
+        for s in stages {
+            self.destroy_stages(s);
         }
     }
 
-    /// Compile one library: `stages` + `groups`, LAYOUT-FREE
-    /// (`DESCRIPTOR_HEAP_EXT`), each stage chained with the cache's mapping
-    /// table, with the shared ray interface. Every library (and the link)
-    /// opts into cluster acceleration structures and opacity micromaps —
-    /// these must agree across the whole linked pipeline.
-    fn create_library(
-        &self,
-        stages: &[vk::PipelineShaderStageCreateInfo],
-        groups: &[vk::RayTracingShaderGroupCreateInfoKHR],
-        modules: Vec<vk::ShaderModule>,
-    ) -> Option<RtLibrary> {
-        // One mapping-info struct shared read-only by every stage's pNext.
-        let mut mapping_info = vk::ShaderDescriptorSetAndBindingMappingInfoEXT::default();
-        mapping_info.mapping_count = self.heap_mappings.len() as u32;
-        mapping_info.p_mappings = self.heap_mappings.as_ptr();
-        let stages: Vec<vk::PipelineShaderStageCreateInfo> = stages
-            .iter()
-            .map(|s| {
-                let mut s = *s;
-                debug_assert!(s.p_next.is_null());
-                s.p_next = (&mapping_info
-                    as *const vk::ShaderDescriptorSetAndBindingMappingInfoEXT)
-                    .cast();
-                s
-            })
-            .collect();
-        let cluster_info =
-            vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV::default()
-                .allow_cluster_acceleration_structure(true);
-        // With a `PipelineCreateFlags2CreateInfo` chained, the legacy `flags`
-        // field is ignored — every flag (incl. the heap opt-in, which has no
-        // legacy bit) lives here.
-        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default().flags(
-            vk::PipelineCreateFlags2::LIBRARY_KHR
-                | vk::PipelineCreateFlags2::RAY_TRACING_OPACITY_MICROMAP_EXT
-                | vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT,
-        );
-        let interface = vk::RayTracingPipelineInterfaceCreateInfoKHR::default()
-            .max_pipeline_ray_payload_size(MAX_RAY_PAYLOAD_SIZE)
-            .max_pipeline_ray_hit_attribute_size(MAX_HIT_ATTRIBUTE_SIZE);
-        let mut info = vk::RayTracingPipelineCreateInfoKHR::default()
-            .stages(&stages)
-            .groups(groups)
-            // Depth 2: raygen's hit object executes the closest-hit (1), which
-            // traces a NEE shadow ray (2). Must agree with the link.
-            .max_pipeline_ray_recursion_depth(2)
-            .library_interface(&interface);
-        // ash doesn't register the cluster struct as an extender (no typed
-        // `push_next`); chain flags2 -> cluster via raw `p_next`. Both outlive
-        // the call.
-        flags2.p_next =
-            (&cluster_info as *const vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV)
-                .cast();
-        info.p_next = (&flags2 as *const vk::PipelineCreateFlags2CreateInfo).cast();
-        // SAFETY: stages/groups reference live modules; the mapping table
-        // outlives the call (owned by self).
-        match unsafe {
-            self.rt.create_ray_tracing_pipelines(
-                vk::DeferredOperationKHR::null(),
-                vk::PipelineCache::null(),
-                &[info],
-                None,
-            )
-        } {
-            Ok(p) => Some(RtLibrary {
-                pipeline: p.into_iter().next()?,
-                modules,
-            }),
-            Err(e) => {
-                bevy_log::error!("rt_pipeline: library compile failed: {:?}", e.1);
-                for m in modules {
-                    // SAFETY: modules were created for this library; nothing
-                    // else references them.
-                    unsafe { self.device.destroy_shader_module(m, None) };
-                }
-                None
-            }
-        }
-    }
-
-    fn destroy_library(&self, lib: RtLibrary) {
-        // The linked pipeline that referenced this library is already gone (the
+    fn destroy_stages(&self, stages: RtStages) {
+        // The pipeline that referenced these modules is already gone (the
         // dispatch removes RtPipeline before rebuilding); drain in-flight work
         // then destroy.
         self._device_keepalive.quiesce_before_raw_destroy();
-        // SAFETY: quiesced; handles exclusively owned here.
-        unsafe {
-            self.device.destroy_pipeline(lib.pipeline, None);
-            for m in lib.modules {
-                self.device.destroy_shader_module(m, None);
-            }
+        for (_, module, _) in stages.stages {
+            // SAFETY: quiesced; handles exclusively owned here.
+            unsafe { self.device.destroy_shader_module(module, None) };
         }
     }
 
-    /// Raygen library (static per app run — the shader-clock variant choice
+    /// Raygen stage (static per app run — the shader-clock variant choice
     /// is fixed at device creation).
     ///
     /// [`RAYGEN_CAPABILITIES`] pins Shader Execution Reordering to the NV
@@ -531,18 +440,15 @@ impl RtLibraryCache {
         .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
         .ok()?;
         let module = create_shader_module(&self.device, &raygen_spv.spirv)?;
-        let lib = self.create_library(
-            &[shader_stage(vk::ShaderStageFlags::RAYGEN_KHR, module, c"raygen")],
-            &[general_group(0)],
-            vec![module],
-        )?;
-        self.raygen = Some(lib);
+        self.raygen = Some(RtStages {
+            stages: vec![(vk::ShaderStageFlags::RAYGEN_KHR, module, c"raygen".to_owned())],
+        });
         Some(())
     }
 
-    /// Primary-miss library — composes the swappable `custom_sky` module
+    /// Primary-miss stage — composes the swappable `custom_sky` module
     /// (`SolariSky::Shader`; defaults to the built-in procedural gradient).
-    /// A generation change rebuilds exactly this library.
+    /// A generation change recompiles exactly this stage.
     fn ensure_miss(&mut self, sources: &SlangSources, custom_sky: (&str, u64)) -> Option<()> {
         let (custom_sky_source, generation) = custom_sky;
         if matches!(&self.miss, Some((cached, _)) if *cached == generation) {
@@ -562,19 +468,19 @@ impl RtLibraryCache {
         .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
         .ok()?;
         let module = create_shader_module(&self.device, &miss_spv.spirv)?;
-        let lib = self.create_library(
-            &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"miss_primary")],
-            &[general_group(0)],
-            vec![module],
-        )?;
         if let Some((_, old)) = self.miss.take() {
-            self.destroy_library(old);
+            self.destroy_stages(old);
         }
-        self.miss = Some((generation, lib));
+        self.miss = Some((
+            generation,
+            RtStages {
+                stages: vec![(vk::ShaderStageFlags::MISS_KHR, module, c"miss_primary".to_owned())],
+            },
+        ));
         Some(())
     }
 
-    /// Shadow-miss library (static — no modules, no variant axes).
+    /// Shadow-miss stage (static — no modules, no variant axes).
     fn ensure_shadow(&mut self, sources: &SlangSources) -> Option<()> {
         if self.miss_shadow.is_some() {
             return Some(());
@@ -590,16 +496,13 @@ impl RtLibraryCache {
         .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
         .ok()?;
         let module = create_shader_module(&self.device, &shadow_spv.spirv)?;
-        let lib = self.create_library(
-            &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"miss_shadow")],
-            &[general_group(0)],
-            vec![module],
-        )?;
-        self.miss_shadow = Some(lib);
+        self.miss_shadow = Some(RtStages {
+            stages: vec![(vk::ShaderStageFlags::MISS_KHR, module, c"miss_shadow".to_owned())],
+        });
         Some(())
     }
 
-    /// One library per registry hit group (chit + optional any-hit). The
+    /// One stage set per registry hit group (chit + optional any-hit). The
     /// registry is append-only, so only entries past the cached count compile.
     fn ensure_hit_groups(
         &mut self,
@@ -616,83 +519,111 @@ impl RtLibraryCache {
             let chit_mod = compile(&hg.closest_hit)?;
             let chit_name = std::ffi::CString::new(hg.closest_hit.entry)
                 .expect("shader entry name has interior NUL");
-            let lib = if let Some(ah) = &hg.any_hit {
+            let mut stages =
+                vec![(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, chit_name)];
+            if let Some(ah) = &hg.any_hit {
                 let ah_mod = compile(ah)?;
                 let ah_name = std::ffi::CString::new(ah.entry)
                     .expect("shader entry name has interior NUL");
-                self.create_library(
-                    &[
-                        shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, &chit_name),
-                        shader_stage(vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, &ah_name),
-                    ],
-                    &[hit_group_with_any_hit(0, 1)],
-                    vec![chit_mod, ah_mod],
-                )?
-            } else {
-                self.create_library(
-                    &[shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, &chit_name)],
-                    &[hit_group(0)],
-                    vec![chit_mod],
-                )?
-            };
-            self.hit_groups.push(lib);
+                stages.push((vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, ah_name));
+            }
+            self.hit_groups.push(RtStages { stages });
         }
         Some(())
     }
 
-    /// Link the cached libraries into an executable pipeline. Group numbering
-    /// is the concatenation of the libraries' groups in list order — raygen
-    /// (0), primary miss (1), hit groups (2..), shadow miss last — matching
-    /// the SBT layout [`RtPipeline::new`] bakes.
+    /// Create the executable pipeline: one MONOLITHIC
+    /// `vkCreateRayTracingPipelinesKHR` over every cached stage, LAYOUT-FREE
+    /// (`DESCRIPTOR_HEAP_EXT`), each stage chained with the cache's mapping
+    /// table. Group numbering: raygen (0), primary miss (1), hit groups
+    /// (2..), shadow miss last — matching the SBT layout [`RtPipeline::new`]
+    /// bakes.
     ///
-    /// Profiler note: Nsight's SASS↔source correlation is currently lost
-    /// across the library link — the RT stages show as Unattributed, while
-    /// the same modules attribute fine in a monolithic create (and in the
-    /// heap compute pipelines). Findings + leads in `docs/slang_lib.md`.
-    fn link(&self) -> Option<vk::Pipeline> {
-        let mut libs: Vec<vk::Pipeline> =
+    /// Monolithic on purpose: with the stages in `VK_KHR_pipeline_library`
+    /// pipelines and a link step, Nsight's shader profiler loses all
+    /// SASS↔source correlation (every RT sample lands in Unattributed) — a
+    /// driver/tool gap with no host-side fix (see `docs/slang_lib.md`). The
+    /// monolithic create costs ~1.25s where a library link costs ~7.5ms,
+    /// paid on every rebuild axis (sky swap, new hit group, source edit);
+    /// accepted so RT perf work has per-line attribution.
+    fn create(&self) -> Option<vk::Pipeline> {
+        // Stage list in group order; groups reference stages by index.
+        let mut stage_refs: Vec<&(vk::ShaderStageFlags, vk::ShaderModule, std::ffi::CString)> =
+            Vec::new();
+        let mut groups: Vec<vk::RayTracingShaderGroupCreateInfoKHR> =
             Vec::with_capacity(3 + self.hit_groups.len());
-        libs.push(self.raygen.as_ref()?.pipeline);
-        libs.push(self.miss.as_ref()?.1.pipeline);
-        libs.extend(self.hit_groups.iter().map(|l| l.pipeline));
-        libs.push(self.miss_shadow.as_ref()?.pipeline);
+        stage_refs.push(&self.raygen.as_ref()?.stages[0]);
+        groups.push(general_group(0));
+        stage_refs.push(&self.miss.as_ref()?.1.stages[0]);
+        groups.push(general_group(1));
+        for hg in &self.hit_groups {
+            let chit = stage_refs.len() as u32;
+            stage_refs.push(&hg.stages[0]);
+            groups.push(match hg.stages.get(1) {
+                Some(ah) => {
+                    stage_refs.push(ah);
+                    hit_group_with_any_hit(chit, chit + 1)
+                }
+                None => hit_group(chit),
+            });
+        }
+        groups.push(general_group(stage_refs.len() as u32));
+        stage_refs.push(&self.miss_shadow.as_ref()?.stages[0]);
+
+        // One mapping-info struct shared read-only by every stage's pNext.
+        let mut mapping_info = vk::ShaderDescriptorSetAndBindingMappingInfoEXT::default();
+        mapping_info.mapping_count = self.heap_mappings.len() as u32;
+        mapping_info.p_mappings = self.heap_mappings.as_ptr();
+        let stages: Vec<vk::PipelineShaderStageCreateInfo> = stage_refs
+            .iter()
+            .map(|(flags, module, name)| {
+                let mut s = shader_stage(*flags, *module, name);
+                s.p_next = (&mapping_info
+                    as *const vk::ShaderDescriptorSetAndBindingMappingInfoEXT)
+                    .cast();
+                s
+            })
+            .collect();
 
         let cluster_info =
             vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV::default()
                 .allow_cluster_acceleration_structure(true);
-        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default().flags(
-            vk::PipelineCreateFlags2::RAY_TRACING_OPACITY_MICROMAP_EXT
-                | vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT,
-        );
-        let library_info = vk::PipelineLibraryCreateInfoKHR::default().libraries(&libs);
-        let interface = vk::RayTracingPipelineInterfaceCreateInfoKHR::default()
-            .max_pipeline_ray_payload_size(MAX_RAY_PAYLOAD_SIZE)
-            .max_pipeline_ray_hit_attribute_size(MAX_HIT_ATTRIBUTE_SIZE);
+        // With a `PipelineCreateFlags2CreateInfo` chained, the legacy `flags`
+        // field is ignored — every flag (incl. the heap opt-in, which has no
+        // legacy bit) lives here.
+        //
         // Opt into opacity micromaps. Unlike ray queries (which honor OMM straight
         // from the AS), a ray-tracing *pipeline* ignores opacity micromaps entirely
         // unless created with this flag — the driver invokes the any-hit shader on
         // every micro-triangle as if no OMM were present. OMM is a required
         // extension (solari disables without it), so the flag is unconditional.
-        //
-        // Dynamic stack size: the driver's DEFAULT stack for a pipeline linked
-        // from libraries is unreliable (computed per library, not across the
-        // link), and an undersized stack corrupts payload/local spills with no
-        // validation error. The dispatch sets an explicit size (queried per
-        // group) via `vkCmdSetRayTracingPipelineStackSizeKHR` — which requires
-        // opting into the dynamic state here.
+        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default().flags(
+            vk::PipelineCreateFlags2::RAY_TRACING_OPACITY_MICROMAP_EXT
+                | vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT,
+        );
+        // The dispatch sets an explicit stack size (spec formula over the
+        // queried per-group sizes — see [`RtPipeline::new`]) via
+        // `vkCmdSetRayTracingPipelineStackSizeKHR`, which requires opting
+        // into the dynamic state here.
         let dynamic_states = [vk::DynamicState::RAY_TRACING_PIPELINE_STACK_SIZE_KHR];
         let dynamic_info =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let mut info = vk::RayTracingPipelineCreateInfoKHR::default()
+            .stages(&stages)
+            .groups(&groups)
+            // Depth 2: raygen's hit object executes the closest-hit (1), which
+            // traces a NEE shadow ray (2).
             .max_pipeline_ray_recursion_depth(2)
-            .library_info(&library_info)
-            .library_interface(&interface)
             .dynamic_state(&dynamic_info);
+        // ash doesn't register the cluster struct as an extender (no typed
+        // `push_next`); chain flags2 -> cluster via raw `p_next`. Both outlive
+        // the call.
         flags2.p_next =
             (&cluster_info as *const vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV)
                 .cast();
         info.p_next = (&flags2 as *const vk::PipelineCreateFlags2CreateInfo).cast();
-        // SAFETY: libraries live (owned by this cache).
+        // SAFETY: stages/groups reference live modules (owned by this cache);
+        // the mapping table outlives the call (owned by self).
         match unsafe {
             self.rt.create_ray_tracing_pipelines(
                 vk::DeferredOperationKHR::null(),
@@ -703,31 +634,28 @@ impl RtLibraryCache {
         } {
             Ok(p) => p.into_iter().next(),
             Err(e) => {
-                bevy_log::error!("rt_pipeline: pipeline link failed: {:?}", e.1);
+                bevy_log::error!("rt_pipeline: pipeline create failed: {:?}", e.1);
                 None
             }
         }
     }
 }
 
-impl Drop for RtLibraryCache {
+impl Drop for RtShaderCache {
     fn drop(&mut self) {
-        // In-flight traces may still reference the layouts; drain first.
+        // In-flight traces may still reference the modules; drain first.
         self._device_keepalive.quiesce_before_raw_destroy();
-        let libs = self
+        let stage_sets = self
             .raygen
             .take()
             .into_iter()
-            .chain(self.miss.take().map(|(_, l)| l))
+            .chain(self.miss.take().map(|(_, s)| s))
             .chain(self.miss_shadow.take())
             .chain(std::mem::take(&mut self.hit_groups));
-        for lib in libs {
-            // SAFETY: quiesced above; handles exclusively owned here.
-            unsafe {
-                self.device.destroy_pipeline(lib.pipeline, None);
-                for m in lib.modules {
-                    self.device.destroy_shader_module(m, None);
-                }
+        for set in stage_sets {
+            for (_, module, _) in set.stages {
+                // SAFETY: quiesced above; handles exclusively owned here.
+                unsafe { self.device.destroy_shader_module(module, None) };
             }
         }
     }
@@ -783,9 +711,9 @@ pub struct RtPipeline {
     /// the dispatch compares this against [`SolariCustomSky`](crate::render::sky::SolariCustomSky).
     custom_sky_generation: u64,
 
-    /// Explicit pipeline stack size (bytes), queried per group from the linked
-    /// pipeline and set dynamically at trace time — the driver default is
-    /// unreliable for library-linked pipelines.
+    /// Explicit pipeline stack size (bytes), queried per group from the
+    /// pipeline and set dynamically at trace time — an undersized driver
+    /// default corrupts payload/local spills with no validation error.
     stack_size: u32,
 
     /// Keeps the `VkDevice` alive until this drops. The cloned `ash::Device`
@@ -870,17 +798,16 @@ unsafe impl Sync for RtViewBindings {}
 
 impl RtPipeline {
     /// Build the RT pipeline (raygen + miss + opaque/glass/hair closest-hit)
-    /// by LINKING the per-stage libraries cached in `libraries` — only stages
-    /// the cache hasn't seen (a new sky generation, a newly registered hit
-    /// group) compile; everything else relinks. The cache also owns the
-    /// shared pipeline layout (compatible with the wgpu scene/columns bind
-    /// groups bound at trace time). Built lazily (see the dispatch) once
-    /// those bind groups exist. Returns `None` if SPIR-V compilation or any
-    /// Vulkan step fails (logged).
+    /// from the stages cached in `shaders` — only stages the cache hasn't
+    /// seen (a new sky generation, a newly registered hit group) compile;
+    /// the monolithic create over the cached modules always reruns (see
+    /// [`RtShaderCache::create`]). Built lazily (see the dispatch) once the
+    /// wgpu scene/columns bind groups exist. Returns `None` if SPIR-V
+    /// compilation or any Vulkan step fails (logged).
     pub fn new(
         allocator: &Allocator,
         seam: &crate::gpu::binding_seam::BindingSeam,
-        libraries: &mut RtLibraryCache,
+        shaders: &mut RtShaderCache,
         material_classes: &[u32],
         hit_groups: &[SolariHitGroupDef],
         custom_sky: (&str, u64),
@@ -907,25 +834,23 @@ impl RtPipeline {
         let handle_align = rt_props.shader_group_handle_alignment as u64;
         let base_align = rt_props.shader_group_base_alignment as u64;
 
-        // --- Stage libraries (cached) + link -----------------------------------
+        // --- Cached stage compiles + monolithic create --------------------------
         // Fixed general programs (raygen + the two miss shaders); every closest-hit
         // ("hit group", + optional any-hit) comes from `hit_groups` (the registry), so
         // adding a surface shader needs no edit here — Solari's own opaque/glass/hair/
         // portal register the same way as any downstream material (see SolariPlugin).
-        libraries.ensure_raygen(sources)?;
-        libraries.ensure_miss(sources, custom_sky)?;
-        libraries.ensure_shadow(sources)?;
-        libraries.ensure_hit_groups(sources, hit_groups)?;
-        let pipeline = libraries.link()?;
+        shaders.ensure_raygen(sources)?;
+        shaders.ensure_miss(sources, custom_sky)?;
+        shaders.ensure_shadow(sources)?;
+        shaders.ensure_hit_groups(sources, hit_groups)?;
+        let pipeline = shaders.create()?;
 
         // Explicit pipeline stack size (spec formula for recursion depth 2, no
-        // intersection/callable stages). The driver's DEFAULT stack for a
-        // pipeline linked from LIBRARIES is unreliable — an undersized stack
-        // corrupts payload/local spills with no validation error — so query
-        // the per-group stack sizes from the linked pipeline and set the size
-        // dynamically at trace time.
+        // intersection/callable stages): an undersized stack corrupts
+        // payload/local spills with no validation error, so query the
+        // per-group stack sizes and set the size dynamically at trace time.
         let group_stack = |group: u32, ty: vk::ShaderGroupShaderKHR| -> u64 {
-            // SAFETY: pipeline live; `group` is within the linked group range.
+            // SAFETY: pipeline live; `group` is within the pipeline's group range.
             unsafe { rt.get_ray_tracing_shader_group_stack_size(pipeline, group, ty) }
         };
         let shadow_group = 2 + hit_groups.len() as u32;
@@ -946,7 +871,7 @@ impl RtPipeline {
         // spec's exact expression (folds the any-hit into every level).
         let stack_size = (raygen_stack + 2 * (chit_stack + any_hit_stack).max(miss_stack)) as u32;
 
-        // Linked group numbering (see `RtLibraryCache::link`): raygen (0), primary
+        // Group numbering (see `RtShaderCache::create`): raygen (0), primary
         // miss (1), one hit group per registry entry (its index = its SBT class;
         // class c -> group 2+c -> handle(2+c)), shadow miss LAST.
         let shadow_miss_group = 2 + hit_groups.len() as u32;
@@ -1403,8 +1328,8 @@ impl RtPipeline {
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 self.pipeline,
             );
-            // The linked pipeline opts into the dynamic stack-size state (see
-            // `RtLibraryCache::link`); the queried-per-group size replaces the
+            // The pipeline opts into the dynamic stack-size state (see
+            // `RtShaderCache::create`); the queried-per-group size replaces the
             // driver default, which is unreliable across library boundaries.
             self.rt
                 .cmd_set_ray_tracing_pipeline_stack_size(command_buffer, self.stack_size);
@@ -1520,9 +1445,9 @@ impl Drop for RtPipeline {
     fn drop(&mut self) {
         // In-flight traces may still reference the pipeline/SBT; drain first.
         self._device_keepalive.quiesce_before_raw_destroy();
-        // SAFETY: the linked pipeline + SBT were created by this resource; the
+        // SAFETY: the pipeline + SBT were created by this resource; the
         // queue is drained and the device alive (keepalive). The layouts and
-        // stage libraries belong to `RtLibraryCache` and survive the rebuild.
+        // stage modules belong to `RtShaderCache` and survive the rebuild.
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_buffer(self.sbt.buffer, None);
@@ -1532,7 +1457,7 @@ impl Drop for RtPipeline {
 }
 
 /// Raygen's target capability atoms (`slangc -capability` equivalents) —
-/// see [`RtLibraryCache::ensure_raygen`]. Declaring any atom makes the set
+/// see [`RtShaderCache::ensure_raygen`]. Declaring any atom makes the set
 /// raygen's whole target profile, so it must cover everything the entry
 /// uses (clock + coopvec too) or slang warns "profile implicitly upgraded".
 /// Declaring clock support is fine for the non-clock variant — the set says

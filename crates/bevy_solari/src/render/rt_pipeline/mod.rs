@@ -40,7 +40,7 @@ use crate::ecs_gpu::{GpuSlot, SceneColumns};
 use crate::geometry::ClusterMeshManager;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
 use crate::gpu::rt_pipeline::{
-    RtCamera, RtGeometryAddresses, RtLibraryCache, RtPipeline, RtViewBindings, SolariHitGroupDef,
+    RtCamera, RtGeometryAddresses, RtShaderCache, RtPipeline, RtViewBindings, SolariHitGroupDef,
     SolariHitGroupRegistry, SolariRtShader,
 };
 use crate::gpu::RawTraceBindable;
@@ -1162,7 +1162,7 @@ pub(crate) fn rt_pipeline(
         Option<Res<crate::geometry::tess_classify::TessClassify>>,
         Option<Res<SolariHitGroupRegistry>>,
         Option<Res<crate::accel::deform::Deform>>,
-        Option<ResMut<RtLibraryCache>>,
+        Option<ResMut<RtShaderCache>>,
         Option<Res<crate::gpu::binding_seam::BindingSeam>>,
         Res<crate::gpu::slang_sources::SlangSources>,
     ),
@@ -1215,7 +1215,7 @@ pub(crate) fn rt_pipeline(
         tess_classify,
         hit_group_registry,
         deform,
-        mut library_cache,
+        mut shader_cache,
         seam,
         slang_sources,
     ) = geometry_res;
@@ -1303,10 +1303,10 @@ pub(crate) fn rt_pipeline(
     };
 
     // Hot reload: a `.slang` edit bumped the source generation — every cached
-    // library's SPIR-V is stale (the shared modules cross all stages). Drain,
-    // destroy the libraries + the linked pipeline, and rebuild next frame
-    // from the live sources.
-    if let Some(cache) = library_cache.as_deref_mut() {
+    // stage's SPIR-V is stale (the shared modules cross all stages). Drain,
+    // destroy the modules + the pipeline, and rebuild next frame from the
+    // live sources.
+    if let Some(cache) = shader_cache.as_deref_mut() {
         if cache.sources_generation() != slang_sources.generation() {
             let _ = render_device
                 .wgpu_device()
@@ -1338,13 +1338,13 @@ pub(crate) fn rt_pipeline(
                 seam.as_deref(),
                 hit_group_registry.as_deref(),
             ) {
-                // Get-or-create the stage-library cache: it lives across
-                // pipeline rebuilds (a sky/material change relinks cached
-                // libraries instead of recompiling every stage).
+                // Get-or-create the shader-stage cache: it lives across
+                // pipeline rebuilds (a sky/material change recompiles only
+                // the changed stages, not every stage).
                 let mut fresh_cache = None;
-                let cache: &mut RtLibraryCache = match library_cache {
+                let cache: &mut RtShaderCache = match shader_cache {
                     Some(cache) => cache.into_inner(),
-                    None => fresh_cache.insert(RtLibraryCache::new(
+                    None => fresh_cache.insert(RtShaderCache::new(
                         allocator,
                         crate::gpu::rt_pipeline::build_heap_mappings(
                             seam,
