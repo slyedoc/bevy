@@ -36,7 +36,7 @@ pub use bind_groups::{
     init_cluster_scene_bind_group_layout, prepare_cluster_scene_bind_group, ClusterSceneBindGroup,
     ClusterSceneBindGroupLayout,
 };
-pub use binder::{prepare_raytracing_scene_bindings, RaytracingSceneBindings};
+pub use binder::{prepare_raytracing_scene_bindings, RaytracingSceneBindings, SceneHeapSlots};
 pub(crate) use binder::GPU_MATERIAL_SIZE;
 #[cfg(test)]
 pub(crate) use binder::MAX_TEXTURE_COUNT;

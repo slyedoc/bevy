@@ -44,17 +44,43 @@ pub struct RaytracingSceneBindings {
     /// via [`RawTraceBindable`](crate::gpu::RawTraceBindable), so it stays valid for
     /// any in-flight trace. `0` until the first bind-group build.
     pub materials_device_address: crate::gpu::allocator::StableAddr,
-    /// M2 staging: the scene set's BUFFER bindings mirrored as descriptor-heap
-    /// slots, refreshed every frame right after the bind group rebuild (the
-    /// tables may reallocate as they grow). Unread until the heap-pipeline
-    /// flip; textures/samplers/TLAS follow separately (heap image + sampler
-    /// descriptors are written from CREATE INFO, and the TLAS rides push data).
+    /// M2 staging: the scene set mirrored as descriptor-heap slots, refreshed
+    /// every frame right after the bind group rebuild (the tables may
+    /// reallocate as they grow; heap descriptor updates are plain host
+    /// writes). Unread until the heap-pipeline flip. The TLAS (binding 4) is
+    /// deliberately absent: its address rides push data — shader-side heap AS
+    /// access device-losts even on R610.
     pub scene_heap: Option<SceneHeapSlots>,
 }
 
-/// `(set-0 binding index, heap buffer-region slot)` pairs, in binding order.
+/// The scene set's resources as descriptor-heap slots. The bindless arrays
+/// get one contiguous block each ([`BindingSeam::alloc_heap_block`]), dense
+/// mirrors of the bind-group arrays: element `i`'s descriptor lives at
+/// `block + i`, so the material table's texture ids index the heap unchanged.
+///
+/// [`BindingSeam::alloc_heap_block`]: crate::gpu::binding_seam::BindingSeam::alloc_heap_block
 pub struct SceneHeapSlots {
+    /// `(set-0 binding index, heap buffer-region slot)` pairs, in binding order.
     pub buffers: Vec<(u32, u32)>,
+    /// Image block backing `textures[]` (binding 2), `MAX_TEXTURE_COUNT` slots.
+    pub texture_block: u32,
+    /// Sampler block backing `samplers[]` (binding 3), parallel to
+    /// `texture_block` but only `sampler_block_len` entries — the sampler heap
+    /// is hardware-small (4096 slots on NVIDIA, under `MAX_TEXTURE_COUNT`), so
+    /// the block takes what the region can hold. Distinct live samplers can't
+    /// approach it anyway: the classic path's `maxSamplerAllocationCount` is
+    /// 4000 on the same hardware. Exceeding it is a loud assert, not a skip.
+    pub sampler_block: u32,
+    /// Slot count of `sampler_block`.
+    pub sampler_block_len: u32,
+    /// Image block backing `texture_arrays[]` (binding 13), `MAX_TEXTURE_ARRAY_COUNT` slots.
+    pub texture_array_block: u32,
+    /// DFG LUT image (binding 6).
+    pub dfg_lut: u32,
+    /// DFG LUT sampler (binding 7).
+    pub dfg_sampler: u32,
+    /// Shared `texture_arrays` sampler (binding 14).
+    pub array_sampler: u32,
 }
 
 /// The scene's per-frame-rebuilt tables, on persistent **stable-address**
@@ -397,15 +423,17 @@ pub fn prepare_raytracing_scene_bindings(
         )),
     ));
 
-    // M2 staging: mirror the scene set's buffer bindings into the descriptor
-    // heap, same cadence as the bind-group rebuild above (these tables can
-    // reallocate as they grow, so the descriptors are rewritten each frame —
-    // heap descriptor updates are plain host writes). First frame allocates
-    // the slots; afterwards the same slots are rewritten in place, so the
-    // flip's mapping table stays valid across scene growth.
+    // M2 staging: mirror the scene set into the descriptor heap, same cadence
+    // as the bind-group rebuild above (the tables can reallocate as they grow,
+    // and textures load/evict — so every descriptor is rewritten each frame;
+    // heap descriptor updates are plain host writes). First frame reserves the
+    // slots and blocks; afterwards the same slots are rewritten in place, so
+    // the flip's mapping table stays valid across scene growth.
     if let Some(seam) = seam.as_deref() {
         use crate::gpu::binding_seam::{HeapKind, HeapResource};
+        use ash::vk;
         use bevy_render::render_resource::BindingResource;
+        use wgpu::hal::api::Vulkan as VkApi;
         let heap_resource = |res: BindingResource, uniform: bool| -> Option<HeapResource> {
             let BindingResource::Buffer(b) = res else {
                 return None;
@@ -442,24 +470,80 @@ pub fn prepare_raytracing_scene_bindings(
         .into_iter()
         .filter_map(|(binding, res, uniform)| Some((binding, heap_resource(res, uniform)?)))
         .collect();
-        match &mut raytracing_scene_bindings.scene_heap {
-            Some(slots) => {
-                for ((binding, resource), &(slot_binding, slot)) in
-                    resources.into_iter().zip(&slots.buffers)
-                {
-                    debug_assert_eq!(binding, slot_binding);
-                    seam.rewrite_heap_index(HeapKind::Buffer, slot, resource);
-                }
+        let slots = raytracing_scene_bindings.scene_heap.get_or_insert_with(|| {
+            // Leave sampler headroom for the singles below + per-view env samplers.
+            let sampler_block_len = MAX_TEXTURE_COUNT
+                .get()
+                .min(seam.region_capacity(HeapKind::Sampler).saturating_sub(64));
+            SceneHeapSlots {
+                buffers: resources
+                    .iter()
+                    .map(|(binding, _)| (*binding, seam.alloc_heap_block(HeapKind::Buffer, 1)))
+                    .collect(),
+                texture_block: seam.alloc_heap_block(HeapKind::Image, MAX_TEXTURE_COUNT.get()),
+                sampler_block: seam.alloc_heap_block(HeapKind::Sampler, sampler_block_len),
+                sampler_block_len,
+                texture_array_block: seam
+                    .alloc_heap_block(HeapKind::Image, MAX_TEXTURE_ARRAY_COUNT.get()),
+                dfg_lut: seam.alloc_heap_block(HeapKind::Image, 1),
+                dfg_sampler: seam.alloc_heap_block(HeapKind::Sampler, 1),
+                array_sampler: seam.alloc_heap_block(HeapKind::Sampler, 1),
             }
-            none => {
-                *none = Some(SceneHeapSlots {
-                    buffers: resources
-                        .into_iter()
-                        .map(|(binding, r)| (binding, seam.alloc_heap_index(r)))
-                        .collect(),
-                });
-            }
+        });
+        for ((binding, resource), &(slot_binding, slot)) in
+            resources.into_iter().zip(&slots.buffers)
+        {
+            debug_assert_eq!(binding, slot_binding);
+            seam.rewrite_heap_index(HeapKind::Buffer, slot, resource);
         }
+        // Sampled images are written from the view's create info (the fork's
+        // hal `TextureView` records it at creation). All are wgpu-tracked
+        // sampled textures, read-optimal by trace time (the classic path's
+        // bind-group usage keeps the transitions happening until the flip;
+        // the flip takes over the transition responsibility).
+        #[allow(unsafe_code)]
+        let write_view = |slot: u32, view: &wgpu::TextureView| {
+            // SAFETY: the view is a live wgpu resource on the Vulkan backend;
+            // the guard is dropped before anything can destroy it.
+            if let Some(hal_view) = unsafe { view.as_hal::<VkApi>() } {
+                let info = hal_view.image_view_create_info();
+                seam.rewrite_heap_index(
+                    HeapKind::Image,
+                    slot,
+                    HeapResource::SampledImage {
+                        view: &info,
+                        layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    },
+                );
+            }
+        };
+        #[allow(unsafe_code)]
+        let write_sampler = |slot: u32, sampler: &wgpu::Sampler| {
+            // SAFETY: as for the view above.
+            if let Some(hal_sampler) = unsafe { sampler.as_hal::<VkApi>() } {
+                let info = hal_sampler.create_info();
+                seam.rewrite_heap_index(HeapKind::Sampler, slot, HeapResource::Sampler(&info));
+            }
+        };
+        for (i, &view) in textures.as_slice().iter().enumerate() {
+            write_view(slots.texture_block + i as u32, view);
+        }
+        assert!(
+            samplers.len() <= slots.sampler_block_len as usize,
+            "scene sampler mirror: {} live samplers exceed the {}-slot sampler block \
+             (hardware sampler-heap limit)",
+            samplers.len(),
+            slots.sampler_block_len,
+        );
+        for (i, &sampler) in samplers.iter().enumerate() {
+            write_sampler(slots.sampler_block + i as u32, sampler);
+        }
+        for (i, &view) in texture_arrays.as_slice().iter().enumerate() {
+            write_view(slots.texture_array_block + i as u32, view);
+        }
+        write_view(slots.dfg_lut, dfg_view);
+        write_sampler(slots.dfg_sampler, dfg_sampler);
+        write_sampler(slots.array_sampler, array_sampler);
     }
 }
 

@@ -151,13 +151,44 @@ Driver intel (researched 2026-08-01):
   `VK_NV_push_constant_bank` (interesting for push-data-heavy binding).
 
 ### M2. RT goes heap + record-bindless (through the seam)
-- Set 1 (per-view): camera/output/G-buffers → push-data BDA pointers + heap
-  indices; delete per-view descriptor pool/sets. Env cube = heap image index
-  in push data. (M0 verdict: bindings stay in the shaders and the mapping
-  targets the heap — zero shader edits.)
-- Scene set 0: textures/samplers → heap indices carried in the Material
-  table; TLAS → device address (`RaytracingAccelerationStructure(addr)`);
-  kills `Tlas::from_hal` + the `[5000]` sized arrays.
+- **STAGING COMPLETE (2026-08-01): every RT-visible resource is mirrored
+  into the heap, unread, classic path still driving.** Set 1 per view
+  (`RtViewHeapSlots`: 15 buffers + env cube image + env sampler), scene set
+  0 (`SceneHeapSlots`: 8 storage buffers + dense image blocks for
+  `textures[]`/`texture_arrays[]` + parallel sampler block + DFG LUT pair +
+  array sampler), columns set 2 (`SceneColumns::heap_slots`, signature
+  cadence). Fork additions that made it verbatim: hal `TextureView` records
+  its `ImageViewCreateInfo` (+`image_view_create_info()`), hal
+  `Sampler::create_info()`, and `Sampler::as_hal` (new, all three layers).
+- **Hardware datum**: NVIDIA sampler heap max = 128 KB ⇒ 4096 sampler
+  descriptors (4080 usable). The `samplers[5000]` parallel array can never
+  mirror 1:1 — block clamps to capacity (4016) with a loud assert. Classic
+  path has the same wall disguised (`maxSamplerAllocationCount` 4000). At
+  flip, shrink the WGSL sampler array bound or decouple sampler ids from
+  texture ids (records). Resource heap max 32 MB — buffers/images roomy.
+- **M2c FLIP DONE (2026-08-02, first run clean — no VVL, no device loss,
+  NRC converging on real hit data).** Libraries + link carry
+  `PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT` (flags moved to flags2), NO
+  pipeline layout, NO set-1 DSL; every stage chains one shared mapping
+  table (`build_heap_mappings`): scene set 0 + columns set 2 at constant
+  heap offsets, all 17 set-1 bindings `HEAP_WITH_PUSH_INDEX` (slot indices
+  from push data — one pipeline serves every view, resize/skybox rebuilds
+  don't relink), TLAS as `PUSH_ADDRESS`. Trace = `bind_heaps` + one 76-B
+  `push_data` blob + bind + trace rays. DELETED: per-view descriptor
+  pool/set/env-sampler objects, `cmd_bind_descriptor_sets`, camera dynamic
+  offset, `raw_bgl`/`raw_set`, both `keep_bind_group_alive` calls, the
+  layout_key cache invalidation. Sampler mappings use the `sampler_*`
+  union fields (separate sampler heap bind point). R610+ is REQUIRED:
+  seam-absent now disables solari wholesale (no classic fallback path).
+  The wgpu scene/columns bind groups still exist — the ReSTIR spatial
+  wgpu pass consumes them (they leave the RT trace's world, not the
+  renderer).
+- Materials: `[[vk::shader_record]]` manual unpack in chit_opaque/chit_glass
+  is volatility in shader source — replace with mapped record sources
+  (SHADER_RECORD_DATA / HEAP_WITH_SHADER_RECORD_INDEX) via `write_record`.
+- Post-flip: texture/sampler heap writes move off the per-frame mirror onto
+  the diff-driven upload path (write descriptors at register/evict, material
+  records carry heap indices; steady-state frames write zero descriptors).
 - Materials: `[[vk::shader_record]]` manual unpack in chit_opaque/chit_glass
   is volatility in shader source — replace with mapped record sources
   (SHADER_RECORD_DATA / HEAP_WITH_SHADER_RECORD_INDEX) via `write_record`.

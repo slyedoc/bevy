@@ -28,10 +28,13 @@ use std::sync::{Arc, Mutex};
 
 /// Descriptor capacity of each per-type heap region. Fixed for now; growing a
 /// region means a new heap + rewriting live descriptors, which the diff-driven
-/// column pipeline can do once a consumer actually overflows these.
+/// column pipeline can do once a consumer actually overflows these. The image
+/// and sampler regions are sized for the scene's bindless arrays (a contiguous
+/// [`BindingSeam::alloc_heap_block`] each, `MAX_TEXTURE_COUNT` entries) plus
+/// singles and slack; each is clamped against the device's max heap size.
 const BUFFER_SLOTS: u64 = 4096;
-const IMAGE_SLOTS: u64 = 2048;
-const SAMPLER_SLOTS: u64 = 256;
+const IMAGE_SLOTS: u64 = 8192;
+const SAMPLER_SLOTS: u64 = 5120;
 
 /// SBT records: one per material slot, hit-group handle followed by the
 /// material's pointers / heap indices / constants.
@@ -122,14 +125,23 @@ impl FreeList {
         if let Some(idx) = self.free.pop() {
             return idx;
         }
+        self.alloc_block(kind, 1)
+    }
+
+    /// Bump-allocate `count` CONTIGUOUS slots. A multi-slot block backs a
+    /// bindless array and is app-lifetime (there is no block free); a
+    /// single-slot block is an ordinary slot and may go back through
+    /// [`free`](FreeList::free).
+    fn alloc_block(&mut self, kind: HeapKind, count: u32) -> u32 {
         assert!(
-            self.next < self.capacity,
-            "binding_seam: {kind:?} heap region full ({} slots)",
+            self.next + count <= self.capacity,
+            "binding_seam: {kind:?} heap region full ({} of {} slots used, {count} requested)",
+            self.next,
             self.capacity
         );
-        let idx = self.next;
-        self.next += 1;
-        idx
+        let base = self.next;
+        self.next += count;
+        base
     }
 }
 
@@ -184,13 +196,43 @@ impl BindingSeam {
 
         let heap_fns = ash::ext::descriptor_heap::Device::load(instance, device);
 
+        // Region capacities, clamped so each heap (descriptors + reserved
+        // range) fits the device's max heap size. A clamp below what the
+        // scene's bindless arrays need surfaces as a region-full panic with
+        // the numbers logged here.
+        let image_slots = IMAGE_SLOTS.min(
+            heap_props
+                .max_resource_heap_size
+                .saturating_sub(
+                    heap_props.min_resource_heap_reserved_range
+                        + BUFFER_SLOTS * heap_props.buffer_descriptor_size,
+                )
+                / heap_props.image_descriptor_size,
+        );
+        let sampler_slots = SAMPLER_SLOTS.min(
+            heap_props
+                .max_sampler_heap_size
+                .saturating_sub(heap_props.min_sampler_heap_reserved_range)
+                / heap_props.sampler_descriptor_size,
+        );
+        bevy_log::info!(
+            "binding_seam: descriptor sizes buffer/image/sampler = {}/{}/{} B, \
+             max heap sizes resource/sampler = {}/{} B, regions = {BUFFER_SLOTS} buffers \
+             + {image_slots} images + {sampler_slots} samplers",
+            heap_props.buffer_descriptor_size,
+            heap_props.image_descriptor_size,
+            heap_props.sampler_descriptor_size,
+            heap_props.max_resource_heap_size,
+            heap_props.max_sampler_heap_size,
+        );
+
         // Resource heap: [buffer region][image region][reserved range].
         let image_region_offset = align_up(
             BUFFER_SLOTS * heap_props.buffer_descriptor_size,
             heap_props.image_descriptor_alignment.max(1),
         );
         let resource_descriptors_end =
-            image_region_offset + IMAGE_SLOTS * heap_props.image_descriptor_size;
+            image_region_offset + image_slots * heap_props.image_descriptor_size;
         let resource_heap = RawHeap::new(
             allocator,
             vk::BufferUsageFlags::DESCRIPTOR_HEAP_EXT,
@@ -202,7 +244,7 @@ impl BindingSeam {
         let sampler_heap = RawHeap::new(
             allocator,
             vk::BufferUsageFlags::DESCRIPTOR_HEAP_EXT,
-            SAMPLER_SLOTS * heap_props.sampler_descriptor_size,
+            sampler_slots * heap_props.sampler_descriptor_size,
             heap_props.sampler_heap_alignment.max(1),
             heap_props.min_sampler_heap_reserved_range,
         );
@@ -242,11 +284,11 @@ impl BindingSeam {
                         ..Default::default()
                     },
                     image: FreeList {
-                        capacity: IMAGE_SLOTS as u32,
+                        capacity: image_slots as u32,
                         ..Default::default()
                     },
                     sampler: FreeList {
-                        capacity: SAMPLER_SLOTS as u32,
+                        capacity: sampler_slots as u32,
                         ..Default::default()
                     },
                 }),
@@ -270,6 +312,35 @@ impl BindingSeam {
         };
         self.write_descriptor(&resource, index);
         index
+    }
+
+    /// Total slot capacity of `kind`'s region — the [`SAMPLER_SLOTS`]-style
+    /// constants clamped to the device's max heap size (NVIDIA caps the
+    /// sampler heap at 128 KB ⇒ 4096 slots, well under the buffer/image
+    /// regions). Block sizing for bindless arrays consults this.
+    pub fn region_capacity(&self, kind: HeapKind) -> u32 {
+        let free = self.inner.free.lock().unwrap();
+        match kind {
+            HeapKind::Buffer => free.buffer.capacity,
+            HeapKind::Image => free.image.capacity,
+            HeapKind::Sampler => free.sampler.capacity,
+        }
+    }
+
+    /// Reserve `count` CONTIGUOUS slots in `kind`'s region and return the base
+    /// index, without writing any descriptors — a bindless array's backing
+    /// (`binding_array<..., N>` maps to `N` consecutive heap descriptors).
+    /// Elements are written via [`rewrite_heap_index`](Self::rewrite_heap_index)
+    /// at `base + i`. A multi-slot block is app-lifetime (no block free); a
+    /// single-slot block is an ordinary slot —
+    /// [`free_heap_index`](Self::free_heap_index) works on it.
+    pub fn alloc_heap_block(&self, kind: HeapKind, count: u32) -> u32 {
+        let mut free = self.inner.free.lock().unwrap();
+        match kind {
+            HeapKind::Buffer => free.buffer.alloc_block(kind, count),
+            HeapKind::Image => free.image.alloc_block(kind, count),
+            HeapKind::Sampler => free.sampler.alloc_block(kind, count),
+        }
     }
 
     /// Rewrite the descriptor at an existing slot (resource replaced in
@@ -354,10 +425,48 @@ impl BindingSeam {
         self.inner.record_stride - self.inner.handle_size
     }
 
+    /// The SPIR-V resource types a mapping for `kind` covers (broad on
+    /// purpose: one builder serves storage + uniform buffers, sampled +
+    /// storage images).
+    fn resource_mask(kind: HeapKind) -> vk::SpirvResourceTypeFlagsEXT {
+        match kind {
+            HeapKind::Buffer => {
+                vk::SpirvResourceTypeFlagsEXT::READ_ONLY_STORAGE_BUFFER
+                    | vk::SpirvResourceTypeFlagsEXT::READ_WRITE_STORAGE_BUFFER
+                    | vk::SpirvResourceTypeFlagsEXT::UNIFORM_BUFFER
+            }
+            HeapKind::Image => {
+                vk::SpirvResourceTypeFlagsEXT::SAMPLED_IMAGE
+                    | vk::SpirvResourceTypeFlagsEXT::READ_ONLY_IMAGE
+                    | vk::SpirvResourceTypeFlagsEXT::READ_WRITE_IMAGE
+            }
+            HeapKind::Sampler => vk::SpirvResourceTypeFlagsEXT::SAMPLER,
+        }
+    }
+
+    fn map_entry(
+        set: u32,
+        binding: u32,
+        mask: vk::SpirvResourceTypeFlagsEXT,
+        source: vk::DescriptorMappingSourceEXT,
+        source_data: vk::DescriptorMappingSourceDataEXT<'static>,
+    ) -> vk::DescriptorSetAndBindingMappingEXT<'static> {
+        vk::DescriptorSetAndBindingMappingEXT::default()
+            .descriptor_set(set)
+            .first_binding(binding)
+            .binding_count(1)
+            .resource_mask(mask)
+            .source(source)
+            .source_data(source_data)
+    }
+
     /// Mapping for one classic `[[vk::binding(binding, set)]]` declaration:
     /// descriptor sourced from the heap at the given region-local index
     /// (`HEAP_WITH_CONSTANT_OFFSET` — the offset is BYTES, computed here).
-    /// Chain the returned mappings onto the stage create info via
+    /// The array stride is always set, so an arrayed binding (`binding_array`)
+    /// reads consecutive descriptors from `index` — pass a
+    /// [`alloc_heap_block`](Self::alloc_heap_block) base for those.
+    /// Chain the returned mappings onto each stage create info via
     /// `ShaderDescriptorSetAndBindingMappingInfoEXT`; the pipeline itself
     /// needs `PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT` and no layout.
     pub fn map_binding(
@@ -367,34 +476,113 @@ impl BindingSeam {
         kind: HeapKind,
         index: u32,
     ) -> vk::DescriptorSetAndBindingMappingEXT<'static> {
-        let (byte_offset, mask) = match kind {
-            HeapKind::Buffer => (
-                index as u64 * self.inner.buffer_desc_size,
-                vk::SpirvResourceTypeFlagsEXT::READ_ONLY_STORAGE_BUFFER
-                    | vk::SpirvResourceTypeFlagsEXT::READ_WRITE_STORAGE_BUFFER
-                    | vk::SpirvResourceTypeFlagsEXT::UNIFORM_BUFFER,
-            ),
-            HeapKind::Image => (
-                self.inner.image_region_offset + index as u64 * self.inner.image_desc_size,
-                vk::SpirvResourceTypeFlagsEXT::SAMPLED_IMAGE
-                    | vk::SpirvResourceTypeFlagsEXT::READ_ONLY_IMAGE
-                    | vk::SpirvResourceTypeFlagsEXT::READ_WRITE_IMAGE,
-            ),
-            HeapKind::Sampler => (
-                index as u64 * self.inner.sampler_desc_size,
-                vk::SpirvResourceTypeFlagsEXT::SAMPLER,
-            ),
+        let inner = &self.inner;
+        // Samplers live in the separately-bound sampler heap; their mapping
+        // fields are the `sampler_*` half of the source union.
+        let source_data = match kind {
+            HeapKind::Buffer => vk::DescriptorMappingSourceDataEXT {
+                constant_offset: vk::DescriptorMappingSourceConstantOffsetEXT {
+                    heap_offset: (index as u64 * inner.buffer_desc_size) as u32,
+                    heap_array_stride: inner.buffer_desc_size as u32,
+                    ..Default::default()
+                },
+            },
+            HeapKind::Image => vk::DescriptorMappingSourceDataEXT {
+                constant_offset: vk::DescriptorMappingSourceConstantOffsetEXT {
+                    heap_offset: (inner.image_region_offset
+                        + index as u64 * inner.image_desc_size)
+                        as u32,
+                    heap_array_stride: inner.image_desc_size as u32,
+                    ..Default::default()
+                },
+            },
+            HeapKind::Sampler => vk::DescriptorMappingSourceDataEXT {
+                constant_offset: vk::DescriptorMappingSourceConstantOffsetEXT {
+                    sampler_heap_offset: (index as u64 * inner.sampler_desc_size) as u32,
+                    sampler_heap_array_stride: inner.sampler_desc_size as u32,
+                    ..Default::default()
+                },
+            },
         };
-        vk::DescriptorSetAndBindingMappingEXT::default()
-            .descriptor_set(set)
-            .first_binding(binding)
-            .binding_count(1)
-            .resource_mask(mask)
-            .source(vk::DescriptorMappingSourceEXT::HEAP_WITH_CONSTANT_OFFSET)
-            .source_data(vk::DescriptorMappingSourceDataEXT {
-                constant_offset: vk::DescriptorMappingSourceConstantOffsetEXT::default()
-                    .heap_offset(byte_offset as u32),
-            })
+        Self::map_entry(
+            set,
+            binding,
+            Self::resource_mask(kind),
+            vk::DescriptorMappingSourceEXT::HEAP_WITH_CONSTANT_OFFSET,
+            source_data,
+        )
+    }
+
+    /// Mapping whose heap INDEX is read from push data at `push_offset`
+    /// (`HEAP_WITH_PUSH_INDEX`): the descriptor lives at
+    /// `region base + pushed_index × descriptor size`. Per-view resources use
+    /// this so one linked pipeline serves every view — the trace pushes the
+    /// view's region-local slot indices.
+    pub fn map_binding_push_index(
+        &self,
+        set: u32,
+        binding: u32,
+        kind: HeapKind,
+        push_offset: u32,
+    ) -> vk::DescriptorSetAndBindingMappingEXT<'static> {
+        let inner = &self.inner;
+        let source_data = match kind {
+            HeapKind::Buffer => vk::DescriptorMappingSourceDataEXT {
+                push_index: vk::DescriptorMappingSourcePushIndexEXT {
+                    heap_offset: 0,
+                    push_offset,
+                    heap_index_stride: inner.buffer_desc_size as u32,
+                    heap_array_stride: inner.buffer_desc_size as u32,
+                    ..Default::default()
+                },
+            },
+            HeapKind::Image => vk::DescriptorMappingSourceDataEXT {
+                push_index: vk::DescriptorMappingSourcePushIndexEXT {
+                    heap_offset: inner.image_region_offset as u32,
+                    push_offset,
+                    heap_index_stride: inner.image_desc_size as u32,
+                    heap_array_stride: inner.image_desc_size as u32,
+                    ..Default::default()
+                },
+            },
+            HeapKind::Sampler => vk::DescriptorMappingSourceDataEXT {
+                push_index: vk::DescriptorMappingSourcePushIndexEXT {
+                    sampler_heap_offset: 0,
+                    sampler_push_offset: push_offset,
+                    sampler_heap_index_stride: inner.sampler_desc_size as u32,
+                    sampler_heap_array_stride: inner.sampler_desc_size as u32,
+                    ..Default::default()
+                },
+            },
+        };
+        Self::map_entry(
+            set,
+            binding,
+            Self::resource_mask(kind),
+            vk::DescriptorMappingSourceEXT::HEAP_WITH_PUSH_INDEX,
+            source_data,
+        )
+    }
+
+    /// Acceleration-structure mapping sourced from a DEVICE ADDRESS in push
+    /// data at `push_offset` (`PUSH_ADDRESS`). The TLAS must come this way:
+    /// shader-side heap AS access device-losts on current NVIDIA drivers,
+    /// while address sourcing is solid.
+    pub fn map_binding_push_address(
+        &self,
+        set: u32,
+        binding: u32,
+        push_offset: u32,
+    ) -> vk::DescriptorSetAndBindingMappingEXT<'static> {
+        Self::map_entry(
+            set,
+            binding,
+            vk::SpirvResourceTypeFlagsEXT::ACCELERATION_STRUCTURE,
+            vk::DescriptorMappingSourceEXT::PUSH_ADDRESS,
+            vk::DescriptorMappingSourceDataEXT {
+                push_address_offset: push_offset,
+            },
+        )
     }
 
     /// Bind both heaps on a raw command buffer. Once per command buffer,

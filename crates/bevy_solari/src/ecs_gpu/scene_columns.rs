@@ -54,6 +54,11 @@ pub struct SceneColumns {
     /// was built from. Unchanged ⇒ keep the cached group; changed (a column grew /
     /// first appeared) ⇒ rebuild.
     signature: Vec<(u32, BufferId, u64)>,
+    /// M2 staging: the columns mirrored as `(binding, heap buffer-region slot)`
+    /// pairs, rewritten on the same signature cadence as the bind group (the
+    /// column buffers are stable-address, so an unchanged signature means
+    /// unchanged descriptors). Unread until the heap-pipeline flip.
+    pub heap_slots: Option<Vec<(u32, u32)>>,
 }
 
 impl SceneColumns {
@@ -188,9 +193,48 @@ pub fn prepare_scene_columns_bind_group(world: &mut World) {
         })
         .collect();
     let bind_group = device.create_bind_group("solari_scene_columns", &layout, &entries);
+
+    // M2 staging: mirror the columns into the descriptor heap on the same
+    // signature cadence as the bind group. Rewritten in place so the flip's
+    // mapping table stays valid across column growth; slots are re-allocated
+    // only if the registered column count itself changes.
+    let heap_slots = world
+        .get_resource::<crate::gpu::binding_seam::BindingSeam>()
+        .cloned()
+        .map(|seam| {
+            use crate::gpu::binding_seam::{HeapKind, HeapResource};
+            let old = world.resource_mut::<SceneColumns>().heap_slots.take();
+            let slots: Vec<(u32, u32)> = match old {
+                Some(slots) if slots.len() == buffers.len() => slots,
+                stale => {
+                    for (_, slot) in stale.into_iter().flatten() {
+                        seam.free_heap_index(HeapKind::Buffer, slot);
+                    }
+                    buffers
+                        .iter()
+                        .map(|(binding, _, _)| (*binding, seam.alloc_heap_block(HeapKind::Buffer, 1)))
+                        .collect()
+                }
+            };
+            for ((binding, buffer, bytes), &(slot_binding, slot)) in buffers.iter().zip(&slots) {
+                debug_assert_eq!(*binding, slot_binding);
+                seam.rewrite_heap_index(
+                    HeapKind::Buffer,
+                    slot,
+                    // The committed range, matching the bind group entry above.
+                    HeapResource::Buffer {
+                        address: seam.device_address(buffer).get(),
+                        size: *bytes,
+                    },
+                );
+            }
+            slots
+        });
+
     let mut scene = world.resource_mut::<SceneColumns>();
     scene.bind_group = Some(bind_group);
     scene.signature = signature;
+    scene.heap_slots = heap_slots.or(scene.heap_slots.take());
 }
 
 /// Inits [`SceneColumns`] and schedules its per-frame bind-group build. Added once

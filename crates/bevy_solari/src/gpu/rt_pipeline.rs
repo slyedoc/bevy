@@ -1,13 +1,23 @@
 // Raw Vulkan ray-tracing PIPELINE (raygen / closest-hit / miss / any-hit +
 // shader binding table + cmd_trace_rays), the multi-material SBT shading path.
-// Self-contained: builds its own descriptor set layout, pool, sets, pipeline
-// layout, pipeline, and SBT in raw `ash` — no wgpu-hal accessor additions. The
-// RT-stage shaders are all Slang: precompiled SPIR-V blobs, except the primary
-// miss (and any downstream `SolariChitSource::Slang` closest-hit), compiled at
-// build via `gpu/slang.rs`, then handed to `vkCreateRayTracingPipelinesKHR`.
 //
-// Mirrors `gpu/allocator.rs`'s raw-VK style; gated on the
-// `RayTracingPipelineFeature` device feature.
+// LAYOUT-FREE: the pipeline is created with
+// `PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT` — no descriptor set layouts, no
+// pipeline layout, no pools/sets. Shaders keep their classic `[[vk::binding]]`
+// declarations; every (set, binding) is sourced host-side from the
+// [`BindingSeam`](crate::gpu::binding_seam::BindingSeam)'s descriptor heap via
+// per-stage mapping tables ([`build_heap_mappings`]): scene set 0 and columns
+// set 2 at constant heap offsets (their slots are app-lifetime), the per-view
+// set 1 through push-data slot indices (one linked pipeline serves every
+// view), and the TLAS from a device address in push data (shader-side heap AS
+// access device-losts on current NVIDIA drivers). The trace binds the heaps +
+// pushes 76 bytes; `VK_EXT_descriptor_heap` (NVIDIA R610+) is required.
+//
+// The RT-stage shaders are all Slang: precompiled SPIR-V blobs, except the
+// primary miss (and any downstream `SolariChitSource::Slang` closest-hit),
+// compiled at build via `gpu/slang.rs`, then handed to
+// `vkCreateRayTracingPipelinesKHR`. Mirrors `gpu/allocator.rs`'s raw-VK style;
+// gated on the `RayTracingPipelineFeature` device feature.
 #![allow(unsafe_code)]
 
 use ash::khr;
@@ -60,6 +70,69 @@ const BINDING_NRC_WEIGHTS: u32 = 13;
 const BINDING_NRC_BIAS: u32 = 14;
 const BINDING_NRC_RECORDS: u32 = 15;
 const BINDING_NRC_QUERIES: u32 = 16;
+
+// Push-data layout (`vkCmdPushDataEXT`, one blob per trace). The shaders have
+// no `[[vk::push_constant]]` block — push data exists purely as a mapping
+// source: the TLAS device address, then one u32 heap-slot index per set-1
+// binding (the per-view resources; see `build_heap_mappings` and the
+// `HEAP_WITH_PUSH_INDEX` entries it emits, whose `push_offset`s index here).
+const PUSH_TLAS_ADDRESS_OFFSET: usize = 0;
+const PUSH_VIEW_SLOTS_OFFSET: usize = 8;
+const PUSH_DATA_SIZE: usize = PUSH_VIEW_SLOTS_OFFSET + (BINDING_NRC_QUERIES as usize + 1) * 4;
+
+/// Build the mapping table chained onto every RT stage: how each classic
+/// `[[vk::binding(b, set)]]` the shaders declare is sourced under the
+/// layout-free heap pipeline.
+///
+/// - Scene set 0 + columns set 2: constant heap offsets from the staging
+///   mirrors' slots ([`SceneHeapSlots`], [`SceneColumns::heap_slots`]) — both
+///   are allocated once and rewritten in place, so the baked offsets never go
+///   stale. The scene's non-buffer binding numbers (2/3/4/6/7/13/14) mirror
+///   `raytracing_scene_bindings.wgsl` / the binder's layout.
+/// - The TLAS (0,4): a device address in push data (`PUSH_ADDRESS`) — the
+///   PTLAS double-buffers, and shader-side heap AS access device-losts.
+/// - Set 1: heap indices read from push data (`HEAP_WITH_PUSH_INDEX`), so one
+///   linked pipeline serves every view and survives view rebuilds
+///   (resize/skybox swap) without relinking.
+///
+/// [`SceneHeapSlots`]: crate::bindings::SceneHeapSlots
+/// [`SceneColumns::heap_slots`]: crate::ecs_gpu::SceneColumns
+pub fn build_heap_mappings(
+    seam: &crate::gpu::binding_seam::BindingSeam,
+    scene: &crate::bindings::SceneHeapSlots,
+    columns: &[(u32, u32)],
+) -> Vec<vk::DescriptorSetAndBindingMappingEXT<'static>> {
+    use crate::gpu::binding_seam::HeapKind;
+    let mut mappings =
+        Vec::with_capacity(scene.buffers.len() + 7 + (BINDING_NRC_QUERIES as usize + 1) + columns.len());
+    for &(binding, slot) in &scene.buffers {
+        mappings.push(seam.map_binding(0, binding, HeapKind::Buffer, slot));
+    }
+    mappings.push(seam.map_binding(0, 2, HeapKind::Image, scene.texture_block));
+    mappings.push(seam.map_binding(0, 3, HeapKind::Sampler, scene.sampler_block));
+    mappings.push(seam.map_binding_push_address(0, 4, PUSH_TLAS_ADDRESS_OFFSET as u32));
+    mappings.push(seam.map_binding(0, 6, HeapKind::Image, scene.dfg_lut));
+    mappings.push(seam.map_binding(0, 7, HeapKind::Sampler, scene.dfg_sampler));
+    mappings.push(seam.map_binding(0, 13, HeapKind::Image, scene.texture_array_block));
+    mappings.push(seam.map_binding(0, 14, HeapKind::Sampler, scene.array_sampler));
+    for binding in 0..=BINDING_NRC_QUERIES {
+        let kind = match binding {
+            BINDING_ENV_MAP => HeapKind::Image,
+            BINDING_ENV_SAMPLER => HeapKind::Sampler,
+            _ => HeapKind::Buffer,
+        };
+        mappings.push(seam.map_binding_push_index(
+            1,
+            binding,
+            kind,
+            (PUSH_VIEW_SLOTS_OFFSET + binding as usize * 4) as u32,
+        ));
+    }
+    for &(binding, slot) in columns {
+        mappings.push(seam.map_binding(2, binding, HeapKind::Buffer, slot));
+    }
+    mappings
+}
 
 /// Per-frame camera inputs the raygen shader reads — std140-compatible
 /// (mat4 + vec4). `inverse_view_proj` reconstructs a world-space ray per pixel;
@@ -262,20 +335,19 @@ struct RtLibrary {
 /// rebuilds so each rebuild recompiles only what changed and RELINKS the
 /// rest: a custom-sky swap recompiles the primary-miss library alone; a new
 /// registry hit group compiles just its own library; SBT growth or material
-/// class churn relinks with zero shader compiles. Also owns the shared
-/// set-1 descriptor layout + pipeline layout every library and every linked
-/// pipeline is built against — the cache is recreated wholesale when either
-/// wgpu-owned raw set layout changes (the dispatch compares
-/// [`Self::layout_key`]).
+/// class churn relinks with zero shader compiles. Also owns the descriptor
+/// mapping table chained onto every stage — its constant-offset entries bake
+/// the scene/columns heap slots, which are allocated once and rewritten in
+/// place, so the table never goes stale and the cache is never invalidated.
 #[derive(Resource)]
 pub struct RtLibraryCache {
     device: ash::Device,
     rt: khr::ray_tracing_pipeline::Device,
-    /// The wgpu-owned scene (set 0) + columns (set 2) raw layouts the shared
-    /// pipeline layout bakes in; a handle change invalidates the whole cache.
-    layout_key: (vk::DescriptorSetLayout, vk::DescriptorSetLayout),
-    pipeline_layout: vk::PipelineLayout,
-    descriptor_set_layout: vk::DescriptorSetLayout,
+    /// The per-stage descriptor mapping table (see [`build_heap_mappings`]),
+    /// chained onto every library stage's create info — kept because library
+    /// compiles are lazy (a sky swap or new hit group compiles long after the
+    /// cache was created). The driver copies the mappings at create time.
+    heap_mappings: Vec<vk::DescriptorSetAndBindingMappingEXT<'static>>,
     raygen: Option<RtLibrary>,
     /// Composed with the `custom_sky` module; the key is the module source's
     /// generation, so a sky swap rebuilds exactly this library.
@@ -295,168 +367,84 @@ unsafe impl Send for RtLibraryCache {}
 unsafe impl Sync for RtLibraryCache {}
 
 impl RtLibraryCache {
-    /// Build the shared set-1 descriptor layout + pipeline layout. Libraries
-    /// compile lazily via the `ensure_*` methods on first pipeline build.
+    /// Store the mapping table; libraries compile lazily via the `ensure_*`
+    /// methods on first pipeline build, each stage chained with the table.
     pub fn new(
         allocator: &Allocator,
-        scene_layout: vk::DescriptorSetLayout,
-        columns_layout: vk::DescriptorSetLayout,
-    ) -> Option<Self> {
+        heap_mappings: Vec<vk::DescriptorSetAndBindingMappingEXT<'static>>,
+    ) -> Self {
         let device = allocator.device().clone();
         // SAFETY: instance + device are live; loading the RT-pipeline function
         // table is valid because the extension was enabled at device creation.
         let rt = khr::ray_tracing_pipeline::Device::load(allocator.instance(), &device);
-
-        // --- Descriptor set layout (set 1: output + camera) --------------------
-        // TLAS is NOT here — it comes from the scene bind group (set 0). raygen
-        // writes the output buffer; raygen reads the camera.
-        let mut bindings = vec![
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(BINDING_OUTPUT)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(BINDING_CAMERA)
-                // The camera is a GPU buffer filled by the `rt_camera` compute pass (or a
-                // CPU fallback `write_buffer`) each frame; `*_DYNAMIC` bound at a constant
-                // offset of 0 (see `trace`).
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                .descriptor_count(1)
-                // raygen unprojects; miss reads sky brightness/clear color; the
-                // closest-hit reads the view matrices for the DLSS depth/motion guide.
-                .stage_flags(
-                    vk::ShaderStageFlags::RAYGEN_KHR
-                        | vk::ShaderStageFlags::MISS_KHR
-                        | vk::ShaderStageFlags::CLOSEST_HIT_KHR,
-                ),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(BINDING_ENV_MAP)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::MISS_KHR),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(BINDING_ENV_SAMPLER)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::MISS_KHR),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(BINDING_GEOMETRY)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1)
-                // The closest-hit's geometry resolve AND the alpha-cutout any-hit both
-                // read the bindless geometry addresses (packed-vertex UV + materials).
-                .stage_flags(
-                    vk::ShaderStageFlags::CLOSEST_HIT_KHR | vk::ShaderStageFlags::ANY_HIT_KHR,
-                ),
-        ];
-        // DLSS guide G-buffers: raygen clears the primary pixel (sky/miss default);
-        // the closest-hit overwrites it on a primary hit. Layout slots must match the
-        // WGSL `#ifdef SOLARI_DLSS` bindings 5/6/7 exactly.
-        for binding in [
-            BINDING_GBUFFER_NORMAL,
-            BINDING_GBUFFER_DIFFUSE,
-            BINDING_GBUFFER_SPECULAR,
-            BINDING_GBUFFER_MOTION,
-        ] {
-            bindings.push(
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1)
-                    .stage_flags(
-                        vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::CLOSEST_HIT_KHR,
-                    ),
-            );
-        }
-        // ReSTIR reservoirs: raygen clears the current slot, the chit merges + stores.
-        // Surface G-buffer: the chit writes it for the spatial merge+shade pass.
-        for binding in [BINDING_RESERVOIRS, BINDING_SURFACE, BINDING_LIGHT_SAMPLES, BINDING_GI_SAMPLES, BINDING_NRC_WEIGHTS, BINDING_NRC_BIAS, BINDING_NRC_RECORDS, BINDING_NRC_QUERIES] {
-            bindings.push(
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1)
-                    .stage_flags(
-                        vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::CLOSEST_HIT_KHR,
-                    ),
-            );
-        }
-        let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-        // SAFETY: well-formed create info; device live.
-        let descriptor_set_layout =
-            unsafe { device.create_descriptor_set_layout(&dsl_info, None) }.ok()?;
-
-        // Pipeline layout: [scene (set 0), rt-private (set 1), columns (set 2)].
-        let set_layouts = [scene_layout, descriptor_set_layout, columns_layout];
-        let layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
-        // SAFETY: well-formed; device live; the scene/columns layouts outlive this
-        // cache (owned by wgpu's bind-group-layout cache; the dispatch recreates
-        // the cache when they change).
-        let pipeline_layout = match unsafe { device.create_pipeline_layout(&layout_info, None) } {
-            Ok(l) => l,
-            Err(e) => {
-                bevy_log::error!("rt_pipeline: create_pipeline_layout failed: {e:?}");
-                // SAFETY: just created above; nothing references it yet.
-                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
-                return None;
-            }
-        };
-
-        Some(Self {
+        Self {
             device,
             rt,
-            layout_key: (scene_layout, columns_layout),
-            pipeline_layout,
-            descriptor_set_layout,
+            heap_mappings,
             raygen: None,
             miss: None,
             miss_shadow: None,
             hit_groups: Vec::new(),
             _device_keepalive: allocator.clone(),
-        })
+        }
     }
 
-    /// The wgpu raw layouts this cache's pipeline layout was built against;
-    /// the dispatch recreates the cache when they no longer match.
-    pub fn layout_key(&self) -> (vk::DescriptorSetLayout, vk::DescriptorSetLayout) {
-        self.layout_key
-    }
-
-    /// Compile one library: `stages` + `groups` against the shared layout,
-    /// with the shared ray interface. Every library (and the link) opts into
-    /// cluster acceleration structures and opacity micromaps — these must
-    /// agree across the whole linked pipeline.
+    /// Compile one library: `stages` + `groups`, LAYOUT-FREE
+    /// (`DESCRIPTOR_HEAP_EXT`), each stage chained with the cache's mapping
+    /// table, with the shared ray interface. Every library (and the link)
+    /// opts into cluster acceleration structures and opacity micromaps —
+    /// these must agree across the whole linked pipeline.
     fn create_library(
         &self,
         stages: &[vk::PipelineShaderStageCreateInfo],
         groups: &[vk::RayTracingShaderGroupCreateInfoKHR],
         modules: Vec<vk::ShaderModule>,
     ) -> Option<RtLibrary> {
+        // One mapping-info struct shared read-only by every stage's pNext.
+        let mut mapping_info = vk::ShaderDescriptorSetAndBindingMappingInfoEXT::default();
+        mapping_info.mapping_count = self.heap_mappings.len() as u32;
+        mapping_info.p_mappings = self.heap_mappings.as_ptr();
+        let stages: Vec<vk::PipelineShaderStageCreateInfo> = stages
+            .iter()
+            .map(|s| {
+                let mut s = *s;
+                debug_assert!(s.p_next.is_null());
+                s.p_next = (&mapping_info
+                    as *const vk::ShaderDescriptorSetAndBindingMappingInfoEXT)
+                    .cast();
+                s
+            })
+            .collect();
         let cluster_info =
             vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV::default()
                 .allow_cluster_acceleration_structure(true);
+        // With a `PipelineCreateFlags2CreateInfo` chained, the legacy `flags`
+        // field is ignored — every flag (incl. the heap opt-in, which has no
+        // legacy bit) lives here.
+        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default().flags(
+            vk::PipelineCreateFlags2::LIBRARY_KHR
+                | vk::PipelineCreateFlags2::RAY_TRACING_OPACITY_MICROMAP_EXT
+                | vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT,
+        );
         let interface = vk::RayTracingPipelineInterfaceCreateInfoKHR::default()
             .max_pipeline_ray_payload_size(MAX_RAY_PAYLOAD_SIZE)
             .max_pipeline_ray_hit_attribute_size(MAX_HIT_ATTRIBUTE_SIZE);
         let mut info = vk::RayTracingPipelineCreateInfoKHR::default()
-            .flags(
-                vk::PipelineCreateFlags::LIBRARY_KHR
-                    | vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT,
-            )
-            .stages(stages)
+            .stages(&stages)
             .groups(groups)
             // Depth 2: raygen's hit object executes the closest-hit (1), which
             // traces a NEE shadow ray (2). Must agree with the link.
             .max_pipeline_ray_recursion_depth(2)
-            .library_interface(&interface)
-            .layout(self.pipeline_layout);
+            .library_interface(&interface);
         // ash doesn't register the cluster struct as an extender (no typed
-        // `push_next`); chain it via raw `p_next`. It outlives the call.
-        info.p_next =
+        // `push_next`); chain flags2 -> cluster via raw `p_next`. Both outlive
+        // the call.
+        flags2.p_next =
             (&cluster_info as *const vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV)
                 .cast();
-        // SAFETY: stages/groups reference live modules; layout live.
+        info.p_next = (&flags2 as *const vk::PipelineCreateFlags2CreateInfo).cast();
+        // SAFETY: stages/groups reference live modules; the mapping table
+        // outlives the call (owned by self).
         match unsafe {
             self.rt.create_ray_tracing_pipelines(
                 vk::DeferredOperationKHR::null(),
@@ -629,6 +617,10 @@ impl RtLibraryCache {
         let cluster_info =
             vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV::default()
                 .allow_cluster_acceleration_structure(true);
+        let mut flags2 = vk::PipelineCreateFlags2CreateInfo::default().flags(
+            vk::PipelineCreateFlags2::RAY_TRACING_OPACITY_MICROMAP_EXT
+                | vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT,
+        );
         let library_info = vk::PipelineLibraryCreateInfoKHR::default().libraries(&libs);
         let interface = vk::RayTracingPipelineInterfaceCreateInfoKHR::default()
             .max_pipeline_ray_payload_size(MAX_RAY_PAYLOAD_SIZE)
@@ -649,16 +641,15 @@ impl RtLibraryCache {
         let dynamic_info =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let mut info = vk::RayTracingPipelineCreateInfoKHR::default()
-            .flags(vk::PipelineCreateFlags::RAY_TRACING_OPACITY_MICROMAP_EXT)
             .max_pipeline_ray_recursion_depth(2)
             .library_info(&library_info)
             .library_interface(&interface)
-            .dynamic_state(&dynamic_info)
-            .layout(self.pipeline_layout);
-        info.p_next =
+            .dynamic_state(&dynamic_info);
+        flags2.p_next =
             (&cluster_info as *const vk::RayTracingPipelineClusterAccelerationStructureCreateInfoNV)
                 .cast();
-        // SAFETY: libraries + layout live (owned by this cache).
+        info.p_next = (&flags2 as *const vk::PipelineCreateFlags2CreateInfo).cast();
+        // SAFETY: libraries live (owned by this cache).
         match unsafe {
             self.rt.create_ray_tracing_pipelines(
                 vk::DeferredOperationKHR::null(),
@@ -696,15 +687,6 @@ impl Drop for RtLibraryCache {
                 }
             }
         }
-        // SAFETY: the set-1 layout outlives the per-view pools/sets allocated
-        // from it (destroying a layout with live sets is legal), and those
-        // sets drop with their RtViewBindings.
-        unsafe {
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-        }
     }
 }
 
@@ -720,23 +702,19 @@ struct MappedBuffer {
 }
 
 /// Render-world resource owning the **view-independent** ray-tracing pipeline +
-/// SBT + the set-1 descriptor *layout* and the shared env sampler. The per-view
-/// resources (set-1 descriptor set, camera UBO, output-buffer binding, env cube)
-/// live in [`RtViewBindings`], a component, so multiple views (split-screen) each
-/// trace into their own output with their own camera/env.
+/// SBT. The per-view resources (heap slots, camera UBO, output-buffer slot, env
+/// cube) live in [`RtViewBindings`], a component, so multiple views
+/// (split-screen) each trace into their own output with their own camera/env.
 ///
-/// Built lazily once the scene layouts and materials exist; `RayTracingPipelineFeature`
-/// is a hard requirement, so absence here only ever means "not built yet".
+/// Built lazily once the scene heap slots and materials exist;
+/// `RayTracingPipelineFeature` + the descriptor heap are hard requirements, so
+/// absence here only ever means "not built yet".
 #[derive(Resource)]
 pub struct RtPipeline {
     device: ash::Device,
     rt: khr::ray_tracing_pipeline::Device,
 
     pipeline: vk::Pipeline,
-    /// Handle COPIES of the shared layouts [`RtLibraryCache`] owns (the cache
-    /// outlives every linked pipeline; a wgpu layout change recreates both).
-    pipeline_layout: vk::PipelineLayout,
-    descriptor_set_layout: vk::DescriptorSetLayout,
 
     sbt: MappedBuffer,
     raygen_region: vk::StridedDeviceAddressRegionKHR,
@@ -782,44 +760,34 @@ pub struct RtPipeline {
 unsafe impl Send for RtPipeline {}
 unsafe impl Sync for RtPipeline {}
 
-/// Per-view ray-tracing resources: the set-1 descriptor set (output buffer @0,
-/// camera UBO @1, env cube @2, env sampler @3), the camera UBO it points at, and
-/// the env image to transition around the trace. One per [`SolariCamera`] view,
-/// so split-screen views don't share an output buffer or camera. Built from
-/// [`RtPipeline::create_view_bindings`]; rebuilt when the view's output buffer is
-/// reallocated (viewport resize).
+/// Per-view ray-tracing resources: the descriptor-heap slots for the set-1
+/// bindings (pushed as indices at trace time), the geometry-address UBO, and
+/// the env image to transition around the trace. One per [`SolariCamera`]
+/// view, so split-screen views don't share an output buffer or camera. Built
+/// from [`RtPipeline::create_view_bindings`]; rebuilt when the view's output
+/// buffer is reallocated (viewport resize) or the env view changes.
 #[derive(Component)]
 pub struct RtViewBindings {
     device: ash::Device,
-    descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
     /// Bindless geometry addresses (set 1, binding 4); refreshed per frame via the
     /// mapping (`set_geometry_addresses`). Not ringed: the addresses are stable
     /// (stable-address `RawTraceBindable` buffers), so an in-flight overwrite writes
     /// identical bytes — benign, unlike the per-frame-varying camera.
     geometry: MappedBuffer,
-    /// This view's own linear env-cube sampler (destroyed on drop). Owned here, not
-    /// on `RtPipeline`, so the per-view set survives a pipeline rebuild — the set
-    /// is compatible-by-content with the rebuilt set-1 layout and references
-    /// nothing the rebuilt pipeline owns.
-    env_map_sampler: vk::Sampler,
     /// `Some` ⇒ the env cube is the storage atmosphere cube (GENERAL); transition
     /// it around each trace. `None` ⇒ already a read-optimal wgpu-sampled texture.
     env_map_image: Option<vk::Image>,
-    /// The output `VkBuffer` baked into binding 0. The dispatch rebuilds this
-    /// component if the view's output buffer changes (resize) — the descriptor is
-    /// written once and never updated (updating an in-flight set device-losts).
+    /// The output `VkBuffer` behind the output heap slot. The dispatch rebuilds
+    /// this component if the view's output buffer changes (resize).
     output_buffer: vk::Buffer,
-    /// The env cube view baked into binding 2, for the same rebuild check: a
-    /// skybox that finishes loading (or is swapped) changes the view, and the
-    /// baked-once set would otherwise sample the stale cube forever.
+    /// The env cube view behind the env heap slot, for the same rebuild check:
+    /// a skybox that finishes loading (or is swapped) changes the view, and the
+    /// slots would otherwise sample the stale cube forever.
     env_map_view: vk::ImageView,
-    /// Parallel descriptor-heap slots for this view's set-1 resources —
-    /// M2 staging: allocated alongside the classic descriptor set when the
-    /// [`BindingSeam`](crate::gpu::binding_seam::BindingSeam) exists, unread
-    /// until the heap-flagged pipeline flip consumes them as mapping targets.
-    #[expect(dead_code, reason = "M2 staging: read at the heap-pipeline flip")]
-    heap: Option<RtViewHeapSlots>,
+    /// This view's set-1 resources as heap slots; the trace pushes the indices
+    /// (see `PUSH_VIEW_SLOTS_OFFSET`) for the pipeline's `HEAP_WITH_PUSH_INDEX`
+    /// mappings.
+    heap: RtViewHeapSlots,
     /// Keeps the `VkDevice` alive until this drops — see the twin field on
     /// [`RtPipeline`]; without it, teardown drop order decides whether [`Drop`]'s
     /// raw destroys run against a dead device.
@@ -827,15 +795,14 @@ pub struct RtViewBindings {
 }
 
 /// The set-1 resources as descriptor-heap slots (buffer-region indices, plus
-/// the env sampler in the sampler region). Slot order mirrors the set-1
-/// binding list: output, camera (uniform), geometry (uniform), the DLSS
-/// G-buffers, then reservoirs/surface/light_samples/gi_samples/nrc×4.
-/// The env-cube IMAGE slot arrives with the scene-set conversion (heap image
-/// descriptors are written from `ImageViewCreateInfo`, which needs the raw
-/// image + params plumbed from the caller).
+/// the env cube in the image region and its sampler in the sampler region).
+/// Slot order mirrors the set-1 binding list: output, camera (uniform),
+/// geometry (uniform), the DLSS G-buffers, then
+/// reservoirs/surface/light_samples/gi_samples/nrc×4.
 pub struct RtViewHeapSlots {
     seam: crate::gpu::binding_seam::BindingSeam,
     buffers: Vec<u32>,
+    env_map: u32,
     env_sampler: u32,
 }
 
@@ -847,6 +814,7 @@ impl Drop for RtViewHeapSlots {
         for &slot in &self.buffers {
             self.seam.free_heap_index(HeapKind::Buffer, slot);
         }
+        self.seam.free_heap_index(HeapKind::Image, self.env_map);
         self.seam.free_heap_index(HeapKind::Sampler, self.env_sampler);
     }
 }
@@ -1073,8 +1041,6 @@ impl RtPipeline {
             device,
             rt,
             pipeline,
-            pipeline_layout: libraries.pipeline_layout,
-            descriptor_set_layout: libraries.descriptor_set_layout,
             sbt,
             raygen_region,
             miss_region,
@@ -1131,33 +1097,33 @@ impl RtPipeline {
         self.material_classes[..] != current[..n] || current[n..].iter().any(|&c| c != 0)
     }
 
-    /// Build the per-view set-1 resources (descriptor set) for one view: a fresh pool,
-    /// a set allocated from the shared set-1 layout, and the descriptor written ONCE
-    /// (output buffer @0, camera @1, env cube @2, shared sampler @3). The set is never
-    /// updated again — updating one while a prior frame's command buffer still binds it
-    /// is illegal and device-losts; the camera *contents* change per frame in the bound
-    /// GPU buffer (the `rt_camera` compute pass writes it), and both the output and
-    /// camera buffers are stable (the dispatch rebuilds this whole component if the
-    /// view's output buffer is reallocated). `env_map_image` is `Some` when the env cube
-    /// is the storage atmosphere cube (transitioned around the trace).
+    /// Build the per-view resources for one view: the geometry-address UBO and
+    /// the heap slots for every set-1 binding ([`RtViewHeapSlots`] — the trace
+    /// pushes the slot indices). Descriptors are written once; the camera
+    /// *contents* change per frame in the GPU buffer behind its slot (the
+    /// `rt_camera` compute pass writes it), and both the output and camera
+    /// buffers are stable (the dispatch rebuilds this whole component if the
+    /// view's output buffer is reallocated). `env_map_image` is `Some` when the
+    /// env cube is the storage atmosphere cube (transitioned around the trace).
     pub fn create_view_bindings(
         &self,
         allocator: &Allocator,
+        seam: &crate::gpu::binding_seam::BindingSeam,
         output_buffer: vk::Buffer,
         output_size: u64,
-        // The per-view `RtCamera` `VkBuffer` (wgpu-owned) baked into binding 1.
+        // The per-view `RtCamera` `VkBuffer` (wgpu-owned) behind the camera slot.
         camera_buffer: vk::Buffer,
-        // DLSS guide G-buffers `(VkBuffer, size)` bound at BINDING_GBUFFER_* (set 1).
-        // Empty unless the `dlss` feature is on; its length sizes the storage-buffer
-        // pool slot, so it must agree with the layout the pipeline was built with.
+        // DLSS guide G-buffers `(VkBuffer, size)` at BINDING_GBUFFER_* (set 1).
+        // Empty unless the `dlss` feature is on (the WGSL then has no gbuffer
+        // bindings either).
         gbuffers: &[(vk::Buffer, u64)],
-        // ReSTIR reservoir buffer `(VkBuffer, size)` bound at BINDING_RESERVOIRS.
+        // ReSTIR reservoir buffer `(VkBuffer, size)` at BINDING_RESERVOIRS.
         reservoirs: (vk::Buffer, u64),
-        // ReSTIR surface G-buffer `(VkBuffer, size)` bound at BINDING_SURFACE.
+        // ReSTIR surface G-buffer `(VkBuffer, size)` at BINDING_SURFACE.
         surface: (vk::Buffer, u64),
-        // ReSTIR winner light samples `(VkBuffer, size)` bound at BINDING_LIGHT_SAMPLES.
+        // ReSTIR winner light samples `(VkBuffer, size)` at BINDING_LIGHT_SAMPLES.
         light_samples: (vk::Buffer, u64),
-        // ReSTIR GI canonical samples `(VkBuffer, size)` bound at BINDING_GI_SAMPLES.
+        // ReSTIR GI canonical samples `(VkBuffer, size)` at BINDING_GI_SAMPLES.
         gi_samples: (vk::Buffer, u64),
         // NRC inference weights / biases / training records / screen (BINDING_NRC_*).
         nrc_weights: (vk::Buffer, u64),
@@ -1166,48 +1132,12 @@ impl RtPipeline {
         nrc_queries: (vk::Buffer, u64),
         env_map_view: vk::ImageView,
         env_map_image: Option<vk::Image>,
-        // When the binding seam exists, every set-1 resource also gets a
-        // descriptor-heap slot (M2 staging — see [`RtViewHeapSlots`]).
-        seam: Option<&crate::gpu::binding_seam::BindingSeam>,
+        // The env view's create info (the fork's hal `TextureView` records it) —
+        // heap image descriptors are written from create info, not the live
+        // view above.
+        env_view_info: &vk::ImageViewCreateInfo<'static>,
     ) -> Option<RtViewBindings> {
-        // One pool per view, sized for exactly this view's single set-1 set.
-        let pool_sizes = [
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(9 + gbuffers.len() as u32), // + 4×NRC (weights/bias/records/queries)
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                .descriptor_count(1), // camera (ringed)
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1), // geometry addresses
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1),
-        ];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .pool_sizes(&pool_sizes)
-            .max_sets(1);
-        // SAFETY: well-formed; device live.
-        let descriptor_pool =
-            unsafe { self.device.create_descriptor_pool(&pool_info, None) }.ok()?;
-        let own_set_layouts = [self.descriptor_set_layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(&own_set_layouts);
-        // SAFETY: pool + layout live.
-        let descriptor_set = match unsafe { self.device.allocate_descriptor_sets(&alloc_info) } {
-            Ok(sets) => sets.into_iter().next()?,
-            Err(e) => {
-                bevy_log::error!("rt_pipeline: allocate_descriptor_sets failed: {e:?}");
-                // SAFETY: pool just created, no sets in use.
-                unsafe { self.device.destroy_descriptor_pool(descriptor_pool, None) };
-                return None;
-            }
-        };
+        use crate::gpu::binding_seam::HeapResource;
 
         let geometry = alloc_mapped_buffer(
             allocator,
@@ -1215,9 +1145,9 @@ impl RtPipeline {
             vk::BufferUsageFlags::UNIFORM_BUFFER,
         )?;
 
-        // This view's own linear env-cube sampler (we own it rather than reaching
-        // into wgpu's Sampler, which has no raw accessor). Clamp-to-edge is fine
-        // for a cube.
+        // This view's env-cube sampler CONFIG — the heap sampler descriptor is
+        // written from create info; no `VkSampler` object exists. Clamp-to-edge
+        // linear is fine for a cube.
         let sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -1226,217 +1156,61 @@ impl RtPipeline {
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .max_lod(vk::LOD_CLAMP_NONE);
-        // SAFETY: well-formed; device live.
-        let env_map_sampler = unsafe { self.device.create_sampler(&sampler_info, None) }.ok()?;
 
-        let output_info = [vk::DescriptorBufferInfo::default()
-            .buffer(output_buffer)
-            .offset(0)
-            .range(output_size)];
-        // Dynamic uniform bound at a constant offset 0 (`trace` passes 0) — the
-        // GPU-written `RtCamera` buffer, filled by the `rt_camera` compute pass (or
-        // a CPU `write_buffer`) before the trace reads it.
-        let camera_info = [vk::DescriptorBufferInfo::default()
-            .buffer(camera_buffer)
-            .offset(0)
-            .range(size_of::<RtCamera>() as u64)];
-        // `trace()` transitions the atmosphere cube to SHADER_READ_ONLY_OPTIMAL
-        // around the dispatch (skybox/fallback are already in this layout), so the
-        // descriptor always sees read-optimal.
-        let env_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(env_map_view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let env_sampler_info =
-            [vk::DescriptorImageInfo::default().sampler(env_map_sampler)];
-        let geometry_info = [vk::DescriptorBufferInfo::default()
-            .buffer(geometry.buffer)
-            .offset(0)
-            .range(geometry.size)];
-        let reservoirs_info = [vk::DescriptorBufferInfo::default()
-            .buffer(reservoirs.0)
-            .offset(0)
-            .range(reservoirs.1)];
-        let surface_info = [vk::DescriptorBufferInfo::default()
-            .buffer(surface.0)
-            .offset(0)
-            .range(surface.1)];
-        let light_samples_info = [vk::DescriptorBufferInfo::default()
-            .buffer(light_samples.0)
-            .offset(0)
-            .range(light_samples.1)];
-        let gi_samples_info = [vk::DescriptorBufferInfo::default()
-            .buffer(gi_samples.0)
-            .offset(0)
-            .range(gi_samples.1)];
-        let nrc_weights_info = [vk::DescriptorBufferInfo::default()
-            .buffer(nrc_weights.0)
-            .offset(0)
-            .range(nrc_weights.1)];
-        let nrc_bias_info = [vk::DescriptorBufferInfo::default()
-            .buffer(nrc_bias.0)
-            .offset(0)
-            .range(nrc_bias.1)];
-        let nrc_records_info = [vk::DescriptorBufferInfo::default()
-            .buffer(nrc_records.0)
-            .offset(0)
-            .range(nrc_records.1)];
-        let nrc_queries_info = [vk::DescriptorBufferInfo::default()
-            .buffer(nrc_queries.0)
-            .offset(0)
-            .range(nrc_queries.1)];
-        // DLSS guide descriptors built outside `writes` so the per-binding infos
-        // outlive `update_descriptor_sets` (empty when the feature is off).
-        let gbuffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = gbuffers
-            .iter()
-            .map(|&(buf, size)| {
-                [vk::DescriptorBufferInfo::default()
-                    .buffer(buf)
-                    .offset(0)
-                    .range(size)]
-            })
-            .collect();
-        let mut writes = vec![
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_OUTPUT)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&output_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_CAMERA)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                .buffer_info(&camera_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_ENV_MAP)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .image_info(&env_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_ENV_SAMPLER)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .image_info(&env_sampler_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_GEOMETRY)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(&geometry_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_RESERVOIRS)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&reservoirs_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_SURFACE)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&surface_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_LIGHT_SAMPLES)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&light_samples_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_GI_SAMPLES)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&gi_samples_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_NRC_WEIGHTS)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&nrc_weights_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_NRC_BIAS)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&nrc_bias_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_NRC_RECORDS)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&nrc_records_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(BINDING_NRC_QUERIES)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&nrc_queries_info),
+        // Heap slots for every set-1 resource. Uniform vs storage matches the
+        // shader declarations (camera + geometry are uniforms); the buffer-slot
+        // order mirrors the binding list (see `trace`'s push-blob assembly).
+        let storage = |buffer: vk::Buffer, size: u64| HeapResource::Buffer {
+            address: seam.raw_buffer_address(buffer),
+            size,
+        };
+        let mut resources = vec![
+            storage(output_buffer, output_size),
+            HeapResource::UniformBuffer {
+                address: seam.raw_buffer_address(camera_buffer),
+                size: size_of::<RtCamera>() as u64,
+            },
+            HeapResource::UniformBuffer {
+                address: geometry.device_address,
+                size: geometry.size,
+            },
         ];
-        {
-            let gbuffer_bindings = [
-                BINDING_GBUFFER_NORMAL,
-                BINDING_GBUFFER_DIFFUSE,
-                BINDING_GBUFFER_SPECULAR,
-                BINDING_GBUFFER_MOTION,
-            ];
-            for (i, info) in gbuffer_infos.iter().enumerate() {
-                writes.push(
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(descriptor_set)
-                        .dst_binding(gbuffer_bindings[i])
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(info),
-                );
-            }
-        }
-        // SAFETY: targets the freshly-allocated set; buffers + image/sampler live.
-        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
-
-        // M2 staging: mirror every set-1 resource into the descriptor heap.
-        // Uniform vs storage matches the set-1 layout (camera + geometry are
-        // uniforms); slot order mirrors the binding list so the mapping table
-        // at the heap-pipeline flip reads straight off this Vec.
-        let heap = seam.map(|seam| {
-            use crate::gpu::binding_seam::HeapResource;
-            let storage = |buffer: vk::Buffer, size: u64| HeapResource::Buffer {
-                address: seam.raw_buffer_address(buffer),
-                size,
-            };
-            let mut resources = vec![
-                storage(output_buffer, output_size),
-                HeapResource::UniformBuffer {
-                    address: seam.raw_buffer_address(camera_buffer),
-                    size: size_of::<RtCamera>() as u64,
-                },
-                HeapResource::UniformBuffer {
-                    address: geometry.device_address,
-                    size: geometry.size,
-                },
-            ];
-            resources.extend(gbuffers.iter().map(|&(buf, size)| storage(buf, size)));
-            resources.extend(
-                [
-                    reservoirs,
-                    surface,
-                    light_samples,
-                    gi_samples,
-                    nrc_weights,
-                    nrc_bias,
-                    nrc_records,
-                    nrc_queries,
-                ]
-                .into_iter()
-                .map(|(buf, size)| storage(buf, size)),
-            );
-            let buffers = resources
-                .into_iter()
-                .map(|r| seam.alloc_heap_index(r))
-                .collect();
-            let env_sampler_slot =
-                seam.alloc_heap_index(HeapResource::Sampler(&sampler_info));
-            RtViewHeapSlots {
-                seam: seam.clone(),
-                buffers,
-                env_sampler: env_sampler_slot,
-            }
+        resources.extend(gbuffers.iter().map(|&(buf, size)| storage(buf, size)));
+        resources.extend(
+            [
+                reservoirs,
+                surface,
+                light_samples,
+                gi_samples,
+                nrc_weights,
+                nrc_bias,
+                nrc_records,
+                nrc_queries,
+            ]
+            .into_iter()
+            .map(|(buf, size)| storage(buf, size)),
+        );
+        let buffers = resources
+            .into_iter()
+            .map(|r| seam.alloc_heap_index(r))
+            .collect();
+        // The trace transitions the env cube to SHADER_READ_ONLY_OPTIMAL around
+        // the dispatch, so the descriptor always sees read-optimal.
+        let env_map = seam.alloc_heap_index(HeapResource::SampledImage {
+            view: env_view_info,
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         });
+        let env_sampler = seam.alloc_heap_index(HeapResource::Sampler(&sampler_info));
+        let heap = RtViewHeapSlots {
+            seam: seam.clone(),
+            buffers,
+            env_map,
+            env_sampler,
+        };
 
         Some(RtViewBindings {
             device: self.device.clone(),
-            descriptor_pool,
-            descriptor_set,
             geometry,
-            env_map_sampler,
             env_map_image,
             output_buffer,
             env_map_view,
@@ -1446,25 +1220,22 @@ impl RtPipeline {
     }
 
     /// Record bind + `cmd_trace_rays` into `command_buffer` for a `width`×`height`
-    /// dispatch, writing this view's per-pixel output storage buffer. `scene_set` /
-    /// `columns_set` are the raw `VkDescriptorSet`s of wgpu's scene + columns bind
-    /// groups (sets 0 and 2), from `BindGroup::raw_descriptor_set`; `view` carries
-    /// the per-view set 1 + env image to transition.
+    /// dispatch, writing this view's per-pixel output storage buffer. There are
+    /// no descriptor sets: the heaps are bound, then one push blob supplies the
+    /// TLAS device address plus this view's heap-slot indices for the
+    /// pipeline's push-sourced mappings.
     ///
     /// # Safety
-    /// `command_buffer` must be recording; the scene/columns sets must be valid
-    /// and match the layouts the pipeline was built with; `view` must have been
-    /// built by `self.create_view_bindings`.
+    /// `command_buffer` must be recording; `tlas_address` must be the current
+    /// PTLAS's device address; `view` must have been built by
+    /// `self.create_view_bindings` against the same seam the pipeline's
+    /// mappings were.
     pub unsafe fn trace(
         &self,
         command_buffer: vk::CommandBuffer,
-        scene_set: vk::DescriptorSet,
+        seam: &crate::gpu::binding_seam::BindingSeam,
         view: &RtViewBindings,
-        columns_set: vk::DescriptorSet,
-        // Dynamic offset for the camera buffer (binding 1). Always 0 — the buffer holds
-        // exactly this frame's `RtCamera`; the binding stays dynamic only to reuse the
-        // set-1 layout unchanged.
-        camera_dynamic_offset: u32,
+        tlas_address: u64,
         width: u32,
         height: u32,
     ) {
@@ -1534,6 +1305,59 @@ impl RtPipeline {
                 );
             }
 
+            // Heaps + push data replace descriptor sets entirely. The push blob
+            // feeds the pipeline's mapping sources: TLAS device address at
+            // offset 0 (`PUSH_ADDRESS`), then one u32 heap-slot index per set-1
+            // binding (`HEAP_WITH_PUSH_INDEX`) — indexed by binding number, so
+            // the assembly below must mirror `build_heap_mappings`' set-1 loop.
+            seam.bind_heaps(command_buffer);
+            let mut push = [0u8; PUSH_DATA_SIZE];
+            push[PUSH_TLAS_ADDRESS_OFFSET..PUSH_TLAS_ADDRESS_OFFSET + 8]
+                .copy_from_slice(&tlas_address.to_le_bytes());
+            {
+                let h = &view.heap;
+                let mut by_binding = [0u32; BINDING_NRC_QUERIES as usize + 1];
+                by_binding[BINDING_OUTPUT as usize] = h.buffers[0];
+                by_binding[BINDING_CAMERA as usize] = h.buffers[1];
+                by_binding[BINDING_ENV_MAP as usize] = h.env_map;
+                by_binding[BINDING_ENV_SAMPLER as usize] = h.env_sampler;
+                by_binding[BINDING_GEOMETRY as usize] = h.buffers[2];
+                // The buffer-slot list continues [gbuffers×0/4, reservoirs,
+                // surface, light_samples, gi_samples, nrc×4] (see
+                // `create_view_bindings`); without DLSS the gbuffer bindings
+                // stay 0 — the shaders don't declare them.
+                let gbuffer_count = h.buffers.len() - 11;
+                let gbuffer_bindings = [
+                    BINDING_GBUFFER_NORMAL,
+                    BINDING_GBUFFER_DIFFUSE,
+                    BINDING_GBUFFER_SPECULAR,
+                    BINDING_GBUFFER_MOTION,
+                ];
+                let mut next = 3;
+                for &binding in &gbuffer_bindings[..gbuffer_count] {
+                    by_binding[binding as usize] = h.buffers[next];
+                    next += 1;
+                }
+                for binding in [
+                    BINDING_RESERVOIRS,
+                    BINDING_SURFACE,
+                    BINDING_LIGHT_SAMPLES,
+                    BINDING_GI_SAMPLES,
+                    BINDING_NRC_WEIGHTS,
+                    BINDING_NRC_BIAS,
+                    BINDING_NRC_RECORDS,
+                    BINDING_NRC_QUERIES,
+                ] {
+                    by_binding[binding as usize] = h.buffers[next];
+                    next += 1;
+                }
+                for (i, slot) in by_binding.into_iter().enumerate() {
+                    push[PUSH_VIEW_SLOTS_OFFSET + i * 4..PUSH_VIEW_SLOTS_OFFSET + i * 4 + 4]
+                        .copy_from_slice(&slot.to_le_bytes());
+                }
+            }
+            seam.push_data(command_buffer, &push);
+
             self.device.cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
@@ -1544,17 +1368,6 @@ impl RtPipeline {
             // driver default, which is unreliable across library boundaries.
             self.rt
                 .cmd_set_ray_tracing_pipeline_stack_size(command_buffer, self.stack_size);
-            self.device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::RAY_TRACING_KHR,
-                self.pipeline_layout,
-                0,
-                &[scene_set, view.descriptor_set, columns_set],
-                // One dynamic offset, for set 1's camera (binding 1) — the only
-                // dynamic descriptor across the three bound sets (scene/columns are
-                // wgpu-built with none, hence the prior empty slice).
-                &[camera_dynamic_offset],
-            );
             self.rt.cmd_trace_rays(
                 command_buffer,
                 &self.raygen_region,
@@ -1637,17 +1450,14 @@ impl RtViewBindings {
 
 impl Drop for RtViewBindings {
     fn drop(&mut self) {
-        // In-flight traces may still reference the set/pool; drain first (near-
-        // free when the rebuild path already drained).
+        // In-flight traces may still read the geometry UBO and the heap slots
+        // (freed by `RtViewHeapSlots`' own Drop right after this body); drain
+        // first (near-free when the rebuild path already drained).
         self._device_keepalive.quiesce_before_raw_destroy();
-        // SAFETY: the pool + camera buffer were created for this view; the queue
-        // is drained and the device alive (keepalive). Destroying the pool frees
-        // its descriptor set.
+        // SAFETY: the geometry buffer was created for this view; the queue is
+        // drained and the device alive (keepalive). `camera_buffer` is
+        // wgpu-owned (the per-view `RtOutputBuffer`), freed there.
         unsafe {
-            self.device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.device.destroy_sampler(self.env_map_sampler, None);
-            // `camera_buffer` is wgpu-owned (the per-view `RtOutputBuffer`), freed there.
             self.device.destroy_buffer(self.geometry.buffer, None);
             self.device.free_memory(self.geometry.memory, None);
         }

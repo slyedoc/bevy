@@ -860,15 +860,17 @@ pub fn init_allocator(
         );
         return;
     };
-    // The binding seam (descriptor heaps + SBT records) rides on the allocator.
-    // Absent on drivers without VK_EXT_descriptor_heap (R610+ on NVIDIA — see
-    // the wgpu-hal fork's enable site); consumers hold `Option<Res<BindingSeam>>`
-    // and keep the classic descriptor path meanwhile.
-    match crate::gpu::binding_seam::BindingSeam::try_new(&memory) {
-        Some(seam) => commands.insert_resource(seam),
-        None => bevy_log::info!(
-            "solari: VK_EXT_descriptor_heap absent — RT stays on classic descriptor sets"
-        ),
-    }
+    // The binding seam (descriptor heaps + SBT records) rides on the allocator
+    // and is REQUIRED: the RT pipeline is layout-free (descriptor-heap
+    // mappings), with no descriptor-set path. Without the extension, solari
+    // disables wholesale — same as the cluster-AS/OMM/RT-pipeline gate above.
+    let Some(seam) = crate::gpu::binding_seam::BindingSeam::try_new(&memory) else {
+        bevy_log::warn_once!(
+            "bevy_solari disabled: the driver lacks VK_EXT_descriptor_heap \
+             (NVIDIA R610+). All solari passes no-op."
+        );
+        return;
+    };
+    commands.insert_resource(seam);
     commands.insert_resource(memory);
 }

@@ -58,25 +58,6 @@ use crate::resource_manager::SolariResourceManager;
 use crate::transform::{TransformGraph, TransformPropagate};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 
-/// Raw `VkDescriptorSetLayout` of the wgpu bind group built from `descriptor`,
-/// or `None` if not Vulkan-backed. The pipeline-cache dedups layouts by
-/// descriptor, so the handle is stable across frames — safe to bake into the RT
-/// pipeline layout once.
-fn raw_bgl(
-    pipeline_cache: &PipelineCache,
-    descriptor: &BindGroupLayoutDescriptor,
-) -> Option<vk::DescriptorSetLayout> {
-    let layout = pipeline_cache.get_bind_group_layout(descriptor);
-    // SAFETY: Vulkan-backed; we read the layout handle, never destroy it.
-    unsafe { layout.as_hal::<VkApi>() }.map(|l| l.raw_handle())
-}
-
-/// Raw `VkDescriptorSet` of a wgpu bind group, or `None` if not Vulkan-backed.
-fn raw_set(bind_group: &bevy_render::render_resource::BindGroup) -> Option<vk::DescriptorSet> {
-    // SAFETY: Vulkan-backed; we read the set handle for binding, never destroy it.
-    unsafe { bind_group.as_hal::<VkApi>() }.map(|bg| bg.raw_descriptor_set())
-}
-
 /// Raw `VkImageView` of a wgpu texture view, or `None` if not Vulkan-backed. Used
 /// to bake the environment-cube view into the RT pipeline's set 1 (the wgpu
 /// texture owns it; we only read the handle).
@@ -1284,13 +1265,14 @@ pub(crate) fn rt_pipeline(
             .map_or(0.0, |env| env.brightness)
     };
 
-    // Scene (set 0) + columns (set 2) bind groups — built each frame by the
-    // binder / scene-columns prepare. Both required: they carry the TLAS,
-    // geometry, materials, lights, textures, and transforms the chits resolve.
-    let (Some(scene_bg), Some(columns_bg), Some(columns_layout_desc)) = (
+    // Scene + columns readiness: the bind groups (consumed by the wgpu compute
+    // passes — the spatial pass below) and their heap mirrors, which the RT
+    // pipeline's mapping table and this frame's descriptors come from.
+    let (Some(scene_bg), Some(columns_bg), Some(scene_heap), Some(columns_heap)) = (
         scene_bindings.bind_group.as_ref(),
         scene_columns.bind_group.as_ref(),
-        scene_columns.layout(),
+        scene_bindings.scene_heap.as_ref(),
+        scene_columns.heap_slots.as_ref(),
     ) else {
         return;
     };
@@ -1304,37 +1286,32 @@ pub(crate) fn rt_pipeline(
     let material_classes = materials.sbt_classes();
 
     // Lazily build the view-independent RT pipeline once the scene + columns
-    // layouts exist (its pipeline layout bakes in their raw VkDescriptorSetLayouts)
-    // and materials are present (the SBT sizes one hit record per material slot).
-    // The per-view set 1 (output/camera/env) is built separately below. Inserted
-    // via commands → live next frame.
+    // heap mirrors exist (the mapping table bakes their constant heap offsets;
+    // the slots are allocated once and rewritten in place, so the table never
+    // goes stale) and materials are present (the SBT sizes one hit record per
+    // material slot). The per-view resources are built separately below.
+    // Inserted via commands → live next frame.
     let Some(rt) = rt else {
         if materials.len() > 0 {
-            if let (Some(allocator), Some(scene_layout), Some(columns_layout), Some(registry)) = (
+            if let (Some(allocator), Some(seam), Some(registry)) = (
                 allocator.as_deref(),
-                raw_bgl(&pipeline_cache, &scene_bindings.bind_group_layout),
-                raw_bgl(&pipeline_cache, columns_layout_desc),
+                seam.as_deref(),
                 hit_group_registry.as_deref(),
             ) {
-                // Get-or-recreate the stage-library cache: it lives across
+                // Get-or-create the stage-library cache: it lives across
                 // pipeline rebuilds (a sky/material change relinks cached
-                // libraries instead of recompiling every stage), but its
-                // shared pipeline layout bakes in the wgpu raw layouts, so a
-                // layout handle change starts a fresh cache (the stale one is
-                // dropped when `insert_resource` overwrites it).
+                // libraries instead of recompiling every stage).
                 let mut fresh_cache = None;
                 let cache: &mut RtLibraryCache = match library_cache {
-                    Some(cache) if cache.layout_key() == (scene_layout, columns_layout) => {
-                        cache.into_inner()
-                    }
-                    _ => {
-                        fresh_cache =
-                            RtLibraryCache::new(allocator, scene_layout, columns_layout);
-                        match fresh_cache.as_mut() {
-                            Some(cache) => cache,
-                            None => return,
-                        }
-                    }
+                    Some(cache) => cache.into_inner(),
+                    None => fresh_cache.insert(RtLibraryCache::new(
+                        allocator,
+                        crate::gpu::rt_pipeline::build_heap_mappings(
+                            seam,
+                            scene_heap,
+                            columns_heap,
+                        ),
+                    )),
                 };
                 if let Some(built) = RtPipeline::new(
                     allocator,
@@ -1398,18 +1375,28 @@ pub(crate) fn rt_pipeline(
                     .is_none_or(|env| env_images.texture_assets.get(&env.image).is_some())
             };
             if env_ready {
-                if let (Some(allocator), Some(env_view)) = (allocator.as_deref(), current_env_view)
-                {
+                // The env view's create info (the fork's hal `TextureView`
+                // records it) — the heap's env-cube image descriptor is written
+                // from it. SAFETY: live wgpu view on the Vulkan backend; the
+                // guard drops immediately.
+                let env_view_info = unsafe { environment_map_view.as_hal::<VkApi>() }
+                    .map(|v| v.image_view_create_info());
+                if let (Some(allocator), Some(seam), Some(env_view), Some(env_view_info)) = (
+                    allocator.as_deref(),
+                    seam.as_deref(),
+                    current_env_view,
+                    env_view_info,
+                ) {
                     // Resize rebuild: the old bindings point at a freed output
                     // buffer (RtOutputBuffer realloc'd). Drain the GPU so dropping
-                    // the stale component can't free an in-flight set/camera UBO.
+                    // the stale component can't free an in-flight slot/camera UBO.
                     if existing.is_some() {
                         let _ = render_device
                             .wgpu_device()
                             .poll(wgpu::PollType::wait_indefinitely());
                     }
-                    // DLSS guide G-buffers — bound into set 1 alongside the
-                    // color output, same size, same lifetime.
+                    // DLSS guide G-buffers — slotted alongside the color output,
+                    // same size, same lifetime.
                     let gbuffers = [
                         (output.gbuffer[0].raw, output.size),
                         (output.gbuffer[1].raw, output.size),
@@ -1417,12 +1404,13 @@ pub(crate) fn rt_pipeline(
                         (output.gbuffer[3].raw, output.size),
                     ];
                     // NRC buffers are created in Prepare (needs the Allocator);
-                    // the static set-1 bindings bake their raw handles, so wait.
+                    // the view's heap slots bake their raw handles, so wait.
                     let Some(nrc_bufs) = debug.nrc_buffers.as_deref() else {
                         return;
                     };
                     if let Some(built) = rt.create_view_bindings(
                         allocator,
+                        seam,
                         output.raw,
                         output.size,
                         output.camera_raw,
@@ -1440,7 +1428,7 @@ pub(crate) fn rt_pipeline(
                         (output.nrc_queries_raw, output.nrc_queries_size),
                         env_view,
                         environment_map_image,
-                        seam.as_deref(),
+                        &env_view_info,
                     ) {
                         commands.entity(view_entity).insert(built);
                     }
@@ -1457,10 +1445,6 @@ pub(crate) fn rt_pipeline(
         return;
     };
 
-    // Raw scene + columns descriptor sets (sets 0 and 2).
-    let (Some(scene_set), Some(columns_set)) = (raw_set(scene_bg), raw_set(columns_bg)) else {
-        return;
-    };
 
     // Camera inputs for the raygen unprojection + RNG frame seed.
     // `view.clip_from_world` is usually None; derive world_from_clip from the
@@ -1602,7 +1586,7 @@ pub(crate) fn rt_pipeline(
             && cluster_mesh_manager.as_ref().is_none_or(|m| {
                 m.pending_clas_uploads.is_empty() && m.pending_procedural.is_empty()
             })
-            && ptlas.is_some_and(|p| p.has_built);
+            && ptlas.as_ref().is_some_and(|p| p.has_built);
         *settle_frames = if pipelines_ready && scene_quiet && !spatial_pending {
             settle_frames.saturating_add(1)
         } else {
@@ -1839,7 +1823,6 @@ pub(crate) fn rt_pipeline(
     if !gpu_camera {
         render_queue.write_buffer(&output.camera_buffer, 0, bytemuck::bytes_of(&camera_inputs));
     }
-    let camera_dynamic_offset = 0u32;
     *frame_counter = frame_counter.wrapping_add(1);
     // Cache this frame's unjittered clip-from-world as next frame's "previous".
     commands
@@ -1879,6 +1862,16 @@ pub(crate) fn rt_pipeline(
             .clear_buffer(&output.nrc_queries, 0, Some(16));
     }
 
+    // The current PTLAS's device address, pushed for the TLAS's `PUSH_ADDRESS`
+    // mapping. The trace only runs once the scene bind group exists, which
+    // requires a built PTLAS, so the address is live.
+    let tlas_address = match ptlas.as_ref() {
+        Some(p) if p.as_handle_device_address[p.current] != 0 => {
+            p.as_handle_device_address[p.current]
+        }
+        _ => return,
+    };
+
     // The raw cmd_trace_rays must go in its OWN command buffer — wgpu-core
     // panics if a single encoder mixes wgpu passes (the blit) with raw
     // `as_hal_mut`. `add_command_buffer` flushes any pending ctx work then
@@ -1887,31 +1880,22 @@ pub(crate) fn rt_pipeline(
     let mut trace_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("rt_pipeline_trace"),
     });
-    // SAFETY: Vulkan backend; descriptors were just updated for this frame; the
-    // scene/columns sets match the layouts the pipeline was built with.
+    // SAFETY: Vulkan backend; the heap descriptors were rewritten this frame by
+    // the scene/columns/view mirrors the pipeline's mappings point at.
     unsafe {
         trace_encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
             let hal_encoder = hal_encoder.expect("rt_pipeline requires the Vulkan backend");
             let command_buffer = hal_encoder.raw_handle();
             rt.trace(
                 command_buffer,
-                scene_set,
+                seam.as_deref().expect("seam exists whenever the RT pipeline was built"),
                 view_bindings,
-                columns_set,
-                camera_dynamic_offset,
+                tlas_address,
                 viewport.x,
                 viewport.y,
             );
         });
     }
-    // `rt.trace` bound the scene + columns descriptor sets via raw
-    // `cmd_bind_descriptor_sets`, bypassing wgpu's tracker — so wgpu would free
-    // those descriptor sets as soon as the bind groups are dropped (the binder
-    // rebuilds the scene group every frame), even while this trace is still
-    // in-flight (the regenerate device-lost). Registering them here ties their
-    // lifetime to this submission's completion via wgpu's normal deferred-free.
-    trace_encoder.keep_bind_group_alive(scene_bg);
-    trace_encoder.keep_bind_group_alive(columns_bg);
     ctx.add_command_buffer(trace_encoder.finish());
 
     // ReSTIR spatial merge+shade: after the trace (all reservoirs +
