@@ -50,6 +50,14 @@ pub struct CompiledShader {
 const SLANG_SPIRV: i32 = 6;
 /// `CompilerOptionName::Capability` — `intValue0` is a `SlangCapabilityID`.
 const COMPILER_OPTION_CAPABILITY: i32 = 39;
+/// `CompilerOptionName::DebugInformation` — `intValue0` is a
+/// `SlangDebugInfoLevel`.
+const COMPILER_OPTION_DEBUG_INFORMATION: i32 = 44;
+/// `CompilerOptionName::DebugInfoIncludeSource` — embed the source text into
+/// the debug info regardless of level.
+const COMPILER_OPTION_DEBUG_INFO_INCLUDE_SOURCE: i32 = 157;
+/// `SLANG_DEBUG_INFO_LEVEL_MAXIMAL`.
+const DEBUG_INFO_LEVEL_MAXIMAL: i32 = 3;
 /// `CompilerOptionValueKind::Int`.
 const OPTION_KIND_INT: i32 = 0;
 /// `kDefaultTargetFlags` (= GENERATE_SPIRV_DIRECTLY).
@@ -311,7 +319,26 @@ fn compile_with_session(
     // released by a ComPtr guard.
     unsafe {
         // Target: SPIR-V with the declared capability set (the mechanism that
-        // pins e.g. SER to the NV flavor — see the fn docs).
+        // pins e.g. SER to the NV flavor — see the fn docs), plus full debug
+        // info WITH the source text embedded — profilers (Nsight) attribute
+        // samples to Slang source lines with zero path configuration, even
+        // for hot-reloaded content that exists nowhere on disk. NonSemantic
+        // debug instructions are stripped by the driver's final compile, so
+        // codegen/runtime cost is unaffected; the price is SPIR-V bytes.
+        let int_option = |name: i32, value: i32| CompilerOptionEntry {
+            name,
+            value: CompilerOptionValue {
+                kind: OPTION_KIND_INT,
+                int_value0: value,
+                int_value1: 0,
+                string_value0: core::ptr::null(),
+                string_value1: core::ptr::null(),
+            },
+        };
+        let mut target_options = vec![
+            int_option(COMPILER_OPTION_DEBUG_INFORMATION, DEBUG_INFO_LEVEL_MAXIMAL),
+            int_option(COMPILER_OPTION_DEBUG_INFO_INCLUDE_SOURCE, 1),
+        ];
         let capability_entries: Vec<CompilerOptionEntry> = capabilities
             .iter()
             .map(|cap| {
@@ -323,18 +350,10 @@ fn compile_with_session(
                         cap.to_string_lossy()
                     ));
                 }
-                Ok(CompilerOptionEntry {
-                    name: COMPILER_OPTION_CAPABILITY,
-                    value: CompilerOptionValue {
-                        kind: OPTION_KIND_INT,
-                        int_value0: id,
-                        int_value1: 0,
-                        string_value0: core::ptr::null(),
-                        string_value1: core::ptr::null(),
-                    },
-                })
+                Ok(int_option(COMPILER_OPTION_CAPABILITY, id))
             })
             .collect::<Result<_, String>>()?;
+        target_options.extend(capability_entries);
         let target = TargetDesc {
             structure_size: size_of::<TargetDesc>(),
             format: SLANG_SPIRV,
@@ -343,8 +362,8 @@ fn compile_with_session(
             floating_point_mode: 0,
             line_directive_mode: 0,
             force_glsl_scalar_buffer_layout: false,
-            compiler_option_entries: capability_entries.as_ptr(),
-            compiler_option_entry_count: capability_entries.len() as u32,
+            compiler_option_entries: target_options.as_ptr(),
+            compiler_option_entry_count: target_options.len() as u32,
         };
         let macros: Vec<PreprocessorMacroDesc> = defines
             .iter()
@@ -624,7 +643,7 @@ unsafe fn blob_bytes<'a>(blob: *mut c_void) -> Option<&'a [u8]> {
 // never wrong shaders. All cache I/O is best-effort: any failure just
 // recompiles.
 
-const CACHE_MAGIC: u32 = u32::from_le_bytes(*b"SLN1");
+const CACHE_MAGIC: u32 = u32::from_le_bytes(*b"SLN2");
 
 fn cache_key(
     build_tag: &str,

@@ -640,6 +640,11 @@ impl RtLibraryCache {
     /// is the concatenation of the libraries' groups in list order — raygen
     /// (0), primary miss (1), hit groups (2..), shadow miss last — matching
     /// the SBT layout [`RtPipeline::new`] bakes.
+    ///
+    /// Profiler note: Nsight's SASS↔source correlation is currently lost
+    /// across the library link — the RT stages show as Unattributed, while
+    /// the same modules attribute fine in a monolithic create (and in the
+    /// heap compute pipelines). Findings + leads in `docs/slang_lib.md`.
     fn link(&self) -> Option<vk::Pipeline> {
         let mut libs: Vec<vk::Pipeline> =
             Vec::with_capacity(3 + self.hit_groups.len());
@@ -2081,6 +2086,18 @@ mod tests {
             assert_no_runtime_descriptor_array(file, &spv.spirv);
             assert_bindings_mapped(file, &spv.spirv);
             assert_entry_is_main(file, &spv.spirv);
+            // Profiler attribution (Nsight): every stage must carry source-
+            // level debug info with the source text embedded.
+            let bytes: Vec<u8> = spv.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+            assert!(
+                contains(b"NonSemantic.Shader.DebugInfo.100"),
+                "{file}: no shader debug info emitted"
+            );
+            assert!(
+                contains(b"[shader("),
+                "{file}: source text not embedded in the debug info"
+            );
             // Reflection is what dispatch tables are assembled from; every
             // binding surviving in the SPIR-V must appear there (the reverse
             // need not hold — reflection also lists DCE'd parameters).
