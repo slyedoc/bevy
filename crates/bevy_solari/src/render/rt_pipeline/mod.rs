@@ -1315,6 +1315,7 @@ pub(crate) fn rt_pipeline(
                 };
                 if let Some(built) = RtPipeline::new(
                     allocator,
+                    seam,
                     cache,
                     &material_classes,
                     &registry.groups,
@@ -2045,13 +2046,13 @@ pub(crate) fn rt_pipeline(
                 1.0
             };
             let _ = crate::nrc::dispatch_nrc_query_infer(
-                ctx.command_encoder(),
+                &mut ctx,
                 nrc_bufs,
                 nrc_pipelines,
                 &render_device,
                 &render_queue,
-                &output.nrc_queries,
-                &output.buffer,
+                view_bindings.nrc_queries_slot(),
+                view_bindings.output_slot(),
                 output.pixels as u32,
                 blend / rounds,
                 camera.exposure,

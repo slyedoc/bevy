@@ -564,6 +564,29 @@ impl BindingSeam {
         )
     }
 
+    /// Uniform-buffer mapping sourced INLINE from the hit group's SBT record
+    /// data (`SHADER_RECORD_DATA`): the block's bytes come from the record at
+    /// `record_offset` (0 = first byte after the shader-group handle — the
+    /// fields [`write_record`](Self::write_record) writes). Replaces
+    /// `[[vk::shader_record]]` declarations: the shader keeps a plain
+    /// `[[vk::binding]]` and the host decides it reads record bytes.
+    pub fn map_binding_shader_record_data(
+        &self,
+        set: u32,
+        binding: u32,
+        record_offset: u32,
+    ) -> vk::DescriptorSetAndBindingMappingEXT<'static> {
+        Self::map_entry(
+            set,
+            binding,
+            vk::SpirvResourceTypeFlagsEXT::UNIFORM_BUFFER,
+            vk::DescriptorMappingSourceEXT::SHADER_RECORD_DATA,
+            vk::DescriptorMappingSourceDataEXT {
+                shader_record_data_offset: record_offset,
+            },
+        )
+    }
+
     /// Acceleration-structure mapping sourced from a DEVICE ADDRESS in push
     /// data at `push_offset` (`PUSH_ADDRESS`). The TLAS must come this way:
     /// shader-side heap AS access device-losts on current NVIDIA drivers,
@@ -583,6 +606,56 @@ impl BindingSeam {
                 push_address_offset: push_offset,
             },
         )
+    }
+
+    /// Create a heap-flagged (layout-free) COMPUTE pipeline from SPIR-V whose
+    /// set-0 bindings `0..binding_count` are all buffers, each sourced by a
+    /// heap-slot index read from push data at `binding * 4`
+    /// ([`map_binding_push_index`](Self::map_binding_push_index)). Dispatch =
+    /// [`bind_heaps`](Self::bind_heaps) + [`push_data`](Self::push_data) with
+    /// the slot array + `vkCmdDispatch`; the same pipeline serves any buffer
+    /// set (the slots are per-dispatch data, not baked).
+    pub fn create_heap_compute_pipeline(
+        &self,
+        spirv: &[u32],
+        binding_count: u32,
+        label: &str,
+    ) -> Option<(vk::ShaderModule, vk::Pipeline)> {
+        let device = self.inner.allocator.device();
+        let module_info = vk::ShaderModuleCreateInfo::default().code(spirv);
+        // SAFETY: spirv is a validated word slice; device live.
+        let module = unsafe { device.create_shader_module(&module_info, None) }
+            .map_err(|e| bevy_log::error!("binding_seam: {label}: create_shader_module: {e:?}"))
+            .ok()?;
+        let mappings: Vec<vk::DescriptorSetAndBindingMappingEXT> = (0..binding_count)
+            .map(|b| self.map_binding_push_index(0, b, HeapKind::Buffer, b * 4))
+            .collect();
+        let mut mapping_info = vk::ShaderDescriptorSetAndBindingMappingInfoEXT::default();
+        mapping_info.mapping_count = mappings.len() as u32;
+        mapping_info.p_mappings = mappings.as_ptr();
+        let flags2 = vk::PipelineCreateFlags2CreateInfo::default()
+            .flags(vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT);
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(module)
+            .name(c"main");
+        stage.p_next =
+            (&mapping_info as *const vk::ShaderDescriptorSetAndBindingMappingInfoEXT).cast();
+        let mut info = vk::ComputePipelineCreateInfo::default().stage(stage);
+        info.p_next = (&flags2 as *const vk::PipelineCreateFlags2CreateInfo).cast();
+        // SAFETY: module + mapping table live for the call; layout-free by the
+        // heap flag.
+        match unsafe {
+            device.create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+        } {
+            Ok(p) => Some((module, p.into_iter().next()?)),
+            Err((_, e)) => {
+                bevy_log::error!("binding_seam: {label}: create_compute_pipelines: {e:?}");
+                // SAFETY: just created; nothing references it.
+                unsafe { device.destroy_shader_module(module, None) };
+                None
+            }
+        }
     }
 
     /// Bind both heaps on a raw command buffer. Once per command buffer,

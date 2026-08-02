@@ -36,14 +36,15 @@ import brdf;
 [[vk::binding(8, 1)]] RWStructuredBuffer<float4> gbuffer_motion;
 static const uint NO_GBUFFER = 0xffffffff;
 
-// Per-material SBT shader record — the material id baked into this record
-// (same as `chit_opaque`). Uniform per record, so material + texture fetches
-// stay uniform per warp after SER.
+// Per-material SBT record — the material id baked into this record (same as
+// `chit_opaque`): a plain binding on the record-sourced set (3), mapped
+// host-side to the record's data bytes (`SHADER_RECORD_DATA`). Uniform per
+// record, so material + texture fetches stay uniform per warp after SER.
 struct SbtRecord
 {
     uint material_id;
 }
-[[vk::shader_record]] ConstantBuffer<SbtRecord> sbt;
+[[vk::binding(0, 3)]] ConstantBuffer<SbtRecord> sbt;
 
 [shader("closesthit")]
 void chit_glass(inout RtPayload payload, in BuiltInTriangleIntersectionAttributes attribs)

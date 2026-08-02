@@ -54,16 +54,18 @@ static const uint SHADOW_MISS_INDEX = 1;
 static const uint SHADOW_RAY_FLAGS =
     RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
 
-// Per-material SBT shader record: each hit record bakes its material id (the
-// record index = the material slot, set as
-// `instance_contribution_to_hit_group_index` in ptlas_fill). Uniform per
-// shader-record, so after SER reorders the warp by hit, material + texture
-// fetches stay uniform — sidestepping non-uniform descriptor divergence.
+// Per-material SBT record: each hit record bakes its material id (the record
+// index = the material slot, set as `instance_contribution_to_hit_group_index`
+// in ptlas_fill). Uniform per record, so after SER reorders the warp by hit,
+// material + texture fetches stay uniform — sidestepping non-uniform
+// descriptor divergence. A plain binding on the record-sourced set (3): the
+// host maps it to the record's data bytes (`SHADER_RECORD_DATA`), so the
+// shader never names the binding model.
 struct SbtRecord
 {
     uint material_id;
 }
-[[vk::shader_record]] ConstantBuffer<SbtRecord> sbt;
+[[vk::binding(0, 3)]] ConstantBuffer<SbtRecord> sbt;
 
 // NEE visibility test: assume occluded; `miss_shadow` clears the flag iff the
 // ray reaches the light. Fixed-function traversal → no register cost here.

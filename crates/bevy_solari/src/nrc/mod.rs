@@ -21,9 +21,7 @@
 use bevy_ecs::prelude::*;
 use bevy_render::{
     extract_resource::ExtractResource,
-    render_resource::{
-        BindGroup, BindGroupEntries, Buffer, BufferUsages, ComputePassDescriptor, ShaderStages,
-    },
+    render_resource::{Buffer, BufferUsages},
     renderer::{RenderDevice, RenderQueue},
 };
 use half::f16;
@@ -140,24 +138,54 @@ struct LearnParams {
 /// naga reflection, nothing queued on the `PipelineCache`.
 #[derive(Resource)]
 pub struct NrcPipelines {
-    adam_layout: bevy_render::render_resource::BindGroupLayout,
-    encode_layout: bevy_render::render_resource::BindGroupLayout,
-    infer_layout: bevy_render::render_resource::BindGroupLayout,
-    learn_layout: bevy_render::render_resource::BindGroupLayout,
-    learn: bevy_render::render_resource::ComputePipeline,
-    pub adam: bevy_render::render_resource::ComputePipeline,
-    pub encode_records: bevy_render::render_resource::ComputePipeline,
-    pub query_infer: bevy_render::render_resource::ComputePipeline,
+    /// Heap-flagged (layout-free) raw compute pipelines, one per kernel. Every
+    /// binding is a push-indexed heap slot
+    /// ([`BindingSeam::create_heap_compute_pipeline`]), so a dispatch is
+    /// push-slots + bind + `vkCmdDispatch` — the same pipeline serves any
+    /// buffer set (adam runs twice, weights then biases, from one pipeline).
+    ///
+    /// [`BindingSeam::create_heap_compute_pipeline`]: crate::gpu::binding_seam::BindingSeam::create_heap_compute_pipeline
+    learn: (vk::ShaderModule, vk::Pipeline),
+    adam: (vk::ShaderModule, vk::Pipeline),
+    encode_records: (vk::ShaderModule, vk::Pipeline),
+    query_infer: (vk::ShaderModule, vk::Pipeline),
+    seam: crate::gpu::binding_seam::BindingSeam,
     /// `VK_NV_cooperative_vector` fn table + the raw device — the per-layer
     /// TrainingOptimal→RowMajor dW conversion is a raw device command.
     coopvec_fns: ash::nv::cooperative_vector::Device,
     raw_device: ash::Device,
     /// Bytes per layer's TrainingOptimal dW block (host convert size query).
     pub opt_size: u32,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
+}
+
+impl Drop for NrcPipelines {
+    fn drop(&mut self) {
+        // In-flight dispatches may still reference the pipelines; drain first.
+        self._device_keepalive.quiesce_before_raw_destroy();
+        for (module, pipeline) in [
+            self.learn,
+            self.adam,
+            self.encode_records,
+            self.query_infer,
+        ] {
+            // SAFETY: quiesced; handles exclusively owned here.
+            unsafe {
+                self.raw_device.destroy_pipeline(pipeline, None);
+                self.raw_device.destroy_shader_module(module, None);
+            }
+        }
+    }
 }
 
 /// All NRC GPU state. Weights/optimizer are global (one cache per app);
 /// records rotate through a fixed-capacity ring written by raygen.
+///
+/// Many buffer fields are never read after init: they exist as OWNERSHIP —
+/// their memory backs live heap descriptors ([`NrcHeapSlots`]) the raw
+/// dispatches read through, and dropping one would free it under the GPU.
+#[allow(dead_code)]
 #[derive(Resource)]
 pub struct NrcBuffers {
     // RT-visible (raw VK handles baked into set 1)
@@ -205,7 +233,9 @@ pub struct NrcBuffers {
     adam_b_ubo: Buffer,
     train_ubo: Buffer,
     query_ubo: Buffer,
-    groups: Option<NrcBindGroups>,
+    /// Every buffer's descriptor-heap slot — the dispatch functions push the
+    /// per-kernel slot arrays for the pipelines' push-indexed mappings.
+    slots: NrcHeapSlots,
     pub step: u32,
     /// Non-blocking loss readback: 0 = idle, 1 = copied (map next frame),
     /// 2 = map requested (read when the shared flag flips).
@@ -213,135 +243,71 @@ pub struct NrcBuffers {
     loss_mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-struct NrcBindGroups {
-    learn: BindGroup,
-    adam_w: BindGroup,
-    adam_b: BindGroup,
-    encode: BindGroup,
+/// Heap slots for the NRC buffers (allocated once in [`init_nrc_buffers`] —
+/// the buffers never reallocate). Uniform param blocks get UNIFORM_BUFFER
+/// descriptors; everything else STORAGE_BUFFER.
+struct NrcHeapSlots {
+    records: u32,
+    acts: u32,
+    targets: u32,
+    preds: u32,
+    loss: u32,
+    dw_opt: u32,
+    db: u32,
+    zeros: u32,
+    weights_t: u32,
+    bias16: u32,
+    w16: u32,
+    master_w: u32,
+    master_b: u32,
+    dw: u32,
+    m_w: u32,
+    v_w: u32,
+    m_b: u32,
+    v_b: u32,
+    ema_w: u32,
+    ema_b: u32,
+    weights_t_ema: u32,
+    bias16_ema: u32,
+    train_ubo: u32,
+    learn_ubo: u32,
+    adam_w_ubo: u32,
+    adam_b_ubo: u32,
+    query_ubo: u32,
 }
 
-/// `RenderStartup`: explicit layouts + eager passthrough pipelines. Every
-/// kernel is Slang-precompiled SPIR-V (no naga reflection), so each bind
-/// group layout is spelled out to match the `[[vk::binding]]` tables in
-/// nrc_train.slang / nrc_mlp.slang.
+/// `RenderStartup` (after `SolariSetup`): heap-flagged raw pipelines, one per
+/// Slang-precompiled kernel. Every `[[vk::binding]]` in the kernels is a
+/// push-indexed heap slot — the binding tables live in the dispatch functions'
+/// slot arrays, which must match nrc_train.slang / nrc_mlp.slang order.
 #[allow(unsafe_code)]
-pub fn init_nrc_pipelines(mut commands: Commands, render_device: Res<RenderDevice>) {
-    let storage_entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    };
-    let uniform_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
+pub fn init_nrc_pipelines(
+    mut commands: Commands,
+    render_device: Res<RenderDevice>,
+    allocator: Option<Res<Allocator>>,
+    seam: Option<Res<crate::gpu::binding_seam::BindingSeam>>,
+) {
+    let (Some(allocator), Some(seam)) = (allocator, seam) else {
+        return;
     };
 
-    // Passthrough SPIR-V bindings must be contiguous from 0 per kernel:
-    // wgpu-hal's Vulkan backend numbers descriptor bindings sequentially by
-    // layout-entry order, ignoring sparse wgpu binding numbers — a sparse
-    // table silently desyncs the blob's [[vk::binding]] slots.
-    let adam_layout = render_device.create_bind_group_layout(
-        "nrc_adam_layout",
-        &[
-            storage_entry(0, false), // master
-            storage_entry(1, true),  // grad_in
-            storage_entry(2, false), // moment_m
-            storage_entry(3, false), // moment_v
-            storage_entry(4, false), // mirror_f16
-            storage_entry(5, false), // mirror_alt
-            storage_entry(6, false), // ema_master
-            storage_entry(7, false), // mirror_ema
-            uniform_entry(8),        // adam_u
-        ],
-    );
-    let infer_layout = render_device.create_bind_group_layout(
-        "nrc_infer_layout",
-        &[
-            storage_entry(0, true),  // weights_t
-            storage_entry(1, true),  // biases
-            storage_entry(2, true),  // queries
-            storage_entry(3, false), // out_radiance
-            uniform_entry(4),        // qparams
-        ],
-    );
-    let encode_layout = render_device.create_bind_group_layout(
-        "nrc_encode_layout",
-        &[
-            storage_entry(0, true),  // records
-            storage_entry(1, false), // act_out
-            storage_entry(2, false), // targets_out
-            uniform_entry(3),        // train_params
-        ],
-    );
-    let learn_layout = render_device.create_bind_group_layout(
-        "nrc_learn_layout",
-        &[
-            storage_entry(0, true),  // acts (encoded batch)
-            storage_entry(1, true),  // weights_t (live mirror)
-            storage_entry(2, true),  // bias16 (live mirror)
-            storage_entry(3, true),  // targets
-            storage_entry(4, false), // preds
-            storage_entry(5, false), // loss
-            storage_entry(6, false), // dw_opt (TrainingOptimal accumulate)
-            storage_entry(7, false), // db (f32 accumulate)
-            uniform_entry(8),        // params
-            storage_entry(9, true),  // zeros
-        ],
-    );
-
-    // SAFETY (all blobs): compiled from the in-tree .slang sources and
-    // spirv-val-validated (regen commands in their headers); each explicit
-    // layout above matches its kernel's binding table.
-    let make = |label: &'static str,
-                spv_bytes: &'static [u8],
-                layout: &bevy_render::render_resource::BindGroupLayout| {
+    // Kernel binding counts (contiguous from 0, per the .slang binding tables).
+    let make = |label: &'static str, spv_bytes: &'static [u8], bindings: u32| {
         let spv = wgpu::util::make_spirv_raw(spv_bytes);
-        let module = unsafe {
-            render_device.wgpu_device().create_shader_module_passthrough(
-                wgpu::ShaderModuleDescriptorPassthrough {
-                    spirv: Some(spv),
-                    ..Default::default()
-                },
-            )
-        };
-        let pl = render_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(label),
-            bind_group_layouts: &[Some(layout)],
-            immediate_size: 0,
-        });
-        render_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(label),
-            layout: Some(&pl),
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        })
+        seam.create_heap_compute_pipeline(&spv, bindings, label)
     };
-
-    let learn = make("nrc_learn", include_bytes!("nrc_train.spv"), &learn_layout);
-    let adam = make("nrc_adam", include_bytes!("nrc_adam.spv"), &adam_layout);
-    let encode_records = make(
-        "nrc_encode_records",
-        include_bytes!("nrc_encode_records.spv"),
-        &encode_layout,
-    );
-    let query_infer = make(
-        "nrc_query_infer",
-        include_bytes!("nrc_query_infer.spv"),
-        &infer_layout,
-    );
+    let (Some(learn), Some(adam), Some(encode_records), Some(query_infer)) = (
+        make("nrc_learn", include_bytes!("nrc_train.spv"), 10),
+        make("nrc_adam", include_bytes!("nrc_adam.spv"), 9),
+        make(
+            "nrc_encode_records",
+            include_bytes!("nrc_encode_records.spv"),
+            4,
+        ),
+        make("nrc_query_infer", include_bytes!("nrc_query_infer.spv"), 5),
+    ) else {
+        return;
+    };
 
     // Raw handles for the dW layout conversion: the fn table once
     // (extension.rs pattern) plus the host-side size query for the opaque
@@ -383,17 +349,15 @@ pub fn init_nrc_pipelines(mut commands: Commands, render_device: Res<RenderDevic
     };
 
     commands.insert_resource(NrcPipelines {
-        adam_layout,
-        encode_layout,
-        infer_layout,
-        learn_layout,
         learn,
         adam,
         encode_records,
         query_infer,
+        seam: seam.clone(),
         coopvec_fns,
         raw_device,
         opt_size,
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -402,6 +366,7 @@ pub fn init_nrc_buffers(
     mut commands: Commands,
     existing: Option<Res<NrcBuffers>>,
     allocator: Option<Res<Allocator>>,
+    seam: Option<Res<crate::gpu::binding_seam::BindingSeam>>,
     pipelines: Option<Res<NrcPipelines>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -411,11 +376,15 @@ pub fn init_nrc_buffers(
         return;
     }
     let Some(allocator) = allocator else { return };
+    let Some(seam) = seam else { return };
     let Some(pipelines) = pipelines else { return };
 
     let batch = NRC_RECORD_CAP as u64;
     let storage = BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
-    let uniform = BufferUsages::UNIFORM | BufferUsages::COPY_DST;
+    // STORAGE rides along for `SHADER_DEVICE_ADDRESS` (the fork adds the
+    // address bit to storage buffers) — the heap's UNIFORM_BUFFER descriptors
+    // are written from device addresses.
+    let uniform = BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST;
     let mk = |label: &'static str, size: u64, usage: BufferUsages| {
         render_device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
@@ -521,6 +490,89 @@ pub fn init_nrc_buffers(
     let dw_opt_addr = allocator.wgpu_buffer_device_address(&dw_opt).get();
     let dw_addr = allocator.wgpu_buffer_device_address(&dw).get();
 
+    let acts = mk("nrc_acts", batch * width * 2, storage);
+    let preds = mk("nrc_preds", batch * width * 4, storage);
+    let targets = mk("nrc_targets", batch * 16, storage);
+    let loss = mk("nrc_loss", batch * 4, storage);
+    let zeros = mk("nrc_zeros", 1024, storage);
+    let master_b = mk("nrc_master_b", (NRC_B_TOTAL * 4) as u64, storage);
+    let db = mk("nrc_db", (NRC_B_TOTAL * 4) as u64, storage);
+    let m_w = mk("nrc_m_w", (NRC_W_TOTAL * 4) as u64, storage);
+    let v_w = mk("nrc_v_w", (NRC_W_TOTAL * 4) as u64, storage);
+    let m_b = mk("nrc_m_b", (NRC_B_TOTAL * 4) as u64, storage);
+    let v_b = mk("nrc_v_b", (NRC_B_TOTAL * 4) as u64, storage);
+    let ema_b = mk("nrc_ema_b", (NRC_B_TOTAL * 4) as u64, storage);
+    let learn_ubo = mk_ubo("nrc_learn_ubo", 16);
+    let adam_w_ubo = mk_ubo("nrc_adam_w_ubo", 48);
+    let adam_b_ubo = mk_ubo("nrc_adam_b_ubo", 48);
+    let train_ubo = mk_ubo("nrc_train_ubo", 16);
+    let query_ubo = mk_ubo("nrc_query_ubo", 16);
+
+    // Mark every raw-only buffer initialized with a TRACKED write: wgpu lazily
+    // zero-initializes a buffer at its first tracked use, and these are
+    // otherwise touched only by untracked raw dispatches — so a later tracked
+    // use (the loss/targets staging copies) would wipe raw-written contents,
+    // and never-tracked buffers (adam moments, zeros) would start as garbage.
+    let zero_init: [(&Buffer, usize); 9] = [
+        (&zeros, 1024),
+        (&master_b, NRC_B_TOTAL * 4),
+        (&ema_b, NRC_B_TOTAL * 4),
+        (&m_w, NRC_W_TOTAL * 4),
+        (&v_w, NRC_W_TOTAL * 4),
+        (&m_b, NRC_B_TOTAL * 4),
+        (&v_b, NRC_B_TOTAL * 4),
+        (&loss, batch as usize * 4),
+        (&targets, batch as usize * 16),
+    ];
+    for (buf, bytes) in zero_init {
+        render_queue.write_buffer(buf, 0, &vec![0u8; bytes]);
+    }
+
+    // Heap slots (the buffers are app-lifetime; the pipelines' push-indexed
+    // mappings receive these per dispatch).
+    use crate::gpu::binding_seam::HeapResource;
+    let sslot = |b: &Buffer| {
+        seam.alloc_heap_index(HeapResource::Buffer {
+            address: seam.device_address(b).get(),
+            size: b.size(),
+        })
+    };
+    let uslot = |b: &Buffer| {
+        seam.alloc_heap_index(HeapResource::UniformBuffer {
+            address: seam.device_address(b).get(),
+            size: b.size(),
+        })
+    };
+    let slots = NrcHeapSlots {
+        records: sslot(&records),
+        acts: sslot(&acts),
+        targets: sslot(&targets),
+        preds: sslot(&preds),
+        loss: sslot(&loss),
+        dw_opt: sslot(&dw_opt),
+        db: sslot(&db),
+        zeros: sslot(&zeros),
+        weights_t: sslot(&weights_t),
+        bias16: sslot(&bias16),
+        w16: sslot(&w16),
+        master_w: sslot(&master_w),
+        master_b: sslot(&master_b),
+        dw: sslot(&dw),
+        m_w: sslot(&m_w),
+        v_w: sslot(&v_w),
+        m_b: sslot(&m_b),
+        v_b: sslot(&v_b),
+        ema_w: sslot(&ema_w),
+        ema_b: sslot(&ema_b),
+        weights_t_ema: sslot(&weights_t_ema),
+        bias16_ema: sslot(&bias16_ema),
+        train_ubo: uslot(&train_ubo),
+        learn_ubo: uslot(&learn_ubo),
+        adam_w_ubo: uslot(&adam_w_ubo),
+        adam_b_ubo: uslot(&adam_b_ubo),
+        query_ubo: uslot(&query_ubo),
+    };
+
     commands.insert_resource(NrcBuffers {
         weights_t,
         weights_t_raw,
@@ -531,108 +583,42 @@ pub fn init_nrc_buffers(
         records,
         records_raw,
         w16,
-        acts: mk("nrc_acts", batch * width * 2, storage),
-        preds: mk("nrc_preds", batch * width * 4, storage),
-        targets: mk("nrc_targets", batch * 16, storage),
-        loss: mk("nrc_loss", batch * 4, storage),
+        acts,
+        preds,
+        targets,
+        loss,
         loss_staging: mk(
             "nrc_loss_staging",
             // 4 loss bytes + 16 target bytes per record.
             batch * LOSS_STAGING_BYTES_PER_RECORD,
             BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         ),
-        zeros: mk("nrc_zeros", 1024, storage),
+        zeros,
         master_w,
-        master_b: mk("nrc_master_b", (NRC_B_TOTAL * 4) as u64, storage),
+        master_b,
         dw,
-        db: mk("nrc_db", (NRC_B_TOTAL * 4) as u64, storage),
-        m_w: mk("nrc_m_w", (NRC_W_TOTAL * 4) as u64, storage),
-        v_w: mk("nrc_v_w", (NRC_W_TOTAL * 4) as u64, storage),
-        m_b: mk("nrc_m_b", (NRC_B_TOTAL * 4) as u64, storage),
-        v_b: mk("nrc_v_b", (NRC_B_TOTAL * 4) as u64, storage),
+        db,
+        m_w,
+        v_w,
+        m_b,
+        v_b,
         ema_w,
-        ema_b: mk("nrc_ema_b", (NRC_B_TOTAL * 4) as u64, storage),
+        ema_b,
         weights_t_ema,
         bias16_ema,
         dw_opt,
         dw_opt_addr,
         dw_addr,
-        learn_ubo: mk_ubo("nrc_learn_ubo", 16),
-        adam_w_ubo: mk_ubo("nrc_adam_w_ubo", 48),
-        adam_b_ubo: mk_ubo("nrc_adam_b_ubo", 48),
-        train_ubo: mk_ubo("nrc_train_ubo", 16),
-        query_ubo: mk_ubo("nrc_query_ubo", 16),
-        groups: None,
+        learn_ubo,
+        adam_w_ubo,
+        adam_b_ubo,
+        train_ubo,
+        query_ubo,
+        slots,
         step: 0,
         loss_state: 0,
         loss_mapped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
-}
-
-fn build_bind_groups(
-    bufs: &NrcBuffers,
-    pipelines: &NrcPipelines,
-    device: &RenderDevice,
-) -> NrcBindGroups {
-    NrcBindGroups {
-        learn: device.create_bind_group(
-            "nrc_learn",
-            &pipelines.learn_layout,
-            &BindGroupEntries::with_indices((
-                (0, bufs.acts.as_entire_binding()),
-                (1, bufs.weights_t.as_entire_binding()),
-                (2, bufs.bias16.as_entire_binding()),
-                (3, bufs.targets.as_entire_binding()),
-                (4, bufs.preds.as_entire_binding()),
-                (5, bufs.loss.as_entire_binding()),
-                (6, bufs.dw_opt.as_entire_binding()),
-                (7, bufs.db.as_entire_binding()),
-                (8, bufs.learn_ubo.as_entire_binding()),
-                // f32 zeros reinterpreted: all-zero bytes are all-zero f16s
-                (9, bufs.zeros.as_entire_binding()),
-            )),
-        ),
-        adam_w: device.create_bind_group(
-            "nrc_adam_w",
-            &pipelines.adam_layout,
-            &BindGroupEntries::with_indices((
-                (0, bufs.master_w.as_entire_binding()),
-                (1, bufs.dw.as_entire_binding()),
-                (2, bufs.m_w.as_entire_binding()),
-                (3, bufs.v_w.as_entire_binding()),
-                (4, bufs.w16.as_entire_binding()),
-                (5, bufs.weights_t.as_entire_binding()),
-                (6, bufs.ema_w.as_entire_binding()),
-                (7, bufs.weights_t_ema.as_entire_binding()),
-                (8, bufs.adam_w_ubo.as_entire_binding()),
-            )),
-        ),
-        adam_b: device.create_bind_group(
-            "nrc_adam_b",
-            &pipelines.adam_layout,
-            &BindGroupEntries::with_indices((
-                (0, bufs.master_b.as_entire_binding()),
-                (1, bufs.db.as_entire_binding()),
-                (2, bufs.m_b.as_entire_binding()),
-                (3, bufs.v_b.as_entire_binding()),
-                (4, bufs.bias16.as_entire_binding()),
-                (5, bufs.weights_t.as_entire_binding()),
-                (6, bufs.ema_b.as_entire_binding()),
-                (7, bufs.bias16_ema.as_entire_binding()),
-                (8, bufs.adam_b_ubo.as_entire_binding()),
-            )),
-        ),
-        encode: device.create_bind_group(
-            "nrc_encode",
-            &pipelines.encode_layout,
-            &BindGroupEntries::with_indices((
-                (0, bufs.records.as_entire_binding()),
-                (1, bufs.acts.as_entire_binding()),
-                (2, bufs.targets.as_entire_binding()),
-                (3, bufs.train_ubo.as_entire_binding()),
-            )),
-        ),
-    }
 }
 
 #[repr(C)]
@@ -647,22 +633,22 @@ struct NrcQueryParams {
 /// Record the batched termination-query inference + composite pass: evaluate
 /// the MLP for every query raygen appended this frame and add the
 /// de-factorized radiance into the per-pixel output buffer (`scale` pre-folds
-/// the raygen accumulation blend). Recorded on the ctx encoder AFTER the
-/// trace.
+/// the raygen accumulation blend). A raw heap dispatch in its own command
+/// buffer, appended AFTER the trace's; `queries_slot`/`output_slot` are the
+/// view's heap slots (the same ones the trace pushes).
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_nrc_query_infer(
-    encoder: &mut wgpu::CommandEncoder,
+    ctx: &mut bevy_render::renderer::RenderContext,
     bufs: &NrcBuffers,
     pipelines: &NrcPipelines,
     device: &RenderDevice,
     queue: &RenderQueue,
-    queries: &Buffer,
-    output: &Buffer,
+    queries_slot: u32,
+    output_slot: u32,
     cap: u32,
     scale: f32,
     exposure: f32,
 ) -> bool {
-    let infer = &pipelines.query_infer;
     queue.write_buffer(
         &bufs.query_ubo,
         0,
@@ -673,25 +659,46 @@ pub fn dispatch_nrc_query_infer(
             pad: 0,
         }),
     );
-    let bg = device.create_bind_group(
-        "nrc_query_infer",
-        &pipelines.infer_layout,
-        &BindGroupEntries::with_indices((
-            (0, bufs.weights_t_ema.as_entire_binding()),
-            (1, bufs.bias16_ema.as_entire_binding()),
-            (2, queries.as_entire_binding()),
-            (3, output.as_entire_binding()),
-            (4, bufs.query_ubo.as_entire_binding()),
-        )),
-    );
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+    // Binding order per nrc_mlp.slang's query kernel.
+    let slots = [
+        bufs.slots.weights_t_ema,
+        bufs.slots.bias16_ema,
+        queries_slot,
+        output_slot,
+        bufs.slots.query_ubo,
+    ];
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("nrc_query_infer"),
-        timestamp_writes: None,
     });
-    pass.set_pipeline(infer);
-    pass.set_bind_group(0, &bg, &[]);
-    // The count lives on the GPU; over-dispatch to the cap, threads early-out.
-    pass.dispatch_workgroups(cap.div_ceil(64), 1, 1);
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors.
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &pipelines.raw_device;
+            let seam = &pipelines.seam;
+            // Queries were appended by the trace (its post-barrier already
+            // covers RT write -> compute read on this queue).
+            seam.bind_heaps(cb);
+            seam.push_data(cb, bytemuck::cast_slice(&slots));
+            dev.cmd_bind_pipeline(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                pipelines.query_infer.1,
+            );
+            // The count lives on the GPU; over-dispatch to the cap, threads
+            // early-out.
+            dev.cmd_dispatch(cb, cap.div_ceil(64), 1, 1);
+            // Composite writes -> the wgpu blit's read of the output buffer.
+            let post = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ)];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&post));
+        });
+    }
+    ctx.add_command_buffer(encoder.finish());
     true
 }
 
@@ -707,10 +714,6 @@ pub fn dispatch_training(
     queue: &RenderQueue,
     nrc: &SolariNrc,
 ) -> bool {
-    let (adam, encode) = (&pipelines.adam, &pipelines.encode_records);
-    if bufs.groups.is_none() {
-        bufs.groups = Some(build_bind_groups(bufs, pipelines, device));
-    }
 
     bufs.step += 1;
     let batch = NRC_RECORD_CAP as u32;
@@ -772,43 +775,52 @@ pub fn dispatch_training(
         }),
     );
 
-    let groups = bufs.groups.as_ref().unwrap();
-    {
-        // The gradient accumulators start at zero every step (the fused
-        // kernel's outer-product/reduce-sum accumulates are additive).
-        let encoder = ctx.command_encoder();
-        encoder.clear_buffer(&bufs.dw_opt, 0, None);
-        encoder.clear_buffer(&bufs.db, 0, None);
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("nrc_training"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(encode);
-        pass.set_bind_group(0, &groups.encode, &[]);
-        pass.dispatch_workgroups(batch.div_ceil(64), 1, 1);
-        // fused forward + loss + backward incl. the dW/db accumulates
-        // (nrc_train.slang)
-        pass.set_pipeline(&pipelines.learn);
-        pass.set_bind_group(0, &groups.learn, &[]);
-        pass.dispatch_workgroups(batch.div_ceil(64), 1, 1);
-    }
+    // Per-kernel heap-slot arrays — order matches each kernel's
+    // `[[vk::binding]]` table (nrc_encode_records / nrc_train / nrc_adam).
+    let s = &bufs.slots;
+    let encode_slots = [s.records, s.acts, s.targets, s.train_ubo];
+    let learn_slots = [
+        s.acts, s.weights_t, s.bias16, s.targets, s.preds, s.loss, s.dw_opt, s.db, s.learn_ubo,
+        s.zeros,
+    ];
+    let adam_w_slots = [
+        s.master_w,
+        s.dw,
+        s.m_w,
+        s.v_w,
+        s.w16,
+        s.weights_t,
+        s.ema_w,
+        s.weights_t_ema,
+        s.adam_w_ubo,
+    ];
+    let adam_b_slots = [
+        s.master_b,
+        s.db,
+        s.m_b,
+        s.v_b,
+        s.bias16,
+        s.weights_t,
+        s.ema_b,
+        s.bias16_ema,
+        s.adam_b_ubo,
+    ];
 
-    // Per-layer TrainingOptimal→RowMajor dW conversion: a raw device command,
-    // in its OWN encoder (wgpu-core panics if one encoder mixes wgpu passes
-    // with raw `as_hal_mut`); `add_command_buffer` flushes the training pass
-    // above first, so on the single queue the converts run after it. wgpu
-    // tracks none of this, so both sides are fenced with raw sync2 barriers.
-    let mut conv_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("nrc_dw_convert"),
+    // The whole chain — gradient clears, encode, fused train, dW layout
+    // convert, adam ×2 — in ONE raw command buffer with sync2 barriers (wgpu
+    // tracks none of it; the UBO writes above ride the pre-submit staging
+    // belt).
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("nrc_training"),
     });
-    // SAFETY: Vulkan backend; the addresses point at live storage buffers
-    // created with SHADER_DEVICE_ADDRESS (wgpu-hal adds it to all storage
-    // buffers); sizes come from the host convert query at init.
+    // SAFETY: Vulkan backend; every slot references a live heap descriptor;
+    // the convert addresses point at live SHADER_DEVICE_ADDRESS buffers.
     unsafe {
-        conv_encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
             let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
             let cb = hal_encoder.raw_handle();
             let dev = &pipelines.raw_device;
+            let seam = &pipelines.seam;
             let barrier = |src_stage, src_access, dst_stage, dst_access| {
                 vk::MemoryBarrier2::default()
                     .src_stage_mask(src_stage)
@@ -816,16 +828,75 @@ pub fn dispatch_training(
                     .dst_stage_mask(dst_stage)
                     .dst_access_mask(dst_access)
             };
+            let barrier2 = |cb, b: &[vk::MemoryBarrier2]| {
+                dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(b));
+            };
+            let raw_buf = |b: &Buffer| -> vk::Buffer {
+                b.as_hal::<VkApi>()
+                    .map(|hb| hb.raw_handle())
+                    .expect("bevy_solari requires the Vulkan backend")
+            };
+
+            // Zero the gradient accumulators (the fused kernel's accumulates
+            // are additive). Last frame's convert read dw_opt and adam read
+            // db/dw — fence those reads (and the trace's record writes) before
+            // the clears and the reads below.
             let pre = [barrier(
+                vk::PipelineStageFlags2::COMPUTE_SHADER
+                    | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                    | vk::PipelineStageFlags2::CONVERT_COOPERATIVE_VECTOR_MATRIX_NV,
+                vk::AccessFlags2::SHADER_WRITE
+                    | vk::AccessFlags2::SHADER_READ
+                    | vk::AccessFlags2::TRANSFER_READ,
+                vk::PipelineStageFlags2::CLEAR | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::TRANSFER_WRITE
+                    | vk::AccessFlags2::SHADER_READ
+                    | vk::AccessFlags2::SHADER_WRITE,
+            )];
+            barrier2(cb, &pre);
+            dev.cmd_fill_buffer(cb, raw_buf(&bufs.dw_opt), 0, vk::WHOLE_SIZE, 0);
+            dev.cmd_fill_buffer(cb, raw_buf(&bufs.db), 0, vk::WHOLE_SIZE, 0);
+            barrier2(
+                cb,
+                &[barrier(
+                    vk::PipelineStageFlags2::CLEAR,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                )],
+            );
+
+            seam.bind_heaps(cb);
+            let compute_to_compute = [barrier(
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+            )];
+
+            // encode: records -> acts + targets
+            seam.push_data(cb, bytemuck::cast_slice(&encode_slots));
+            dev.cmd_bind_pipeline(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                pipelines.encode_records.1,
+            );
+            dev.cmd_dispatch(cb, batch.div_ceil(64), 1, 1);
+            barrier2(cb, &compute_to_compute);
+
+            // fused forward + loss + backward incl. the dW/db accumulates
+            seam.push_data(cb, bytemuck::cast_slice(&learn_slots));
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipelines.learn.1);
+            dev.cmd_dispatch(cb, batch.div_ceil(64), 1, 1);
+
+            // Per-layer TrainingOptimal -> RowMajor dW conversion.
+            let to_convert = [barrier(
                 vk::PipelineStageFlags2::COMPUTE_SHADER,
                 vk::AccessFlags2::SHADER_WRITE,
                 vk::PipelineStageFlags2::CONVERT_COOPERATIVE_VECTOR_MATRIX_NV,
-                vk::AccessFlags2::TRANSFER_READ,
+                vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE,
             )];
-            dev.cmd_pipeline_barrier2(
-                cb,
-                &vk::DependencyInfo::default().memory_barriers(&pre),
-            );
+            barrier2(cb, &to_convert);
             let opt_size = pipelines.opt_size as usize;
             let row_bytes = NRC_W_ELEMS * 4;
             let mut dst_sizes = [row_bytes; NRC_LAYERS];
@@ -854,32 +925,41 @@ pub fn dispatch_training(
             pipelines
                 .coopvec_fns
                 .cmd_convert_cooperative_vector_matrix(cb, &infos);
-            let post = [barrier(
-                vk::PipelineStageFlags2::CONVERT_COOPERATIVE_VECTOR_MATRIX_NV,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_READ,
-            )];
-            dev.cmd_pipeline_barrier2(
+            barrier2(
                 cb,
-                &vk::DependencyInfo::default().memory_barriers(&post),
+                &[barrier(
+                    vk::PipelineStageFlags2::CONVERT_COOPERATIVE_VECTOR_MATRIX_NV,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_READ,
+                )],
             );
-        });
-    }
-    ctx.add_command_buffer(conv_encoder.finish());
 
-    {
-        let encoder = ctx.command_encoder();
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("nrc_adam"),
-            timestamp_writes: None,
+            // adam: weights, then biases (both write the transposed weight
+            // mirror -> fence between them).
+            seam.push_data(cb, bytemuck::cast_slice(&adam_w_slots));
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipelines.adam.1);
+            dev.cmd_dispatch(cb, (NRC_W_TOTAL as u32).div_ceil(64), 1, 1);
+            barrier2(cb, &compute_to_compute);
+            seam.push_data(cb, bytemuck::cast_slice(&adam_b_slots));
+            dev.cmd_dispatch(cb, (NRC_B_TOTAL as u32).div_ceil(64), 1, 1);
+
+            // Updated mirrors -> next frame's raygen inference; loss/targets
+            // -> the tracked staging copies below.
+            let post = [barrier(
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER
+                    | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                    | vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::TRANSFER_READ,
+            )];
+            barrier2(cb, &post);
         });
-        pass.set_pipeline(adam);
-        pass.set_bind_group(0, &groups.adam_w, &[]);
-        pass.dispatch_workgroups((NRC_W_TOTAL as u32).div_ceil(64), 1, 1);
-        pass.set_bind_group(0, &groups.adam_b, &[]);
-        pass.dispatch_workgroups((NRC_B_TOTAL as u32).div_ceil(64), 1, 1);
     }
+    ctx.add_command_buffer(encoder.finish());
+
+
     let encoder = ctx.command_encoder();
     if nrc.log_loss && bufs.step % 120 == 0 && bufs.loss_state == 0 {
         encoder.copy_buffer_to_buffer(&bufs.loss, 0, &bufs.loss_staging, 0, batch as u64 * 4);

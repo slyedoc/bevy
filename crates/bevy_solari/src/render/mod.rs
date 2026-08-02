@@ -126,7 +126,12 @@ impl Plugin for SolarRenderPlugin {
             .init_resource::<sky::SolariCustomSky>()
             .add_systems(RenderStartup, rt_pipeline::init_rt_blit)
             .add_systems(RenderStartup, rt_pipeline::init_restir_spatial)
-            .add_systems(RenderStartup, crate::nrc::init_nrc_pipelines)
+            // After `SolariSetup`: the pipelines are heap-flagged raw compute,
+            // built through the seam the allocator init inserts.
+            .add_systems(
+                RenderStartup,
+                crate::nrc::init_nrc_pipelines.after(crate::SolariSetup),
+            )
             .add_systems(
                 Render,
                 rt_pipeline::queue_restir_spatial_pipeline.in_set(RenderSystems::PrepareResources),

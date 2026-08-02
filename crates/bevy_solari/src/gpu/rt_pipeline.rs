@@ -131,6 +131,10 @@ pub fn build_heap_mappings(
     for &(binding, slot) in columns {
         mappings.push(seam.map_binding(2, binding, HeapKind::Buffer, slot));
     }
+    // Set 3: record-sourced bindings. (3,0) is the chits' per-material record
+    // block (`SbtRecord` in chit_opaque/chit_glass), read inline from the hit
+    // record's data bytes — the fields `write_record` bakes.
+    mappings.push(seam.map_binding_shader_record_data(3, 0, 0));
     mappings
 }
 
@@ -836,6 +840,7 @@ impl RtPipeline {
     /// Vulkan step fails (logged).
     pub fn new(
         allocator: &Allocator,
+        seam: &crate::gpu::binding_seam::BindingSeam,
         libraries: &mut RtLibraryCache,
         material_classes: &[u32],
         hit_groups: &[SolariHitGroupDef],
@@ -917,17 +922,19 @@ impl RtPipeline {
         // The set-1 descriptor set + camera UBO + env binding are per-view, built
         // lazily in `create_view_bindings` (one per `SolariCamera`).
 
-        // --- SBT: raygen + 2 miss + ONE HIT RECORD PER MATERIAL (+ hair) -------
-        // Three regions, each base-aligned. The hit region holds one record per
-        // material slot; an instance's `instance_contribution_to_hit_group_index`
-        // = its material slot selects its record. Each HIT record is
-        // [shader group handle | shader-record data]; the data slot holds the
-        // material id (= record index), which `chit_opaque`'s `var<shader_record>`
-        // reads as the canonical material binding (uniform per record → uniform
-        // per warp after SER). Distinct per-material records also give SER a
-        // per-material reorder key.
+        // --- SBT: raygen + 2 miss local; ONE HIT RECORD PER MATERIAL (+ hair)
+        // in the seam's record table -------------------------------------------
+        // The hit region holds one record per material slot; an instance's
+        // `instance_contribution_to_hit_group_index` = its material slot selects
+        // its record. Each HIT record is [shader group handle | fields]; the
+        // fields hold the material id (= record index), which the chits read
+        // through the record-sourced set-3 mapping (uniform per record →
+        // uniform per warp after SER). Distinct per-material records also give
+        // SER a per-material reorder key. Records live in the seam's table
+        // (`write_record`), rewritten wholesale here — safe because every
+        // rebuild path drains the GPU before dropping the old pipeline, and the
+        // first build precedes any trace.
         const MISS_COUNT: u64 = 2; // miss index 0 = primary, 1 = shadow
-        const HIT_RECORD_DATA: u64 = 4; // bytes of shader-record data (u32 material id)
         const RECORD_HEADROOM: u32 = 1024; // absorb streaming material growth post-build
         // One extra hit record, appended AFTER the per-material records, baked with
         // the hair hit-group handle (group 4). Hair instances route to it
@@ -938,14 +945,10 @@ impl RtPipeline {
         let record_capacity = material_count + RECORD_HEADROOM;
         let total_records = record_capacity as u64 + HAIR_RECORDS;
         let handle_stride = align_up(handle_size, handle_align);
-        // Hit records carry the material-id data slot, so they're wider than a
-        // bare handle.
-        let hit_record_stride = align_up(handle_size + HIT_RECORD_DATA, handle_align);
         let raygen_offset = 0u64;
         let miss_offset = align_up(handle_stride, base_align);
-        // The miss region holds MISS_COUNT contiguous handle-stride records.
-        let hit_offset = align_up(miss_offset + MISS_COUNT * handle_stride, base_align);
-        let sbt_size = hit_offset + total_records * hit_record_stride;
+        // The local SBT holds only raygen + the MISS_COUNT miss records.
+        let sbt_size = miss_offset + MISS_COUNT * handle_stride;
         let sbt = alloc_mapped_buffer(
             allocator,
             sbt_size,
@@ -987,11 +990,10 @@ impl RtPipeline {
         // material's record lands on the closest-hit its CLASS selects, not always
         // the opaque one. (Hair is class 2 → group 4, reached via the reserved
         // record below, not a material.) Headroom records past the live material
-        // count, and any out-of-range class, fall back to opaque. The data slot =
-        // the record index = the material id, read back via `var<shader_record>`
-        // (uniform per record → uniform per warp after SER).
+        // count, and any out-of-range class, fall back to opaque. The fields =
+        // the record index = the material id, read back through the set-3
+        // record mapping (uniform per record → uniform per warp after SER).
         for record in 0..total_records {
-            let rec_off = hit_offset + record * hit_record_stride;
             // The appended hair record (index == record_capacity) always routes to
             // the hair closest-hit (group 4); every other record picks its material
             // class handle (headroom / out-of-range → opaque).
@@ -1005,19 +1007,11 @@ impl RtPipeline {
                     .min(max_class);
                 handle(2 + class as usize)
             };
-            // SAFETY: rec_off + handle_size + 4 within the record.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    group_handle.as_ptr(),
-                    sbt.mapped.add(rec_off as usize),
-                    handle_size as usize,
-                );
-                core::ptr::copy_nonoverlapping(
-                    (record as u32).to_le_bytes().as_ptr(),
-                    sbt.mapped.add((rec_off + handle_size) as usize),
-                    4,
-                );
-            }
+            seam.write_record(
+                record as u32,
+                group_handle,
+                &(record as u32).to_le_bytes(),
+            );
         }
 
         let raygen_region = vk::StridedDeviceAddressRegionKHR::default()
@@ -1031,10 +1025,7 @@ impl RtPipeline {
         // Per-material records + the appended hair record; stride steps one record.
         // An instance's material slot indexes the material records; hair indexes the
         // last one (`hair_sbt_record`).
-        let hit_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(sbt.device_address + hit_offset)
-            .stride(hit_record_stride)
-            .size(total_records * hit_record_stride);
+        let hit_region = seam.record_region(0, total_records as u32);
         let callable_region = vk::StridedDeviceAddressRegionKHR::default();
 
         let out = Self {
@@ -1426,6 +1417,18 @@ impl RtViewBindings {
     /// the view's current output buffer to detect a resize-driven reallocation.
     pub fn output_buffer(&self) -> vk::Buffer {
         self.output_buffer
+    }
+
+    /// Heap slot of the per-pixel output buffer (set-1 binding 0) — the NRC
+    /// query composite writes through it.
+    pub fn output_slot(&self) -> u32 {
+        self.heap.buffers[0]
+    }
+
+    /// Heap slot of the NRC termination-query ring (set-1 binding 16, the last
+    /// buffer slot) — the NRC query-infer kernel consumes it.
+    pub fn nrc_queries_slot(&self) -> u32 {
+        *self.heap.buffers.last().unwrap()
     }
 
     /// The env cube view baked into binding 2. The dispatch compares this to the

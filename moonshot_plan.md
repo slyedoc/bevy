@@ -183,15 +183,14 @@ Driver intel (researched 2026-08-01):
   The wgpu scene/columns bind groups still exist — the ReSTIR spatial
   wgpu pass consumes them (they leave the RT trace's world, not the
   renderer).
-- Materials: `[[vk::shader_record]]` manual unpack in chit_opaque/chit_glass
-  is volatility in shader source — replace with mapped record sources
-  (SHADER_RECORD_DATA / HEAP_WITH_SHADER_RECORD_INDEX) via `write_record`.
 - Post-flip: texture/sampler heap writes move off the per-frame mirror onto
   the diff-driven upload path (write descriptors at register/evict, material
   records carry heap indices; steady-state frames write zero descriptors).
-- Materials: `[[vk::shader_record]]` manual unpack in chit_opaque/chit_glass
-  is volatility in shader source — replace with mapped record sources
-  (SHADER_RECORD_DATA / HEAP_WITH_SHADER_RECORD_INDEX) via `write_record`.
+- **Materials DONE (2026-08-02)**: chits declare `[[vk::binding(0, 3)]]`
+  (set 3 = record-sourced), mapped from SHADER_RECORD_DATA at data offset 0;
+  the SBT hit region lives in the seam's record table (`write_record` +
+  `record_region`), rewritten at pipeline build (every rebuild drains
+  first); the local SBT holds only raygen + miss.
 - Columns set 2: plain storage → BDA pointers in push data.
 - Coopvec caveat RESOLVED by M0: raygen's inline NRC query maps like every
   other binding; no static matmul set needed. (BDA pointer forms remain
@@ -200,11 +199,21 @@ Driver intel (researched 2026-08-01):
   bistro viewer) + no VVL errors.
 
 ### M3. NRC + compute follow the seam
-- H1 from heap_plan, reshaped: training chain on raw dispatch, matmul per
-  M0's verdict, everything else BDA/heap; one raw encoder, fills + converts
-  inline (Law 9 stops applying); dedicated aligned buffers for the convert
-  (VUID 10084/10085 — stop relying on driver tolerance).
-- Gym certifies (0.545 gradcheck / ≥2900 steps/s baseline).
+- **DONE (2026-08-02, clean run, loss parity ~0.17)**: the whole chain —
+  encode → fused coopvec train → dW convert → adam×2 — is ONE raw
+  sync2-fenced command buffer; query-infer + composite its own. All kernel
+  bindings are push-indexed heap slots
+  (`BindingSeam::create_heap_compute_pipeline`): one adam pipeline serves
+  weights AND biases (slots are per-dispatch push data); per-view infer
+  reuses the view's RT slots. wgpu compute pipelines/BGLs/bind groups
+  deleted from nrc. Traps: UBOs need STORAGE usage riding along for
+  SHADER_DEVICE_ADDRESS (VVL 02601); raw-only buffers must be explicitly
+  zeroed at init AND raw-written-then-wgpu-copied buffers (loss/targets)
+  must be marked initialized or lazy zero-init wipes them (Law 9 corollary).
+- Kernel SPIR-V unchanged → the gym's certification stands (it is a
+  standalone plain-wgpu harness over the same blobs).
+- Remaining nicety: dedicated 64-B-aligned convert buffers (VUID
+  10084/10085 — VVL currently silent, still driver tolerance).
 
 ### M4. Slang module linking (replaces the blob workflow)
 - Precompiled `.slang-module` IR per stage; libslang links + specializes at
