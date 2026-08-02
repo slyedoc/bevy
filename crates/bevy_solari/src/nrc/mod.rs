@@ -132,10 +132,9 @@ struct LearnParams {
     pad_b: u32,
 }
 
-/// Bind-group layouts + pipelines for the training kernels. Every kernel is
-/// Slang-compiled passthrough SPIR-V (nrc_train.slang + nrc_mlp.slang — regen
-/// commands in their headers) with an explicit layout, created eagerly: no
-/// naga reflection, nothing queued on the `PipelineCache`.
+/// The training/inference kernels, compiled from Slang source at startup
+/// (`compile_rt_slang`) and created eagerly — nothing queued on the
+/// `PipelineCache`.
 #[derive(Resource)]
 pub struct NrcPipelines {
     /// Heap-flagged (layout-free) raw compute pipelines, one per kernel. Every
@@ -145,10 +144,10 @@ pub struct NrcPipelines {
     /// buffer set (adam runs twice, weights then biases, from one pipeline).
     ///
     /// [`BindingSeam::create_heap_compute_pipeline`]: crate::gpu::binding_seam::BindingSeam::create_heap_compute_pipeline
-    learn: (vk::ShaderModule, vk::Pipeline),
-    adam: (vk::ShaderModule, vk::Pipeline),
-    encode_records: (vk::ShaderModule, vk::Pipeline),
-    query_infer: (vk::ShaderModule, vk::Pipeline),
+    learn: NrcKernel,
+    adam: NrcKernel,
+    encode_records: NrcKernel,
+    query_infer: NrcKernel,
     seam: crate::gpu::binding_seam::BindingSeam,
     /// `VK_NV_cooperative_vector` fn table + the raw device — the per-layer
     /// TrainingOptimal→RowMajor dW conversion is a raw device command.
@@ -164,18 +163,64 @@ impl Drop for NrcPipelines {
     fn drop(&mut self) {
         // In-flight dispatches may still reference the pipelines; drain first.
         self._device_keepalive.quiesce_before_raw_destroy();
-        for (module, pipeline) in [
-            self.learn,
-            self.adam,
-            self.encode_records,
-            self.query_infer,
+        for kernel in [
+            &self.learn,
+            &self.adam,
+            &self.encode_records,
+            &self.query_infer,
         ] {
             // SAFETY: quiesced; handles exclusively owned here.
             unsafe {
-                self.raw_device.destroy_pipeline(pipeline, None);
-                self.raw_device.destroy_shader_module(module, None);
+                self.raw_device.destroy_pipeline(kernel.pipeline, None);
+                self.raw_device.destroy_shader_module(kernel.module, None);
             }
         }
+    }
+}
+
+/// One heap-flagged kernel plus its reflected set-0 parameter table — the
+/// contract [`push_slots`](Self::push_slots) assembles push data against.
+struct NrcKernel {
+    module: vk::ShaderModule,
+    pipeline: vk::Pipeline,
+    /// `(parameter name, binding)` from slang reflection of this kernel.
+    bindings: Vec<(String, u32)>,
+}
+
+impl NrcKernel {
+    /// Assemble the push-data slot array from `(parameter name, heap slot)`
+    /// pairs: `slots[binding] = slot`, with the binding read from the
+    /// shader's own reflected layout. Any mismatch — a missing, misnamed,
+    /// duplicated, or extra parameter — panics naming the kernel and the
+    /// parameter, so a shader binding edit can't silently desync a dispatch.
+    fn push_slots(&self, label: &str, named: &[(&str, u32)]) -> Vec<u32> {
+        let len = self
+            .bindings
+            .iter()
+            .map(|&(_, binding)| binding + 1)
+            .max()
+            .unwrap_or(0);
+        let mut slots = vec![u32::MAX; len as usize];
+        for &(name, slot) in named {
+            let Some(&(_, binding)) = self.bindings.iter().find(|(n, _)| n == name) else {
+                panic!(
+                    "nrc: {label} has no parameter `{name}` (shader declares {:?})",
+                    self.bindings
+                );
+            };
+            assert!(
+                slots[binding as usize] == u32::MAX,
+                "nrc: {label}: parameter `{name}` supplied twice"
+            );
+            slots[binding as usize] = slot;
+        }
+        for (name, binding) in &self.bindings {
+            assert!(
+                slots[*binding as usize] != u32::MAX,
+                "nrc: {label}: parameter `{name}` not supplied"
+            );
+        }
+        slots
     }
 }
 
@@ -293,10 +338,14 @@ pub fn init_nrc_pipelines(
         return;
     };
 
-    // Kernel binding counts (contiguous from 0, per the .slang binding tables).
+    // Nothing about the kernels' bindings is hand-maintained: the mapping
+    // table per kernel is derived from its compiled SPIR-V
+    // (`create_heap_compute_pipeline`), and the dispatch slot arrays are
+    // assembled by parameter NAME against the kernel's reflected layout
+    // ([`NrcKernel::push_slots`]).
     let mlp: &[(&str, &str)] = &[("nrc_mlp", include_str!("nrc_mlp.slang"))];
-    let make = |label: &'static str, file: &'static str, source: &'static str, entry: &'static str, bindings: u32| {
-        let spv = crate::gpu::slang::compile_rt_slang(
+    let make = |label: &'static str, file: &'static str, source: &'static str, entry: &'static str| {
+        let shader = crate::gpu::slang::compile_rt_slang(
             file,
             source,
             entry,
@@ -307,7 +356,17 @@ pub fn init_nrc_pipelines(
         )
         .map_err(|e| bevy_log::error!("nrc: {e}"))
         .ok()?;
-        seam.create_heap_compute_pipeline(&spv, bindings, label)
+        let (module, pipeline) = seam.create_heap_compute_pipeline(&shader.spirv, label)?;
+        Some(NrcKernel {
+            module,
+            pipeline,
+            bindings: shader
+                .bindings
+                .into_iter()
+                .filter(|&(_, set, _)| set == 0)
+                .map(|(name, _, binding)| (name, binding))
+                .collect(),
+        })
     };
     let (Some(learn), Some(adam), Some(encode_records), Some(query_infer)) = (
         make(
@@ -315,28 +374,24 @@ pub fn init_nrc_pipelines(
             "nrc_train.slang",
             include_str!("nrc_train.slang"),
             "learn_gradient",
-            10,
         ),
         make(
             "nrc_adam",
             "nrc_adam.slang",
             include_str!("nrc_adam.slang"),
             "adam",
-            9,
         ),
         make(
             "nrc_encode_records",
             "nrc_encode_records.slang",
             include_str!("nrc_encode_records.slang"),
             "nrc_encode_records",
-            4,
         ),
         make(
             "nrc_query_infer",
             "nrc_query_infer.slang",
             include_str!("nrc_query_infer.slang"),
             "nrc_query_infer",
-            5,
         ),
     ) else {
         return;
@@ -697,14 +752,16 @@ pub fn dispatch_nrc_query_infer(
             pad: 0,
         }),
     );
-    // Binding order per nrc_mlp.slang's query kernel.
-    let slots = [
-        bufs.slots.weights_t_ema,
-        bufs.slots.bias16_ema,
-        queries_slot,
-        output_slot,
-        bufs.slots.query_ubo,
-    ];
+    let slots = pipelines.query_infer.push_slots(
+        "nrc_query_infer",
+        &[
+            ("weights_t", bufs.slots.weights_t_ema),
+            ("biases", bufs.slots.bias16_ema),
+            ("nrc_queries", queries_slot),
+            ("out_radiance", output_slot),
+            ("qparams", bufs.slots.query_ubo),
+        ],
+    );
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("nrc_query_infer"),
     });
@@ -722,7 +779,7 @@ pub fn dispatch_nrc_query_infer(
             dev.cmd_bind_pipeline(
                 cb,
                 vk::PipelineBindPoint::COMPUTE,
-                pipelines.query_infer.1,
+                pipelines.query_infer.pipeline,
             );
             // The count lives on the GPU; over-dispatch to the cap, threads
             // early-out.
@@ -813,36 +870,62 @@ pub fn dispatch_training(
         }),
     );
 
-    // Per-kernel heap-slot arrays — order matches each kernel's
-    // `[[vk::binding]]` table (nrc_encode_records / nrc_train / nrc_adam).
+    // Per-kernel heap-slot arrays, assembled by parameter name against each
+    // kernel's reflected binding table — a shader binding rename/reorder
+    // panics here instead of silently desyncing.
     let s = &bufs.slots;
-    let encode_slots = [s.records, s.acts, s.targets, s.train_ubo];
-    let learn_slots = [
-        s.acts, s.weights_t, s.bias16, s.targets, s.preds, s.loss, s.dw_opt, s.db, s.learn_ubo,
-        s.zeros,
-    ];
-    let adam_w_slots = [
-        s.master_w,
-        s.dw,
-        s.m_w,
-        s.v_w,
-        s.w16,
-        s.weights_t,
-        s.ema_w,
-        s.weights_t_ema,
-        s.adam_w_ubo,
-    ];
-    let adam_b_slots = [
-        s.master_b,
-        s.db,
-        s.m_b,
-        s.v_b,
-        s.bias16,
-        s.weights_t,
-        s.ema_b,
-        s.bias16_ema,
-        s.adam_b_ubo,
-    ];
+    let encode_slots = pipelines.encode_records.push_slots(
+        "nrc_encode_records",
+        &[
+            ("records", s.records),
+            ("act_out", s.acts),
+            ("targets_out", s.targets),
+            ("train_params", s.train_ubo),
+        ],
+    );
+    let learn_slots = pipelines.learn.push_slots(
+        "nrc_learn",
+        &[
+            ("acts", s.acts),
+            ("weights_t", s.weights_t),
+            ("biases", s.bias16),
+            ("targets", s.targets),
+            ("preds", s.preds),
+            ("loss_out", s.loss),
+            ("dw_opt", s.dw_opt),
+            ("db", s.db),
+            ("params", s.learn_ubo),
+            ("zeros_buf", s.zeros),
+        ],
+    );
+    let adam_w_slots = pipelines.adam.push_slots(
+        "nrc_adam (weights)",
+        &[
+            ("master", s.master_w),
+            ("grad_in", s.dw),
+            ("moment_m", s.m_w),
+            ("moment_v", s.v_w),
+            ("mirror_f16", s.w16),
+            ("mirror_alt", s.weights_t),
+            ("ema_master", s.ema_w),
+            ("mirror_ema", s.weights_t_ema),
+            ("adam_u", s.adam_w_ubo),
+        ],
+    );
+    let adam_b_slots = pipelines.adam.push_slots(
+        "nrc_adam (biases)",
+        &[
+            ("master", s.master_b),
+            ("grad_in", s.db),
+            ("moment_m", s.m_b),
+            ("moment_v", s.v_b),
+            ("mirror_f16", s.bias16),
+            ("mirror_alt", s.weights_t),
+            ("ema_master", s.ema_b),
+            ("mirror_ema", s.bias16_ema),
+            ("adam_u", s.adam_b_ubo),
+        ],
+    );
 
     // The whole chain — gradient clears, encode, fused train, dW layout
     // convert, adam ×2 — in ONE raw command buffer with sync2 barriers (wgpu
@@ -917,14 +1000,14 @@ pub fn dispatch_training(
             dev.cmd_bind_pipeline(
                 cb,
                 vk::PipelineBindPoint::COMPUTE,
-                pipelines.encode_records.1,
+                pipelines.encode_records.pipeline,
             );
             dev.cmd_dispatch(cb, batch.div_ceil(64), 1, 1);
             barrier2(cb, &compute_to_compute);
 
             // fused forward + loss + backward incl. the dW/db accumulates
             seam.push_data(cb, bytemuck::cast_slice(&learn_slots));
-            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipelines.learn.1);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipelines.learn.pipeline);
             dev.cmd_dispatch(cb, batch.div_ceil(64), 1, 1);
 
             // Per-layer TrainingOptimal -> RowMajor dW conversion.
@@ -976,7 +1059,7 @@ pub fn dispatch_training(
             // adam: weights, then biases (both write the transposed weight
             // mirror -> fence between them).
             seam.push_data(cb, bytemuck::cast_slice(&adam_w_slots));
-            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipelines.adam.1);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipelines.adam.pipeline);
             dev.cmd_dispatch(cb, (NRC_W_TOTAL as u32).div_ceil(64), 1, 1);
             barrier2(cb, &compute_to_compute);
             seam.push_data(cb, bytemuck::cast_slice(&adam_b_slots));

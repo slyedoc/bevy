@@ -19,8 +19,21 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::sync::Mutex;
+
+/// A compiled entry point: the SPIR-V plus the program's reflected
+/// descriptor-bound global parameters. The parameter table lets dispatch-side
+/// binding tables be assembled BY NAME against the shader's own layout
+/// instead of hand-ordered ("must match the `[[vk::binding]]` table")
+/// contracts — see `NrcKernel::push_slots`.
+pub struct CompiledShader {
+    pub spirv: Vec<u32>,
+    /// `(parameter name, descriptor set, binding)` per global parameter, in
+    /// reflection order. Reflection covers the declared layout — a parameter
+    /// DCE'd out of the SPIR-V still appears here.
+    pub bindings: Vec<(String, u32, u32)>,
+}
 
 /// Stage of a runtime-compiled entry point.
 #[derive(Clone, Copy, Debug)]
@@ -63,6 +76,13 @@ struct Api {
     add_preprocessor_define: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char),
     find_capability: unsafe extern "C" fn(*mut c_void, *const c_char) -> i32,
     add_target_capability: unsafe extern "C" fn(*mut c_void, c_int, i32),
+    get_reflection: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    reflection_parameter_count: unsafe extern "C" fn(*mut c_void) -> c_uint,
+    reflection_parameter_by_index: unsafe extern "C" fn(*mut c_void, c_uint) -> *mut c_void,
+    parameter_binding_index: unsafe extern "C" fn(*mut c_void) -> c_uint,
+    parameter_binding_space: unsafe extern "C" fn(*mut c_void) -> c_uint,
+    variable_layout_variable: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    variable_name: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     add_translation_unit: unsafe extern "C" fn(*mut c_void, c_int, *const c_char) -> c_int,
     add_translation_unit_source_string:
         unsafe extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char),
@@ -106,6 +126,13 @@ fn load_api() -> Result<Api, String> {
         add_preprocessor_define: sym!(b"spAddPreprocessorDefine"),
         find_capability: sym!(b"spFindCapability"),
         add_target_capability: sym!(b"spAddTargetCapability"),
+        get_reflection: sym!(b"spGetReflection"),
+        reflection_parameter_count: sym!(b"spReflection_GetParameterCount"),
+        reflection_parameter_by_index: sym!(b"spReflection_GetParameterByIndex"),
+        parameter_binding_index: sym!(b"spReflectionParameter_GetBindingIndex"),
+        parameter_binding_space: sym!(b"spReflectionParameter_GetBindingSpace"),
+        variable_layout_variable: sym!(b"spReflectionVariableLayout_GetVariable"),
+        variable_name: sym!(b"spReflectionVariable_GetName"),
         add_translation_unit: sym!(b"spAddTranslationUnit"),
         add_translation_unit_source_string: sym!(b"spAddTranslationUnitSourceString"),
         add_entry_point: sym!(b"spAddEntryPoint"),
@@ -144,7 +171,7 @@ pub fn compile_rt_slang(
     modules: &[(&str, &str)],
     defines: &[(&str, &str)],
     capabilities: &[&str],
-) -> Result<Vec<u32>, String> {
+) -> Result<CompiledShader, String> {
     let mut guard = SLANG.lock().unwrap();
     let api = match guard.get_or_insert_with(load_api) {
         Ok(api) => api,
@@ -189,7 +216,7 @@ fn compile_with_request(
     stage: SlangRtStage,
     defines: &[(&str, &str)],
     capabilities: &[&str],
-) -> Result<Vec<u32>, String> {
+) -> Result<CompiledShader, String> {
     let cstr = |s: &str, what: &str| {
         CString::new(s).map_err(|_| format!("{entry_file}: interior NUL in {what}"))
     };
@@ -269,12 +296,45 @@ fn compile_with_request(
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
+
+        // Global-parameter reflection, copied out before the request (which
+        // owns the reflection blob) is destroyed.
+        let mut bindings = Vec::new();
+        let reflection = (api.get_reflection)(req);
+        if !reflection.is_null() {
+            for i in 0..(api.reflection_parameter_count)(reflection) {
+                let param = (api.reflection_parameter_by_index)(reflection, i);
+                if param.is_null() {
+                    continue;
+                }
+                let var = (api.variable_layout_variable)(param);
+                let name_ptr = if var.is_null() {
+                    core::ptr::null()
+                } else {
+                    (api.variable_name)(var)
+                };
+                if name_ptr.is_null() {
+                    continue;
+                }
+                let name = std::ffi::CStr::from_ptr(name_ptr)
+                    .to_string_lossy()
+                    .into_owned();
+                bindings.push((
+                    name,
+                    (api.parameter_binding_space)(param),
+                    (api.parameter_binding_index)(param),
+                ));
+            }
+        }
         (api.destroy_compile_request)(req);
 
         if words[0] != 0x0723_0203 {
             return Err(format!("{entry_file}: slang output is not SPIR-V"));
         }
-        Ok(words)
+        Ok(CompiledShader {
+            spirv: words,
+            bindings,
+        })
     }
 }
 

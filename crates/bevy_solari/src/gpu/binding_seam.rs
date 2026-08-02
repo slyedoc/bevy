@@ -617,26 +617,35 @@ impl BindingSeam {
     }
 
     /// Create a heap-flagged (layout-free) COMPUTE pipeline from SPIR-V whose
-    /// set-0 bindings `0..binding_count` are all buffers, each sourced by a
-    /// heap-slot index read from push data at `binding * 4`
-    /// ([`map_binding_push_index`](Self::map_binding_push_index)). Dispatch =
+    /// set-0 bindings are all buffers, each sourced by a heap-slot index read
+    /// from push data at `binding * 4`
+    /// ([`map_binding_push_index`](Self::map_binding_push_index)). The binding
+    /// list is read from the SPIR-V itself
+    /// ([`spirv_descriptor_bindings`]) — the mapping table covers exactly
+    /// what the module declares, nothing hand-counted. Dispatch =
     /// [`bind_heaps`](Self::bind_heaps) + [`push_data`](Self::push_data) with
-    /// the slot array + `vkCmdDispatch`; the same pipeline serves any buffer
-    /// set (the slots are per-dispatch data, not baked).
+    /// the slot array (indexed by binding number) + `vkCmdDispatch`; the same
+    /// pipeline serves any buffer set (the slots are per-dispatch data, not
+    /// baked).
     pub fn create_heap_compute_pipeline(
         &self,
         spirv: &[u32],
-        binding_count: u32,
         label: &str,
     ) -> Option<(vk::ShaderModule, vk::Pipeline)> {
         let device = self.inner.allocator.device();
+        let bindings = spirv_descriptor_bindings(spirv);
+        assert!(
+            !bindings.is_empty() && bindings.iter().all(|&(set, _)| set == 0),
+            "binding_seam: {label}: heap compute kernels bind set 0 only (found {bindings:?})"
+        );
         let module_info = vk::ShaderModuleCreateInfo::default().code(spirv);
         // SAFETY: spirv is a validated word slice; device live.
         let module = unsafe { device.create_shader_module(&module_info, None) }
             .map_err(|e| bevy_log::error!("binding_seam: {label}: create_shader_module: {e:?}"))
             .ok()?;
-        let mappings: Vec<vk::DescriptorSetAndBindingMappingEXT> = (0..binding_count)
-            .map(|b| self.map_binding_push_index(0, b, HeapKind::Buffer, b * 4))
+        let mappings: Vec<vk::DescriptorSetAndBindingMappingEXT> = bindings
+            .iter()
+            .map(|&(_, b)| self.map_binding_push_index(0, b, HeapKind::Buffer, b * 4))
             .collect();
         let mut mapping_info = vk::ShaderDescriptorSetAndBindingMappingInfoEXT::default();
         mapping_info.mapping_count = mappings.len() as u32;
@@ -884,4 +893,43 @@ impl Drop for SeamInner {
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
+}
+
+/// The `(descriptor set, binding)` pairs a SPIR-V module declares — every id
+/// carrying both a `DescriptorSet` and a `Binding` decoration, sorted and
+/// deduplicated. This is what a heap mapping table must cover, read from the
+/// exact artifact the driver sees (no hand-maintained binding counts, no
+/// reflection of sources that DCE may have diverged from).
+pub(crate) fn spirv_descriptor_bindings(spirv: &[u32]) -> Vec<(u32, u32)> {
+    const OP_DECORATE: u32 = 71;
+    const DECORATION_BINDING: u32 = 33;
+    const DECORATION_DESCRIPTOR_SET: u32 = 34;
+    let mut sets = std::collections::HashMap::new();
+    let mut bindings = std::collections::HashMap::new();
+    let mut i = 5; // past the SPIR-V header
+    while i < spirv.len() {
+        let word_count = (spirv[i] >> 16) as usize;
+        if word_count == 0 || i + word_count > spirv.len() {
+            break;
+        }
+        if spirv[i] & 0xFFFF == OP_DECORATE && word_count == 4 {
+            match spirv[i + 2] {
+                DECORATION_DESCRIPTOR_SET => {
+                    sets.insert(spirv[i + 1], spirv[i + 3]);
+                }
+                DECORATION_BINDING => {
+                    bindings.insert(spirv[i + 1], spirv[i + 3]);
+                }
+                _ => {}
+            }
+        }
+        i += word_count;
+    }
+    let mut out: Vec<(u32, u32)> = sets
+        .iter()
+        .filter_map(|(id, &set)| bindings.get(id).map(|&binding| (set, binding)))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }

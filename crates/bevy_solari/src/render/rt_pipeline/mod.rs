@@ -1164,6 +1164,7 @@ pub(crate) fn rt_pipeline(
         Option<Res<crate::accel::deform::Deform>>,
         Option<ResMut<RtLibraryCache>>,
         Option<Res<crate::gpu::binding_seam::BindingSeam>>,
+        Res<crate::gpu::slang_sources::SlangSources>,
     ),
     materials: RtMaterials,
     // Tupled: baked sky cube + atmosphere GPU state (sky_frame quat) +
@@ -1209,8 +1210,15 @@ pub(crate) fn rt_pipeline(
         ptlas,
     ) = render_res;
     let (mut frame_counter, mut settle_frames) = counters;
-    let (cluster_mesh_manager, tess_classify, hit_group_registry, deform, library_cache, seam) =
-        geometry_res;
+    let (
+        cluster_mesh_manager,
+        tess_classify,
+        hit_group_registry,
+        deform,
+        mut library_cache,
+        seam,
+        slang_sources,
+    ) = geometry_res;
     let (atmosphere_sky, atmosphere_gpu, atmosphere_volumes, custom_sky) = atmosphere_res;
     let view_entity = view.entity();
     let (
@@ -1294,6 +1302,21 @@ pub(crate) fn rt_pipeline(
         return;
     };
 
+    // Hot reload: a `.slang` edit bumped the source generation — every cached
+    // library's SPIR-V is stale (the shared modules cross all stages). Drain,
+    // destroy the libraries + the linked pipeline, and rebuild next frame
+    // from the live sources.
+    if let Some(cache) = library_cache.as_deref_mut() {
+        if cache.sources_generation() != slang_sources.generation() {
+            let _ = render_device
+                .wgpu_device()
+                .poll(wgpu::PollType::wait_indefinitely());
+            cache.invalidate_sources(slang_sources.generation());
+            commands.remove_resource::<RtPipeline>();
+            return;
+        }
+    }
+
     // Per-material-slot SBT hit-group class the pipeline bakes into each material's
     // hit record — the routing key that sends glass instances to `chit_glass`
     // instead of every hit landing on `chit_opaque`. Derived from the already
@@ -1328,6 +1351,7 @@ pub(crate) fn rt_pipeline(
                             scene_heap,
                             columns_heap,
                         ),
+                        slang_sources.generation(),
                     )),
                 };
                 if let Some(built) = RtPipeline::new(
@@ -1337,6 +1361,7 @@ pub(crate) fn rt_pipeline(
                     &material_classes,
                     &registry.groups,
                     (&custom_sky.source, custom_sky.generation),
+                    &slang_sources,
                 ) {
                     commands.insert_resource(built);
                 }

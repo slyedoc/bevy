@@ -5,6 +5,7 @@ pub mod extension;
 pub mod raw_trace;
 pub mod rt_pipeline;
 pub mod slang;
+pub mod slang_sources;
 pub mod persistent_buffer;
 pub mod persistent_buffer_impls;
 pub mod retire;

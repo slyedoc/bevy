@@ -124,6 +124,13 @@ impl Plugin for SolarRenderPlugin {
             // Empty; surfaces register into it (built-ins via `SolariPlugin`).
             .init_resource::<crate::gpu::rt_pipeline::SolariHitGroupRegistry>()
             .init_resource::<sky::SolariCustomSky>()
+            // The live shader-source registry: RT stages hot reload on edit.
+            .init_resource::<crate::gpu::slang_sources::SlangSources>()
+            .add_systems(
+                Render,
+                crate::gpu::slang_sources::poll_slang_sources
+                    .in_set(RenderSystems::PrepareResources),
+            )
             .add_systems(RenderStartup, rt_pipeline::init_rt_blit)
             .add_systems(RenderStartup, rt_pipeline::init_restir_spatial)
             // After `SolariSetup`: the pipelines are heap-flagged raw compute,

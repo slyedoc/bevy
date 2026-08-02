@@ -29,6 +29,7 @@ use core::ffi::CStr;
 use wgpu::naga;
 
 use super::allocator::Allocator;
+use super::slang_sources::SlangSources;
 
 // RT-pipeline-private descriptor set (set 1). Set 0 is the shared scene bind
 // group (raytracing_scene_bindings, incl. the TLAS at its binding 9) and set 2
@@ -298,7 +299,7 @@ impl SolariHitGroupRegistry {
             ),
         ] {
             let Some(shader) = shader else { continue };
-            if let Err(e) = compile_group_shader(&group, shader, stage) {
+            if let Err(e) = compile_group_shader(&group, shader, stage, None) {
                 bevy_log::error!(
                     "rt_pipeline: hit group '{}': {kind} failed to compile: {e}. \
                      The RT pipeline will fail to build until this is fixed.",
@@ -354,6 +355,10 @@ pub struct RtLibraryCache {
     /// append-only — existing entries never change identity, so cached
     /// libraries stay valid and only NEW registry entries compile.
     hit_groups: Vec<RtLibrary>,
+    /// The [`SlangSources`] generation the cached libraries were compiled
+    /// from; a mismatch means a shader file was edited — the dispatch calls
+    /// [`invalidate_sources`](Self::invalidate_sources).
+    sources_generation: u64,
     /// See the twin field on [`RtPipeline`].
     _device_keepalive: Allocator,
 }
@@ -369,6 +374,7 @@ impl RtLibraryCache {
     pub fn new(
         allocator: &Allocator,
         heap_mappings: Vec<vk::DescriptorSetAndBindingMappingEXT<'static>>,
+        sources_generation: u64,
     ) -> Self {
         let device = allocator.device().clone();
         // SAFETY: instance + device are live; loading the RT-pipeline function
@@ -382,7 +388,31 @@ impl RtLibraryCache {
             miss: None,
             miss_shadow: None,
             hit_groups: Vec::new(),
+            sources_generation,
             _device_keepalive: allocator.clone(),
+        }
+    }
+
+    /// The [`SlangSources`] generation the cached libraries came from.
+    pub fn sources_generation(&self) -> u64 {
+        self.sources_generation
+    }
+
+    /// Destroy every cached library: a source edit invalidates all compiled
+    /// SPIR-V (the shared modules cross every stage). The next pipeline
+    /// build recompiles from the live sources.
+    pub fn invalidate_sources(&mut self, generation: u64) {
+        self.sources_generation = generation;
+        let libraries: Vec<RtLibrary> = self
+            .raygen
+            .take()
+            .into_iter()
+            .chain(self.miss.take().map(|(_, lib)| lib))
+            .chain(self.miss_shadow.take())
+            .chain(std::mem::take(&mut self.hit_groups))
+            .collect();
+        for lib in libraries {
+            self.destroy_library(lib);
         }
     }
 
@@ -487,7 +517,7 @@ impl RtLibraryCache {
     /// SPIR-V flavor — the `VK_NV_ray_tracing_invocation_reorder` extension is
     /// what the device enables; left unconstrained, slang emits the EXT flavor
     /// and the module is invalid on this device (VUID 08740/08742).
-    fn ensure_raygen(&mut self) -> Option<()> {
+    fn ensure_raygen(&mut self, sources: &SlangSources) -> Option<()> {
         if self.raygen.is_some() {
             return Some(());
         }
@@ -500,16 +530,16 @@ impl RtLibraryCache {
         };
         let raygen_spv = crate::gpu::slang::compile_rt_slang(
             "raygen.slang",
-            include_str!("../render/rt_pipeline/raygen.slang"),
+            sources.source("raygen.slang"),
             "raygen",
             crate::gpu::slang::SlangRtStage::RayGeneration,
-            RT_SLANG_MODULES,
+            &rt_slang_modules(Some(sources)),
             defines,
             RAYGEN_CAPABILITIES,
         )
         .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
         .ok()?;
-        let module = create_shader_module(&self.device, &raygen_spv)?;
+        let module = create_shader_module(&self.device, &raygen_spv.spirv)?;
         let lib = self.create_library(
             &[shader_stage(vk::ShaderStageFlags::RAYGEN_KHR, module, c"main")],
             &[general_group(0)],
@@ -522,21 +552,18 @@ impl RtLibraryCache {
     /// Primary-miss library — composes the swappable `custom_sky` module
     /// (`SolariSky::Shader`; defaults to the built-in procedural gradient).
     /// A generation change rebuilds exactly this library.
-    fn ensure_miss(&mut self, custom_sky: (&str, u64)) -> Option<()> {
+    fn ensure_miss(&mut self, sources: &SlangSources, custom_sky: (&str, u64)) -> Option<()> {
         let (custom_sky_source, generation) = custom_sky;
         if matches!(&self.miss, Some((cached, _)) if *cached == generation) {
             return Some(());
         }
         let miss_spv = crate::gpu::slang::compile_rt_slang(
             "miss.slang",
-            include_str!("../render/rt_pipeline/miss.slang"),
+            sources.source("miss.slang"),
             "miss_primary",
             crate::gpu::slang::SlangRtStage::Miss,
             &[
-                (
-                    "rt_payload",
-                    include_str!("../render/rt_pipeline/rt_payload.slang"),
-                ),
+                ("rt_payload", sources.source("rt_payload.slang")),
                 ("custom_sky", custom_sky_source),
             ],
             &[],
@@ -544,7 +571,7 @@ impl RtLibraryCache {
         )
         .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
         .ok()?;
-        let module = create_shader_module(&self.device, &miss_spv)?;
+        let module = create_shader_module(&self.device, &miss_spv.spirv)?;
         let lib = self.create_library(
             &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"main")],
             &[general_group(0)],
@@ -558,13 +585,13 @@ impl RtLibraryCache {
     }
 
     /// Shadow-miss library (static — no modules, no variant axes).
-    fn ensure_shadow(&mut self) -> Option<()> {
+    fn ensure_shadow(&mut self, sources: &SlangSources) -> Option<()> {
         if self.miss_shadow.is_some() {
             return Some(());
         }
         let shadow_spv = crate::gpu::slang::compile_rt_slang(
             "miss_shadow.slang",
-            include_str!("../render/rt_pipeline/miss_shadow.slang"),
+            sources.source("miss_shadow.slang"),
             "miss_shadow",
             crate::gpu::slang::SlangRtStage::Miss,
             &[],
@@ -573,7 +600,7 @@ impl RtLibraryCache {
         )
         .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
         .ok()?;
-        let module = create_shader_module(&self.device, &shadow_spv)?;
+        let module = create_shader_module(&self.device, &shadow_spv.spirv)?;
         let lib = self.create_library(
             &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"main")],
             &[general_group(0)],
@@ -585,13 +612,17 @@ impl RtLibraryCache {
 
     /// One library per registry hit group (chit + optional any-hit). The
     /// registry is append-only, so only entries past the cached count compile.
-    fn ensure_hit_groups(&mut self, hit_groups: &[SolariHitGroupDef]) -> Option<()> {
+    fn ensure_hit_groups(
+        &mut self,
+        sources: &SlangSources,
+        hit_groups: &[SolariHitGroupDef],
+    ) -> Option<()> {
         for hg in &hit_groups[self.hit_groups.len()..] {
             let compile = |shader, stage| {
-                let spv = compile_group_shader(hg, shader, stage)
+                let shader = compile_group_shader(hg, shader, stage, Some(sources))
                     .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
                     .ok()?;
-                create_shader_module(&self.device, &spv)
+                create_shader_module(&self.device, &shader.spirv)
             };
             let chit_mod = compile(
                 &hg.closest_hit,
@@ -858,6 +889,7 @@ impl RtPipeline {
         material_classes: &[u32],
         hit_groups: &[SolariHitGroupDef],
         custom_sky: (&str, u64),
+        sources: &SlangSources,
     ) -> Option<Self> {
         let custom_sky_generation = custom_sky.1;
         // One hit record per material slot; `material_classes[slot]` selects the
@@ -885,10 +917,10 @@ impl RtPipeline {
         // ("hit group", + optional any-hit) comes from `hit_groups` (the registry), so
         // adding a surface shader needs no edit here — Solari's own opaque/glass/hair/
         // portal register the same way as any downstream material (see SolariPlugin).
-        libraries.ensure_raygen()?;
-        libraries.ensure_miss(custom_sky)?;
-        libraries.ensure_shadow()?;
-        libraries.ensure_hit_groups(hit_groups)?;
+        libraries.ensure_raygen(sources)?;
+        libraries.ensure_miss(sources, custom_sky)?;
+        libraries.ensure_shadow(sources)?;
+        libraries.ensure_hit_groups(sources, hit_groups)?;
         let pipeline = libraries.link()?;
 
         // Explicit pipeline stack size (spec formula for recursion depth 2, no
@@ -1535,19 +1567,37 @@ const RT_SLANG_MODULES: &[(&str, &str)] = &[
     ("hair", include_str!("../render/rt_pipeline/hair.slang")),
 ];
 
+/// The built-in module set, resolved through the live source registry when
+/// one is at hand (a pipeline build — module edits hot reload) and from the
+/// embedded copies otherwise (registration-time validation, tests).
+fn rt_slang_modules(sources: Option<&SlangSources>) -> Vec<(&'static str, &'static str)> {
+    RT_SLANG_MODULES
+        .iter()
+        .map(|&(name, embedded)| {
+            let live = sources.and_then(|s| s.get(&format!("{name}.slang")));
+            (name, live.unwrap_or(embedded))
+        })
+        .collect()
+}
+
 /// Compile one of a hit group's stages with the built-in module set plus the
 /// group's own `composable_modules` importable. Shared by eager registration
-/// validation and the pipeline build.
+/// validation (`sources` = `None`: the registered snapshot is what's being
+/// validated) and the pipeline build (the live registry wins, so the
+/// built-in hit shaders hot reload; a downstream group's own files aren't
+/// watched and always use their registered source).
 fn compile_group_shader(
     group: &SolariHitGroupDef,
     shader: &SolariRtShader,
     stage: crate::gpu::slang::SlangRtStage,
-) -> Result<Vec<u32>, String> {
-    let mut modules = RT_SLANG_MODULES.to_vec();
+    sources: Option<&SlangSources>,
+) -> Result<crate::gpu::slang::CompiledShader, String> {
+    let mut modules = rt_slang_modules(sources);
     modules.extend_from_slice(group.composable_modules);
+    let live = sources.and_then(|s| s.get(shader.file));
     crate::gpu::slang::compile_rt_slang(
         shader.file,
-        shader.source,
+        live.unwrap_or(shader.source),
         shader.entry,
         stage,
         &modules,
@@ -1844,6 +1894,28 @@ mod tests {
         }
     }
 
+    /// Every `(set, binding)` a stage declares must be covered by the heap
+    /// mapping surface (`build_heap_mappings` + the push blob): scene set 0
+    /// bindings 0..=14, view set 1 bindings 0..=16, columns set 2 (mapped as
+    /// a runtime-sized block), record set 3 binding 0. A shader gaining a
+    /// binding without the table/push-blob growing would otherwise surface as
+    /// a misrouted descriptor at runtime.
+    fn assert_bindings_mapped(file: &str, spv: &[u32]) {
+        for (set, binding) in crate::gpu::binding_seam::spirv_descriptor_bindings(spv) {
+            let mapped = match set {
+                0 => binding <= 14,
+                1 => binding <= 16,
+                2 => true,
+                3 => binding == 0,
+                _ => false,
+            };
+            assert!(
+                mapped,
+                "{file}: (set {set}, binding {binding}) has no heap mapping"
+            );
+        }
+    }
+
     fn assert_no_runtime_descriptor_array(file: &str, spv: &[u32]) {
         const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
         const OP_TYPE_POINTER: u32 = 32;
@@ -1922,7 +1994,8 @@ mod tests {
                 &[],
             )
             .unwrap_or_else(|e| panic!("miss.slang: {e}"));
-            assert_no_runtime_descriptor_array("miss.slang", &spv);
+            assert_no_runtime_descriptor_array("miss.slang", &spv.spirv);
+            assert_bindings_mapped("miss.slang", &spv.spirv);
         }
 
         // Every other stage compiles from source at pipeline build; compile
@@ -2004,10 +2077,20 @@ mod tests {
             let spv =
                 crate::gpu::slang::compile_rt_slang(file, source, entry, stage, RT_SLANG_MODULES, defines, caps)
                     .unwrap_or_else(|e| panic!("{file}: {e}"));
-            assert_no_runtime_descriptor_array(file, &spv);
+            assert_no_runtime_descriptor_array(file, &spv.spirv);
+            assert_bindings_mapped(file, &spv.spirv);
+            // Reflection is what dispatch tables are assembled from; every
+            // binding surviving in the SPIR-V must appear there (the reverse
+            // need not hold — reflection also lists DCE'd parameters).
+            for pair in crate::gpu::binding_seam::spirv_descriptor_bindings(&spv.spirv) {
+                assert!(
+                    spv.bindings.iter().any(|&(_, s, b)| (s, b) == pair),
+                    "{file}: SPIR-V binding {pair:?} missing from slang reflection"
+                );
+            }
             // The target capability must pin SER to the NV flavor — the EXT
             // capability/extension is invalid on the device (VUID 08740).
-            let bytes: Vec<u8> = spv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let bytes: Vec<u8> = spv.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
             assert!(
                 !bytes
                     .windows(b"SPV_EXT_shader_invocation_reorder".len())

@@ -361,7 +361,7 @@ fn build_pipelines(device: &wgpu::Device) -> Pipelines {
         .unwrap_or_else(|e| panic!("{e}"));
         let module = unsafe {
             device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
-                spirv: Some(std::borrow::Cow::Owned(spv)),
+                spirv: Some(std::borrow::Cow::Owned(spv.spirv)),
                 ..Default::default()
             })
         };

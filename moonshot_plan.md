@@ -307,6 +307,26 @@ Shipped:
   `next_multiple_of(64)` at the size query (production + gym), so every
   `vkCmdConvertCooperativeVectorMatrixNV` src/dst address is 64-B aligned
   (VUID 10084/10085).
+- Slang integration follow-ups (2026-08-02): **hot reload** — `SlangSources`
+  (gpu/slang_sources.rs) resolves every RT stage/module source from disk
+  when the checkout exists (embedded otherwise), polls mtimes per frame,
+  and a generation bump makes the dispatch drain + `invalidate_sources` the
+  library cache → next build recompiles from the live files (built-in hit
+  shaders included via the registry override in `compile_group_shader`;
+  downstream groups keep their registered source). **SPIR-V-derived
+  mappings** — `create_heap_compute_pipeline` reads its binding list from
+  the module's own decorations (`spirv_descriptor_bindings`), no
+  hand-passed counts; `rt_shaders_compile` asserts every stage's declared
+  (set, binding) surface is covered by the heap mapping table. NRC kernels
+  stay static per run (no reload path). **Reflection-driven dispatch** —
+  `compile_rt_slang` returns `CompiledShader { spirv, bindings }` (name/set/
+  binding per global param via spGetReflection); `NrcKernel::push_slots`
+  assembles every dispatch slot array by parameter NAME against the
+  kernel's reflected layout — the "must match the [[vk::binding]] table"
+  order contracts are gone, and any mismatch panics naming kernel +
+  parameter. `rt_shaders_compile` cross-checks reflection ⊇ the SPIR-V
+  scan per stage (also proves GetBindingIndex/Space return the explicit
+  [[vk::binding]] values).
 - Bistro-scale fixes (validated on bistro.bsn): seam `MAX_RECORDS`
   4096 → 16384 (2 MiB at the 128-B stride) — bistro's >3000 material slots
   plus the 1024-record headroom overflowed the table; the RT pipeline now
