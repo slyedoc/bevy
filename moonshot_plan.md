@@ -249,3 +249,68 @@ Driver intel (researched 2026-08-01):
 - Unaligned convert addresses; `vkCmdFillBuffer` is CLEAR-stage.
 - Heap kernels under wgpu-tracked dispatch (H-LAW 1/2 in heap_plan.md);
   wgpu lazy zero-init wipes untracked writes (slang_plan LAW 9).
+
+## M4 implementation design (2026-08-02) — DONE
+
+Reinterpreted for the sp* request API already proven by the miss/custom-sky
+path: the "link-time constants" mechanism IS composed modules + preprocessor
+defines — the precompiled blobs are gone; every stage compiles at build via
+`compile_rt_slang`. True `.slang-module` IR precompilation remains a later
+startup-latency optimization, not the value.
+
+Shipped:
+- `compile_rt_slang` gained `defines: &[(&str, &str)]`
+  (`spAddPreprocessorDefine`); `SlangRtStage::Compute` (= SlangStage 6).
+- Capabilities go through the API, NOT in-source: `compile_rt_slang` gained
+  `capabilities: &[&str]` (`spFindCapability` + `spAddTargetCapability` —
+  exact `-capability` CLI parity). An in-source `[require(...)]` was tried
+  first and cost a bistro device-loss: it makes slang emit the EXT SER
+  flavor (`SPV_EXT_shader_invocation_reorder`, VUID 08740 — the device
+  enables only `VK_NV_ray_tracing_invocation_reorder`) and turns on strict
+  capability checking besides. Raygen passes
+  `spvShaderInvocationReorderNV`; `rt_shaders_compile` asserts the EXT
+  flavor never appears in its SPIR-V.
+- `ensure_raygen` compiles from source with the clock define chosen from the
+  device; `ensure_shadow` likewise; hit groups collapsed to Slang-source-only
+  (`SolariRtShader { source, file, entry }` replaces
+  `SolariChitSource`/`SolariAnyHitDef` — the SpirV arms were a dead dual
+  path with a compiler-mismatch hazard). Any-hits now compile with the
+  built-in module set + `composable_modules` like chits, and registration
+  eagerly validates both stages.
+- NRC kernels compile at `init_nrc_pipelines` (`nrc_mlp` importable —
+  MLP-constant agreement across kernels holds by construction); the gym
+  compiles the same sources through `bevy::solari::gpu::slang`
+  (`required-features = ["bevy_solari"]`), so its certification is now
+  same-source same-compiler instead of same-blob.
+- All 14 `.spv` blobs deleted; regen commands stripped from every header;
+  `rt_shaders_compile` compiles EVERY stage from source (both raygen define
+  variants included) as the headless link check.
+
+## Post-flip refinements (2026-08-02) — DONE
+
+- Diff-driven descriptor writes: scene textures/arrays moved to stable slot
+  tables (`TextureSlotTable`) — an asset takes its heap slot at first sight
+  (one descriptor write) and keeps it while the asset lives; eviction and
+  view replacement run only on `RenderAssets<GpuImage>` change frames
+  (evict-or-rewrite sweep); wgpu binding arrays are built from the tables
+  with fallback-padded holes. Buffer descriptors rewrite only on
+  address/size change; the singles (DFG LUT/samplers) once + on change
+  frames. Steady-state frames write ZERO descriptors.
+- Record-referenced sampler configs: `samplers[]` now holds deduplicated
+  sampler CONFIGS (`SAMPLER_CONFIG_COUNT` = 256, keyed on the full
+  `VkSamplerCreateInfo`), and material texture ids pack
+  `sampler_config << 16 | texture_slot` (scene_resolve unpacks at the
+  sample sites). Sampler-heap use is bounded by distinct configs, not
+  texture count — the 4096-descriptor hardware sampler heap ceases to be a
+  scene-size constraint, and the old capacity clamp/assert died with it.
+- Convert alignment: the TrainingOptimal per-layer stride is
+  `next_multiple_of(64)` at the size query (production + gym), so every
+  `vkCmdConvertCooperativeVectorMatrixNV` src/dst address is 64-B aligned
+  (VUID 10084/10085).
+- Bistro-scale fixes (validated on bistro.bsn): seam `MAX_RECORDS`
+  4096 → 16384 (2 MiB at the 128-B stride) — bistro's >3000 material slots
+  plus the 1024-record headroom overflowed the table; the RT pipeline now
+  clamps headroom to the table and asserts if the live count alone cannot
+  fit. Sampler mappings mirror their stride into `heapArrayStride` (VVL
+  checks the non-sampler union half for any descriptor array — warning
+  only, the driver reads the `sampler_*` half).

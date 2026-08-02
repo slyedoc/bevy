@@ -10,8 +10,6 @@
 // ([pos.xyz bits, material], [normal cyl, -wo cyl, throughput f16x2 ×2],
 // [pixel, unused ×3]).
 //
-// Regenerate SPIR-V (from crates/bevy_solari/src/nrc/):
-//   slangc nrc_query_infer.slang -target spirv -entry nrc_query_infer -o nrc_query_infer.spv
 import nrc_mlp;
 
 struct NrcQueryParams

@@ -1,11 +1,14 @@
 use super::extract::SolariMaterialAssets;
 use crate::material::MaterialSlots;
 use crate::accel::ptlas::Ptlas;
+use crate::gpu::binding_seam::{BindingSeam, HeapKind, HeapResource};
 use crate::instance::InstanceManager;
 use crate::geometry::ClusterMeshManager;
-use bevy_asset::Handle;
+use ash::vk;
+use bevy_asset::{AssetId, Handle};
 use bevy_color::{ColorToComponents, LinearRgba};
 use bevy_ecs::{
+    change_detection::DetectChanges,
     resource::Resource,
     system::{Commands, Res, ResMut},
 };
@@ -23,7 +26,9 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
     texture::{FallbackImage, GpuImage},
 };
-use core::{hash::Hash, num::NonZeroU32, ops::Deref};
+use bevy_image::Image;
+use core::{num::NonZeroU32, ops::Deref};
+use wgpu::hal::api::Vulkan as VkApi;
 
 pub(crate) const MAX_TEXTURE_COUNT: NonZeroU32 = NonZeroU32::new(5_000).unwrap();
 
@@ -31,7 +36,18 @@ pub(crate) const MAX_TEXTURE_COUNT: NonZeroU32 = NonZeroU32::new(5_000).unwrap()
 /// `binding_array<texture_2d_array<f32>, 16>` in `raytracing_scene_bindings.wgsl`.
 pub(crate) const MAX_TEXTURE_ARRAY_COUNT: NonZeroU32 = NonZeroU32::new(16).unwrap();
 
+/// Size of the deduplicated sampler-config array (`samplers[]`, binding 3) —
+/// must match `SAMPLER_CONFIG_COUNT` in `scene_resolve.slang`. Bounded by
+/// distinct sampler *configurations*, not texture count: the hardware sampler
+/// heap holds ~4096 descriptors total, far under [`MAX_TEXTURE_COUNT`].
+pub(crate) const SAMPLER_CONFIG_COUNT: NonZeroU32 = NonZeroU32::new(256).unwrap();
+
 const TEXTURE_MAP_NONE: u32 = u32::MAX;
+
+/// Material texture ids pack `sampler_config << 16 | texture_slot`
+/// (`TEXTURE_MAP_NONE` is never a valid packed id: config indices stay far
+/// below 0xFFFF). The shader unpacks in `scene_resolve.slang`'s samplers.
+const SAMPLER_CFG_SHIFT: u32 = 16;
 
 #[derive(Resource)]
 pub struct RaytracingSceneBindings {
@@ -44,13 +60,143 @@ pub struct RaytracingSceneBindings {
     /// via [`RawTraceBindable`](crate::gpu::RawTraceBindable), so it stays valid for
     /// any in-flight trace. `0` until the first bind-group build.
     pub materials_device_address: crate::gpu::allocator::StableAddr,
-    /// M2 staging: the scene set mirrored as descriptor-heap slots, refreshed
-    /// every frame right after the bind group rebuild (the tables may
-    /// reallocate as they grow; heap descriptor updates are plain host
-    /// writes). Unread until the heap-pipeline flip. The TLAS (binding 4) is
+    /// The scene set as descriptor-heap slots. The TLAS (binding 4) is
     /// deliberately absent: its address rides push data — shader-side heap AS
     /// access device-losts even on R610.
     pub scene_heap: Option<SceneHeapSlots>,
+    /// Stable slots for `textures[]` (binding 2) — see [`TextureSlotTable`].
+    texture_slots: TextureSlotTable,
+    /// Stable slots for `texture_arrays[]` (binding 13).
+    texture_array_slots: TextureSlotTable,
+    /// Deduplicated sampler configs for `samplers[]` (binding 3).
+    sampler_configs: SamplerConfigs,
+}
+
+/// Stable-slot table for one bindless texture array: an asset takes a slot at
+/// first sight and keeps it while the asset lives, so the ids baked into
+/// material records — and the heap descriptor written at `block + slot` —
+/// survive across frames. Steady-state frames register nothing and write zero
+/// descriptors; eviction and view replacement are handled only on frames
+/// where `RenderAssets<GpuImage>` changed. Values are
+/// `(slot, sampler_config)`; freed slots recycle, and the wgpu binding array
+/// pads holes with the fallback view.
+#[derive(Default)]
+struct TextureSlotTable {
+    slots: HashMap<AssetId<Image>, (u32, u32)>,
+    free: Vec<u32>,
+    high_water: u32,
+}
+
+impl TextureSlotTable {
+    fn alloc(&mut self, capacity: u32) -> u32 {
+        let slot = self.free.pop().unwrap_or_else(|| {
+            let slot = self.high_water;
+            self.high_water += 1;
+            slot
+        });
+        assert!(
+            slot < capacity,
+            "texture slot table overflow: more than {capacity} live textures"
+        );
+        slot
+    }
+}
+
+/// Sampler descriptors deduplicated by create-info. Material texture ids
+/// carry the config index in their high bits ([`SAMPLER_CFG_SHIFT`]), so
+/// sampler-heap and array use is bounded by [`SAMPLER_CONFIG_COUNT`] distinct
+/// configurations instead of texture count. Configs are never evicted (they
+/// hold no texture memory — the clones keep the few `VkSampler`s alive).
+#[derive(Default)]
+struct SamplerConfigs {
+    by_key: HashMap<[u32; 16], u32>,
+    samplers: Vec<Sampler>,
+}
+
+/// Register `sampler`'s configuration, returning its config index; a new
+/// config writes its heap descriptor once at `sampler_block + index`.
+#[allow(unsafe_code)]
+fn sampler_config(
+    configs: &mut SamplerConfigs,
+    sampler: &Sampler,
+    heap: Option<(&BindingSeam, &SceneHeapSlots)>,
+) -> u32 {
+    // SAFETY: the sampler is a live wgpu resource on the Vulkan backend; the
+    // guard is dropped before anything can destroy it.
+    let Some(info) = unsafe { sampler.as_hal::<VkApi>() }.map(|s| s.create_info()) else {
+        return 0;
+    };
+    let key = sampler_key(&info);
+    if let Some(&index) = configs.by_key.get(&key) {
+        return index;
+    }
+    let index = configs.samplers.len() as u32;
+    assert!(
+        index < SAMPLER_CONFIG_COUNT.get(),
+        "more than {SAMPLER_CONFIG_COUNT} distinct sampler configurations"
+    );
+    if let Some((seam, slots)) = heap {
+        seam.rewrite_heap_index(
+            HeapKind::Sampler,
+            slots.sampler_block + index,
+            HeapResource::Sampler(&info),
+        );
+    }
+    configs.by_key.insert(key, index);
+    configs.samplers.push(sampler.clone());
+    index
+}
+
+/// Dedup key: every `VkSamplerCreateInfo` field that shapes the descriptor.
+fn sampler_key(info: &vk::SamplerCreateInfo) -> [u32; 16] {
+    [
+        info.flags.as_raw(),
+        info.mag_filter.as_raw() as u32,
+        info.min_filter.as_raw() as u32,
+        info.mipmap_mode.as_raw() as u32,
+        info.address_mode_u.as_raw() as u32,
+        info.address_mode_v.as_raw() as u32,
+        info.address_mode_w.as_raw() as u32,
+        info.mip_lod_bias.to_bits(),
+        info.anisotropy_enable,
+        info.max_anisotropy.to_bits(),
+        info.compare_enable,
+        info.compare_op.as_raw() as u32,
+        info.min_lod.to_bits(),
+        info.max_lod.to_bits(),
+        info.border_color.as_raw() as u32,
+        info.unnormalized_coordinates,
+    ]
+}
+
+/// Write one sampled-image heap descriptor from the view's recorded create
+/// info (read-optimal by trace time — the wgpu bind group's usage keeps the
+/// layout transitions happening).
+#[allow(unsafe_code)]
+fn write_image_descriptor(seam: &BindingSeam, slot: u32, view: &wgpu::TextureView) {
+    // SAFETY: the view is a live wgpu resource on the Vulkan backend; the
+    // guard is dropped before anything can destroy it.
+    if let Some(hal_view) = unsafe { view.as_hal::<VkApi>() } {
+        let info = hal_view.image_view_create_info();
+        seam.rewrite_heap_index(
+            HeapKind::Image,
+            slot,
+            HeapResource::SampledImage {
+                view: &info,
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            },
+        );
+    }
+}
+
+/// Write one sampler heap descriptor from the sampler's recorded create info.
+#[allow(unsafe_code)]
+fn write_sampler_descriptor(seam: &BindingSeam, slot: u32, sampler: &wgpu::Sampler) {
+    // SAFETY: as for the view above.
+    if let Some(hal_sampler) = unsafe { sampler.as_hal::<VkApi>() } {
+        let info = hal_sampler.create_info();
+        seam.rewrite_heap_index(HeapKind::Sampler, slot, HeapResource::Sampler(&info));
+    }
 }
 
 /// The scene set's resources as descriptor-heap slots. The bindless arrays
@@ -60,19 +206,18 @@ pub struct RaytracingSceneBindings {
 ///
 /// [`BindingSeam::alloc_heap_block`]: crate::gpu::binding_seam::BindingSeam::alloc_heap_block
 pub struct SceneHeapSlots {
-    /// `(set-0 binding index, heap buffer-region slot)` pairs, in binding order.
+    /// `(set-0 binding index, heap buffer-region slot)` pairs, in
+    /// [`SCENE_BUFFER_BINDINGS`] order.
     pub buffers: Vec<(u32, u32)>,
+    /// Last `(device address, size)` written per [`buffers`](Self::buffers)
+    /// entry — a frame rewrites a buffer descriptor only when its backing
+    /// grew or reallocated.
+    pub(crate) buffer_written: Vec<(u64, u64)>,
     /// Image block backing `textures[]` (binding 2), `MAX_TEXTURE_COUNT` slots.
     pub texture_block: u32,
-    /// Sampler block backing `samplers[]` (binding 3), parallel to
-    /// `texture_block` but only `sampler_block_len` entries — the sampler heap
-    /// is hardware-small (4096 slots on NVIDIA, under `MAX_TEXTURE_COUNT`), so
-    /// the block takes what the region can hold. Distinct live samplers can't
-    /// approach it anyway: the classic path's `maxSamplerAllocationCount` is
-    /// 4000 on the same hardware. Exceeding it is a loud assert, not a skip.
+    /// Sampler block backing `samplers[]` (binding 3),
+    /// [`SAMPLER_CONFIG_COUNT`] deduplicated config slots.
     pub sampler_block: u32,
-    /// Slot count of `sampler_block`.
-    pub sampler_block_len: u32,
     /// Image block backing `texture_arrays[]` (binding 13), `MAX_TEXTURE_ARRAY_COUNT` slots.
     pub texture_array_block: u32,
     /// DFG LUT image (binding 6).
@@ -81,7 +226,15 @@ pub struct SceneHeapSlots {
     pub dfg_sampler: u32,
     /// Shared `texture_arrays` sampler (binding 14).
     pub array_sampler: u32,
+    /// Whether the single (non-array) descriptors above have been written;
+    /// they rewrite only on `RenderAssets` change frames after that.
+    pub(crate) singles_written: bool,
 }
+
+/// The set-0 storage-buffer bindings mirrored into the heap, in binding
+/// order. The TLAS (4) rides push data; 6/7 and 13/14 are images/samplers;
+/// 2/3 are the bindless arrays.
+const SCENE_BUFFER_BINDINGS: [u32; 8] = [0, 1, 5, 8, 9, 10, 11, 12];
 
 /// The scene's per-frame-rebuilt tables, on persistent **stable-address**
 /// buffers. The RT trace reads them by device address (`materials`) or descriptor
@@ -155,7 +308,7 @@ pub fn prepare_raytracing_scene_bindings(
     hair: HairSceneDeps,
     mut raytracing_scene_bindings: ResMut<RaytracingSceneBindings>,
     scene_buffers: Option<ResMut<SolariSceneBuffers>>,
-    seam: Option<Res<crate::gpu::binding_seam::BindingSeam>>,
+    seam: Option<Res<BindingSeam>>,
 ) {
     raytracing_scene_bindings.bind_group = None;
 
@@ -194,8 +347,6 @@ pub fn prepare_raytracing_scene_bindings(
         return;
     };
 
-    let mut textures = CachedBindingArray::new();
-    let mut samplers = Vec::new();
     // Materials live in a persistent, stable-address `StableStorageBuffer` (built
     // once in `init_solari_scene_buffers`). The RT chit reads them by device
     // address (`physical_load<Material>`); a stable address that's never freed
@@ -211,40 +362,136 @@ pub fn prepare_raytracing_scene_bindings(
         active_light_list,
         array_sampler,
     } = &mut *scene_buffers;
-    let mut process_texture = |texture_handle: &Option<Handle<_>>| -> Option<u32> {
-        match texture_handle {
-            Some(texture_handle) => match texture_assets.get(texture_handle.id()) {
-                Some(texture) => {
-                    let (texture_id, is_new) =
-                        textures.push_if_absent(texture.texture_view.deref(), texture_handle.id());
-                    if is_new {
-                        samplers.push(texture.sampler.deref());
-                    }
-                    Some(texture_id)
+    let RaytracingSceneBindings {
+        bind_group,
+        bind_group_layout,
+        materials_device_address,
+        scene_heap,
+        texture_slots,
+        texture_array_slots,
+        sampler_configs,
+    } = &mut *raytracing_scene_bindings;
+    let seam = seam.as_deref();
+
+    // Heap blocks are allocated once — their bases are baked into the RT
+    // pipeline's mapping tables, so they must never move. Descriptor writes
+    // into them are diff-driven from here on: texture registration/eviction,
+    // buffer reallocation, and `RenderAssets` change frames; a steady-state
+    // frame writes none.
+    if let Some(seam) = seam {
+        scene_heap.get_or_insert_with(|| SceneHeapSlots {
+            buffers: SCENE_BUFFER_BINDINGS
+                .iter()
+                .map(|&binding| (binding, seam.alloc_heap_block(HeapKind::Buffer, 1)))
+                .collect(),
+            buffer_written: vec![(0, 0); SCENE_BUFFER_BINDINGS.len()],
+            texture_block: seam.alloc_heap_block(HeapKind::Image, MAX_TEXTURE_COUNT.get()),
+            sampler_block: seam.alloc_heap_block(HeapKind::Sampler, SAMPLER_CONFIG_COUNT.get()),
+            texture_array_block: seam
+                .alloc_heap_block(HeapKind::Image, MAX_TEXTURE_ARRAY_COUNT.get()),
+            dfg_lut: seam.alloc_heap_block(HeapKind::Image, 1),
+            dfg_sampler: seam.alloc_heap_block(HeapKind::Sampler, 1),
+            array_sampler: seam.alloc_heap_block(HeapKind::Sampler, 1),
+            singles_written: false,
+        });
+    }
+    let heap: Option<(&BindingSeam, &SceneHeapSlots)> = seam.zip(scene_heap.as_ref());
+
+    // `RenderAssets` changed ⇒ textures may have loaded, been replaced, or
+    // unloaded: evict dead entries (recycling their slots) and rewrite every
+    // live descriptor — replacement swaps the underlying view/sampler, and
+    // rewriting an unchanged descriptor is a benign host write. Quiet frames
+    // (the steady state) skip this entirely.
+    let assets_changed = texture_assets.is_changed();
+    if assets_changed {
+        let TextureSlotTable { slots, free, .. } = &mut *texture_slots;
+        slots.retain(|id, (slot, cfg)| match texture_assets.get(*id) {
+            Some(texture) => {
+                if let Some((seam, heap_slots)) = heap {
+                    write_image_descriptor(
+                        seam,
+                        heap_slots.texture_block + *slot,
+                        &texture.texture_view,
+                    );
                 }
-                None => None,
-            },
-            None => Some(TEXTURE_MAP_NONE),
+                *cfg = sampler_config(sampler_configs, &texture.sampler, heap);
+                true
+            }
+            None => {
+                free.push(*slot);
+                false
+            }
+        });
+        let TextureSlotTable { slots, free, .. } = &mut *texture_array_slots;
+        slots.retain(|id, (slot, _)| match texture_assets.get(*id) {
+            // A replaced asset may have collapsed to a plain D2 image — evict
+            // it like an unload (D2 views can't enter the D2Array pool).
+            Some(texture) if texture.texture.depth_or_array_layers() > 1 => {
+                if let Some((seam, heap_slots)) = heap {
+                    write_image_descriptor(
+                        seam,
+                        heap_slots.texture_array_block + *slot,
+                        &texture.texture_view,
+                    );
+                }
+                true
+            }
+            _ => {
+                free.push(*slot);
+                false
+            }
+        });
+    }
+
+    let mut process_texture = |texture_handle: &Option<Handle<Image>>| -> Option<u32> {
+        let Some(texture_handle) = texture_handle else {
+            return Some(TEXTURE_MAP_NONE);
+        };
+        let id = texture_handle.id();
+        let texture = texture_assets.get(id)?;
+        if let Some(&(slot, cfg)) = texture_slots.slots.get(&id) {
+            return Some(cfg << SAMPLER_CFG_SHIFT | slot);
         }
+        // First sight: take a stable slot, write its heap descriptor, dedup
+        // the sampler into a config slot. Registration is the only frame this
+        // texture costs descriptor writes.
+        let slot = texture_slots.alloc(MAX_TEXTURE_COUNT.get());
+        let cfg = sampler_config(sampler_configs, &texture.sampler, heap);
+        if let Some((seam, heap_slots)) = heap {
+            write_image_descriptor(seam, heap_slots.texture_block + slot, &texture.texture_view);
+        }
+        texture_slots.slots.insert(id, (slot, cfg));
+        Some(cfg << SAMPLER_CFG_SHIFT | slot)
     };
 
     // Layered pool (`texture_arrays`, binding 13). Only D2Array views may enter —
     // a plain D2 image would fail bind-group validation. Unlike flat textures a
     // still-loading array degrades to NONE (not a material skip): array-painted
     // chits carry a procedural fallback, so they shade flat until the pop-in.
-    let mut texture_arrays = CachedBindingArray::new();
-    let mut process_texture_array = |texture_handle: &Option<Handle<_>>| -> u32 {
-        match texture_handle {
-            Some(texture_handle) => match texture_assets.get(texture_handle.id()) {
-                Some(texture) if texture.texture.depth_or_array_layers() > 1 => {
-                    let (texture_id, _) =
-                        texture_arrays.push_if_absent(texture.texture_view.deref(), texture_handle.id());
-                    texture_id
-                }
-                _ => TEXTURE_MAP_NONE,
-            },
-            None => TEXTURE_MAP_NONE,
+    let mut process_texture_array = |texture_handle: &Option<Handle<Image>>| -> u32 {
+        let Some(texture_handle) = texture_handle else {
+            return TEXTURE_MAP_NONE;
+        };
+        let id = texture_handle.id();
+        let Some(texture) = texture_assets.get(id) else {
+            return TEXTURE_MAP_NONE;
+        };
+        if texture.texture.depth_or_array_layers() <= 1 {
+            return TEXTURE_MAP_NONE;
         }
+        if let Some(&(slot, _)) = texture_array_slots.slots.get(&id) {
+            return slot;
+        }
+        let slot = texture_array_slots.alloc(MAX_TEXTURE_ARRAY_COUNT.get());
+        if let Some((seam, heap_slots)) = heap {
+            write_image_descriptor(
+                seam,
+                heap_slots.texture_array_block + slot,
+                &texture.texture_view,
+            );
+        }
+        texture_array_slots.slots.insert(id, (slot, 0));
+        slot
     };
 
     // `materials[]` is indexed by **stable** material slot
@@ -344,12 +591,34 @@ pub fn prepare_raytracing_scene_bindings(
         };
     }
 
-    if textures.is_empty() {
-        textures.vec.push(fallback_texture.d2.texture_view.deref());
-        samplers.push(fallback_texture.d2.sampler.deref());
+    // The wgpu binding arrays mirror the slot tables: holes (recycled slots)
+    // and the zero-entry case pad with the fallback so every array element
+    // stays valid. Lengths track the tables' high-water, not churn per frame.
+    let mut textures_wgpu: Vec<&wgpu::TextureView> = vec![
+        fallback_texture.d2.texture_view.deref();
+        texture_slots.high_water.max(1) as usize
+    ];
+    for (id, &(slot, _)) in &texture_slots.slots {
+        if let Some(texture) = texture_assets.get(*id) {
+            textures_wgpu[slot as usize] = &texture.texture_view;
+        }
     }
-    if texture_arrays.is_empty() {
-        texture_arrays.vec.push(fallback_texture.d2_array.texture_view.deref());
+    let mut samplers_wgpu: Vec<&wgpu::Sampler> = sampler_configs
+        .samplers
+        .iter()
+        .map(|sampler| sampler.deref())
+        .collect();
+    if samplers_wgpu.is_empty() {
+        samplers_wgpu.push(fallback_texture.d2.sampler.deref());
+    }
+    let mut texture_arrays_wgpu: Vec<&wgpu::TextureView> = vec![
+        fallback_texture.d2_array.texture_view.deref();
+        texture_array_slots.high_water.max(1) as usize
+    ];
+    for (id, &(slot, _)) in &texture_array_slots.slots {
+        if let Some(texture) = texture_assets.get(*id) {
+            texture_arrays_wgpu[slot as usize] = &texture.texture_view;
+        }
     }
 
     // The light-source table (`crate::lights::LightSources`, rebuilt
@@ -373,7 +642,7 @@ pub fn prepare_raytracing_scene_bindings(
     // Expose the (stable-handle) materials buffer for the RT-pipeline's bindless
     // `physical_load`. `trace_device_address` is only callable on stable-address
     // buffers, so the trace can never capture a reallocating one (compile-time).
-    raytracing_scene_bindings.materials_device_address = materials.trace_device_address();
+    *materials_device_address = materials.trace_device_address();
 
     // The TLAS (PTLAS) is built by `ptlas::dispatch_ptlas`.
 
@@ -391,9 +660,9 @@ pub fn prepare_raytracing_scene_bindings(
     // `directional_lights` / `instance_cluster_ranges` are GPU columns — bound from
     // the shared `ecs_gpu::SceneColumns` group (built generically from each column's
     // `SCENE_BINDING`), not assembled here.
-    raytracing_scene_bindings.bind_group = Some(render_device.create_bind_group(
+    *bind_group = Some(render_device.create_bind_group(
         "raytracing_scene_bind_group",
-        &pipeline_cache.get_bind_group_layout(&raytracing_scene_bindings.bind_group_layout),
+        &pipeline_cache.get_bind_group_layout(bind_group_layout),
         // Vertex attributes + materials are reached bindlessly by
         // buffer-device-address (the RT pipeline's `geometry_addresses` uniform),
         // so only the cluster index/table, textures, TLAS, lights, and hair are
@@ -405,8 +674,8 @@ pub fn prepare_raytracing_scene_bindings(
         &BindGroupEntries::sequential((
             cluster_mesh_manager.indices.binding(),         // 0 cluster_indices
             cluster_mesh_manager.clusters.binding(),        // 1 clusters
-            textures.as_slice(),                            // 2 textures
-            samplers.as_slice(),                            // 3 samplers
+            textures_wgpu.as_slice(),                       // 2 textures
+            samplers_wgpu.as_slice(),                       // 3 samplers
             tlas.as_binding(),                              // 4 tlas
             light_sources.binding().unwrap(),               // 5 light_sources
             dfg_view,                                       // 6 brdf_dfg_lut
@@ -418,132 +687,49 @@ pub fn prepare_raytracing_scene_bindings(
             hair_instance_buffer.as_entire_binding(),       // 10 hair_instances
             hair_params.clone(),                            // 11 hair_params
             transform_propagate.current_world().as_entire_binding(), // 12 hair_world
-            texture_arrays.as_slice(),                      // 13 texture_arrays
+            texture_arrays_wgpu.as_slice(),                 // 13 texture_arrays
             &*array_sampler,                                // 14 texture_arrays_sampler
         )),
     ));
 
-    // M2 staging: mirror the scene set into the descriptor heap, same cadence
-    // as the bind-group rebuild above (the tables can reallocate as they grow,
-    // and textures load/evict — so every descriptor is rewritten each frame;
-    // heap descriptor updates are plain host writes). First frame reserves the
-    // slots and blocks; afterwards the same slots are rewritten in place, so
-    // the flip's mapping table stays valid across scene growth.
-    if let Some(seam) = seam.as_deref() {
-        use crate::gpu::binding_seam::{HeapKind, HeapResource};
-        use ash::vk;
-        use bevy_render::render_resource::BindingResource;
-        use wgpu::hal::api::Vulkan as VkApi;
-        let heap_resource = |res: BindingResource, uniform: bool| -> Option<HeapResource> {
+    // Buffer descriptors: rewritten only when the backing buffer grew or
+    // reallocated (address/size change). The texture/sampler blocks were
+    // handled above at registration/eviction/change time — a steady-state
+    // frame reaches here having written nothing.
+    if let (Some(seam), Some(slots)) = (seam, scene_heap.as_mut()) {
+        let buffer_targets: [(u32, BindingResource); 8] = [
+            (0, cluster_mesh_manager.indices.binding()),
+            (1, cluster_mesh_manager.clusters.binding()),
+            (5, light_sources.binding().unwrap()),
+            (8, active_light_list.binding().unwrap()),
+            (9, hair_manager.segments.buffer().as_entire_binding()),
+            (10, hair_instance_buffer.as_entire_binding()),
+            (11, hair_params),
+            (12, transform_propagate.current_world().as_entire_binding()),
+        ];
+        for (i, (binding, res)) in buffer_targets.into_iter().enumerate() {
             let BindingResource::Buffer(b) = res else {
-                return None;
+                continue;
             };
             let address = seam.device_address(b.buffer).get() + b.offset;
-            let size = b
-                .size
-                .map(u64::from)
-                .unwrap_or(b.buffer.size() - b.offset);
-            Some(if uniform {
-                HeapResource::UniformBuffer { address, size }
-            } else {
-                HeapResource::Buffer { address, size }
-            })
-        };
-        let resources: Vec<(u32, HeapResource)> = [
-            (0, cluster_mesh_manager.indices.binding(), false),
-            (1, cluster_mesh_manager.clusters.binding(), false),
-            (5, light_sources.binding().unwrap(), false),
-            (8, active_light_list.binding().unwrap(), false),
-            (
-                9,
-                hair_manager.segments.buffer().as_entire_binding(),
-                false,
-            ),
-            (10, hair_instance_buffer.as_entire_binding(), false),
-            (11, hair_params, false),
-            (
-                12,
-                transform_propagate.current_world().as_entire_binding(),
-                false,
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(binding, res, uniform)| Some((binding, heap_resource(res, uniform)?)))
-        .collect();
-        let slots = raytracing_scene_bindings.scene_heap.get_or_insert_with(|| {
-            // Leave sampler headroom for the singles below + per-view env samplers.
-            let sampler_block_len = MAX_TEXTURE_COUNT
-                .get()
-                .min(seam.region_capacity(HeapKind::Sampler).saturating_sub(64));
-            SceneHeapSlots {
-                buffers: resources
-                    .iter()
-                    .map(|(binding, _)| (*binding, seam.alloc_heap_block(HeapKind::Buffer, 1)))
-                    .collect(),
-                texture_block: seam.alloc_heap_block(HeapKind::Image, MAX_TEXTURE_COUNT.get()),
-                sampler_block: seam.alloc_heap_block(HeapKind::Sampler, sampler_block_len),
-                sampler_block_len,
-                texture_array_block: seam
-                    .alloc_heap_block(HeapKind::Image, MAX_TEXTURE_ARRAY_COUNT.get()),
-                dfg_lut: seam.alloc_heap_block(HeapKind::Image, 1),
-                dfg_sampler: seam.alloc_heap_block(HeapKind::Sampler, 1),
-                array_sampler: seam.alloc_heap_block(HeapKind::Sampler, 1),
-            }
-        });
-        for ((binding, resource), &(slot_binding, slot)) in
-            resources.into_iter().zip(&slots.buffers)
-        {
+            let size = b.size.map(u64::from).unwrap_or(b.buffer.size() - b.offset);
+            let (slot_binding, slot) = slots.buffers[i];
             debug_assert_eq!(binding, slot_binding);
-            seam.rewrite_heap_index(HeapKind::Buffer, slot, resource);
-        }
-        // Sampled images are written from the view's create info (the fork's
-        // hal `TextureView` records it at creation). All are wgpu-tracked
-        // sampled textures, read-optimal by trace time (the classic path's
-        // bind-group usage keeps the transitions happening until the flip;
-        // the flip takes over the transition responsibility).
-        #[allow(unsafe_code)]
-        let write_view = |slot: u32, view: &wgpu::TextureView| {
-            // SAFETY: the view is a live wgpu resource on the Vulkan backend;
-            // the guard is dropped before anything can destroy it.
-            if let Some(hal_view) = unsafe { view.as_hal::<VkApi>() } {
-                let info = hal_view.image_view_create_info();
-                seam.rewrite_heap_index(
-                    HeapKind::Image,
-                    slot,
-                    HeapResource::SampledImage {
-                        view: &info,
-                        layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    },
-                );
+            if slots.buffer_written[i] == (address, size) {
+                continue;
             }
-        };
-        #[allow(unsafe_code)]
-        let write_sampler = |slot: u32, sampler: &wgpu::Sampler| {
-            // SAFETY: as for the view above.
-            if let Some(hal_sampler) = unsafe { sampler.as_hal::<VkApi>() } {
-                let info = hal_sampler.create_info();
-                seam.rewrite_heap_index(HeapKind::Sampler, slot, HeapResource::Sampler(&info));
-            }
-        };
-        for (i, &view) in textures.as_slice().iter().enumerate() {
-            write_view(slots.texture_block + i as u32, view);
+            slots.buffer_written[i] = (address, size);
+            seam.rewrite_heap_index(HeapKind::Buffer, slot, HeapResource::Buffer { address, size });
         }
-        assert!(
-            samplers.len() <= slots.sampler_block_len as usize,
-            "scene sampler mirror: {} live samplers exceed the {}-slot sampler block \
-             (hardware sampler-heap limit)",
-            samplers.len(),
-            slots.sampler_block_len,
-        );
-        for (i, &sampler) in samplers.iter().enumerate() {
-            write_sampler(slots.sampler_block + i as u32, sampler);
+        // The single image/sampler descriptors: once at startup, then only on
+        // `RenderAssets` change frames (the DFG LUT swaps from the fallback to
+        // the baked texture when it loads).
+        if !slots.singles_written || assets_changed {
+            slots.singles_written = true;
+            write_image_descriptor(seam, slots.dfg_lut, dfg_view);
+            write_sampler_descriptor(seam, slots.dfg_sampler, dfg_sampler);
+            write_sampler_descriptor(seam, slots.array_sampler, array_sampler);
         }
-        for (i, &view) in texture_arrays.as_slice().iter().enumerate() {
-            write_view(slots.texture_array_block + i as u32, view);
-        }
-        write_view(slots.dfg_lut, dfg_view);
-        write_sampler(slots.dfg_sampler, dfg_sampler);
-        write_sampler(slots.array_sampler, array_sampler);
     }
 }
 
@@ -553,6 +739,9 @@ impl RaytracingSceneBindings {
             bind_group: None,
             materials_device_address: Default::default(),
             scene_heap: None,
+            texture_slots: Default::default(),
+            texture_array_slots: Default::default(),
+            sampler_configs: Default::default(),
             bind_group_layout: BindGroupLayoutDescriptor::new(
                 "raytracing_scene_bind_group_layout",
                 // `transforms` / `previous_frame_transforms` / `material_ids` /
@@ -577,7 +766,7 @@ impl RaytracingSceneBindings {
                         storage_buffer_read_only_sized(false, None), // 1 clusters
                         texture_2d(TextureSampleType::Float { filterable: true })
                             .count(MAX_TEXTURE_COUNT), // 2 textures
-                        sampler(SamplerBindingType::Filtering).count(MAX_TEXTURE_COUNT), // 3 samplers
+                        sampler(SamplerBindingType::Filtering).count(SAMPLER_CONFIG_COUNT), // 3 samplers
                         acceleration_structure(),                    // 4 tlas
                         storage_buffer_read_only_sized(false, None), // 5 light_sources
                         texture_2d(TextureSampleType::Float { filterable: true }), // 6 brdf_dfg_lut
@@ -600,39 +789,6 @@ impl RaytracingSceneBindings {
 impl Default for RaytracingSceneBindings {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-struct CachedBindingArray<T, I: Eq + Hash> {
-    map: HashMap<I, u32>,
-    vec: Vec<T>,
-}
-
-impl<T, I: Eq + Hash> CachedBindingArray<T, I> {
-    fn new() -> Self {
-        Self {
-            map: HashMap::default(),
-            vec: Vec::default(),
-        }
-    }
-
-    fn push_if_absent(&mut self, item: T, item_id: I) -> (u32, bool) {
-        let mut is_new = false;
-        let i = *self.map.entry(item_id).or_insert_with(|| {
-            is_new = true;
-            let i = self.vec.len() as u32;
-            self.vec.push(item);
-            i
-        });
-        (i, is_new)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.vec.is_empty()
-    }
-
-    fn as_slice(&self) -> &[T] {
-        self.vec.as_slice()
     }
 }
 

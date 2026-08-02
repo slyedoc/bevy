@@ -1650,6 +1650,7 @@ wasm = false
 name = "solari_nrc_gym"
 path = "examples/3d/solari/nrc_gym.rs"
 doc-scrape-examples = true
+required-features = ["bevy_solari"]
 
 [package.metadata.example.solari_nrc_gym]
 name = "Solari (NRC rung-0 gym)"

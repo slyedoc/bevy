@@ -3,8 +3,6 @@
 // TRANSPOSED weight mirror [out x in] row-major per layer, `biases` = f16
 // bias mirror, `preds_out` = predictions.
 //
-// Regenerate SPIR-V (from crates/bevy_solari/src/nrc/):
-//   slangc nrc_infer_coopvec.slang -target spirv -entry nrc_infer_coopvec -o nrc_infer_coopvec.spv
 import nrc_mlp;
 
 struct EwParams

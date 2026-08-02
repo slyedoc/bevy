@@ -277,9 +277,11 @@ struct NrcHeapSlots {
 }
 
 /// `RenderStartup` (after `SolariSetup`): heap-flagged raw pipelines, one per
-/// Slang-precompiled kernel. Every `[[vk::binding]]` in the kernels is a
-/// push-indexed heap slot — the binding tables live in the dispatch functions'
-/// slot arrays, which must match nrc_train.slang / nrc_mlp.slang order.
+/// kernel, compiled from Slang source here (`nrc_mlp` importable, so the MLP
+/// constants agree across kernels by construction). Every `[[vk::binding]]` in
+/// the kernels is a push-indexed heap slot — the binding tables live in the
+/// dispatch functions' slot arrays, which must match nrc_train.slang /
+/// nrc_mlp.slang order.
 #[allow(unsafe_code)]
 pub fn init_nrc_pipelines(
     mut commands: Commands,
@@ -292,19 +294,50 @@ pub fn init_nrc_pipelines(
     };
 
     // Kernel binding counts (contiguous from 0, per the .slang binding tables).
-    let make = |label: &'static str, spv_bytes: &'static [u8], bindings: u32| {
-        let spv = wgpu::util::make_spirv_raw(spv_bytes);
+    let mlp: &[(&str, &str)] = &[("nrc_mlp", include_str!("nrc_mlp.slang"))];
+    let make = |label: &'static str, file: &'static str, source: &'static str, entry: &'static str, bindings: u32| {
+        let spv = crate::gpu::slang::compile_rt_slang(
+            file,
+            source,
+            entry,
+            crate::gpu::slang::SlangRtStage::Compute,
+            mlp,
+            &[],
+            &[],
+        )
+        .map_err(|e| bevy_log::error!("nrc: {e}"))
+        .ok()?;
         seam.create_heap_compute_pipeline(&spv, bindings, label)
     };
     let (Some(learn), Some(adam), Some(encode_records), Some(query_infer)) = (
-        make("nrc_learn", include_bytes!("nrc_train.spv"), 10),
-        make("nrc_adam", include_bytes!("nrc_adam.spv"), 9),
+        make(
+            "nrc_learn",
+            "nrc_train.slang",
+            include_str!("nrc_train.slang"),
+            "learn_gradient",
+            10,
+        ),
+        make(
+            "nrc_adam",
+            "nrc_adam.slang",
+            include_str!("nrc_adam.slang"),
+            "adam",
+            9,
+        ),
         make(
             "nrc_encode_records",
-            include_bytes!("nrc_encode_records.spv"),
+            "nrc_encode_records.slang",
+            include_str!("nrc_encode_records.slang"),
+            "nrc_encode_records",
             4,
         ),
-        make("nrc_query_infer", include_bytes!("nrc_query_infer.spv"), 5),
+        make(
+            "nrc_query_infer",
+            "nrc_query_infer.slang",
+            include_str!("nrc_query_infer.slang"),
+            "nrc_query_infer",
+            5,
+        ),
     ) else {
         return;
     };
@@ -345,7 +378,12 @@ pub fn init_nrc_pipelines(
         info.p_dst_size = &mut dst_size;
         fns.convert_cooperative_vector_matrix(&info)
             .expect("vkConvertCooperativeVectorMatrixNV size query failed");
-        (fns, hal_device.raw_device().clone(), dst_size as u32)
+        // Round the per-layer stride to 64 B: `vkCmdConvertCooperativeVector-
+        // MatrixNV` requires 64-B-aligned src/dst addresses (VUID 10084/
+        // 10085), and every layer offset is a multiple of this stride. All
+        // consumers — the dw_opt buffer size, the fused kernel's accumulate
+        // offsets, the convert src addresses — inherit it from here.
+        (fns, hal_device.raw_device().clone(), (dst_size as u32).next_multiple_of(64))
     };
 
     commands.insert_resource(NrcPipelines {

@@ -1,7 +1,5 @@
 // Adam optimizer step + the f16 inference mirrors (forward, transposed, EMA).
 //
-// Regenerate SPIR-V (from crates/bevy_solari/src/nrc/):
-//   slangc nrc_adam.slang -target spirv -entry adam -o nrc_adam.spv
 import nrc_mlp;
 
 struct AdamParams

@@ -5,7 +5,7 @@
 //! finite differences of the stop-grad-frozen loss, and loss convergence.
 //!
 //! The training step is hybrid: a fused Slang kernel (nrc_train.slang,
-//! shipped as passthrough SPIR-V) runs forward + loss + the whole dZ
+//! compiled at startup like production's) runs forward + loss + the whole dZ
 //! backward chain in one dispatch, and the coopmat kernels (nrc_mlp.slang)
 //! reduce dW/db from the recorded activations/dZ before adam.
 
@@ -246,7 +246,9 @@ async fn run(args: Args) {
         info.p_dst_size = &mut dst_size;
         fns.convert_cooperative_vector_matrix(&info)
             .expect("vkConvertCooperativeVectorMatrixNV size query failed");
-        (fns, hal_device.raw_device().clone(), dst_size as u32)
+        // 64-B stride so every layer's convert src address stays aligned
+        // (VUID 10084) — same rounding as production's `init_nrc_pipelines`.
+        (fns, hal_device.raw_device().clone(), (dst_size as u32).next_multiple_of(64))
     };
     println!("dW TrainingOptimal block: {opt_size} B/layer (row-major {} B)", WIDTH * WIDTH * 4);
 
@@ -314,8 +316,8 @@ fn init_weights(seed: u64) -> (Vec<f32>, Vec<f32>) {
 }
 
 fn build_pipelines(device: &wgpu::Device) -> Pipelines {
-    // Every kernel is Slang-precompiled passthrough SPIR-V (nrc_train.slang +
-    // nrc_mlp.slang + nrc_gym_gen.slang — regen commands in their headers):
+    // Every kernel compiles from the crate's Slang source, with the same
+    // `nrc_mlp` module production imports, then loads as passthrough SPIR-V:
     // no naga reflection, so each bind group layout is spelled out to match
     // its kernel's [[vk::binding]] table.
     let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
@@ -338,10 +340,28 @@ fn build_pipelines(device: &wgpu::Device) -> Pipelines {
         },
         count: None,
     };
-    let make = |label: &str, spv_bytes: &[u8], entries: &[wgpu::BindGroupLayoutEntry]| {
+    let mlp: &[(&str, &str)] = &[(
+        "nrc_mlp",
+        include_str!("../../../crates/bevy_solari/src/nrc/nrc_mlp.slang"),
+    )];
+    let make = |label: &str,
+                file: &str,
+                source: &str,
+                entry: &str,
+                entries: &[wgpu::BindGroupLayoutEntry]| {
+        let spv = bevy::solari::gpu::slang::compile_rt_slang(
+            file,
+            source,
+            entry,
+            bevy::solari::gpu::slang::SlangRtStage::Compute,
+            mlp,
+            &[],
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         let module = unsafe {
             device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
-                spirv: Some(wgpu::util::make_spirv_raw(spv_bytes)),
+                spirv: Some(std::borrow::Cow::Owned(spv)),
                 ..Default::default()
             })
         };
@@ -367,7 +387,9 @@ fn build_pipelines(device: &wgpu::Device) -> Pipelines {
     Pipelines {
         learn: make(
             "nrc_learn",
-            include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_train.spv"),
+            "nrc_train.slang",
+            include_str!("../../../crates/bevy_solari/src/nrc/nrc_train.slang"),
+            "learn_gradient",
             &[
                 storage(0, true),  // acts (encoded batch)
                 storage(1, true),  // weights_t
@@ -383,7 +405,9 @@ fn build_pipelines(device: &wgpu::Device) -> Pipelines {
         ),
         adam: make(
             "adam",
-            include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_adam.spv"),
+            "nrc_adam.slang",
+            include_str!("../../../crates/bevy_solari/src/nrc/nrc_adam.slang"),
+            "adam",
             &[
                 storage(0, false), // master
                 storage(1, true),  // grad_in
@@ -398,12 +422,16 @@ fn build_pipelines(device: &wgpu::Device) -> Pipelines {
         ),
         gym_gen: make(
             "gym_gen",
-            include_bytes!("nrc_gym_gen.spv"),
+            "nrc_gym_gen.slang",
+            include_str!("nrc_gym_gen.slang"),
+            "gym_gen",
             &[storage(0, false), storage(1, false), uniform(2)],
         ),
         infer_coopvec: make(
             "nrc_infer_coopvec",
-            include_bytes!("../../../crates/bevy_solari/src/nrc/nrc_infer_coopvec.spv"),
+            "nrc_infer_coopvec.slang",
+            include_str!("../../../crates/bevy_solari/src/nrc/nrc_infer_coopvec.slang"),
+            "nrc_infer_coopvec",
             &[
                 storage(0, true),  // inputs
                 storage(1, true),  // weights_t

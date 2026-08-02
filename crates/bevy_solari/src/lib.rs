@@ -81,9 +81,7 @@ use crate::transform::SolariTransformPlugin;
 #[cfg(feature = "bevy_solari_debug")]
 use crate::debug::SolariDebugPlugin;
 
-pub use crate::gpu::rt_pipeline::{
-    SolariAnyHitDef, SolariChitSource, SolariHitGroupDef, SolariHitGroupRegistry,
-};
+pub use crate::gpu::rt_pipeline::{SolariHitGroupDef, SolariHitGroupRegistry, SolariRtShader};
 pub use crate::material::{
     SolariChitRegistryAppExt, SolariHitGroup, SolariHitGroupClass, SolariHitGroupPlugin,
 };
@@ -187,7 +185,7 @@ pub mod prelude {
         bindings::RaytracingMesh3d,
         bindings::SolariFogVolume,
         bindings::SolariPortal,
-        gpu::rt_pipeline::{SolariAnyHitDef, SolariHitGroupDef},
+        gpu::rt_pipeline::{SolariHitGroupDef, SolariRtShader},
         geometry::ClusterMesh,
         hair::{
             HairAsset, HairMaterial, HairMaterial3d, HairMesh3d, HairStrand, SolariBranches,

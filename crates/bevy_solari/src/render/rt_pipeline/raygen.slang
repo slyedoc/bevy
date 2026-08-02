@@ -5,13 +5,9 @@
 // closest-hit (opaque/glass/hair), which fills the payload with the emitted
 // radiance + attenuation + the next ray.
 //
-// The `SOLARI_SHADER_CLOCK` variant compiles in the per-pixel cost heatmap
-// (`VK_KHR_shader_clock`); the pipeline build selects the blob matching the
-// device.
-//
-// Regenerate SPIR-V (from crates/bevy_solari/src/render/rt_pipeline/):
-//   slangc raygen.slang -target spirv -capability spvShaderInvocationReorderNV -o raygen.spv
-//   slangc raygen.slang -target spirv -capability spvShaderInvocationReorderNV -D SOLARI_SHADER_CLOCK -o raygen_clock.spv
+// The `SOLARI_SHADER_CLOCK` define compiles in the per-pixel cost heatmap
+// (`VK_KHR_shader_clock`); the pipeline build passes it iff the device
+// enabled the extension.
 
 import rt_payload;
 import scene_resolve;

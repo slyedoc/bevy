@@ -6,8 +6,6 @@
 // reflections / through glass, bounded by `MAX_BOUNCES`. No shading, no NEE, no
 // G-buffer — portals carry the view, lit by the far side's own surroundings.
 //
-// Regenerate SPIR-V (from crates/bevy_solari/src/render/rt_pipeline/):
-//   slangc chit_portal.slang -target spirv -o chit_portal.spv
 
 import rt_payload;
 

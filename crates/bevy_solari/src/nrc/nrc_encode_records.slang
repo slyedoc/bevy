@@ -2,8 +2,6 @@
 // inputs + training targets.
 // `NrcRecord` MUST MATCH raygen.slang and nrc/mod.rs.
 //
-// Regenerate SPIR-V (from crates/bevy_solari/src/nrc/):
-//   slangc nrc_encode_records.slang -target spirv -entry nrc_encode_records -o nrc_encode_records.spv
 import nrc_mlp;
 
 struct NrcRecord

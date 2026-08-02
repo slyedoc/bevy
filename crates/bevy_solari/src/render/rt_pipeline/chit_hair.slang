@@ -10,8 +10,6 @@
 // layout always carries the G-buffer bindings and the WGSL twin compiled with
 // `SOLARI_DLSS` always set.
 //
-// Regenerate SPIR-V (from crates/bevy_solari/src/render/rt_pipeline/):
-//   slangc chit_hair.slang -target spirv -o chit_hair.spv
 
 import rt_payload;
 import scene_resolve;

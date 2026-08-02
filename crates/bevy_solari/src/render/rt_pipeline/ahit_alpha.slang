@@ -10,8 +10,6 @@
 // shadow rays (shadow rays are not force-opaque, so foliage casts cutout
 // shadows; see chit_opaque `SHADOW_RAY_FLAGS`).
 //
-// Regenerate SPIR-V (from crates/bevy_solari/src/render/rt_pipeline/):
-//   slangc ahit_alpha.slang -target spirv -o ahit_alpha.spv
 
 import scene_resolve;
 

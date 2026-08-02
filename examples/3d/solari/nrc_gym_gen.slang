@@ -5,8 +5,6 @@
 // nrc_mlp module — the exact functions production uses. Bindings are
 // contiguous from 0 (passthrough SPIR-V requirement — see nrc_mlp.slang).
 //
-// Regenerate SPIR-V (from examples/3d/solari/):
-//   slangc nrc_gym_gen.slang -I ../../../crates/bevy_solari/src/nrc -target spirv -entry gym_gen -o nrc_gym_gen.spv
 import nrc_mlp;
 
 struct GenParams

@@ -1,35 +1,35 @@
-//! Minimal libslang FFI: runtime Slang→SPIR-V for the RT stages that compose
-//! runtime-swappable modules.
+//! Minimal libslang FFI: runtime Slang→SPIR-V for every solari GPU stage.
 //!
-//! Most RT stages ship as Slang-precompiled SPIR-V blobs (regen commands in
-//! each `.slang` header). Two things can't be precompiled: the primary miss
-//! (it composes the app-swappable `custom_sky` module) and downstream
-//! [`SolariChitSource::Slang`](crate::gpu::rt_pipeline::SolariChitSource)
-//! closest-hits. Those compile here, through the deprecated-but-exported
-//! `sp*` compile-request C API — plain C symbols, no COM vtables — dlopen'd
-//! from the pinned Slang toolchain.
+//! All stages — the RT pipeline libraries, downstream
+//! [`SolariHitGroupDef`](crate::gpu::rt_pipeline::SolariHitGroupDef) hits, and
+//! the NRC compute kernels — compile from `include_str!` source at pipeline
+//! build, through the deprecated-but-exported `sp*` compile-request C API —
+//! plain C symbols, no COM vtables — dlopen'd from the pinned Slang toolchain.
+//! One compiler compiles every module in a link, so cross-module layout
+//! agreement (payload structs, the MLP constants) holds by construction, and
+//! variant axes (`defines`, swappable modules like `custom_sky`) are ordinary
+//! build inputs instead of a checked-in blob per combination.
 //!
 //! The library is resolved from `$SLANG_DIR/lib/libslang.so` (default
-//! `SLANG_DIR=/mnt/code/f/slang`, the same install whose `bin/slangc`
-//! produced the checked-in blobs — keep them the same version: modules
-//! compiled by mismatched compilers may disagree on layout).
+//! `SLANG_DIR=/mnt/code/f/slang`).
 //!
 //! Module composition uses a per-compile temp directory on the request's
-//! search path — identical resolution semantics to the `slangc` CLI the
-//! precompiled blobs are built with.
+//! search path — identical resolution semantics to `import x;` finding
+//! `x.slang` beside the entry file under the `slangc` CLI.
 
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::sync::Mutex;
 
-/// RT stage of a runtime-compiled entry point.
+/// Stage of a runtime-compiled entry point.
 #[derive(Clone, Copy, Debug)]
 pub enum SlangRtStage {
     RayGeneration,
     AnyHit,
     ClosestHit,
     Miss,
+    Compute,
 }
 
 impl SlangRtStage {
@@ -40,6 +40,7 @@ impl SlangRtStage {
             SlangRtStage::AnyHit => 9,
             SlangRtStage::ClosestHit => 10,
             SlangRtStage::Miss => 11,
+            SlangRtStage::Compute => 6,
         }
     }
 }
@@ -59,6 +60,9 @@ struct Api {
     destroy_compile_request: unsafe extern "C" fn(*mut c_void),
     add_code_gen_target: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
     add_search_path: unsafe extern "C" fn(*mut c_void, *const c_char),
+    add_preprocessor_define: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char),
+    find_capability: unsafe extern "C" fn(*mut c_void, *const c_char) -> i32,
+    add_target_capability: unsafe extern "C" fn(*mut c_void, c_int, i32),
     add_translation_unit: unsafe extern "C" fn(*mut c_void, c_int, *const c_char) -> c_int,
     add_translation_unit_source_string:
         unsafe extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char),
@@ -99,6 +103,9 @@ fn load_api() -> Result<Api, String> {
         destroy_compile_request: sym!(b"spDestroyCompileRequest"),
         add_code_gen_target: sym!(b"spAddCodeGenTarget"),
         add_search_path: sym!(b"spAddSearchPath"),
+        add_preprocessor_define: sym!(b"spAddPreprocessorDefine"),
+        find_capability: sym!(b"spFindCapability"),
+        add_target_capability: sym!(b"spAddTargetCapability"),
         add_translation_unit: sym!(b"spAddTranslationUnit"),
         add_translation_unit_source_string: sym!(b"spAddTranslationUnitSourceString"),
         add_entry_point: sym!(b"spAddEntryPoint"),
@@ -119,16 +126,24 @@ fn load_api() -> Result<Api, String> {
 /// Compile one RT-stage entry point to SPIR-V words.
 ///
 /// `entry_source` is a translation unit named `entry_file`; `entry_name` is the
-/// entry function inside it (the emitted `OpEntryPoint` is renamed `"main"`, as
-/// with every slangc-compiled stage). `modules` are `(module_name, source)`
-/// pairs made importable to the entry (and to each other) — the same closure a
-/// `slangc` invocation would resolve from files next to the entry.
+/// entry function inside it (the emitted `OpEntryPoint` is renamed `"main"`).
+/// `modules` are `(module_name, source)` pairs made importable to the entry
+/// (and to each other) — the same closure a `slangc` invocation would resolve
+/// from files next to the entry. `defines` are `(key, value)` preprocessor
+/// defines applied to the entry translation unit (`slangc -D key=value`) — the
+/// compile-out feature axes like raygen's `SOLARI_SHADER_CLOCK`. `capabilities`
+/// are target capability atoms (`slangc -capability x`): declaring the
+/// target's capability SET restricts which SPIR-V flavor gets emitted — e.g.
+/// `spvShaderInvocationReorderNV` pins SER to the NV capability/extension the
+/// device enables; without it slang free-chooses and emits the EXT flavor.
 pub fn compile_rt_slang(
     entry_file: &str,
     entry_source: &str,
     entry_name: &str,
     stage: SlangRtStage,
     modules: &[(&str, &str)],
+    defines: &[(&str, &str)],
+    capabilities: &[&str],
 ) -> Result<Vec<u32>, String> {
     let mut guard = SLANG.lock().unwrap();
     let api = match guard.get_or_insert_with(load_api) {
@@ -150,11 +165,21 @@ pub fn compile_rt_slang(
         std::fs::write(&path, source).map_err(|e| format!("{}: {e}", path.display()))?;
     }
 
-    let result = compile_with_request(api, &module_dir, entry_file, entry_source, entry_name, stage);
+    let result = compile_with_request(
+        api,
+        &module_dir,
+        entry_file,
+        entry_source,
+        entry_name,
+        stage,
+        defines,
+        capabilities,
+    );
     let _ = std::fs::remove_dir_all(&module_dir);
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_with_request(
     api: &Api,
     module_dir: &std::path::Path,
@@ -162,6 +187,8 @@ fn compile_with_request(
     entry_source: &str,
     entry_name: &str,
     stage: SlangRtStage,
+    defines: &[(&str, &str)],
+    capabilities: &[&str],
 ) -> Result<Vec<u32>, String> {
     let cstr = |s: &str, what: &str| {
         CString::new(s).map_err(|_| format!("{entry_file}: interior NUL in {what}"))
@@ -171,6 +198,14 @@ fn compile_with_request(
     let tu_path = cstr(entry_file, "entry file name")?;
     let source = cstr(entry_source, "shader source")?;
     let entry = cstr(entry_name, "entry point name")?;
+    let defines: Vec<(CString, CString)> = defines
+        .iter()
+        .map(|(k, v)| Ok((cstr(k, "define key")?, cstr(v, "define value")?)))
+        .collect::<Result<_, String>>()?;
+    let capabilities: Vec<CString> = capabilities
+        .iter()
+        .map(|c| cstr(c, "capability name"))
+        .collect::<Result<_, String>>()?;
 
     // SAFETY: request/session pointers come from the same live libslang; every
     // passed pointer outlives the call (CStrings live to the end of scope), and
@@ -180,10 +215,26 @@ fn compile_with_request(
         if req.is_null() {
             return Err(format!("{entry_file}: spCreateCompileRequest returned null"));
         }
-        // Everything below mirrors `slangc <entry> -target spirv -entry <name>`
-        // with defaults — the checked-in blobs' exact recipe.
-        (api.add_code_gen_target)(req, SLANG_SPIRV);
+        // Everything below mirrors
+        // `slangc <entry> -target spirv -entry <name> [-D k=v] [-capability c]`
+        // with defaults.
+        let target = (api.add_code_gen_target)(req, SLANG_SPIRV);
         (api.add_search_path)(req, search.as_ptr());
+        for (k, v) in &defines {
+            (api.add_preprocessor_define)(req, k.as_ptr(), v.as_ptr());
+        }
+        for cap in &capabilities {
+            // SLANG_CAPABILITY_UNKNOWN = 0.
+            let id = (api.find_capability)(api.session, cap.as_ptr());
+            if id <= 0 {
+                (api.destroy_compile_request)(req);
+                return Err(format!(
+                    "{entry_file}: unknown slang capability {:?}",
+                    cap.to_string_lossy()
+                ));
+            }
+            (api.add_target_capability)(req, target, id);
+        }
         let tu = (api.add_translation_unit)(req, SLANG_SOURCE_LANGUAGE_SLANG, tu_name.as_ptr());
         (api.add_translation_unit_source_string)(req, tu, tu_path.as_ptr(), source.as_ptr());
         (api.add_entry_point)(req, tu, entry.as_ptr(), stage.raw());

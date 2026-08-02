@@ -37,8 +37,10 @@ const IMAGE_SLOTS: u64 = 8192;
 const SAMPLER_SLOTS: u64 = 5120;
 
 /// SBT records: one per material slot, hit-group handle followed by the
-/// material's pointers / heap indices / constants.
-const MAX_RECORDS: u64 = 4096;
+/// material's pointers / heap indices / constants. At a 128-B stride this is
+/// a 2 MiB table; the RT pipeline clamps its headroom to fit (bistro alone
+/// carries >3000 material slots).
+pub const MAX_RECORDS: u64 = 16384;
 /// Bytes of per-record data after the hit-group handle.
 const RECORD_DATA_SIZE: u64 = 96;
 
@@ -500,6 +502,10 @@ impl BindingSeam {
                 constant_offset: vk::DescriptorMappingSourceConstantOffsetEXT {
                     sampler_heap_offset: (index as u64 * inner.sampler_desc_size) as u32,
                     sampler_heap_array_stride: inner.sampler_desc_size as u32,
+                    // Sampler descriptors read only the sampler_* half, but
+                    // VVL checks this field for any descriptor array — mirror
+                    // the stride to keep validation quiet.
+                    heap_array_stride: inner.sampler_desc_size as u32,
                     ..Default::default()
                 },
             },
@@ -551,6 +557,8 @@ impl BindingSeam {
                     sampler_push_offset: push_offset,
                     sampler_heap_index_stride: inner.sampler_desc_size as u32,
                     sampler_heap_array_stride: inner.sampler_desc_size as u32,
+                    // Mirrored for VVL's array-stride check (see map_binding).
+                    heap_array_stride: inner.sampler_desc_size as u32,
                     ..Default::default()
                 },
             },

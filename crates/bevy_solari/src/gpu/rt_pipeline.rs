@@ -13,11 +13,11 @@
 // access device-losts on current NVIDIA drivers). The trace binds the heaps +
 // pushes 76 bytes; `VK_EXT_descriptor_heap` (NVIDIA R610+) is required.
 //
-// The RT-stage shaders are all Slang: precompiled SPIR-V blobs, except the
-// primary miss (and any downstream `SolariChitSource::Slang` closest-hit),
-// compiled at build via `gpu/slang.rs`, then handed to
-// `vkCreateRayTracingPipelinesKHR`. Mirrors `gpu/allocator.rs`'s raw-VK style;
-// gated on the `RayTracingPipelineFeature` device feature.
+// The RT-stage shaders are all Slang, compiled from source at library build
+// via `gpu/slang.rs` (variant axes are preprocessor defines and swappable
+// modules), then handed to `vkCreateRayTracingPipelinesKHR`. Mirrors
+// `gpu/allocator.rs`'s raw-VK style; gated on the `RayTracingPipelineFeature`
+// device feature.
 #![allow(unsafe_code)]
 
 use ash::khr;
@@ -243,51 +243,32 @@ pub struct RtGeometryAddresses {
     pub animated_table: u64,
 }
 
-/// Closest-hit stage source. The built-in stages carry Slang-precompiled
-/// SPIR-V (the regen command lives in each `.slang` header); downstream chits
-/// may instead ship Slang source, compiled at pipeline build via `gpu/slang.rs`
-/// with the built-in module set (`scene_resolve`/`brdf`/`sampling`/…) importable.
+/// One Slang shader stage of a hit group, compiled at pipeline build via
+/// `gpu/slang.rs`. `entry` is the entry function's name in `source` (the
+/// compiled `OpEntryPoint` is renamed `"main"`). The source may `import` the
+/// built-in module set (`scene_resolve`/`brdf`/`sampling`/…) and its group's
+/// [`composable_modules`](SolariHitGroupDef::composable_modules). `&'static`
+/// (usually `include_str!`) so downstream crates register without forking.
 #[derive(Clone)]
-pub enum SolariChitSource {
-    /// Slang source compiled at pipeline build. `entry` is the entry function's
-    /// name in `source` (the compiled `OpEntryPoint` is `"main"`, like every
-    /// slangc-built stage). May `import` the built-in modules and the group's
-    /// [`composable_modules`](SolariHitGroupDef::composable_modules).
-    Slang {
-        source: &'static str,
-        file: &'static str,
-        entry: &'static str,
-    },
-    /// Slang-precompiled SPIR-V words (entry point "main").
-    SpirV(&'static [u8]),
+pub struct SolariRtShader {
+    pub source: &'static str,
+    pub file: &'static str,
+    pub entry: &'static str,
 }
 
-/// One RT closest-hit program; its registry index is its SBT class. Sources are
-/// `&'static` (usually `include_str!`/`include_bytes!`) so downstream crates
-/// register without forking.
+/// One RT hit group (closest-hit + optional any-hit, e.g. alpha cutout); its
+/// registry index is its SBT class.
 #[derive(Clone)]
 pub struct SolariHitGroupDef {
     pub label: &'static str,
-    pub closest_hit: SolariChitSource,
-    pub any_hit: Option<SolariAnyHitDef>,
+    pub closest_hit: SolariRtShader,
+    pub any_hit: Option<SolariRtShader>,
     /// Extra `(module_name, source)` Slang modules importable by this group's
-    /// [`SolariChitSource::Slang`] closest-hit alongside the built-in set — lets
-    /// a downstream crate `import` its own shared Slang (e.g. a terrain function
-    /// used by both a compute pass and a closest-hit) without forking. They may
-    /// import the built-ins and each other. Scoped to this group: other groups
-    /// never see them. Unused by a `SpirV` closest-hit (precompiled stages
-    /// resolve imports at regen time).
+    /// stages alongside the built-in set — lets a downstream crate `import` its
+    /// own shared Slang (e.g. a terrain function used by both a compute pass
+    /// and a closest-hit) without forking. They may import the built-ins and
+    /// each other. Scoped to this group: other groups never see them.
     pub composable_modules: &'static [(&'static str, &'static str)],
-}
-
-/// An any-hit program attached to a [`SolariHitGroupDef`] (alpha cutout, etc.).
-/// Any-hits are Slang-precompiled SPIR-V (see `ahit_alpha.slang` — the regen
-/// command is in its header): they never compose runtime modules, so nothing
-/// needs the WGSL composer here.
-#[derive(Clone)]
-pub struct SolariAnyHitDef {
-    pub spirv: &'static [u8],
-    pub entry: &'static str,
 }
 
 /// Ordered RT hit groups consumed by [`RtPipeline::new`]; index = SBT class.
@@ -299,15 +280,27 @@ pub struct SolariHitGroupRegistry {
 impl SolariHitGroupRegistry {
     /// Append a hit group; returns its SBT class (its index).
     ///
-    /// A `Slang` closest-hit is compiled eagerly (with its `composable_modules`)
+    /// The group's stages are compiled eagerly (with its `composable_modules`)
     /// so a broken user shader is reported at registration — at pipeline-build
     /// time a compile failure in ANY group aborts the whole RT pipeline, which
     /// is far harder to attribute.
     pub fn register(&mut self, group: SolariHitGroupDef) -> u32 {
-        if matches!(group.closest_hit, SolariChitSource::Slang { .. }) {
-            if let Err(e) = compile_slang_chit(&group) {
+        for (kind, shader, stage) in [
+            (
+                "closest-hit",
+                Some(&group.closest_hit),
+                crate::gpu::slang::SlangRtStage::ClosestHit,
+            ),
+            (
+                "any-hit",
+                group.any_hit.as_ref(),
+                crate::gpu::slang::SlangRtStage::AnyHit,
+            ),
+        ] {
+            let Some(shader) = shader else { continue };
+            if let Err(e) = compile_group_shader(&group, shader, stage) {
                 bevy_log::error!(
-                    "rt_pipeline: hit group '{}': closest-hit failed to compile: {e}. \
+                    "rt_pipeline: hit group '{}': {kind} failed to compile: {e}. \
                      The RT pipeline will fail to build until this is fixed.",
                     group.label
                 );
@@ -489,19 +482,34 @@ impl RtLibraryCache {
 
     /// Raygen library (static per app run — the shader-clock variant choice
     /// is fixed at device creation).
+    ///
+    /// [`RAYGEN_CAPABILITIES`] pins Shader Execution Reordering to the NV
+    /// SPIR-V flavor — the `VK_NV_ray_tracing_invocation_reorder` extension is
+    /// what the device enables; left unconstrained, slang emits the EXT flavor
+    /// and the module is invalid on this device (VUID 08740/08742).
     fn ensure_raygen(&mut self) -> Option<()> {
         if self.raygen.is_some() {
             return Some(());
         }
-        // Slang-precompiled raygen (regen commands in raygen.slang): the
-        // `SOLARI_SHADER_CLOCK` variant carries the cost-heatmap clock reads,
-        // legal only when the device enabled `VK_KHR_shader_clock`.
-        let raygen_spv: &'static [u8] = if crate::gpu::extension::shader_clock_available() {
-            include_bytes!("../render/rt_pipeline/raygen_clock.spv")
+        // The `SOLARI_SHADER_CLOCK` define compiles in the cost-heatmap clock
+        // reads, legal only when the device enabled `VK_KHR_shader_clock`.
+        let defines: &[(&str, &str)] = if crate::gpu::extension::shader_clock_available() {
+            &[("SOLARI_SHADER_CLOCK", "1")]
         } else {
-            include_bytes!("../render/rt_pipeline/raygen.spv")
+            &[]
         };
-        let module = create_shader_module(&self.device, &spirv_words(raygen_spv))?;
+        let raygen_spv = crate::gpu::slang::compile_rt_slang(
+            "raygen.slang",
+            include_str!("../render/rt_pipeline/raygen.slang"),
+            "raygen",
+            crate::gpu::slang::SlangRtStage::RayGeneration,
+            RT_SLANG_MODULES,
+            defines,
+            RAYGEN_CAPABILITIES,
+        )
+        .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
+        .ok()?;
+        let module = create_shader_module(&self.device, &raygen_spv)?;
         let lib = self.create_library(
             &[shader_stage(vk::ShaderStageFlags::RAYGEN_KHR, module, c"main")],
             &[general_group(0)],
@@ -511,10 +519,9 @@ impl RtLibraryCache {
         Some(())
     }
 
-    /// Primary-miss library — the one stage compiled at BUILD time: it
-    /// composes the swappable `custom_sky` module (`SolariSky::Shader`;
-    /// defaults to the built-in procedural gradient), so its SPIR-V can't be
-    /// checked in. A generation change rebuilds exactly this library.
+    /// Primary-miss library — composes the swappable `custom_sky` module
+    /// (`SolariSky::Shader`; defaults to the built-in procedural gradient).
+    /// A generation change rebuilds exactly this library.
     fn ensure_miss(&mut self, custom_sky: (&str, u64)) -> Option<()> {
         let (custom_sky_source, generation) = custom_sky;
         if matches!(&self.miss, Some((cached, _)) if *cached == generation) {
@@ -532,6 +539,8 @@ impl RtLibraryCache {
                 ),
                 ("custom_sky", custom_sky_source),
             ],
+            &[],
+            &[],
         )
         .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
         .ok()?;
@@ -548,16 +557,23 @@ impl RtLibraryCache {
         Some(())
     }
 
-    /// Shadow-miss library (Slang-precompiled, static).
+    /// Shadow-miss library (static — no modules, no variant axes).
     fn ensure_shadow(&mut self) -> Option<()> {
         if self.miss_shadow.is_some() {
             return Some(());
         }
-        // Slang-precompiled (see miss_shadow.slang for the regen command).
-        let module = create_shader_module(
-            &self.device,
-            &spirv_words(include_bytes!("../render/rt_pipeline/miss_shadow.spv")),
-        )?;
+        let shadow_spv = crate::gpu::slang::compile_rt_slang(
+            "miss_shadow.slang",
+            include_str!("../render/rt_pipeline/miss_shadow.slang"),
+            "miss_shadow",
+            crate::gpu::slang::SlangRtStage::Miss,
+            &[],
+            &[],
+            &[],
+        )
+        .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
+        .ok()?;
+        let module = create_shader_module(&self.device, &shadow_spv)?;
         let lib = self.create_library(
             &[shader_stage(vk::ShaderStageFlags::MISS_KHR, module, c"main")],
             &[general_group(0)],
@@ -571,25 +587,22 @@ impl RtLibraryCache {
     /// registry is append-only, so only entries past the cached count compile.
     fn ensure_hit_groups(&mut self, hit_groups: &[SolariHitGroupDef]) -> Option<()> {
         for hg in &hit_groups[self.hit_groups.len()..] {
-            let chit_mod = match &hg.closest_hit {
-                SolariChitSource::Slang { .. } => {
-                    let spv = compile_slang_chit(hg)
-                        .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
-                        .ok()?;
-                    create_shader_module(&self.device, &spv)?
-                }
-                SolariChitSource::SpirV(bytes) => {
-                    create_shader_module(&self.device, &spirv_words(bytes))?
-                }
+            let compile = |shader, stage| {
+                let spv = compile_group_shader(hg, shader, stage)
+                    .map_err(|e| bevy_log::error!("rt_pipeline: {e}"))
+                    .ok()?;
+                create_shader_module(&self.device, &spv)
             };
+            let chit_mod = compile(
+                &hg.closest_hit,
+                crate::gpu::slang::SlangRtStage::ClosestHit,
+            )?;
             let lib = if let Some(ah) = &hg.any_hit {
-                let ah_mod = create_shader_module(&self.device, &spirv_words(ah.spirv))?;
-                let entry = std::ffi::CString::new(ah.entry)
-                    .expect("shader entry name has interior NUL");
+                let ah_mod = compile(ah, crate::gpu::slang::SlangRtStage::AnyHit)?;
                 self.create_library(
                     &[
                         shader_stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, chit_mod, c"main"),
-                        shader_stage(vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, entry.as_c_str()),
+                        shader_stage(vk::ShaderStageFlags::ANY_HIT_KHR, ah_mod, c"main"),
                     ],
                     &[hit_group_with_any_hit(0, 1)],
                     vec![chit_mod, ah_mod],
@@ -942,7 +955,16 @@ impl RtPipeline {
         // (chit_hair keys off the instance, not a per-record material id). Kept off
         // the material region so material routing/SER is untouched.
         const HAIR_RECORDS: u64 = 1;
-        let record_capacity = material_count + RECORD_HEADROOM;
+        // Headroom clamps to the seam's record table; the live material count
+        // itself must fit outright.
+        let max_capacity = (crate::gpu::binding_seam::MAX_RECORDS - HAIR_RECORDS) as u32;
+        assert!(
+            material_count <= max_capacity,
+            "rt_pipeline: {material_count} material slots exceed the \
+             {}-record SBT table",
+            crate::gpu::binding_seam::MAX_RECORDS,
+        );
+        let record_capacity = (material_count + RECORD_HEADROOM).min(max_capacity);
         let total_records = record_capacity as u64 + HAIR_RECORDS;
         let handle_stride = align_up(handle_size, handle_align);
         let raygen_offset = 0u64;
@@ -1482,9 +1504,12 @@ impl Drop for RtPipeline {
     }
 }
 
-/// The built-in Slang modules importable by runtime-compiled RT stages
-/// (`import scene_resolve;` etc.) — the same set the precompiled stages resolve
-/// as files beside them at regen time.
+/// Raygen's target capability atoms (`slangc -capability` equivalents) —
+/// see [`RtLibraryCache::ensure_raygen`].
+const RAYGEN_CAPABILITIES: &[&str] = &["spvShaderInvocationReorderNV"];
+
+/// The built-in Slang modules importable by every RT stage
+/// (`import scene_resolve;` etc.).
 const RT_SLANG_MODULES: &[(&str, &str)] = &[
     (
         "rt_payload",
@@ -1502,21 +1527,24 @@ const RT_SLANG_MODULES: &[(&str, &str)] = &[
     ("hair", include_str!("../render/rt_pipeline/hair.slang")),
 ];
 
-/// Compile a [`SolariChitSource::Slang`] closest-hit with the built-in module
-/// set plus the group's own `composable_modules` importable. Shared by eager
-/// registration validation and the pipeline build.
-fn compile_slang_chit(group: &SolariHitGroupDef) -> Result<Vec<u32>, String> {
-    let SolariChitSource::Slang { source, file, entry } = &group.closest_hit else {
-        unreachable!("compile_slang_chit called on a precompiled closest-hit");
-    };
+/// Compile one of a hit group's stages with the built-in module set plus the
+/// group's own `composable_modules` importable. Shared by eager registration
+/// validation and the pipeline build.
+fn compile_group_shader(
+    group: &SolariHitGroupDef,
+    shader: &SolariRtShader,
+    stage: crate::gpu::slang::SlangRtStage,
+) -> Result<Vec<u32>, String> {
     let mut modules = RT_SLANG_MODULES.to_vec();
     modules.extend_from_slice(group.composable_modules);
     crate::gpu::slang::compile_rt_slang(
-        file,
-        source,
-        entry,
-        crate::gpu::slang::SlangRtStage::ClosestHit,
+        shader.file,
+        shader.source,
+        shader.entry,
+        stage,
         &modules,
+        &[],
+        &[],
     )
 }
 
@@ -1648,13 +1676,6 @@ fn try_compile_rt_wgsl(source: &str, file_path: &str) -> Result<Vec<u32>, String
     }
     naga::back::spv::write_vec(&module, &info, &options, None)
         .map_err(|e| format!("SPIR-V emit failed: {e:?}"))
-}
-
-/// Byte-align an embedded Slang-precompiled SPIR-V blob into words
-/// (`include_bytes!` carries no u32 alignment guarantee).
-fn spirv_words(bytes: &'static [u8]) -> Vec<u32> {
-    debug_assert_eq!(bytes.len() % 4, 0, "SPIR-V blob length not word-aligned");
-    bytemuck::pod_collect_to_vec(bytes)
 }
 
 fn create_shader_module(device: &ash::Device, spv: &[u32]) -> Option<vk::ShaderModule> {
@@ -1867,10 +1888,9 @@ mod tests {
             }
         }
 
-        // The primary miss composes the swappable `custom_sky` module through
-        // libslang at pipeline build (the one runtime-compiled stage). Compile
-        // it here with the default procedural sky AND a user-style replacement
-        // — the `SolariSky::Shader` path — so both stay proven headlessly.
+        // The primary miss composes the swappable `custom_sky` module. Compile
+        // it with the default procedural sky AND a user-style replacement —
+        // the `SolariSky::Shader` path — so both stay proven headlessly.
         // (Needs the pinned Slang toolchain — see `gpu/slang.rs`.)
         for custom_sky in [
             crate::render::sky::DEFAULT_CUSTOM_SKY,
@@ -1882,7 +1902,7 @@ mod tests {
                 "miss.slang",
                 include_str!("../render/rt_pipeline/miss.slang"),
                 "miss_primary",
-                crate::gpu::slang::SlangRtStage::Miss,
+                SlangRtStage::Miss,
                 &[
                     (
                         "rt_payload",
@@ -1890,52 +1910,102 @@ mod tests {
                     ),
                     ("custom_sky", custom_sky),
                 ],
+                &[],
+                &[],
             )
             .unwrap_or_else(|e| panic!("miss.slang: {e}"));
             assert_no_runtime_descriptor_array("miss.slang", &spv);
         }
 
-        // Slang-precompiled stages: sanity-check the embedded blobs (magic +
-        // word alignment). The binding/layout cross-checks against the WGSL
-        // stages (Cluster stride 48, Material field offsets, payload words)
-        // happen at regen time — see the .slang headers.
-        for (file, blob) in [
+        // Every other stage compiles from source at pipeline build; compile
+        // them all here — including both raygen define variants — so a shader
+        // or module edit fails at `cargo test` instead of as a runtime
+        // pipeline-build black screen. The binding/layout agreement across
+        // modules (Cluster stride, Material offsets, payload words) holds by
+        // construction: one compiler compiles every module in a link.
+        use super::{RAYGEN_CAPABILITIES, RT_SLANG_MODULES};
+        use crate::gpu::slang::SlangRtStage;
+        let clock: &[(&str, &str)] = &[("SOLARI_SHADER_CLOCK", "1")];
+        let no_caps: &[&str] = &[];
+        for (file, source, entry, stage, defines, caps) in [
             (
-                "miss_shadow.spv",
-                include_bytes!("../render/rt_pipeline/miss_shadow.spv").as_slice(),
+                "raygen.slang",
+                include_str!("../render/rt_pipeline/raygen.slang"),
+                "raygen",
+                SlangRtStage::RayGeneration,
+                &[][..],
+                RAYGEN_CAPABILITIES,
             ),
             (
-                "ahit_alpha.spv",
-                include_bytes!("../render/rt_pipeline/ahit_alpha.spv").as_slice(),
+                "raygen.slang",
+                include_str!("../render/rt_pipeline/raygen.slang"),
+                "raygen",
+                SlangRtStage::RayGeneration,
+                clock,
+                RAYGEN_CAPABILITIES,
             ),
             (
-                "chit_portal.spv",
-                include_bytes!("../render/rt_pipeline/chit_portal.spv").as_slice(),
+                "miss_shadow.slang",
+                include_str!("../render/rt_pipeline/miss_shadow.slang"),
+                "miss_shadow",
+                SlangRtStage::Miss,
+                &[],
+                no_caps,
             ),
             (
-                "chit_glass.spv",
-                include_bytes!("../render/rt_pipeline/chit_glass.spv").as_slice(),
+                "ahit_alpha.slang",
+                include_str!("../render/rt_pipeline/ahit_alpha.slang"),
+                "ahit_alpha",
+                SlangRtStage::AnyHit,
+                &[],
+                no_caps,
             ),
             (
-                "chit_hair.spv",
-                include_bytes!("../render/rt_pipeline/chit_hair.spv").as_slice(),
+                "chit_opaque.slang",
+                include_str!("../render/rt_pipeline/chit_opaque.slang"),
+                "chit_opaque",
+                SlangRtStage::ClosestHit,
+                &[],
+                no_caps,
             ),
             (
-                "chit_opaque.spv",
-                include_bytes!("../render/rt_pipeline/chit_opaque.spv").as_slice(),
+                "chit_glass.slang",
+                include_str!("../render/rt_pipeline/chit_glass.slang"),
+                "chit_glass",
+                SlangRtStage::ClosestHit,
+                &[],
+                no_caps,
             ),
             (
-                "raygen.spv",
-                include_bytes!("../render/rt_pipeline/raygen.spv").as_slice(),
+                "chit_hair.slang",
+                include_str!("../render/rt_pipeline/chit_hair.slang"),
+                "chit_hair",
+                SlangRtStage::ClosestHit,
+                &[],
+                no_caps,
             ),
             (
-                "raygen_clock.spv",
-                include_bytes!("../render/rt_pipeline/raygen_clock.spv").as_slice(),
+                "chit_portal.slang",
+                include_str!("../render/rt_pipeline/chit_portal.slang"),
+                "chit_portal",
+                SlangRtStage::ClosestHit,
+                &[],
+                no_caps,
             ),
         ] {
-            assert!(blob.len() % 4 == 0 && blob.len() > 20, "{file}: truncated");
-            let magic = u32::from_le_bytes(blob[0..4].try_into().unwrap());
-            assert_eq!(magic, 0x0723_0203, "{file}: not SPIR-V");
+            let spv =
+                crate::gpu::slang::compile_rt_slang(file, source, entry, stage, RT_SLANG_MODULES, defines, caps)
+                    .unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert_no_runtime_descriptor_array(file, &spv);
+            // The target capability must pin SER to the NV flavor — the EXT
+            // capability/extension is invalid on the device (VUID 08740).
+            let bytes: Vec<u8> = spv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert!(
+                !bytes
+                    .windows(b"SPV_EXT_shader_invocation_reorder".len())
+                    .any(|w| w == b"SPV_EXT_shader_invocation_reorder"),
+                "{file}: emitted the EXT shader-invocation-reorder flavor"
+            );
         }
     }
 }

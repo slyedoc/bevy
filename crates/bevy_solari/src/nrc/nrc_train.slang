@@ -10,9 +10,6 @@
 // same buffer coopvec inference reads); the backward W^T·dZ product reads
 // the identical bytes as ColumnMajor. Biases are the f16 mirror.
 //
-// Regenerate SPIR-V (from crates/bevy_solari/src/nrc/):
-//   slangc nrc_train.slang -target spirv -o nrc_train.spv
-//
 // The layer chain is composed by Slang autodiff (bwd_diff through
 // [Differentiable] evals); each layer's hand-written backward recomputes
 // its pre-activation, masks the incoming gradient, records dZ for the

@@ -18,6 +18,13 @@ module scene_resolve;
 public static const uint TEXTURE_MAP_NONE = 0xFFFFFFFF;
 // Mirrors `bindings::MAX_TEXTURE_COUNT` (the descriptor-set array size).
 public static const uint MAX_TEXTURE_COUNT = 5000;
+// Mirrors `bindings::SAMPLER_CONFIG_COUNT`: `samplers[]` holds deduplicated
+// sampler configurations. A material texture id packs
+// `sampler_config << 16 | texture_slot` (never equal to TEXTURE_MAP_NONE —
+// config indices stay far below 0xFFFF).
+public static const uint SAMPLER_CONFIG_COUNT = 256;
+static const uint TEXTURE_SLOT_MASK = 0xFFFF;
+static const uint SAMPLER_CFG_SHIFT = 16;
 public static const float MIRROR_ROUGHNESS_THRESHOLD = 0.001;
 public static const float RAY_T_MIN = 0.001;
 // Effectively infinite ray length. Finite, not `inf`: an `inf` tmax produces
@@ -222,7 +229,7 @@ public struct HairSceneParams
 [[vk::binding(0, 0)]] public StructuredBuffer<uint> cluster_indices;
 [[vk::binding(1, 0)]] public StructuredBuffer<Cluster> clusters;
 [[vk::binding(2, 0)]] public Texture2D textures[MAX_TEXTURE_COUNT];
-[[vk::binding(3, 0)]] public SamplerState samplers[MAX_TEXTURE_COUNT];
+[[vk::binding(3, 0)]] public SamplerState samplers[SAMPLER_CONFIG_COUNT];
 [[vk::binding(4, 0)]] public RaytracingAccelerationStructure tlas;
 // STABLE-SLOT indexed: a light keeps its index for its lifetime.
 [[vk::binding(5, 0)]] public StructuredBuffer<LightSource> light_sources;
@@ -405,8 +412,8 @@ public static const float TEXTURE_LOD_MIP0 = -1000.0;
 
 public float3 sample_texture(uint id, float2 uv)
 {
-    return textures[NonUniformResourceIndex(id)]
-        .SampleLevel(samplers[NonUniformResourceIndex(id)], uv, 0.0).rgb;
+    return textures[NonUniformResourceIndex(id & TEXTURE_SLOT_MASK)]
+        .SampleLevel(samplers[NonUniformResourceIndex(id >> SAMPLER_CFG_SHIFT)], uv, 0.0).rgb;
 }
 
 // As `sample_texture`, but at an explicit ray-cone LOD (the texture's
@@ -415,8 +422,8 @@ public float3 sample_texture(uint id, float2 uv)
 public float3 sample_texture_lod(uint id, float2 uv, float lod)
 {
     let level = max(lod, 0.0); // sentinel & cone-magnification both clamp to mip 0
-    return textures[NonUniformResourceIndex(id)]
-        .SampleLevel(samplers[NonUniformResourceIndex(id)], uv, level).rgb;
+    return textures[NonUniformResourceIndex(id & TEXTURE_SLOT_MASK)]
+        .SampleLevel(samplers[NonUniformResourceIndex(id >> SAMPLER_CFG_SHIFT)], uv, level).rgb;
 }
 
 public ResolvedMaterial resolve_material_lod(Material material, float2 uv, float partial_lod)
@@ -627,8 +634,8 @@ public bool alpha_passes(uint material_id, uint cluster_index, uint primitive_in
     let uv1 = load_packed_uv(cluster.vertex_offset + cluster_indices[idx_base + 1]);
     let uv2 = load_packed_uv(cluster.vertex_offset + cluster_indices[idx_base + 2]);
     let uv = uv0 * (1.0 - bary.x - bary.y) + uv1 * bary.x + uv2 * bary.y;
-    let alpha = textures[NonUniformResourceIndex(texture_id)].SampleLevel(
-        samplers[NonUniformResourceIndex(texture_id)], uv, 0.0).a;
+    let alpha = textures[NonUniformResourceIndex(texture_id & TEXTURE_SLOT_MASK)].SampleLevel(
+        samplers[NonUniformResourceIndex(texture_id >> SAMPLER_CFG_SHIFT)], uv, 0.0).a;
     return alpha >= alpha_mask;
 }
 

@@ -6,8 +6,6 @@
 // visibility test — the traversal lives in the fixed-function unit, not in the
 // closest-hit's registers.
 //
-// Regenerate SPIR-V (from crates/bevy_solari/src/render/rt_pipeline/):
-//   slangc miss_shadow.slang -target spirv -o miss_shadow.spv
 
 // MUST MATCH ShadowPayload in rt_payload.wgsl: two u32 words at offsets 0/4.
 // Payload linkage across the naga/Slang stage boundary is by trace-call
