@@ -61,7 +61,7 @@
 //! the static BVH coherent; hashing statics across many partitions gives
 //! each a scene-spanning AABB whose overlap inflates ray-traversal cost far
 //! more than cheaper per-cell rebuilds save. The static/mover split lives in
-//! `ptlas_fill.wgsl::resolve_partition`.
+//! `ptlas_fill.slang::resolve_partition`.
 
 use ash::vk::{self, TaggedStructure};
 use bevy_ecs::{
@@ -69,11 +69,9 @@ use bevy_ecs::{
     system::{Commands, Res, ResMut},
 };
 use bevy_render::{
-    diagnostic::RecordDiagnostics as _,
     render_resource::{
-        AccelerationStructureFlags, AccelerationStructureUpdateMode, BindGroup, BindGroupEntries,
-        Buffer, ComputePassDescriptor, CreateTlasDescriptor, PipelineCache, RawBufferVec,
-        ShaderType, Tlas, UniformBuffer,
+        AccelerationStructureFlags, AccelerationStructureUpdateMode, Buffer, CreateTlasDescriptor,
+        RawBufferVec, Tlas,
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
 };
@@ -91,10 +89,10 @@ use crate::material::MaterialTraversalFlags;
 use crate::transform::StaticColumn;
 
 use crate::gpu::allocator::{Allocator, SparseBuffer};
+use crate::gpu::binding_seam::BindingSeam;
 use crate::gpu::epoch_table::EpochTable;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use super::blas_sharing::BlasSharing;
-use crate::pipelines::SolariPipelines;
-use crate::resource_manager::SolariResourceManager;
 use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 
 /// Virtual address space for the PTLAS storage buffer — 4 GB.
@@ -114,7 +112,7 @@ pub const PTLAS_WRITE_DATA_VIRTUAL_BYTES: u64 = 1024 * 1024 * 1024;
 pub const PTLAS_SCRATCH_ALIGN: u64 = 256;
 
 /// `VkPartitionedAccelerationStructureWriteInstanceDataNV` byte size —
-/// must match `ptlas_fill.wgsl`'s `WriteInstanceData` struct (the full
+/// must match `ptlas_fill.slang`'s `WriteInstanceData` struct (the full
 /// 104 B record fed to `WRITE_INSTANCE`).
 const WRITE_INSTANCE_DATA_SIZE: u64 = 104;
 
@@ -160,9 +158,9 @@ pub struct PtlasWritePair {
 /// scene-spanning partitions. Movers stay in the global partition.
 pub const PTLAS_PARTITION_COUNT: u32 = 16384;
 
-/// Uniform layout shared with `ptlas_fill.wgsl::PtlasFillParams`.
+/// Push mirror of `ptlas_fill.slang::PtlasFillParams` (32 B).
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct PtlasFillParamsGpu {
     pub active_count: u32,
     pub cpu_count: u32,
@@ -170,6 +168,45 @@ pub struct PtlasFillParamsGpu {
     /// This build's seed-epoch stamp (≥1) — `fill_seed` marks its slots,
     /// `fill_incremental` skips them (one WRITE per instance per build).
     pub epoch: u32,
+    /// X workgroup count of the entry's 2D-split dispatch — stamped per
+    /// dispatch (each entry has its own thread bound).
+    pub groups_x: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+const _: () = assert!(size_of::<PtlasFillParamsGpu>() == 32);
+
+/// The Slang modules `ptlas_fill.slang` imports (referenced by the compile
+/// test too).
+pub(crate) const PTLAS_FILL_MODULES: &[(&str, &str)] = &[
+    (
+        "cluster_bindings",
+        include_str!("../bindings/cluster_bindings.slang"),
+    ),
+    (
+        "instance_mask",
+        include_str!("../instance/instance_mask.slang"),
+    ),
+];
+
+/// The four PTLAS-fill heap kernels + the persistent slot table their set-1
+/// parameters are written through. Built lazily on the first ready dispatch
+/// (the mapping table bakes the cluster-scene heap slots).
+pub struct PtlasKernels {
+    pub seed: HeapKernel,
+    pub incremental: HeapKernel,
+    pub finalize: HeapKernel,
+    pub validate: HeapKernel,
+    /// One slot per set-1 buffer, indexed by the dispatch's slot-table order.
+    pub slots: KernelSlots,
+}
+
+impl PtlasKernels {
+    fn all(&self) -> [&HeapKernel; 4] {
+        [&self.seed, &self.incremental, &self.finalize, &self.validate]
+    }
 }
 
 /// Render-world resource for the incremental partitioned-TLAS pass.
@@ -218,8 +255,9 @@ pub struct Ptlas {
     pub src_infos: Buffer,
     /// 4-byte op count (1 = the single WRITE op). CPU-written.
     pub src_infos_count: Buffer,
-    /// Per-frame fill-compute params uniform.
-    pub fill_params: UniformBuffer<PtlasFillParamsGpu>,
+    /// Per-frame fill-compute push params, filled in
+    /// [`prepare_ptlas_params`]; `groups_x` is stamped per dispatch.
+    pub fill_params: PtlasFillParamsGpu,
     /// `wgpu::Tlas` wrapper over [`Self::storage`] — so ray-trace shaders bind the
     /// PTLAS through wgpu's standard `accelerationStructureEXT` slot.
     /// `current_tlas()` returns the active one. Each wraps a
@@ -253,10 +291,11 @@ pub struct Ptlas {
     /// static instances carried from `src`).
     pub full_rebuild: bool,
 
-    /// Per-frame fill bind group, rebuilt in `Render::PrepareBindGroups`. The fill
-    /// compute pipeline ids live on [`SolariPipelines`], the layout on
-    /// [`SolariResourceManager`].
-    pub bind_group: Option<BindGroup>,
+    /// The fill heap kernels, built lazily (see [`PtlasKernels`]).
+    pub kernels: Option<PtlasKernels>,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 
     /// Per-slot `instance_flags` value last WRITTEN into a PTLAS record
     /// (persistent). The fill derives each instance's flags from its
@@ -310,6 +349,24 @@ pub struct Ptlas {
     pub nulls_map_result: std::sync::Arc<std::sync::atomic::AtomicU8>,
     pub pending_null_rebuild: bool,
 }
+
+impl Drop for Ptlas {
+    fn drop(&mut self) {
+        if let Some(kernels) = self.kernels.take() {
+            self._device_keepalive.quiesce_before_raw_destroy();
+            // SAFETY: quiesced; handles exclusively owned here.
+            unsafe {
+                for kernel in kernels.all() {
+                    kernel.destroy(&self.raw_device);
+                }
+            }
+        }
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for Ptlas {}
+unsafe impl Sync for Ptlas {}
 
 /// u32 words in the validation report: 4 span + capacity + partition count +
 /// bad count + 15 × 5-word entries.
@@ -427,9 +484,6 @@ pub fn init_ptlas(
         mapped_at_creation: false,
     });
 
-    let mut fill_params: UniformBuffer<PtlasFillParamsGpu> = UniformBuffer::default();
-    fill_params.set_label(Some("ptlas.fill_params"));
-
     let instance_written_flags = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("ptlas.instance_written_flags"),
         size: 4,
@@ -475,7 +529,7 @@ pub fn init_ptlas(
         write_slots_cpu,
         src_infos,
         src_infos_count,
-        fill_params,
+        fill_params: PtlasFillParamsGpu::default(),
         tlas: [None, None],
         as_handle_size: 0,
         as_handle_device_address: [0, 0],
@@ -486,7 +540,9 @@ pub fn init_ptlas(
         cpu_count: 0,
         op_count: 0,
         full_rebuild: false,
-        bind_group: None,
+        kernels: None,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
         instance_written_flags,
         written_flags_capacity: 1,
         instance_written_partition,
@@ -738,15 +794,17 @@ pub fn prepare_ptlas_params(
 
     let (epoch, seed_grew) = resources.seed_epoch.begin(&render_device, high_water);
     debug_assert!(!seed_grew || full_rebuild);
-    *resources.fill_params.get_mut() = PtlasFillParamsGpu {
+    // `groups_x` is per-entry; the dispatch stamps it into each push blob.
+    resources.fill_params = PtlasFillParamsGpu {
         active_count,
         cpu_count,
         force_all: full_rebuild as u32,
         epoch,
+        groups_x: 0,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     };
-    resources
-        .fill_params
-        .write_buffer(&render_device, &render_queue);
 
     // ── Size + commit + AS handle for the storage buffer — must happen
     //    before the binder reads `current_tlas()` in PrepareBindGroups. ──
@@ -925,127 +983,103 @@ fn drain_null_count(resources: &mut Ptlas) {
     }
 }
 
-/// `Render::PrepareBindGroups`: rebuild the fill-compute bind group.
-pub fn prepare_ptlas_fill_bind_group(
-    mut ptlas: Option<ResMut<Ptlas>>,
-    resource_manager: Option<Res<SolariResourceManager>>,
-    pipeline_cache: Res<PipelineCache>,
-    sharing: Option<Res<BlasSharing>>,
-    geometry_ids: Option<Res<GpuColumn<GeometryIdColumn>>>,
-    instance_masks: Option<Res<GpuColumn<InstanceMaskColumn>>>,
-    material_ids: Option<Res<GpuColumn<MaterialColumn>>>,
-    material_flags: Res<MaterialTraversalFlags>,
-    transforms: Option<Res<GpuColumn<TransformColumn>>>,
-    node_slots: Option<Res<GpuColumn<NodeSlotColumn>>>,
-    static_flags: Option<Res<GpuColumn<Presence<StaticColumn>>>>,
-    partition_hints: Option<Res<GpuColumn<crate::instance::PartitionColumn>>>,
-    render_device: Res<RenderDevice>,
-) {
-    let Some(ptlas) = ptlas.as_deref_mut() else {
-        return;
-    };
-    let (
-        Some(resource_manager),
-        Some(sharing),
-        Some(geometry_ids),
-        Some(instance_masks),
-        Some(material_ids),
-        Some(transforms),
-        Some(node_slots),
-        Some(static_flags),
-        Some(partition_hints),
-    ) = (
-        resource_manager,
-        sharing,
-        geometry_ids,
-        instance_masks,
-        material_ids,
-        transforms,
-        node_slots,
-        static_flags,
-        partition_hints,
-    )
-    else {
-        ptlas.bind_group = None;
-        return;
-    };
-    let (
-        Some(params_binding),
-        Some(write_slots),
-        Some(active_to_slot),
-        Some(previous_transforms),
-        Some(material_flags),
-    ) = (
-        ptlas.fill_params.binding(),
-        ptlas.write_slots_cpu.buffer(),
-        sharing.active_to_slot.buffer(),
-        // `fill_incremental` compares current vs previous to detect moves.
-        // `TransformColumn` is `KEEP_PREVIOUS`, so this is always `Some`.
-        transforms.previous_buffer(),
-        material_flags.buffer.buffer(),
-    ) else {
-        // The buffers are populated earlier in Prepare; None here means
-        // no instances yet.
-        ptlas.bind_group = None;
-        return;
-    };
-    let geometry_ids = geometry_ids.buffer().as_entire_binding();
-    let instance_masks = instance_masks.buffer().as_entire_binding();
-    let material_ids = material_ids.buffer().as_entire_binding();
-
-    let group = render_device.create_bind_group(
-        "ptlas_fill_bind_group",
-        &pipeline_cache.get_bind_group_layout(&resource_manager.ptlas),
-        &BindGroupEntries::sequential((
-            sharing.instance_blas_address.wgpu_buffer.as_entire_binding(),
-            sharing.geometry_dirty.as_entire_binding(),
-            ptlas.write_count.as_entire_binding(),
-            ptlas.write_data.wgpu_buffer.as_entire_binding(),
-            write_slots.as_entire_binding(),
-            active_to_slot.as_entire_binding(),
-            ptlas.src_infos.as_entire_binding(),
-            params_binding,
-            geometry_ids,
-            instance_masks,
-            previous_transforms.as_entire_binding(),
-            material_ids,
-            material_flags.as_entire_binding(),
-            ptlas.instance_written_flags.as_entire_binding(),
-            // Instance → transform-table node slot, and the node-indexed
-            // `TransformStatic` presence flag — `resolve_partition` reads
-            // `static_flags[node_slots[slot]]` to pick the instance's partition.
-            node_slots.buffer().as_entire_binding(),
-            static_flags.buffer().as_entire_binding(),
-            ptlas.instance_written_partition.as_entire_binding(),
-            ptlas.validate_report.as_entire_binding(),
-            ptlas.seed_epoch.buffer().as_entire_binding(),
-            partition_hints.buffer().as_entire_binding(),
-            sharing.geometry_built_level.as_entire_binding(),
-            sharing.geometry_flags.as_entire_binding(),
-        )),
-    );
-    ptlas.bind_group = Some(group);
+/// Write the fill set-1 descriptors into the kernels' slot table and return
+/// the `(parameter name, heap slot)` pairs each entry's push blob is
+/// assembled from (each entry filters to the bindings surviving in its own
+/// SPIR-V).
+#[allow(clippy::too_many_arguments)]
+fn ptlas_slot_table<'a>(
+    seam: &BindingSeam,
+    slots: &KernelSlots,
+    ptlas: &Ptlas,
+    sharing: &BlasSharing,
+    write_slots: &Buffer,
+    active_to_slot: &Buffer,
+    previous_transforms: &Buffer,
+    material_flags: &Buffer,
+    columns: (&Buffer, &Buffer, &Buffer, &Buffer, &Buffer, &Buffer),
+) -> Vec<(&'a str, u32)> {
+    let (geometry_ids, instance_masks, material_ids, node_slots, static_flags, partition_hints) =
+        columns;
+    vec![
+        (
+            "instance_blas_address",
+            slots.buffer(seam, 0, &sharing.instance_blas_address.wgpu_buffer),
+        ),
+        ("geometry_dirty", slots.buffer(seam, 1, &sharing.geometry_dirty)),
+        ("write_count", slots.buffer(seam, 2, &ptlas.write_count)),
+        ("write_data", slots.buffer(seam, 3, &ptlas.write_data.wgpu_buffer)),
+        ("write_slots_cpu", slots.buffer(seam, 4, write_slots)),
+        ("active_to_slot", slots.buffer(seam, 5, active_to_slot)),
+        ("src_infos", slots.buffer(seam, 6, &ptlas.src_infos)),
+        ("instance_geometry_ids", slots.buffer(seam, 7, geometry_ids)),
+        ("instance_masks", slots.buffer(seam, 8, instance_masks)),
+        (
+            "instance_previous_transforms",
+            slots.buffer(seam, 9, previous_transforms),
+        ),
+        ("instance_material_ids", slots.buffer(seam, 10, material_ids)),
+        ("material_traversal_flags", slots.buffer(seam, 11, material_flags)),
+        (
+            "instance_written_flags",
+            slots.buffer(seam, 12, &ptlas.instance_written_flags),
+        ),
+        // Instance → transform-table node slot, and the node-indexed
+        // `TransformStatic` presence flag — `resolve_partition` reads
+        // `static_flags[node_slots[slot]]` to pick the instance's partition.
+        ("node_slots", slots.buffer(seam, 13, node_slots)),
+        ("static_flags", slots.buffer(seam, 14, static_flags)),
+        (
+            "instance_written_partition",
+            slots.buffer(seam, 15, &ptlas.instance_written_partition),
+        ),
+        ("validate_report", slots.buffer(seam, 16, &ptlas.validate_report)),
+        ("seed_epoch", slots.buffer(seam, 17, ptlas.seed_epoch.buffer())),
+        ("partition_hints", slots.buffer(seam, 18, partition_hints)),
+        (
+            "geometry_built_level",
+            slots.buffer(seam, 19, &sharing.geometry_built_level),
+        ),
+        ("geometry_flags", slots.buffer(seam, 20, &sharing.geometry_flags)),
+    ]
 }
 
 /// `RenderGraph`: fill the WRITE/UPDATE record buffers then record the
 /// partitioned-AS build. Runs after `dispatch_blas_rebuild` (whose fresh
 /// BLAS addresses the fill samples). The op stream + batch counts were
-/// prepared in [`prepare_ptlas_params`]. The wgpu fill records into the
-/// shared `RenderContext` encoder; the raw-VK build records into its own
-/// encoder, handed to the same context — the graph does one submit for the
-/// frame.
+/// prepared in [`prepare_ptlas_params`]. Everything before the build is one
+/// raw heap-kernel encoder (fills → hair/tess appends → finalize →
+/// validate); the two staging copies stay wgpu ops on the shared
+/// `RenderContext` encoder; the raw-VK build records into its own encoder —
+/// the graph does one submit for the frame.
 pub fn dispatch_ptlas(
     render_device: Res<RenderDevice>,
     allocator: Option<Res<Allocator>>,
     fns: Option<Res<ClusterExtensionFns>>,
     mut resources: Option<ResMut<Ptlas>>,
-    pipelines: Res<SolariPipelines>,
     scene_bind_group: Res<ClusterSceneBindGroup>,
-    pipeline_cache: Res<PipelineCache>,
     instances: Option<Res<InstanceManager>>,
     hair_instances: Option<Res<crate::hair::HairInstances>>,
     hair_write: Option<Res<crate::hair::ptlas_hair::HairPtlasWrite>>,
     tess_write: Option<Res<crate::geometry::tess_displace::TessPtlasWrite>>,
+    (seam, propagate, tess_classify, transforms_col): (
+        Option<Res<BindingSeam>>,
+        Option<Res<crate::transform::TransformPropagate>>,
+        Option<Res<crate::geometry::tess_classify::TessClassify>>,
+        Option<Res<GpuColumn<TransformColumn>>>,
+    ),
+    (sharing, geometry_ids, instance_masks, material_ids, material_flags): (
+        Option<Res<BlasSharing>>,
+        Option<Res<GpuColumn<GeometryIdColumn>>>,
+        Option<Res<GpuColumn<InstanceMaskColumn>>>,
+        Option<Res<GpuColumn<MaterialColumn>>>,
+        Res<MaterialTraversalFlags>,
+    ),
+    (node_slots, static_flags, partition_hints): (
+        Option<Res<GpuColumn<NodeSlotColumn>>>,
+        Option<Res<GpuColumn<Presence<StaticColumn>>>>,
+        Option<Res<GpuColumn<crate::instance::PartitionColumn>>>,
+    ),
     render_queue: Res<RenderQueue>,
     mut ctx: RenderContext,
 ) {
@@ -1080,24 +1114,95 @@ pub fn dispatch_ptlas(
     if capacity == 0 {
         return;
     }
-    let (Some(scene_bg), Some(fill_bg)) =
-        (scene_bind_group.bind_group.as_ref(), resources.bind_group.as_ref())
-    else {
-        tracing::debug!(
-            "ptlas.dispatch: build skipped (scene bg={} fill bg={})",
-            scene_bind_group.bind_group.is_some(),
-            resources.bind_group.is_some(),
-        );
-        return;
-    };
-    let (Some(seed_pipe), Some(incremental_pipe), Some(finalize_pipe)) = (
-        pipeline_cache.get_compute_pipeline(pipelines.ptlas_seed),
-        pipeline_cache.get_compute_pipeline(pipelines.ptlas_incremental),
-        pipeline_cache.get_compute_pipeline(pipelines.ptlas_finalize),
+    // The cluster-scene heap mirror is the set-0 surface (and doubles as the
+    // scene-ready signal).
+    let (Some(_), Some(heap_slots), Some(seam)) = (
+        scene_bind_group.bind_group.as_ref(),
+        scene_bind_group.heap_slots.as_ref(),
+        seam.as_deref(),
     ) else {
-        tracing::debug!("ptlas.dispatch: build skipped (fill pipelines compiling)");
+        tracing::debug!("ptlas.dispatch: build skipped (cluster-scene heap mirror cold)");
         return;
     };
+    // The fill's set-1 inputs (the buffers the old fill bind group carried).
+    let (
+        Some(sharing),
+        Some(geometry_ids),
+        Some(instance_masks),
+        Some(material_ids),
+        Some(node_slots),
+        Some(static_flags),
+        Some(partition_hints),
+        Some(transforms_col),
+    ) = (
+        sharing.as_deref(),
+        geometry_ids.as_deref(),
+        instance_masks.as_deref(),
+        material_ids.as_deref(),
+        node_slots.as_deref(),
+        static_flags.as_deref(),
+        partition_hints.as_deref(),
+        transforms_col.as_deref(),
+    )
+    else {
+        tracing::debug!("ptlas.dispatch: build skipped (instance columns cold)");
+        return;
+    };
+    let (
+        Some(write_slots),
+        Some(active_to_slot),
+        Some(previous_transforms),
+        Some(material_flags_buf),
+    ) = (
+        resources.write_slots_cpu.buffer(),
+        sharing.active_to_slot.buffer(),
+        // `fill_incremental` compares current vs previous to detect moves.
+        // `TransformColumn` is `KEEP_PREVIOUS`, so this is always `Some`.
+        transforms_col.previous_buffer(),
+        material_flags.buffer.buffer(),
+    ) else {
+        // The buffers are populated earlier in Prepare; None here means
+        // no instances yet.
+        tracing::debug!("ptlas.dispatch: build skipped (fill buffers cold)");
+        return;
+    };
+    // Built lazily on the first ready frame: the mapping table bakes the
+    // cluster-scene heap slots, which exist only once the mirror has run
+    // (the slots are allocated once and rewritten in place, so the table
+    // never goes stale).
+    if resources.kernels.is_none() {
+        let base = crate::gpu::rt_pipeline::cluster_heap_mappings(seam, heap_slots);
+        let params_size = size_of::<PtlasFillParamsGpu>() as u32;
+        let make = |entry: &str| {
+            HeapKernel::new_with_mappings(
+                seam,
+                "ptlas_fill.slang",
+                include_str!("ptlas_fill.slang"),
+                entry,
+                PTLAS_FILL_MODULES,
+                &[],
+                &[],
+                &format!("ptlas_{entry}"),
+                params_size,
+                &base,
+            )
+        };
+        let (Some(seed), Some(incremental), Some(finalize), Some(validate_kernel)) = (
+            make("fill_seed"),
+            make("fill_incremental"),
+            make("finalize"),
+            make("validate"),
+        ) else {
+            return;
+        };
+        resources.kernels = Some(PtlasKernels {
+            seed,
+            incremental,
+            finalize,
+            validate: validate_kernel,
+            slots: KernelSlots::new(seam, 21),
+        });
+    }
     let active_count = instances.active_count() as u32;
 
     // The instances input for the build. Sizing, sparse commits, and
@@ -1167,119 +1272,224 @@ pub fn dispatch_ptlas(
     );
     let mut validate_recorded = false;
 
-    // wgpu fill records into the shared render-context encoder; the raw-VK
-    // build gets its OWN encoder (the fork panics if one encoder mixes wgpu
-    // passes with raw `as_hal_mut`). `add_command_buffer` flushes this fill
-    // work first, so on the single queue the build still runs after it.
-    {
-        let diagnostics = ctx.diagnostic_recorder();
-        let diagnostics = diagnostics.as_deref();
-        let encoder = ctx.command_encoder();
-        // One span over the fill passes (the raw-VK build below is invisible to
-        // wgpu timestamp queries, so it can't be captured here). Taken on the
-        // encoder since these are separate compute passes.
-        let d = diagnostics.time_span(encoder, "ptlas_fill");
-        // Separate passes so wgpu inserts the storage barriers each step's
-        // producer→consumer chain needs (seed/incremental write `write_data`
-        // + `write_count`; finalize reads `write_count` → `src_infos`).
-        if resources.cpu_count > 0 {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("ptlas.fill_seed"),
-                timestamp_writes: None,
-            });
-            pass.set_bind_group(0, scene_bg, &[]);
-            pass.set_bind_group(1, fill_bg, &[]);
-            pass.set_pipeline(seed_pipe);
-            let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(resources.cpu_count.div_ceil(64));
-            pass.dispatch_workgroups(gx, gy, gz);
+    // Everything before the AS build is ONE raw heap-kernel encoder — the
+    // fills, the hair/tess appends, finalize, and validate, with a compute
+    // w→r|w barrier at each producer→consumer step. Raw and wgpu work can't
+    // share an encoder (the fork panics), so the two staging copies below
+    // stay wgpu ops on the shared context encoder, ordered after this
+    // encoder by the `add_command_buffer` splice.
+    let kernels = resources.kernels.as_ref().unwrap();
+    let table = ptlas_slot_table(
+        seam,
+        &kernels.slots,
+        resources,
+        sharing,
+        write_slots,
+        active_to_slot,
+        previous_transforms,
+        material_flags_buf,
+        (
+            geometry_ids.buffer(),
+            instance_masks.buffer(),
+            material_ids.buffer(),
+            node_slots.buffer(),
+            static_flags.buffer(),
+            partition_hints.buffer(),
+        ),
+    );
+    // Each entry's push blob: the shared fill params with the entry's own
+    // dispatch split stamped in, plus the slot-table subset surviving in
+    // that entry's SPIR-V.
+    let blob = |kernel: &HeapKernel, label: &str, groups_x: u32| {
+        let mut params = resources.fill_params;
+        params.groups_x = groups_x;
+        let named: Vec<(&str, u32)> = table
+            .iter()
+            .filter(|(name, _)| kernel.bindings.iter().any(|(n, _)| n == name))
+            .copied()
+            .collect();
+        kernel.push_blob(label, bytemuck::bytes_of(&params), &named)
+    };
+    let seed_groups = crate::ecs_gpu::linear_dispatch(resources.cpu_count.div_ceil(64));
+    let incremental_groups = crate::ecs_gpu::linear_dispatch(active_count.div_ceil(64));
+    let max_records = resources.cpu_count + active_count + hair_count + tess_count;
+    let validate_groups = crate::ecs_gpu::linear_dispatch(max_records.max(1).div_ceil(64));
+    let seed_blob =
+        (resources.cpu_count > 0).then(|| blob(&kernels.seed, "ptlas_fill_seed", seed_groups.0));
+    let incremental_blob =
+        blob(&kernels.incremental, "ptlas_fill_incremental", incremental_groups.0);
+    let finalize_blob = blob(&kernels.finalize, "ptlas_finalize", 1);
+    // Debug: scan the final WRITE stream, null + report corrupt BLAS
+    // addresses before the raw build dereferences them.
+    let validate_blob =
+        validate.then(|| blob(&kernels.validate, "ptlas_validate", validate_groups.0));
+
+    // Hair + tessellation: append their instances to the WRITE stream (same
+    // `write_count`), after the cluster movers and before `finalize`
+    // publishes the count.
+    let hair_append = if hair_count > 0 {
+        match (
+            hair_write.as_ref(),
+            propagate.as_ref(),
+            hair_instances.as_ref().and_then(|h| h.buffer.buffer()),
+        ) {
+            (Some(hair_write), Some(propagate), Some(hair_buffer)) => Some((
+                hair_write,
+                hair_write.kernel.push_blob(
+                    "ptlas_hair_write",
+                    bytemuck::bytes_of(&hair_write.params),
+                    &[
+                        ("hair_instances", hair_write.slots.buffer(seam, 0, hair_buffer)),
+                        ("write_count", hair_write.slots.buffer(seam, 1, &resources.write_count)),
+                        (
+                            "write_data",
+                            hair_write.slots.buffer(seam, 2, &resources.write_data.wgpu_buffer),
+                        ),
+                        ("world", hair_write.slots.buffer(seam, 3, propagate.current_world())),
+                    ],
+                ),
+            )),
+            _ => None,
         }
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("ptlas.fill_incremental"),
-                timestamp_writes: None,
-            });
-            pass.set_bind_group(0, scene_bg, &[]);
-            pass.set_bind_group(1, fill_bg, &[]);
-            pass.set_pipeline(incremental_pipe);
-            let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(active_count.div_ceil(64));
-            pass.dispatch_workgroups(gx, gy, gz);
-        }
-        // Hair: append hair instances to the WRITE stream (same `write_count`),
-        // after the cluster movers and before `finalize` publishes the count.
-        if hair_count > 0 {
-            if let (Some(hair_bg), Some(hair_pipe)) = (
-                hair_write.as_ref().and_then(|w| w.bind_group.as_ref()),
-                pipeline_cache.get_compute_pipeline(pipelines.ptlas_hair_write),
-            ) {
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("ptlas.hair_write"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(hair_pipe);
-                pass.set_bind_group(0, hair_bg, &[]);
-                let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(hair_count.div_ceil(64));
-                pass.dispatch_workgroups(gx, gy, gz);
+    } else {
+        None
+    };
+    let tess_append = match tess_write.as_ref() {
+        Some(tw) if tw.tess_count > 0 => match (
+            tw.instances.buffer(),
+            tess_classify.as_ref().and_then(|c| c.blas_addresses.as_ref()),
+        ) {
+            (Some(instances_buf), Some(blas_addresses)) => Some((
+                tw,
+                tw.kernel.push_blob(
+                    "tess_ptlas_write",
+                    bytemuck::bytes_of(&tw.params),
+                    &[
+                        ("write_count", tw.slots.buffer(seam, 0, &resources.write_count)),
+                        (
+                            "write_data",
+                            tw.slots.buffer(seam, 1, &resources.write_data.wgpu_buffer),
+                        ),
+                        ("instances", tw.slots.buffer(seam, 2, instances_buf)),
+                        ("blas_addresses", tw.slots.buffer(seam, 3, blas_addresses)),
+                        ("transforms", tw.slots.buffer(seam, 4, transforms_col.buffer())),
+                    ],
+                ),
+            )),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let mut fill_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("ptlas.fill"),
+    });
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket each step against its producers, and the post-barrier
+    // additionally covers the staging copies' transfer reads (raw dispatches
+    // are invisible to wgpu's tracking).
+    unsafe {
+        fill_encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &resources.raw_device;
+            let step = [vk::MemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::ALL_TRANSFER,
+                )
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            let step_dep = vk::DependencyInfo::default().memory_barriers(&step);
+            seam.bind_heaps(cb);
+            // Upstream compute (blas sharing / commit_built) + the CPU seeds
+            // (write_count / write_slots / src_infos transfers) -> our reads.
+            dev.cmd_pipeline_barrier2(cb, &step_dep);
+            if let Some(seed_blob) = seed_blob.as_ref() {
+                seam.push_data(cb, seed_blob);
+                dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernels.seed.pipeline);
+                let (gx, gy, gz) = seed_groups;
+                dev.cmd_dispatch(cb, gx, gy, gz);
+                // Seed's epoch stamps + record writes -> incremental's reads.
+                dev.cmd_pipeline_barrier2(cb, &step_dep);
             }
-        }
-        // Tessellation showcase: append its instances to the WRITE stream,
-        // after hair, before `finalize`.
-        if let Some(tw) = tess_write.as_ref() {
-            if tw.tess_count > 0 {
-                if let (Some(tess_bg), Some(tess_pipe)) = (
-                    tw.bind_group.as_ref(),
-                    pipeline_cache.get_compute_pipeline(tw.pipeline),
-                ) {
-                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                        label: Some("ptlas.tess_write"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(tess_pipe);
-                    pass.set_bind_group(0, tess_bg, &[]);
-                    pass.dispatch_workgroups(tw.tess_count.div_ceil(64), 1, 1);
-                }
-            }
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("ptlas.fill_finalize"),
-                timestamp_writes: None,
-            });
-            pass.set_bind_group(0, scene_bg, &[]);
-            pass.set_bind_group(1, fill_bg, &[]);
-            pass.set_pipeline(finalize_pipe);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-        // Debug: scan the final WRITE stream, null + report corrupt BLAS
-        // addresses before the raw build dereferences them.
-        if validate {
-            if let Some(validate_pipe) =
-                pipeline_cache.get_compute_pipeline(pipelines.ptlas_validate)
-            {
-                let max_records = resources.cpu_count + active_count + hair_count + tess_count;
-                {
-                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                        label: Some("ptlas.validate"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_bind_group(0, scene_bg, &[]);
-                    pass.set_bind_group(1, fill_bg, &[]);
-                    pass.set_pipeline(validate_pipe);
-                    let (gx, gy, gz) =
-                        crate::ecs_gpu::linear_dispatch(max_records.max(1).div_ceil(64));
-                    pass.dispatch_workgroups(gx, gy, gz);
-                }
-                encoder.copy_buffer_to_buffer(
-                    &resources.validate_report,
-                    0,
-                    &resources.validate_staging,
-                    0,
-                    VALIDATE_REPORT_WORDS * 4,
+            seam.push_data(cb, &incremental_blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernels.incremental.pipeline);
+            let (gx, gy, gz) = incremental_groups;
+            dev.cmd_dispatch(cb, gx, gy, gz);
+            // The cluster fills' record/count writes -> the appends / finalize.
+            dev.cmd_pipeline_barrier2(cb, &step_dep);
+            if let Some((hair_write, blob)) = hair_append.as_ref() {
+                seam.push_data(cb, blob);
+                dev.cmd_bind_pipeline(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    hair_write.kernel.pipeline,
                 );
-                validate_recorded = true;
+                let (gx, gy, gz) = hair_write.groups;
+                dev.cmd_dispatch(cb, gx, gy, gz);
+                // Hair's record/count writes -> the tess append + finalize.
+                dev.cmd_pipeline_barrier2(cb, &step_dep);
             }
+            if let Some((tw, blob)) = tess_append.as_ref() {
+                seam.push_data(cb, blob);
+                dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, tw.kernel.pipeline);
+                dev.cmd_dispatch(cb, tw.tess_count.div_ceil(64), 1, 1);
+                // Tess's record writes -> `finalize`'s count read.
+                dev.cmd_pipeline_barrier2(cb, &step_dep);
+            }
+            seam.push_data(cb, &finalize_blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernels.finalize.pipeline);
+            dev.cmd_dispatch(cb, 1, 1, 1);
+            if let Some(validate_blob) = validate_blob.as_ref() {
+                // Finalize's count publish -> validate's record scan.
+                dev.cmd_pipeline_barrier2(cb, &step_dep);
+                seam.push_data(cb, validate_blob);
+                dev.cmd_bind_pipeline(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    kernels.validate.pipeline,
+                );
+                let (gx, gy, gz) = validate_groups;
+                dev.cmd_dispatch(cb, gx, gy, gz);
+            }
+            // Our record/count/report writes -> the staging copies' transfer
+            // reads and downstream compute; the AS build's own seam covers its
+            // build-input reads.
+            let post = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::ALL_TRANSFER,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_READ
+                        | vk::AccessFlags2::SHADER_WRITE
+                        | vk::AccessFlags2::TRANSFER_READ,
+                )];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&post));
+        });
+    }
+    ctx.add_command_buffer(fill_encoder.finish());
+
+    // The two staging copies stay wgpu ops (their dst buffers are wgpu
+    // `map_async` targets — a raw copy would bypass wgpu's zero-init/usage
+    // tracking), recorded on the context encoder AFTER the raw encoder was
+    // spliced so they read the validate/heal words it wrote.
+    {
+        let encoder = ctx.command_encoder();
+        if validate_blob.is_some() {
+            encoder.copy_buffer_to_buffer(
+                &resources.validate_report,
+                0,
+                &resources.validate_staging,
+                0,
+                VALIDATE_REPORT_WORDS * 4,
+            );
+            validate_recorded = true;
         }
         // Rebuild-until-clean: pull this build's null-AS record count (always on;
-        // one 4-byte copy). Skipped while a previous readback is still in flight —
+        // one 8-byte copy). Skipped while a previous readback is still in flight —
         // that latency is the retry pacing.
         if resources.nulls_phase == 0 {
             encoder.copy_buffer_to_buffer(
@@ -1291,7 +1501,6 @@ pub fn dispatch_ptlas(
             );
             resources.nulls_phase = 1;
         }
-        d.end(encoder);
     }
     resources.validate_in_flight = validate_recorded;
 

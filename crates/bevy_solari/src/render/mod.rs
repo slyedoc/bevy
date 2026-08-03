@@ -33,7 +33,6 @@ use bevy_ecs::lifecycle::Add;
 use bevy_ecs::observer::On;
 use bevy_ecs::reflect::ReflectComponent;
 use bevy_ecs::system::{Commands, Query};
-use bevy_shader::load_shader_library;
 
 use crate::bindings::RaytracingSceneBindings;
 use crate::ecs_gpu::SceneColumns;
@@ -44,9 +43,6 @@ pub struct SolarRenderPlugin;
 
 impl Plugin for SolarRenderPlugin {
     fn build(&self, app: &mut App) {
-        // Shared single-scattering atmosphere physics (sky bake + aerial perspective).
-        load_shader_library!(app, "atmosphere.wgsl");
-
         // SolariCamera is the render-world filter (`With<SolariCamera>`) every
         // Solari prepare/render system keys off; it must be extracted or those
         // systems match nothing and nothing renders. Its value carries the
@@ -165,17 +161,24 @@ impl Plugin for SolarRenderPlugin {
                 ExtractSchedule,
                 crate::gpu::slang_sources::extract_slang_sources,
             )
-            .add_systems(RenderStartup, rt_pipeline::init_rt_blit)
-            .add_systems(RenderStartup, rt_pipeline::init_restir_spatial)
+            // After `SolariSetup`: the blit + rt_camera are heap-flagged raw
+            // compute, built through the seam the allocator init inserts.
+            .add_systems(
+                RenderStartup,
+                (rt_pipeline::init_rt_blit, rt_pipeline::init_rt_camera)
+                    .after(crate::SolariSetup),
+            )
+            // After `SolariSetup`: the spatial kernel is heap-flagged raw
+            // compute, built through the seam the allocator init inserts.
+            .add_systems(
+                RenderStartup,
+                rt_pipeline::init_restir_spatial.after(crate::SolariSetup),
+            )
             // After `SolariSetup`: the pipelines are heap-flagged raw compute,
             // built through the seam the allocator init inserts.
             .add_systems(
                 RenderStartup,
                 crate::nrc::init_nrc_pipelines.after(crate::SolariSetup),
-            )
-            .add_systems(
-                Render,
-                rt_pipeline::queue_restir_spatial_pipeline.in_set(RenderSystems::PrepareResources),
             )
             .add_systems(
                 Render,
@@ -258,7 +261,12 @@ impl Plugin for SolarRenderPlugin {
         // order that can flip between frames, and a frame where DLSS ran last lost its
         // gizmos (the navmesh overlay flickered).
         render_app
-            .add_systems(RenderStartup, dlss::init_solari_dlss)
+            // After `SolariSetup`: the resolve is a heap-flagged raw compute
+            // kernel, built through the seam the allocator init inserts.
+            .add_systems(
+                RenderStartup,
+                dlss::init_solari_dlss.after(crate::SolariSetup),
+            )
             .add_systems(
                 Render,
                 dlss::prepare_solari_dlss.in_set(RenderSystems::PrepareResources),

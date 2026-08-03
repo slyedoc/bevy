@@ -597,6 +597,12 @@ pub struct SparseBuffer {
 }
 
 impl SparseBuffer {
+    /// Raw `VkBuffer` handle, for raw commands (fill/copy) targeting the
+    /// buffer outside wgpu's tracking.
+    pub fn raw(&self) -> vk::Buffer {
+        self.raw
+    }
+
     /// Stable bevy `Buffer` view of [`Self::wgpu_buffer`] — created once, so its
     /// `Buffer::id()` is fixed for the lifetime. For consumers that key bind-group
     /// caches on the id or store the `Buffer` (e.g. `GpuColumn`, the transform

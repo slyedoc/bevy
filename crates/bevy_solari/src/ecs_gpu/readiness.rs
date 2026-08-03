@@ -43,34 +43,25 @@ use bevy_ecs::{
     resource::Resource,
     system::{Local, Res},
 };
-use bevy_render::render_resource::{
-    CachedComputePipelineId, CachedRenderPipelineId, PipelineCache,
-};
+use bevy_render::render_resource::{CachedRenderPipelineId, PipelineCache};
 
-/// Registry of every solari-created pipeline (label + cache id). Empty means
-/// "not a solari device / startup hasn't run" and reads as NOT ready, so gated
-/// systems stay dormant.
+/// Registry of every solari-created pipeline (label + cache id). The compute
+/// passes are all Slang heap kernels now (compiled synchronously at startup),
+/// so only wgpu render pipelines register here. Empty means "not a solari
+/// device / startup hasn't run" and reads as NOT ready, so gated systems stay
+/// dormant.
 #[derive(Resource, Default)]
 pub struct SolariPipelineRegistry {
-    compute: Vec<(&'static str, CachedComputePipelineId)>,
     render: Vec<(&'static str, CachedRenderPipelineId)>,
 }
 
 impl SolariPipelineRegistry {
-    pub fn register(&mut self, label: &'static str, id: CachedComputePipelineId) {
-        self.compute.push((label, id));
-    }
-
     pub fn register_render(&mut self, label: &'static str, id: CachedRenderPipelineId) {
         self.render.push((label, id));
     }
 
     pub fn ready(&self, cache: &PipelineCache) -> bool {
-        !self.compute.is_empty()
-            && self
-                .compute
-                .iter()
-                .all(|(_, id)| cache.get_compute_pipeline(*id).is_some())
+        !self.render.is_empty()
             && self
                 .render
                 .iter()
@@ -79,16 +70,10 @@ impl SolariPipelineRegistry {
 
     /// Labels still compiling — the startup-wait diagnostic.
     pub fn missing<'a>(&'a self, cache: &'a PipelineCache) -> Vec<&'static str> {
-        self.compute
+        self.render
             .iter()
-            .filter(|(_, id)| cache.get_compute_pipeline(*id).is_none())
+            .filter(|(_, id)| cache.get_render_pipeline(*id).is_none())
             .map(|(label, _)| *label)
-            .chain(
-                self.render
-                    .iter()
-                    .filter(|(_, id)| cache.get_render_pipeline(*id).is_none())
-                    .map(|(label, _)| *label),
-            )
             .collect()
     }
 }

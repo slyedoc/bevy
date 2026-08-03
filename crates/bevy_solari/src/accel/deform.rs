@@ -3,7 +3,7 @@
 //! Each frame, for every active animated instance (capped at
 //! [`MAX_ANIMATED_INSTANCES`]), the [`extract_animated_skins`] system gathers the
 //! skinning palette (joint → transform-table node slot) and the mesh's
-//! inverse-bind poses, and [`dispatch_deform`] runs `deform.wgsl` to skin the
+//! inverse-bind poses, and [`dispatch_deform`] runs `deform.slang` to skin the
 //! rest-pose vertices into a per-instance region of the deform pool. The pool is
 //! consumed downstream by the instantiate pass (per-instance CLAS) and the
 //! resolve shader (deformed-vertex fetch).
@@ -16,6 +16,8 @@
 //! stale.) No CPU skin-matrix upload — only the static inverse-bind poses are
 //! mirrored to the GPU.
 
+#![allow(unsafe_code)]
+
 use ash::vk;
 use bevy_asset::Assets;
 use bevy_ecs::{
@@ -25,26 +27,21 @@ use bevy_ecs::{
 use bevy_math::{Mat4, Vec4};
 use bevy_mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy_render::{
-    diagnostic::RecordDiagnostics as _,
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
-        BufferUsages, ComputePassDescriptor, PipelineCache, RawBufferVec, ShaderStages, ShaderType,
-        UniformBuffer,
-    },
+    render_resource::{Buffer, BufferUsages, RawBufferVec},
     renderer::{RenderContext, RenderDevice, RenderQueue},
     sync_world::RenderEntity,
     Extract,
 };
 use bytemuck::{Pod, Zeroable};
+use wgpu::hal::api::Vulkan as VkApi;
 
 use crate::bindings::RaytracingMesh3d;
 use crate::ecs_gpu::{GpuColumn, GpuSlot};
 use crate::geometry::ClusterMeshManager;
 use crate::gpu::allocator::{Allocator, SparseBuffer, StableAddr};
+use crate::gpu::binding_seam::BindingSeam;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::instance::{Affine3x4, InstanceManager, RaytracingGpuEntity};
-use crate::pipelines::SolariPipelines;
-use crate::resource_manager::SolariResourceManager;
 use crate::transform::{LocalRSColumn, LocalTranslationColumn, ParentColumn, TransformGraph};
 
 /// Max concurrent animated instances per frame. Deform / instantiate / BLAS
@@ -57,7 +54,7 @@ pub const MAX_VERTS_PER_ANIMATED_MESH: u32 = 131072;
 
 const WORKGROUP_SIZE: u32 = 64;
 
-/// Per active animated instance. Mirrors `deform.wgsl::AnimatedSlot` (36 B).
+/// Per active animated instance. Mirrors `deform.slang::AnimatedSlot` (36 B).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct AnimatedSlotGpu {
@@ -75,9 +72,9 @@ pub struct AnimatedSlotGpu {
     pub node_slot: u32,
 }
 
-/// Uniform shared with `deform.wgsl::DeformParams`.
+/// Push params shared with `deform.slang::DeformParams`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct DeformParams {
     num_slots: u32,
     _pad0: u32,
@@ -121,7 +118,7 @@ pub struct Deform {
     slots: RawBufferVec<AnimatedSlotGpu>,
     palette: RawBufferVec<u32>,
     inverse_bind: RawBufferVec<Affine3x4>,
-    params: UniformBuffer<DeformParams>,
+    params: DeformParams,
 
     /// Active animated instances this frame.
     active_count: u32,
@@ -137,36 +134,24 @@ pub struct Deform {
     /// Slots written animated last frame — cleared this frame if no longer animated.
     prev_animated: Vec<u32>,
 
-    bind_group: Option<BindGroup>,
+    kernel: HeapKernel,
+    kernel_slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// The deform bind-group layout. Owned by
-/// [`SolariResourceManager`](crate::resource_manager::SolariResourceManager).
-pub fn deform_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
-        "deform",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 active_slots
-                storage_buffer_read_only_sized(false, None), // 1 transform-table local_t (array<f64>)
-                storage_buffer_read_only_sized(false, None), // 2 inverse_bind
-                storage_buffer_read_only_sized(false, None), // 3 palette
-                storage_buffer_read_only_sized(false, None), // 4 rest_positions
-                storage_buffer_read_only_sized(false, None), // 5 rest_normals
-                storage_buffer_read_only_sized(false, None), // 6 joint_indices
-                storage_buffer_read_only_sized(false, None), // 7 joint_weights
-                uniform_buffer::<DeformParams>(false),       // 8 params
-                storage_buffer_sized(false, None),           // 9 deform_positions (rw)
-                storage_buffer_sized(false, None),           // 10 deform_normals (rw)
-                storage_buffer_read_only_sized(false, None), // 11 transform-table parent
-                storage_buffer_read_only_sized(false, None), // 12 rest_tangents
-                storage_buffer_sized(false, None),           // 13 deform_tangents (rw)
-                storage_buffer_read_only_sized(false, None), // 14 transform-table local_rs
-            ),
-        ),
-    )
+impl Drop for Deform {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
 }
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for Deform {}
+unsafe impl Sync for Deform {}
 
 impl Deform {
     /// Active animated instances this frame.
@@ -236,14 +221,28 @@ fn pool_buffer(
     buf
 }
 
-/// `RenderStartup`: build the deform pool buffers. No-op without the raw-VK
-/// [`Allocator`]. The bind-group layout lives in `SolariResourceManager`.
+/// `RenderStartup`: compile the deform kernel — a layout-free heap pipeline
+/// ([`HeapKernel`]), Slang from source — and build the deform pool buffers.
+/// No-op without the raw-VK [`Allocator`].
 pub fn init_deform(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
+    seam: Option<Res<BindingSeam>>,
     allocator: Option<Res<Allocator>>,
 ) {
-    let Some(allocator) = allocator else {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "deform.slang",
+        include_str!("deform.slang"),
+        "deform",
+        crate::bindings::OCTAHEDRAL_MODULES,
+        &[],
+        "deform",
+        size_of::<DeformParams>() as u32,
+    ) else {
         return;
     };
     let n = (MAX_ANIMATED_INSTANCES * MAX_VERTS_PER_ANIMATED_MESH) as u64;
@@ -258,8 +257,6 @@ pub fn init_deform(
     palette.set_label(Some("deform.palette"));
     let mut inverse_bind = RawBufferVec::<Affine3x4>::new(BufferUsages::STORAGE);
     inverse_bind.set_label(Some("deform.inverse_bind"));
-    let mut params = UniformBuffer::<DeformParams>::default();
-    params.set_label(Some("deform.params"));
 
     let normals_addr = normals.stable_addr();
     let tangents_addr = tangents.stable_addr();
@@ -277,13 +274,16 @@ pub fn init_deform(
         slots,
         palette,
         inverse_bind,
-        params,
+        params: DeformParams::default(),
         active_count: 0,
         max_vertex_count: 0,
         animated_table,
         animated_table_capacity: 1,
         prev_animated: Vec::new(),
-        bind_group: None,
+        kernel,
+        kernel_slots: KernelSlots::new(&seam, 14),
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -416,13 +416,12 @@ pub fn prepare_deform(
         return;
     };
     let num = deform.active_count;
-    *deform.params.get_mut() = DeformParams {
+    deform.params = DeformParams {
         num_slots: num,
         _pad0: 0,
         _pad1: 0,
         _pad2: 0,
     };
-    deform.params.write_buffer(&render_device, &render_queue);
 
     // Maintain the slot-indexed animated table (grow on high-water, then
     // diff-update: clear last frame's animated slots, write this frame's). Runs
@@ -509,110 +508,96 @@ pub fn prepare_deform(
     inverse_bind.write_buffer(&render_device, &render_queue);
 }
 
-/// `Render::PrepareBindGroups`: (re)build the deform bind group. Skipped when no
-/// animated instances are active (the joint pools may be empty / zero-sized).
-pub fn prepare_deform_bind_group(
-    deform: Option<ResMut<Deform>>,
-    resource_manager: Option<Res<SolariResourceManager>>,
+/// `RenderGraph` (`Deform` stage): skin the active animated instances. Runs
+/// after `Propagate` (world[] + instance transforms ready), before `Classify`.
+/// A raw heap dispatch: buffer slots rewritten per dispatch, params + slot
+/// array in push data.
+pub fn dispatch_deform(
+    deform: Option<Res<Deform>>,
+    seam: Option<Res<BindingSeam>>,
     cluster_meshes: Option<Res<ClusterMeshManager>>,
     local_t: Option<Res<GpuColumn<LocalTranslationColumn>>>,
     local_rs: Option<Res<GpuColumn<LocalRSColumn>>>,
     parent: Option<Res<GpuColumn<ParentColumn>>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let Some(mut deform) = deform else {
-        return;
-    };
-    if deform.active_count == 0 {
-        deform.bind_group = None;
-        return;
-    }
-    let (
-        Some(resource_manager),
-        Some(cluster_meshes),
-        Some(local_t),
-        Some(local_rs),
-        Some(parent),
-    ) = (resource_manager, cluster_meshes, local_t, local_rs, parent)
-    else {
-        deform.bind_group = None;
-        return;
-    };
-    let (Some(slots), Some(palette), Some(inverse_bind), Some(params)) = (
-        deform.slots.buffer(),
-        deform.palette.buffer(),
-        deform.inverse_bind.buffer(),
-        deform.params.binding(),
-    ) else {
-        deform.bind_group = None;
-        return;
-    };
-
-    let layout = pipeline_cache.get_bind_group_layout(&resource_manager.deform);
-    let bind_group = render_device.create_bind_group(
-        "deform",
-        &layout,
-        &BindGroupEntries::sequential((
-            slots.as_entire_binding(),
-            local_t.buffer().as_entire_binding(),
-            inverse_bind.as_entire_binding(),
-            palette.as_entire_binding(),
-            cluster_meshes.vertex_positions.buffer().as_entire_binding(),
-            cluster_meshes.vertex_normals.buffer().as_entire_binding(),
-            cluster_meshes
-                .vertex_joint_indices
-                .buffer()
-                .as_entire_binding(),
-            cluster_meshes
-                .vertex_joint_weights
-                .buffer()
-                .as_entire_binding(),
-            params,
-            deform.positions.buffer().as_entire_binding(),
-            deform.normals.buffer().as_entire_binding(),
-            parent.buffer().as_entire_binding(),
-            cluster_meshes.vertex_tangents.buffer().as_entire_binding(),
-            deform.tangents.buffer().as_entire_binding(),
-            local_rs.buffer().as_entire_binding(),
-        )),
-    );
-    deform.bind_group = Some(bind_group);
-}
-
-/// `RenderGraph` (`Deform` stage): skin the active animated instances. Runs
-/// after `Propagate` (world[] + instance transforms ready), before `Classify`.
-pub fn dispatch_deform(
-    deform: Option<Res<Deform>>,
-    pipelines: Res<SolariPipelines>,
-    pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
-    let Some(deform) = deform else {
+    let (Some(deform), Some(seam), Some(cluster_meshes), Some(local_t), Some(local_rs), Some(parent)) =
+        (deform, seam, cluster_meshes, local_t, local_rs, parent)
+    else {
         return;
     };
     if deform.active_count == 0 || deform.max_vertex_count == 0 {
         return;
     }
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.deform) else {
-        return;
-    };
-    let Some(bind_group) = deform.bind_group.as_ref() else {
+    let (Some(slots), Some(palette), Some(inverse_bind)) = (
+        deform.slots.buffer(),
+        deform.palette.buffer(),
+        deform.inverse_bind.buffer(),
+    ) else {
         return;
     };
 
+    let ks = &deform.kernel_slots;
+    let blob = deform.kernel.push_blob(
+        "deform",
+        bytemuck::bytes_of(&deform.params),
+        &[
+            ("active_slots", ks.buffer(&seam, 0, slots)),
+            ("local_t", ks.buffer(&seam, 1, local_t.buffer())),
+            ("inverse_bind", ks.buffer(&seam, 2, inverse_bind)),
+            ("palette", ks.buffer(&seam, 3, palette)),
+            (
+                "rest_positions",
+                ks.buffer(&seam, 4, cluster_meshes.vertex_positions.buffer()),
+            ),
+            (
+                "rest_normals",
+                ks.buffer(&seam, 5, cluster_meshes.vertex_normals.buffer()),
+            ),
+            (
+                "joint_indices",
+                ks.buffer(&seam, 6, cluster_meshes.vertex_joint_indices.buffer()),
+            ),
+            (
+                "joint_weights",
+                ks.buffer(&seam, 7, cluster_meshes.vertex_joint_weights.buffer()),
+            ),
+            ("deform_positions", ks.buffer(&seam, 8, deform.positions.buffer())),
+            ("deform_normals", ks.buffer(&seam, 9, deform.normals.buffer())),
+            ("parent", ks.buffer(&seam, 10, parent.buffer())),
+            (
+                "rest_tangents",
+                ks.buffer(&seam, 11, cluster_meshes.vertex_tangents.buffer()),
+            ),
+            ("deform_tangents", ks.buffer(&seam, 12, deform.tangents.buffer())),
+            ("local_rs", ks.buffer(&seam, 13, local_rs.buffer())),
+        ],
+    );
     let x = deform.max_vertex_count.div_ceil(WORKGROUP_SIZE);
     let y = deform.active_count;
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
     let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("deform"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_group, &[]);
-    let d = diagnostics.time_span(&mut pass, "deform");
-    pass.dispatch_workgroups(x, y, 1);
-    d.end(&mut pass);
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket this dispatch against the surrounding passes (raw
+    // dispatches are invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &deform.raw_device;
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+            // The column scatters' local/parent writes -> our reads.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, deform.kernel.pipeline);
+            dev.cmd_dispatch(cb, x, y, 1);
+            // Our deform-pool writes -> the instantiate/BLAS-build reads.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+        });
+    }
 }

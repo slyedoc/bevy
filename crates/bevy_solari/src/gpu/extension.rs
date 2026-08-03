@@ -224,7 +224,7 @@ pub(crate) unsafe fn register_cluster_extension_callback(settings: &mut RawVulka
                 instance.get_physical_device_properties2(physical_device, &mut props2);
 
                 // Fail fast rather than clamp: the partition count is compiled into
-                // ptlas_fill.wgsl's spatial hash, so a quietly smaller PTLAS would
+                // ptlas_fill.slang's spatial hash, so a quietly smaller PTLAS would
                 // desync the fill pass.
                 assert!(
                     pas_props.max_partition_count >= crate::accel::ptlas::PTLAS_PARTITION_COUNT,

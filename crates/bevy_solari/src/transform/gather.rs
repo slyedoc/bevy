@@ -9,76 +9,93 @@
 //! move detection). The instance world transform is produced entirely GPU-side;
 //! there is no CPU instance-transform path.
 
+#![allow(unsafe_code)]
+
+use ash::vk;
 use bevy_ecs::{
     resource::Resource,
     system::{Commands, Res, ResMut},
 };
-use bevy_render::{
-    diagnostic::RecordDiagnostics as _,
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        ComputePassDescriptor, PipelineCache, ShaderStages, ShaderType, UniformBuffer,
-    },
-    renderer::{RenderContext, RenderDevice, RenderQueue},
-};
+use bevy_render::renderer::RenderContext;
 use bytemuck::{Pod, Zeroable};
+use wgpu::hal::api::Vulkan as VkApi;
 
 use crate::ecs_gpu::GpuColumn;
+use crate::gpu::allocator::Allocator;
+use crate::gpu::binding_seam::BindingSeam;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::instance::{InstanceManager, NodeSlotColumn, TransformColumn};
-use crate::pipelines::SolariPipelines;
-use crate::resource_manager::SolariResourceManager;
 
 use super::propagate::TransformPropagate;
 
 const WORKGROUP_SIZE: u32 = 64;
 
-/// Uniform shared with `transform_gather.wgsl::GatherParams`.
+/// Push params shared with `transform_gather.slang::GatherParams`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct GatherParams {
     instance_count: u32,
     node_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    groups_x: u32,
+    _pad: u32,
 }
 
-/// Render-world resource: the gather pipeline + its bind group.
+/// Render-world resource: the gather heap kernel + its slots.
 #[derive(Resource)]
 pub struct TransformGather {
     instance_count: u32,
-    params: UniformBuffer<GatherParams>,
-    bind_group: Option<BindGroup>,
+    groups: (u32, u32, u32),
+    params: GatherParams,
+    kernel: HeapKernel,
+    slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// The gather bind-group layout. Owned by
-/// [`SolariResourceManager`](crate::resource_manager::SolariResourceManager).
-pub fn transform_gather_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
+impl Drop for TransformGather {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for TransformGather {}
+unsafe impl Sync for TransformGather {}
+
+/// `RenderStartup` (after `SolariSetup`): compile the gather kernel — a
+/// layout-free heap pipeline ([`HeapKernel`]), Slang from source.
+pub fn init_transform_gather(
+    mut commands: Commands,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
+) {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "transform_gather.slang",
+        include_str!("transform_gather.slang"),
+        "gather",
+        &[],
+        &[],
         "transform_gather",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 node_slot
-                storage_buffer_read_only_sized(false, None), // 1 world
-                storage_buffer_sized(false, None),           // 2 transforms current (rw)
-                storage_buffer_sized(false, None),           // 3 transforms previous (rw)
-                uniform_buffer::<GatherParams>(false),       // 4 params
-            ),
-        ),
-    )
-}
-
-/// `RenderStartup`: the gather pass owns only its params buffer + bind group; the
-/// layout lives in `SolariResourceManager`, the pipeline id in `SolariPipelines`.
-pub fn init_transform_gather(mut commands: Commands) {
-    let mut params = UniformBuffer::<GatherParams>::default();
-    params.set_label(Some("transform_gather"));
-
+        size_of::<GatherParams>() as u32,
+    ) else {
+        return;
+    };
+    let slots = KernelSlots::new(&seam, 4);
     commands.insert_resource(TransformGather {
         instance_count: 0,
-        params,
-        bind_group: None,
+        groups: (0, 0, 0),
+        params: GatherParams::default(),
+        kernel,
+        slots,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -88,8 +105,6 @@ pub fn prepare_transform_gather(
     mut gather: Option<ResMut<TransformGather>>,
     instances: Option<Res<InstanceManager>>,
     propagate: Option<Res<TransformPropagate>>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
 ) {
     let (Some(gather), Some(instances), Some(propagate)) =
         (gather.as_deref_mut(), instances, propagate)
@@ -97,82 +112,73 @@ pub fn prepare_transform_gather(
         return;
     };
     gather.instance_count = instances.slot_high_water();
-    *gather.params.get_mut() = GatherParams {
+    gather.groups =
+        crate::ecs_gpu::linear_dispatch(gather.instance_count.div_ceil(WORKGROUP_SIZE));
+    gather.params = GatherParams {
         instance_count: gather.instance_count,
         node_count: propagate.node_count(),
-        ..Default::default()
+        groups_x: gather.groups.0,
+        _pad: 0,
     };
-    gather.params.write_buffer(&render_device, &render_queue);
-}
-
-/// `Render::PrepareBindGroups`: (re)build the gather bind group. Rebuilt every
-/// frame — cheap (one small group), and immune to a bound buffer reallocating
-/// (a cached group over a swapped buffer is a silent session-long stale read).
-pub fn prepare_transform_gather_bind_group(
-    mut gather: Option<ResMut<TransformGather>>,
-    resource_manager: Option<Res<SolariResourceManager>>,
-    node_slots: Option<Res<GpuColumn<NodeSlotColumn>>>,
-    transforms: Option<Res<GpuColumn<TransformColumn>>>,
-    propagate: Option<Res<TransformPropagate>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let (Some(gather), Some(resource_manager), Some(node_slots), Some(transforms), Some(propagate)) =
-        (gather.as_deref_mut(), resource_manager, node_slots, transforms, propagate)
-    else {
-        return;
-    };
-    let Some(params) = gather.params.binding() else {
-        return;
-    };
-    let layout = pipeline_cache.get_bind_group_layout(&resource_manager.transform_gather);
-    let previous = transforms
-        .previous_buffer()
-        .expect("TransformColumn keeps a previous-frame buffer (KEEP_PREVIOUS)");
-    gather.bind_group = Some(render_device.create_bind_group(
-        "transform_gather",
-        &layout,
-        &BindGroupEntries::sequential((
-            node_slots.buffer().as_entire_binding(),
-            propagate.current_world().as_entire_binding(),
-            transforms.buffer().as_entire_binding(),
-            previous.as_entire_binding(),
-            params,
-        )),
-    ));
 }
 
 /// `RenderGraph` (`Propagate`, after the propagation pass): gather GPU-propagated
-/// world transforms into the instance `TransformColumn`.
+/// world transforms into the instance `TransformColumn`. A raw heap dispatch:
+/// buffer slots rewritten per dispatch, params + slot array in push data.
 pub fn dispatch_transform_gather(
     gather: Option<Res<TransformGather>>,
-    pipelines: Res<SolariPipelines>,
-    pipeline_cache: Res<PipelineCache>,
+    seam: Option<Res<BindingSeam>>,
+    node_slots: Option<Res<GpuColumn<NodeSlotColumn>>>,
+    transforms: Option<Res<GpuColumn<TransformColumn>>>,
+    propagate: Option<Res<TransformPropagate>>,
     mut ctx: RenderContext,
 ) {
-    let Some(gather) = gather else {
+    let (Some(gather), Some(seam), Some(node_slots), Some(transforms), Some(propagate)) =
+        (gather, seam, node_slots, transforms, propagate)
+    else {
         return;
     };
     if gather.instance_count == 0 {
         return;
     }
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.transform_gather) else {
-        return;
-    };
-    let Some(bind_group) = gather.bind_group.as_ref() else {
-        return;
-    };
-    let groups = crate::ecs_gpu::linear_dispatch(gather.instance_count.div_ceil(WORKGROUP_SIZE));
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
+    let previous = transforms
+        .previous_buffer()
+        .expect("TransformColumn keeps a previous-frame buffer (KEEP_PREVIOUS)");
+    let blob = gather.kernel.push_blob(
+        "transform_gather",
+        bytemuck::bytes_of(&gather.params),
+        &[
+            ("node_slot", gather.slots.buffer(&seam, 0, node_slots.buffer())),
+            ("world", gather.slots.buffer(&seam, 1, propagate.current_world())),
+            ("transforms", gather.slots.buffer(&seam, 2, transforms.buffer())),
+            ("previous", gather.slots.buffer(&seam, 3, previous)),
+        ],
+    );
+    let (gx, gy, gz) = gather.groups;
     let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("transform_gather"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_group, &[]);
-    let d = diagnostics.time_span(&mut pass, "transform_gather");
-    pass.dispatch_workgroups(groups.0, groups.1, groups.2);
-    d.end(&mut pass);
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket this dispatch against the surrounding wgpu compute
+    // passes (raw dispatches are invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &gather.raw_device;
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+            // Propagate/subtract writes -> our reads (and our transform writes).
+            dev.cmd_pipeline_barrier2(cb, &dep);
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, gather.kernel.pipeline);
+            dev.cmd_dispatch(cb, gx, gy, gz);
+            // Our transform writes -> downstream compute reads (PTLAS fill,
+            // blas sharing); the trace's own pre-barrier covers RT visibility.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+        });
+    }
 }

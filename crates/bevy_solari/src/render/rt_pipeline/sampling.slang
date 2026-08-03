@@ -103,6 +103,79 @@ public struct StoredLight
                       // be 16-byte-aligned in size
 }
 
+// SurfaceGbuf decode shared by raygen and the spatial pass. `f_ab` is the
+// chit's packed LUT read — decoded here, never re-sampled.
+public struct Surf
+{
+    public float3 pos;
+    public float view_z;
+    public float3 ns;
+    public float3 ng;
+    public ResolvedMaterial mat;
+    public float3 wo;
+    public float2 f_ab;
+}
+
+public Surf unpack_surface(SurfaceGbuf s)
+{
+    Surf surf;
+    surf.pos = float3(s.pos_x, s.pos_y, s.pos_z);
+    surf.view_z = s.view_z;
+    surf.ns = octahedral_decode_signed(unpack_snorm2x16(s.normal_oct));
+    surf.ng = octahedral_decode_signed(unpack_snorm2x16(s.geo_normal_oct));
+    let c_rg = unpack_half2x16(s.color_rg);
+    let c_bm = unpack_half2x16(s.color_b_metallic);
+    let r_pr = unpack_half2x16(s.rough_prough);
+    let refl = unpack_half2x16(s.reflectance);
+    ResolvedMaterial m;
+    m.base_color = float3(c_rg, c_bm.x);
+    m.emissive = float3(0.0);
+    m.reflectance = refl.x;
+    m.roughness = r_pr.x;
+    m.perceptual_roughness = r_pr.y;
+    m.metallic = c_bm.y;
+    m.specular_transmission = 0.0;
+    m.ior = 1.5;
+    m.dispersion = 0.0;
+    m.extinction = float3(0.0);
+    m.nested_priority = 0;
+    surf.mat = m;
+    // wo is stored by the chit: world_position is absolute, so the consumer
+    // can't reconstruct the view dir as normalize(-pos).
+    surf.wo = octahedral_decode_signed(unpack_snorm2x16(s.wo_oct));
+    surf.f_ab = unpack_half2x16(s.f_ab_packed);
+    return surf;
+}
+
+public ResolvedLightSample unpack_stored_light(StoredLight s)
+{
+    ResolvedLightSample r;
+    r.world_position = float4(s.px, s.py, s.pz, s.pw);
+    r.world_normal = float3(s.nx, s.ny, s.nz);
+    r.radiance = float3(s.rr, s.rg, s.rb);
+    r.inverse_pdf = s.inv_pdf;
+    return r;
+}
+
+// A GI sample's unweighted contribution at `surf`: f·cos·L toward x_s.
+public float3 gi_shade(Surf surf, GiSample s)
+{
+    let to_s = float3(s.pos_x, s.pos_y, s.pos_z) - surf.pos;
+    let dist = length(to_s);
+    if (dist < 1.0e-6)
+    {
+        return float3(0.0);
+    }
+    let wi = to_s / dist;
+    return evaluate_brdf(surf.wo, wi, surf.ns, surf.mat, surf.f_ab)
+        * max(dot(surf.ns, wi), 0.0) * float3(s.l_r, s.l_g, s.l_b);
+}
+
+public float gi_phat(Surf surf, GiSample s)
+{
+    return pick_luminance(gi_shade(surf, s));
+}
+
 public StoredLight pack_stored_light(ResolvedLightSample r, float3 f, float phat)
 {
     StoredLight s;

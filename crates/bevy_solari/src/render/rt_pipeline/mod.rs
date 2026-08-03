@@ -2,7 +2,7 @@
 //!
 //! The raw-VK [`RtPipeline`](crate::gpu::rt_pipeline::RtPipeline) records a
 //! `cmd_trace_rays` that writes a per-pixel output **storage buffer** (no image
-//! layout to fight wgpu over); a small wgpu compute pass ([`blit.wgsl`]) then
+//! layout to fight wgpu over); a small heap-kernel dispatch (`blit.slang`) then
 //! copies that buffer into the view's HDR storage texture, so the rest of the
 //! frame is unchanged.
 //!
@@ -11,22 +11,15 @@
 #![allow(unsafe_code)]
 
 mod rt_camera;
-pub use rt_camera::{rt_camera_bind_group_layout, RtCameraPassParams};
+pub use rt_camera::{init_rt_camera, RtCameraKernel, RtCameraPassParams};
 
 use ash::vk;
-use bevy_asset::{load_embedded_asset, AssetServer};
 use bevy_ecs::prelude::*;
 use bevy_math::{Mat4, ToRender, UVec4, Vec2, Vec3, Vec4};
 use bevy_render::{
     camera::ExtractedCamera,
     render_asset::RenderAssets,
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, texture_storage_2d},
-        BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, BufferUsages,
-        CachedComputePipelineId, CommandEncoderDescriptor, ComputePassDescriptor,
-        ComputePipelineDescriptor, PipelineCache, ShaderStages, StorageTextureAccess,
-        TextureFormat, UniformBuffer,
-    },
+    render_resource::{BufferUsages, CommandEncoderDescriptor, PipelineCache},
     renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
     sync_world::RenderEntity,
     texture::{FallbackImage, GpuImage},
@@ -39,13 +32,14 @@ use crate::bindings::RaytracingSceneBindings;
 use crate::ecs_gpu::{GpuSlot, SceneColumns};
 use crate::geometry::ClusterMeshManager;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
+use crate::gpu::binding_seam::{BindingSeam, HeapKind};
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::gpu::rt_pipeline::{
     RtCamera, RtGeometryAddresses, RtShaderCache, RtPipeline, RtViewBindings, SolariHitGroupDef,
     SolariHitGroupRegistry, SolariRtShader,
 };
 use crate::gpu::RawTraceBindable;
 use crate::material::{material_sbt_class, MaterialSlots, MaterialTraversalFlags};
-use crate::pipelines::SolariPipelines;
 use crate::render::atmosphere::{
     AtmosphereSky, SolariAtmosphereGpu, SolariAtmosphereView, SolariAtmosphereVolumesGpu,
 };
@@ -54,7 +48,6 @@ use crate::render::view_cull::SolariEnvironmentMap;
 use crate::render::{
     CameraReframe, DiEstimator, GiEstimator, SolariCamera, SolariReference,
 };
-use crate::resource_manager::SolariResourceManager;
 use crate::transform::{TransformGraph, TransformPropagate};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 
@@ -202,14 +195,27 @@ impl RtMaterials<'_> {
     }
 }
 
-/// The wgpu compute pipeline + layout copying the RT output buffer to the view.
+/// The heap kernel copying the RT output buffer to the view (`blit.slang`).
+/// The per-view heap slots live on each view's [`RtViewKernelSlots`].
 #[derive(Resource)]
 pub struct RtBlit {
-    pub layout: BindGroupLayoutDescriptor,
-    pub pipeline: CachedComputePipelineId,
-    /// 16-byte uniform for the diff view: `[mode, scale, 0, 0]` (see `blit.wgsl`).
-    pub params: bevy_render::render_resource::Buffer,
+    kernel: HeapKernel,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
+
+impl Drop for RtBlit {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for RtBlit {}
+unsafe impl Sync for RtBlit {}
 
 /// Freeze/diff harness controls (main-world, extracted). Bump `freeze_epoch` to
 /// snapshot the current accumulated image; `diff` displays `|current − frozen|`
@@ -356,68 +362,78 @@ fn write_dump_exr(path: &str, w: usize, h: usize, data: &[u8]) -> Result<(), exr
     image.write().to_file(path)
 }
 
-/// `RenderStartup`: build the blit pipeline (independent of `SolariPipelines`).
+/// `RenderStartup` (after `SolariSetup`): compile the blit kernel — a
+/// layout-free heap pipeline ([`HeapKernel`]), Slang from source. The 16-byte
+/// diff/exposure params ride the push block.
 pub fn init_rt_blit(
     mut commands: Commands,
-    pipeline_cache: Res<PipelineCache>,
-    asset_server: Res<AssetServer>,
-    render_device: Res<RenderDevice>,
-    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
 ) {
-    let layout = BindGroupLayoutDescriptor::new(
-        "rt_blit_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0: rt_output (array<vec4<f32>>)
-                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // 1: view_output
-                storage_buffer_read_only_sized(false, None), // 2: frozen snapshot (diff view)
-                bevy_render::render_resource::binding_types::uniform_buffer_sized(false, None), // 3: diff params
-            ),
-        ),
-    );
-    let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("rt_blit_pipeline".into()),
-        layout: vec![layout.clone()],
-        shader: load_embedded_asset!(asset_server.as_ref(), "blit.wgsl"),
-        shader_defs: vec![],
-        entry_point: Some("blit".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "blit.slang",
+        include_str!("blit.slang"),
+        "blit",
+        &[],
+        &[],
+        "rt_blit",
+        16,
+    ) else {
+        return;
+    };
+    commands.insert_resource(RtBlit {
+        kernel,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
-    registry.register("rt_blit", pipeline);
-    let params = render_device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rt_blit_params"),
-        size: 16,
-        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    commands.insert_resource(RtBlit { layout, pipeline, params });
 }
 
-/// The ReSTIR spatial merge+shade pass: pipeline + its group-1 layout
-/// (group 0 is the shared scene bind group — TLAS/lights/materials/DFG LUT).
+/// The Slang modules `restir_spatial.slang` imports — the same built-in set
+/// the RT stages compile against (referenced by the compile test too).
+pub(crate) const RESTIR_SPATIAL_MODULES: &[(&str, &str)] = &[
+    ("rt_payload", include_str!("rt_payload.slang")),
+    ("scene_resolve", include_str!("scene_resolve.slang")),
+    ("brdf", include_str!("brdf.slang")),
+    ("sampling", include_str!("sampling.slang")),
+];
+
+/// The ReSTIR spatial merge+shade pass: a multi-set heap kernel
+/// (`restir_spatial.slang` — scene set 0 via `scene_resolve`, columns set 2,
+/// its own set 1) plus the two per-dispatch `SpatialParams` uniforms.
 #[derive(Resource)]
 pub struct RestirSpatial {
-    pub layout: BindGroupLayoutDescriptor,
-    /// Queued lazily on the first dispatch frame: the pipeline layout needs the
-    /// scene-columns bind-group layout (the resolve reads `transforms` from it),
-    /// which doesn't exist yet at `RenderStartup` — same reason the RT pipeline
-    /// itself builds lazily.
-    pub pipeline: Option<CachedComputePipelineId>,
-    pub shader: bevy_asset::Handle<bevy_shader::Shader>,
-    /// `SpatialParams` uniform (see `restir_spatial.wgsl`).
+    /// Built lazily on the first spatial frame: the kernel's mapping table
+    /// bakes the scene/columns heap slots, which don't exist yet at
+    /// `RenderStartup` — same reason the RT pipeline itself builds lazily.
+    pub kernel: Option<HeapKernel>,
+    /// `SpatialParams` uniform (see `restir_spatial.slang`).
     pub params: bevy_render::render_resource::Buffer,
     /// The GI-finalize dispatch's own `SpatialParams` (phase = 1).
     pub params_finalize: bevy_render::render_resource::Buffer,
-    /// group(1) binding(4): `scene_bindings` hard-codes `geometry_addresses` here and
-    /// it rides in transitively via brdf. The spatial pass never dereferences it (no
-    /// `physical_load`), but the binding must exist — a zeroed uniform satisfies it.
-    pub geo_addr: bevy_render::render_resource::Buffer,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// CPU mirror of `restir_spatial.wgsl::SpatialParams`.
+impl Drop for RestirSpatial {
+    fn drop(&mut self) {
+        if let Some(kernel) = self.kernel.take() {
+            self._device_keepalive.quiesce_before_raw_destroy();
+            // SAFETY: quiesced; handles exclusively owned here.
+            unsafe { kernel.destroy(&self.raw_device) };
+        }
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for RestirSpatial {}
+unsafe impl Sync for RestirSpatial {}
+
+/// CPU mirror of `restir_spatial.slang::SpatialParams`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RestirSpatialParams {
@@ -441,34 +457,22 @@ pub struct RestirSpatialParams {
     pub pad_d: u32,
 }
 
-/// `RenderStartup`: build the spatial pass pipeline (scene group 0 + own group 1).
+/// `RenderStartup` (after `SolariSetup`): create the spatial pass's params
+/// uniforms (the kernel itself builds lazily — see [`RestirSpatial::kernel`]).
+/// STORAGE rides along on the uniforms for the fork's device-address flag the
+/// heap descriptors are written from.
 pub fn init_restir_spatial(
     mut commands: Commands,
-    asset_server: Res<AssetServer>,
     render_device: Res<RenderDevice>,
+    allocator: Option<Res<Allocator>>,
 ) {
-    use bevy_render::render_resource::binding_types::{storage_buffer_sized, uniform_buffer_sized};
-    let layout = BindGroupLayoutDescriptor::new(
-        "restir_spatial_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_sized(false, None),           // 0: reservoirs (rw)
-                storage_buffer_read_only_sized(false, None), // 1: surfaces
-                storage_buffer_sized(false, None),           // 2: rt_output (rw, += DI)
-                uniform_buffer_sized(false, None),           // 3: params
-                uniform_buffer_sized(false, None),           // 4: geometry_addresses (unused, transitive)
-                storage_buffer_read_only_sized(false, None), // 5: light_samples (chit-written)
-                storage_buffer_sized(false, None),           // 6: gi_samples (rw: finalize merges + writes back)
-                uniform_buffer_sized(false, None),           // 7: RtCamera (reprojection + estimator flags)
-            ),
-        ),
-    );
-    let shader = load_embedded_asset!(asset_server.as_ref(), "restir_spatial.wgsl");
+    let Some(allocator) = allocator else {
+        return;
+    };
     let params = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("restir_spatial_params"),
         size: size_of::<RestirSpatialParams>() as u64,
-        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        usage: BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     // The finalize dispatch runs the same pipeline in the same frame with its
@@ -476,62 +480,16 @@ pub fn init_restir_spatial(
     let params_finalize = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("restir_gi_finalize_params"),
         size: size_of::<RestirSpatialParams>() as u64,
-        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let geo_addr = render_device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("restir_spatial_geo_addr"),
-        size: size_of::<RtGeometryAddresses>() as u64,
-        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        usage: BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     commands.insert_resource(RestirSpatial {
-        layout,
-        pipeline: None,
-        shader,
+        kernel: None,
         params,
         params_finalize,
-        geo_addr,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
-}
-
-/// `Render::Prepare`: queue the spatial pipeline the moment the scene-columns
-/// layout exists (frame ~2 — it can't be built at `RenderStartup`), so it
-/// compiles alongside the cold-start batch instead of lazily on first use.
-/// Registered into the one readiness gate like every other pipeline.
-pub fn queue_restir_spatial_pipeline(
-    restir_spatial: Option<ResMut<RestirSpatial>>,
-    scene_bindings: Res<RaytracingSceneBindings>,
-    scene_columns: Res<SceneColumns>,
-    pipeline_cache: Res<PipelineCache>,
-    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
-) {
-    let Some(mut rs) = restir_spatial else { return };
-    if rs.pipeline.is_some() {
-        return;
-    }
-    let Some(columns_layout) = scene_columns.layout() else {
-        return;
-    };
-    let id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("restir_spatial".into()),
-        layout: vec![
-            scene_bindings.bind_group_layout.clone(),
-            rs.layout.clone(),
-            columns_layout.clone(),
-        ],
-        shader: rs.shader.clone(),
-        shader_defs: vec![bevy_shader::ShaderDefVal::UInt(
-            "SOLARI_SCENE_COLUMNS_GROUP".into(),
-            2,
-        )],
-        entry_point: Some("spatial".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
-    rs.pipeline = Some(id);
-    registry.register("restir_spatial", id);
 }
 
 /// Per-view output: a `width*height` `vec4<f32>` storage buffer the raygen shader
@@ -567,7 +525,7 @@ pub struct RtOutputBuffer {
     pub nrc_queries_raw: vk::Buffer,
     pub nrc_queries_size: u64,
     /// ReSTIR primary-hit surface G-buffer (48 B/pixel) — chit-written when the
-    /// spatial pass is on; read by `restir_spatial.wgsl` for p̂ re-target + shade.
+    /// spatial pass is on; read by `restir_spatial.slang` for p̂ re-target + shade.
     pub surface: bevy_render::render_resource::Buffer,
     pub surface_raw: vk::Buffer,
     pub surface_size: u64,
@@ -633,14 +591,75 @@ pub struct RtGbuffer {
     pub raw: vk::Buffer,
 }
 
-/// Byte size of `rt_camera.wgsl`'s `PrevCamera` (`mat4x4` + 3×`f64` previous
+/// Byte size of `rt_camera.slang`'s `PrevCamera` (`mat4x4` + 3×`f64` previous
 /// origin + 2×`u32` + 3×`f64` held NRC anchor, std430-padded).
 const RT_PREV_CAMERA_SIZE: u64 = 128;
 
-/// `Prepare`: (re)allocate the per-view RT output buffer to fit the viewport.
+/// Per-view heap slots (+ the rt_camera params UBO) for the view's raw heap
+/// dispatches. Per view because slot descriptors resolve at EXECUTION time:
+/// one shared slot set rewritten per view would leave every recorded dispatch
+/// reading the last view's resources. Created once per view entity and kept —
+/// slots are app-lifetime, and a viewport resize only changes what the
+/// per-dispatch rewrites point them at.
+#[derive(Component)]
+pub struct RtViewKernelSlots {
+    /// `rt_camera.slang`: world, params, out_camera, prev_cam, world_abs_t.
+    camera: KernelSlots,
+    /// [`RtCameraPassParams`] uniform (encase std140), rewritten per frame via
+    /// `write_buffer` — a queue-timeline transfer, so no host-visible ring is
+    /// needed. STORAGE grants the fork's device-address flag the heap
+    /// descriptor is written from.
+    camera_params: bevy_render::render_resource::Buffer,
+    /// `blit.slang`: rt_output, frozen (buffers).
+    blit: KernelSlots,
+    /// `blit.slang::view_output` — the view target's ping-pong textures each
+    /// get their own once-written slot ([`ImageSlotCache`]): descriptors are
+    /// read at execution, so a shared slot rewritten per frame would corrupt
+    /// the in-flight previous frame (a black frame whenever the target
+    /// alternates).
+    blit_images: crate::gpu::heap_kernel::ImageSlotCache,
+    /// `restir_spatial.slang` set 1: reservoirs, surfaces, output, params
+    /// (two slots — the finalize and spatial dispatches record in the same
+    /// frame, so each params uniform needs its own slot), light_samples,
+    /// gi_samples, camera.
+    spatial: KernelSlots,
+}
+
+/// `Prepare` (with [`prepare_rt_output`]): allocate each view's kernel slots
+/// once the seam exists.
+fn create_view_kernel_slots(
+    seam: &BindingSeam,
+    render_device: &RenderDevice,
+) -> RtViewKernelSlots {
+    let camera_params = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rt_camera_params"),
+        size: rt_camera::rt_camera_params_size(),
+        usage: BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    RtViewKernelSlots {
+        camera: KernelSlots::new(seam, 5),
+        camera_params,
+        blit: KernelSlots::new_mixed(seam, &[HeapKind::Buffer, HeapKind::Image, HeapKind::Buffer]),
+        blit_images: crate::gpu::heap_kernel::ImageSlotCache::new(),
+        spatial: KernelSlots::new(seam, 8),
+    }
+}
+
+/// `Prepare`: (re)allocate the per-view RT output buffer to fit the viewport,
+/// and the view's [`RtViewKernelSlots`] once (slots are app-lifetime).
 pub fn prepare_rt_output(
-    views: Query<(Entity, &ExtractedCamera, Option<&RtOutputBuffer>), With<SolariCamera>>,
+    views: Query<
+        (
+            Entity,
+            &ExtractedCamera,
+            Option<&RtOutputBuffer>,
+            Option<&RtViewKernelSlots>,
+        ),
+        With<SolariCamera>,
+    >,
     allocator: Option<Res<Allocator>>,
+    seam: Option<Res<BindingSeam>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut commands: Commands,
@@ -648,7 +667,14 @@ pub fn prepare_rt_output(
     let Some(allocator) = allocator else {
         return;
     };
-    for (entity, camera, existing) in &views {
+    for (entity, camera, existing, kernel_slots) in &views {
+        if kernel_slots.is_none() {
+            if let Some(seam) = seam.as_deref() {
+                commands
+                    .entity(entity)
+                    .insert(create_view_kernel_slots(seam, &render_device));
+            }
+        }
         let Some(viewport) = camera.physical_viewport_size else {
             continue;
         };
@@ -708,7 +734,7 @@ pub fn prepare_rt_output(
         let camera_raw = unsafe { camera_buffer.as_hal::<VkApi>() }
             .map(|b| b.raw_handle())
             .expect("rt_camera buffer must be Vulkan-backed");
-        // Persistent previous-basis buffer for GPU motion vectors — `rt_camera.wgsl`'s
+        // Persistent previous-basis buffer for GPU motion vectors — `rt_camera.slang`'s
         // `PrevCamera` ([`RT_PREV_CAMERA_SIZE`]). Zero-cleared so `valid` starts 0
         // (frame 1 ⇒ zero motion, not a read of uninitialized memory).
         let camera_prev_buffer = allocator.create_buffer(
@@ -940,33 +966,34 @@ fn camera_debug() -> bool {
     CAMERA_DEBUG.get().copied().unwrap_or(false)
 }
 
-/// Dispatch the `rt_camera` compute pass to fill `output.camera_buffer` from the
+/// Dispatch the `rt_camera` heap kernel to fill `output.camera_buffer` from the
 /// camera's transform-table slot. Returns `false` (⇒ caller does the CPU fallback)
-/// when the pass can't run this frame: unsupported device, pipeline/layout not ready,
+/// when the pass can't run this frame: unsupported device, kernel/slots not ready,
 /// or the camera's slot isn't allocated / in range yet.
 #[allow(clippy::too_many_arguments)]
 fn try_dispatch_rt_camera(
     ctx: &mut RenderContext,
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
-    pipeline_cache: &PipelineCache,
-    pipelines: Option<&SolariPipelines>,
-    resources: Option<&SolariResourceManager>,
+    kernel: Option<&RtCameraKernel>,
+    seam: Option<&BindingSeam>,
     propagate: Option<&TransformPropagate>,
     camera_slot: Option<&RtCameraSlot>,
+    view_slots: Option<&RtViewKernelSlots>,
     output: &RtOutputBuffer,
     inputs: RtCameraGpuInputs,
 ) -> bool {
-    let (Some(pipelines), Some(resources), Some(propagate), Some(slot)) =
-        (pipelines, resources, propagate, camera_slot)
+    let (Some(kernel), Some(seam), Some(propagate), Some(slot), Some(view_slots)) =
+        (kernel, seam, propagate, camera_slot, view_slots)
     else {
         if camera_debug() {
             bevy_log::info!(
-                "rt_camera: CPU fallback (pipelines={} resources={} propagate={} slot={:?})",
-                pipelines.is_some(),
-                resources.is_some(),
+                "rt_camera: CPU fallback (kernel={} seam={} propagate={} slot={:?} view_slots={})",
+                kernel.is_some(),
+                seam.is_some(),
                 propagate.is_some(),
                 camera_slot.map(|s| s.0),
+                view_slots.is_some(),
             );
         }
         return false; // cold start (slot extracted a frame after the camera spawns).
@@ -980,12 +1007,6 @@ fn try_dispatch_rt_camera(
         }
         return false;
     }
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.rt_camera) else {
-        if camera_debug() {
-            bevy_log::info!("rt_camera: CPU fallback (pipeline compiling)");
-        }
-        return false; // still compiling (or failed — the cache logs a compile error).
-    };
     if camera_debug() {
         static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -994,7 +1015,9 @@ fn try_dispatch_rt_camera(
         }
     }
 
-    let mut params = UniformBuffer::from(RtCameraPassParams {
+    // The params UBO (too large for push data): encase std140 bytes, written
+    // through the queue timeline so the raw read never sees a torn update.
+    let params = RtCameraPassParams {
         clip_from_view: inputs.clip_from_view,
         view_from_clip: inputs.clip_from_view.inverse(),
         reframe_prev_from_current: inputs.reframe_prev_from_current,
@@ -1013,36 +1036,65 @@ fn try_dispatch_rt_camera(
         exposure: inputs.exposure,
         valid: 1,
         reframe_active: inputs.reframe_active as u32,
-    });
-    params.write_buffer(render_device, render_queue);
-    let Some(params_binding) = params.binding() else {
-        return false;
     };
+    let mut bytes =
+        bevy_render::render_resource::encase::UniformBuffer::new(Vec::<u8>::new());
+    bytes.write(&params).expect("rt_camera params encode");
+    render_queue.write_buffer(&view_slots.camera_params, 0, &bytes.into_inner());
 
-    let layout = pipeline_cache.get_bind_group_layout(&resources.rt_camera);
-    let bind_group = render_device.create_bind_group(
+    let blob = kernel.kernel.push_blob(
         "rt_camera",
-        &layout,
-        &BindGroupEntries::sequential((
-            propagate.current_world().as_entire_binding(),
-            params_binding,
-            output.camera_buffer.as_entire_binding(),
-            output.camera_prev_buffer.as_entire_binding(),
-            propagate.world_abs_t().as_entire_binding(),
-        )),
+        &[],
+        &[
+            ("world", view_slots.camera.buffer(seam, 0, propagate.current_world())),
+            ("params", view_slots.camera.uniform(seam, 1, &view_slots.camera_params)),
+            ("out_camera", view_slots.camera.buffer(seam, 2, &output.camera_buffer)),
+            ("prev_cam", view_slots.camera.buffer(seam, 3, &output.camera_prev_buffer)),
+            ("world_abs_t", view_slots.camera.buffer(seam, 4, propagate.world_abs_t())),
+        ],
     );
-
-    // Recorded on the ctx encoder → flushed (and its write made visible by the trace's
-    // pre-barrier) before the trace's own command buffer runs.
-    let mut pass = ctx
-        .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("rt_camera"),
-            timestamp_writes: None,
+    // Own command buffer: the node's ctx encoder carries wgpu passes, and the
+    // fork panics if one encoder mixes those with raw `as_hal_mut`.
+    // `add_command_buffer` flushes pending ctx work first, so this lands
+    // before the trace (which reads the produced camera UBO).
+    let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("rt_camera"),
+    });
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket this dispatch against the surrounding work (raw
+    // dispatches are invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &kernel.raw_device;
+            // Propagate's world writes + the params upload -> our reads.
+            let pre = [vk::MemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+                )
+                .src_access_mask(
+                    vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
+                )
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&pre));
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernel.kernel.pipeline);
+            dev.cmd_dispatch(cb, 1, 1, 1);
+            // Our camera writes -> downstream compute reads (the spatial pass
+            // binds the camera buffer); the trace's own pre-barrier covers RT
+            // visibility.
+            let post = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ)];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&post));
         });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(1, 1, 1);
+    }
+    ctx.add_command_buffer(encoder.finish());
     true
 }
 
@@ -1144,7 +1196,7 @@ pub(crate) fn rt_pipeline(
         Option<&RtPrevViewProj>,
         Option<&SolariDlssJitter>,
         Option<&CameraReframe>,
-        Option<&RtCameraSlot>,
+        (Option<&RtCameraSlot>, Option<&mut RtViewKernelSlots>),
         &SolariCamera,
         Option<&RtAccumulation>,
         Option<&RtFrozen>,
@@ -1163,7 +1215,7 @@ pub(crate) fn rt_pipeline(
         Option<Res<SolariHitGroupRegistry>>,
         Option<Res<crate::accel::deform::Deform>>,
         Option<ResMut<RtShaderCache>>,
-        Option<Res<crate::gpu::binding_seam::BindingSeam>>,
+        Option<Res<BindingSeam>>,
         Res<crate::gpu::slang_sources::SlangSources>,
     ),
     materials: RtMaterials,
@@ -1178,14 +1230,13 @@ pub(crate) fn rt_pipeline(
     ),
     env_images: RtEnvImages,
     pipeline_cache: Res<PipelineCache>,
-    // Tupled to stay under bevy's 16-param system ceiling. `SolariPipelines`/
-    // `SolariResourceManager`/`TransformPropagate` drive the `rt_camera` compute pass
-    // (`Option` — absent on unsupported devices ⇒ CPU-derived camera fallback).
+    // Tupled to stay under bevy's 16-param system ceiling. `RtCameraKernel`/
+    // `TransformPropagate` drive the `rt_camera` heap dispatch (`Option` —
+    // absent on unsupported devices ⇒ CPU-derived camera fallback).
     render_res: (
         Res<RenderDevice>,
         Res<RenderQueue>,
-        Option<Res<SolariPipelines>>,
-        Option<Res<SolariResourceManager>>,
+        Option<Res<RtCameraKernel>>,
         Option<Res<TransformPropagate>>,
         Res<bevy_time::Time>,
         Option<ResMut<RestirSpatial>>,
@@ -1200,8 +1251,7 @@ pub(crate) fn rt_pipeline(
     let (
         render_device,
         render_queue,
-        solari_pipelines,
-        solari_resources,
+        rt_camera_kernel,
         transform_propagate,
         time,
         mut restir_spatial,
@@ -1232,7 +1282,7 @@ pub(crate) fn rt_pipeline(
         prev_view_proj,
         dlss_jitter,
         reframe,
-        camera_slot,
+        (camera_slot, view_kernel_slots),
         solari_camera,
         accumulation,
         frozen,
@@ -1290,10 +1340,10 @@ pub(crate) fn rt_pipeline(
             .map_or(0.0, |env| env.brightness)
     };
 
-    // Scene + columns readiness: the bind groups (consumed by the wgpu compute
-    // passes — the spatial pass below) and their heap mirrors, which the RT
-    // pipeline's mapping table and this frame's descriptors come from.
-    let (Some(scene_bg), Some(columns_bg), Some(scene_heap), Some(columns_heap)) = (
+    // Scene + columns readiness: the heap mirrors, which the RT pipeline's and
+    // the spatial kernel's mapping tables and this frame's descriptors come
+    // from (the wgpu bind groups' existence doubles as the scene-ready signal).
+    let (Some(_scene_bg), Some(_columns_bg), Some(scene_heap), Some(columns_heap)) = (
         scene_bindings.bind_group.as_ref(),
         scene_columns.bind_group.as_ref(),
         scene_bindings.scene_heap.as_ref(),
@@ -1481,10 +1531,7 @@ pub(crate) fn rt_pipeline(
         }
     };
 
-    let (Some(viewport), Some(blit_pipeline)) = (
-        camera.physical_viewport_size,
-        pipeline_cache.get_compute_pipeline(rt_blit.pipeline),
-    ) else {
+    let Some(viewport) = camera.physical_viewport_size else {
         return;
     };
 
@@ -1612,7 +1659,7 @@ pub(crate) fn rt_pipeline(
         // Hold accumulation until EVERY solari pipeline is compiled (the one
         // readiness gate — a warmup frame with any column/pass missing bakes
         // zero/garbage samples into the running mean permanently), plus the
-        // lazily-queued spatial pass when its levers are on. Pipelines are not
+        // lazily-built spatial kernel when its levers are on. Pipelines are not
         // enough: the cluster→BLAS→PTLAS stream lands the scene several frames
         // AFTER the last pipeline compiles, and accumulating those black frames
         // is a permanent ~K/N energy deficit. So also require the scene quiet — no pending journal
@@ -1622,8 +1669,7 @@ pub(crate) fn rt_pipeline(
             || reference.gi_spatial().is_some())
             && !restir_spatial
                 .as_deref()
-                .and_then(|rs| rs.pipeline)
-                .is_some_and(|id| pipeline_cache.get_compute_pipeline(id).is_some());
+                .is_some_and(|rs| rs.kernel.is_some());
         let pipelines_ready = pipeline_registry.is_some_and(|r| r.ready(&pipeline_cache));
         let scene_quiet = journal.is_none_or(|j| j.count == 0)
             && cluster_mesh_manager.as_ref().is_none_or(|m| {
@@ -1825,21 +1871,21 @@ pub(crate) fn rt_pipeline(
     };
     // Fill this view's GPU camera buffer (bound at a constant dynamic offset 0). The
     // GPU-authoritative path derives the basis from `world[camera_slot]` in the
-    // `rt_camera` compute pass — so the camera is composed on the GPU through any
+    // `rt_camera` heap dispatch — so the camera is composed on the GPU through any
     // hierarchy + floating-origin offset, same-frame, with no dependence on the CPU
     // `GlobalTransform`. Falls back to the CPU-derived `camera_inputs` (a `write_buffer`
-    // TRANSFER write) when the pass isn't ready (device unsupported, pipeline still
-    // compiling, or the camera's slot not yet allocated) — both fills are covered by
+    // TRANSFER write) when the pass isn't ready (device unsupported, kernel/slots
+    // missing, or the camera's slot not yet allocated) — both fills are covered by
     // the trace's existing pre-barrier (`{TRANSFER,SHADER}_WRITE → SHADER_READ`).
     let gpu_camera = try_dispatch_rt_camera(
         &mut ctx,
         &render_device,
         &render_queue,
-        &pipeline_cache,
-        solari_pipelines.as_deref(),
-        solari_resources.as_deref(),
+        rt_camera_kernel.as_deref(),
+        seam.as_deref(),
         transform_propagate.as_deref(),
         camera_slot,
+        view_kernel_slots.as_deref(),
         output,
         {
             // The recenter rebase the GPU applies to its stored previous basis (mirrors
@@ -1960,11 +2006,34 @@ pub(crate) fn rt_pipeline(
         let spatial_on = (di_spatial || gi_spatial) && debug_view == 0 && !show_displacement;
         let finalize_on = gi_finalize && debug_view == 0 && !show_displacement;
         if spatial_on || finalize_on {
-            // Queued by `queue_restir_spatial_pipeline` (Prepare) as soon as the
-            // scene-columns layout exists — compiled with the cold-start batch.
-            if let Some(spatial_pipeline) = rs
-                .pipeline
-                .and_then(|id| pipeline_cache.get_compute_pipeline(id))
+            // Built lazily on the first spatial frame: the kernel's mapping
+            // table bakes the scene/columns heap slots, which exist only once
+            // the staging mirrors have run (same reason the RT pipeline builds
+            // lazily; the slots are allocated once and rewritten in place, so
+            // the table never goes stale).
+            if rs.kernel.is_none() {
+                if let Some(seam) = seam.as_deref() {
+                    rs.kernel = HeapKernel::new_with_mappings(
+                        seam,
+                        "restir_spatial.slang",
+                        include_str!("restir_spatial.slang"),
+                        "spatial",
+                        RESTIR_SPATIAL_MODULES,
+                        &[],
+                        crate::gpu::slang::RAY_QUERY_CAPABILITIES,
+                        "restir_spatial",
+                        // The 8-byte TLAS device address leads the push blob.
+                        8,
+                        &crate::gpu::rt_pipeline::scene_heap_mappings(
+                            seam,
+                            scene_heap,
+                            columns_heap,
+                        ),
+                    );
+                }
+            }
+            if let (Some(kernel), Some(view_slots), Some(seam)) =
+                (rs.kernel.as_ref(), view_kernel_slots.as_deref(), seam.as_deref())
             {
                 let blend_w = if accum_spf > 0 && accum_n > 0 {
                     accum_spf as f32 / (accum_n + accum_spf) as f32
@@ -1989,47 +2058,40 @@ pub(crate) fn rt_pipeline(
                     pad_c: 0,
                     pad_d: 0,
                 };
-                render_queue.write_buffer(
-                    &rs.geo_addr,
-                    0,
-                    bytemuck::bytes_of(&geo_addrs.unwrap_or(bytemuck::Zeroable::zeroed())),
-                );
-                let layout = pipeline_cache.get_bind_group_layout(&rs.layout);
-                let mut dispatch = |params_buf: &bevy_render::render_resource::Buffer,
-                                    params: RestirSpatialParams,
-                                    label: &'static str| {
+                // One push blob per dispatch: [tlas address @0 | set-1 slot
+                // array @8]. The params uniforms get DISTINCT slots (3 and 4) —
+                // both dispatches record before either executes, so a shared
+                // slot would leave the first reading the second's descriptor.
+                let slots = &view_slots.spatial;
+                let record = |params_buf: &bevy_render::render_resource::Buffer,
+                                  params_slot: usize,
+                                  params: RestirSpatialParams,
+                                  label: &str| {
                     render_queue.write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
-                    let bind_group = render_device.create_bind_group(
+                    kernel.push_blob(
                         label,
-                        &layout,
-                        &BindGroupEntries::sequential((
-                            output.reservoirs.as_entire_binding(),
-                            output.surface.as_entire_binding(),
-                            output.buffer.as_entire_binding(),
-                            params_buf.as_entire_binding(),
-                            rs.geo_addr.as_entire_binding(),
-                            output.light_samples.as_entire_binding(),
-                            output.gi_samples.as_entire_binding(),
-                            output.camera_buffer.as_entire_binding(),
-                        )),
-                    );
-                    let encoder = ctx.command_encoder();
-                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                        label: Some(label),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(spatial_pipeline);
-                    pass.set_bind_group(0, scene_bg, &[]);
-                    pass.set_bind_group(1, &bind_group, &[]);
-                    pass.set_bind_group(2, columns_bg, &[]);
-                    pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
+                        &tlas_address.to_le_bytes(),
+                        &[
+                            ("reservoirs", slots.buffer(seam, 0, &output.reservoirs)),
+                            ("surfaces", slots.buffer(seam, 1, &output.surface)),
+                            ("output", slots.buffer(seam, 2, &output.buffer)),
+                            ("params", slots.uniform(seam, params_slot, params_buf)),
+                            ("light_samples", slots.buffer(seam, 5, &output.light_samples)),
+                            ("gi_samples", slots.buffer(seam, 6, &output.gi_samples)),
+                            ("camera", slots.uniform(seam, 7, &output.camera_buffer)),
+                        ],
+                    )
                 };
+                // Finalize first: the spatial dispatch reads the merged chains
+                // it writes back.
+                let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(2);
                 if finalize_on {
-                    dispatch(
+                    blobs.push(record(
                         &rs.params_finalize,
+                        4,
                         RestirSpatialParams { phase: 1, ..base },
                         "restir_gi_finalize",
-                    );
+                    ));
                 }
                 if spatial_on {
                     // One parameter set feeds the pass (DI and GI arms share it);
@@ -2039,8 +2101,9 @@ pub(crate) fn rt_pipeline(
                         .or_else(|| reference.and_then(SolariReference::di_spatial))
                         .or_else(|| reference.and_then(SolariReference::gi_spatial))
                         .expect("spatial_on requires a configured spatial arm");
-                    dispatch(
+                    blobs.push(record(
                         &rs.params,
+                        3,
                         RestirSpatialParams {
                             taps: sp.taps.min(8),
                             radius: sp.radius,
@@ -2051,10 +2114,82 @@ pub(crate) fn rt_pipeline(
                             ..base
                         },
                         "restir_spatial",
-                    );
+                    ));
                 }
+                // Own command buffer, spliced right after the trace — the fork
+                // panics if one encoder mixes wgpu passes with raw as_hal_mut.
+                let mut spatial_encoder =
+                    render_device.create_command_encoder(&CommandEncoderDescriptor {
+                        label: Some("restir_spatial"),
+                    });
+                // SAFETY: Vulkan backend; the slots reference live heap
+                // descriptors; the barriers bracket the dispatches against the
+                // trace and the downstream compute consumers (raw dispatches
+                // are invisible to wgpu's tracking).
+                unsafe {
+                    spatial_encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+                        let hal_encoder =
+                            hal_encoder.expect("bevy_solari requires the Vulkan backend");
+                        let cb = hal_encoder.raw_handle();
+                        let dev = &rs.raw_device;
+                        // Trace writes (reservoirs/surfaces/light_samples/
+                        // gi_samples/output) + the params uniform transfer →
+                        // our reads and writes.
+                        let pre = [vk::MemoryBarrier2::default()
+                            .src_stage_mask(
+                                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR
+                                    | vk::PipelineStageFlags2::COMPUTE_SHADER
+                                    | vk::PipelineStageFlags2::ALL_TRANSFER,
+                            )
+                            .src_access_mask(
+                                vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
+                            )
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(
+                                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                            )];
+                        dev.cmd_pipeline_barrier2(
+                            cb,
+                            &vk::DependencyInfo::default().memory_barriers(&pre),
+                        );
+                        seam.bind_heaps(cb);
+                        dev.cmd_bind_pipeline(
+                            cb,
+                            vk::PipelineBindPoint::COMPUTE,
+                            kernel.pipeline,
+                        );
+                        // Our compute writes ↔ compute reads/writes: between
+                        // the two dispatches (spatial reads the chains finalize
+                        // wrote) and after the last one (NRC composite + blit
+                        // read/append to the output; next frame's trace has its
+                        // own pre-barrier).
+                        let compute = [vk::MemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(
+                                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                            )];
+                        let compute_dep =
+                            vk::DependencyInfo::default().memory_barriers(&compute);
+                        for (i, blob) in blobs.iter().enumerate() {
+                            if i > 0 {
+                                dev.cmd_pipeline_barrier2(cb, &compute_dep);
+                            }
+                            seam.push_data(cb, blob);
+                            dev.cmd_dispatch(
+                                cb,
+                                viewport.x.div_ceil(8),
+                                viewport.y.div_ceil(8),
+                                1,
+                            );
+                        }
+                        dev.cmd_pipeline_barrier2(cb, &compute_dep);
+                    });
+                }
+                ctx.add_command_buffer(spatial_encoder.finish());
             } else {
-                bevy_log::warn_once!("restir_spatial: pipeline not ready — DI missing this frame");
+                bevy_log::warn_once!("restir_spatial: kernel not ready — DI missing this frame");
             }
         }
     }
@@ -2131,11 +2266,11 @@ pub(crate) fn rt_pipeline(
     }
 
     // Blit the per-pixel output buffer into the view's HDR storage texture (a
-    // normal wgpu compute pass on the shared ctx encoder → runs after the trace
-    // buffer, so the view target stays wgpu-layout-tracked). The diff view
-    // rides here: |current − frozen| heatmap when enabled.
-    // Exposure applies HERE: the buffer holds physical radiance. Debug views
-    // paint raw non-radiance values → exposure 1.0 so they display verbatim.
+    // raw heap dispatch on its own command buffer, after the trace + NRC
+    // composite). The diff view rides here: |current − frozen| heatmap when
+    // enabled. Exposure applies HERE: the buffer holds physical radiance.
+    // Debug views paint raw non-radiance values → exposure 1.0 so they
+    // display verbatim.
     let frozen_valid = frozen.filter(|f| f.pixels == output.pixels);
     let diff_on = debug
         .freeze_diff
@@ -2146,28 +2281,85 @@ pub(crate) fn rt_pipeline(
         || show_displacement
         || reference.is_some_and(|r| r.spatial_debug_paint() || r.gi_dead_view());
     let blit_exposure = if debug_paint { 1.0 } else { camera.exposure };
-    render_queue.write_buffer(
-        &rt_blit.params,
-        0,
-        bytemuck::bytes_of(&[diff_on as u32 as f32, diff_scale, blit_exposure, 0.0]),
-    );
     let frozen_binding = frozen_valid.map_or(&output.buffer, |f| &f.buffer);
-    let bind_group = render_device.create_bind_group(
-        "rt_blit_bind_group",
-        &pipeline_cache.get_bind_group_layout(&rt_blit.layout),
-        &BindGroupEntries::sequential((
-            output.buffer.as_entire_binding(),
-            view_target.get_unsampled_color_attachment().view,
-            frozen_binding.as_entire_binding(),
-            rt_blit.params.as_entire_binding(),
-        )),
+    let (Some(mut view_slots), Some(seam)) = (view_kernel_slots, seam.as_deref()) else {
+        return; // slots exist whenever the seam does; without a seam nothing traced.
+    };
+    // wgpu lazily zero-initializes a texture at its first TRACKED use; the raw
+    // blit write is untracked, so on a fresh view target (startup / resize)
+    // the first tracked use would otherwise be the opaque pass's Load —
+    // injecting a zero-clear AFTER the blit that wipes the frame. An empty
+    // attachment pass here pulls that lazy init BEFORE the blit (a no-op pass
+    // once the texture is initialized).
+    {
+        let attachment = view_target.get_unsampled_color_attachment();
+        ctx.command_encoder()
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rt_blit_init"),
+                color_attachments: &[Some(attachment)],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+    }
+    // Transition the view target to its storage state (GENERAL) through wgpu's
+    // tracker BEFORE the raw storage-image write: the raw dispatch is invisible
+    // to wgpu, so the tracked state must be moved to what the write requires —
+    // and downstream wgpu consumers (main pass sampling, DLSS RR) then
+    // transition FROM that tracked storage state with the storage-write
+    // src-access, covering the raw write's visibility.
+    ctx.command_encoder().transition_resources(
+        core::iter::empty(),
+        core::iter::once(wgpu::TextureTransition {
+            // bevy `Texture` → the wrapped `wgpu::Texture`.
+            texture: &**view_target.main_texture(),
+            selector: None,
+            state: wgpu::TextureUses::STORAGE_WRITE_ONLY,
+        }),
     );
-    let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+    let blob = rt_blit.kernel.push_blob(
+        "rt_blit",
+        bytemuck::bytes_of(&[diff_on as u32 as f32, diff_scale, blit_exposure, 0.0]),
+        &[
+            ("rt_output", view_slots.blit.buffer(seam, 0, &output.buffer)),
+            (
+                "view_output",
+                view_slots
+                    .blit_images
+                    .storage_image(seam, view_target.get_unsampled_color_attachment().view),
+            ),
+            ("frozen", view_slots.blit.buffer(seam, 2, frozen_binding)),
+        ],
+    );
+    // Own command buffer (the ctx encoder just recorded the wgpu transition);
+    // `add_command_buffer` flushes that first, so the transition precedes the
+    // dispatch.
+    let mut blit_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("rt_blit"),
-        timestamp_writes: None,
     });
-    pass.set_pipeline(blit_pipeline);
-    pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // pre-barrier orders the composite/spatial output writes before our read
+    // (the trace's own trailing barrier covers the RT-stage writes).
+    unsafe {
+        blit_encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &rt_blit.raw_device;
+            let pre = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ)];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&pre));
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, rt_blit.kernel.pipeline);
+            dev.cmd_dispatch(cb, viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
+            // No trailing raw barrier: the blit writes only the view image, and
+            // every consumer is a wgpu pass whose transition out of the tracked
+            // storage state carries the needed storage-write dependency.
+        });
+    }
+    ctx.add_command_buffer(blit_encoder.finish());
 }

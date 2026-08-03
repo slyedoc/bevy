@@ -18,32 +18,31 @@
 //! Upscaling is not yet implemented: every non-`Off` mode runs as DLAA (render
 //! resolution == display resolution).
 
+#![allow(unsafe_code)]
+
 use std::{
     ops::Deref,
     sync::{Arc, Mutex},
 };
 
+use ash::vk;
 use bevy_anti_alias::dlss::DlssRayReconstructionSupported;
 use bevy_app::App;
-use bevy_asset::{load_embedded_asset, AssetServer};
 use bevy_diagnostic::FrameCount;
 use bevy_ecs::{
     component::Component,
     entity::Entity,
     query::With,
     resource::Resource,
-    system::{Commands, Query, Res, ResMut},
+    system::{Commands, Query, Res},
 };
 use bevy_math::{Mat4, ToRender, UVec2, Vec2};
 use bevy_render::{
     camera::ExtractedCamera,
     extract_resource::ExtractResource,
     render_resource::{
-        binding_types::{storage_buffer_read_only_sized, texture_storage_2d},
-        BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, Extent3d,
-        PipelineCache, ShaderStages, StorageTextureAccess, Texture, TextureDescriptor,
-        TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
+        CommandEncoderDescriptor, Extent3d, Texture, TextureDescriptor, TextureDimension,
+        TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
     },
     renderer::{
         raw_vulkan_init::AdditionalVulkanFeatures, RenderAdapter, RenderContext, RenderDevice,
@@ -52,6 +51,11 @@ use bevy_render::{
     view::{ExtractedView, ViewTarget},
     RenderApp,
 };
+use wgpu::hal::api::Vulkan as VkApi;
+
+use crate::gpu::allocator::Allocator;
+use crate::gpu::binding_seam::{BindingSeam, HeapKind};
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use dlss_wgpu::{
     ray_reconstruction::{
         DlssRayReconstruction, DlssRayReconstructionDepthMode,
@@ -150,12 +154,36 @@ pub struct SolariDlssTextures {
     _textures: [Texture; 6],
 }
 
-/// The DLSS guide-resolve compute pipeline + its bind-group layout.
+/// The DLSS guide-resolve heap kernel (`dlss_resolve.slang`). The per-view
+/// heap slots live on [`SolariDlssResolveSlots`].
 #[derive(Resource)]
 pub struct SolariDlssResolve {
-    pub layout: BindGroupLayoutDescriptor,
-    pub pipeline: CachedComputePipelineId,
+    kernel: HeapKernel,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
+
+impl Drop for SolariDlssResolve {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for SolariDlssResolve {}
+unsafe impl Sync for SolariDlssResolve {}
+
+/// Per-view heap slots for the guide resolve (4 packed-buffer + 6 storage-image
+/// slots). Per view because slot descriptors resolve at execution time — one
+/// shared set rewritten per view would leave every recorded dispatch reading
+/// the last view's resources. Created once per view and kept (slots are
+/// app-lifetime); a resolution change only changes what the per-dispatch
+/// rewrites point them at.
+#[derive(Component)]
+pub struct SolariDlssResolveSlots(KernelSlots);
 
 /// Create the DLSS SDK if Ray Reconstruction is supported on this machine and insert
 /// [`SolariDlssSdk`] into the render world. Returns whether DLSS RR is active.
@@ -199,106 +227,127 @@ pub fn init_dlss(app: &mut App) -> bool {
     }
 }
 
-/// `RenderStartup`: build the guide-resolve compute pipeline (independent of the
-/// per-view DLSS state; harmless when DLSS ends up unsupported).
+/// `RenderStartup` (after `SolariSetup`): compile the guide-resolve kernel —
+/// a layout-free heap pipeline ([`HeapKernel`]), Slang from source (harmless
+/// when DLSS ends up unsupported). No push params: the dispatch sizes itself
+/// from the depth texture.
 pub fn init_solari_dlss(
     mut commands: Commands,
-    pipeline_cache: Res<PipelineCache>,
-    asset_server: Res<AssetServer>,
-    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
 ) {
-    let layout = BindGroupLayoutDescriptor::new(
-        "solari_dlss_resolve_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                // 0..4: packed guide buffers from the trace.
-                storage_buffer_read_only_sized(false, None),
-                storage_buffer_read_only_sized(false, None),
-                storage_buffer_read_only_sized(false, None),
-                storage_buffer_read_only_sized(false, None),
-                // 4..10: unpacked guide textures RR consumes.
-                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
-                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
-                texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
-                texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
-                texture_storage_2d(TextureFormat::Rg16Float, StorageTextureAccess::WriteOnly),
-                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
-            ),
-        ),
-    );
-    let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("solari_dlss_resolve_pipeline".into()),
-        layout: vec![layout.clone()],
-        shader: load_embedded_asset!(asset_server.as_ref(), "dlss_resolve.wgsl"),
-        shader_defs: vec![],
-        entry_point: Some("resolve".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "dlss_resolve.slang",
+        include_str!("dlss_resolve.slang"),
+        "resolve",
+        &[],
+        &[],
+        "solari_dlss_resolve",
+        0,
+    ) else {
+        return;
+    };
+    commands.insert_resource(SolariDlssResolve {
+        kernel,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
-    registry.register("solari_dlss_resolve", pipeline);
-    commands.insert_resource(SolariDlssResolve { layout, pipeline });
 }
 
 fn create_guide_texture(
     render_device: &RenderDevice,
+    render_queue: &RenderQueue,
     size: UVec2,
     format: TextureFormat,
     label: &'static str,
 ) -> (Texture, TextureView) {
+    let extent = Extent3d {
+        width: size.x,
+        height: size.y,
+        depth_or_array_layers: 1,
+    };
     let texture = render_device.create_texture(&TextureDescriptor {
         label: Some(label),
-        size: Extent3d {
-            width: size.x,
-            height: size.y,
-            depth_or_array_layers: 1,
-        },
+        size: extent,
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
         format,
-        // Resolve writes (storage), DLSS reads.
-        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+        // Resolve writes (raw storage), DLSS reads; COPY_DST for the
+        // initializing write below.
+        usage: TextureUsages::STORAGE_BINDING
+            | TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST,
         view_formats: &[],
     });
+    // Mark the texture initialized with a TRACKED write: wgpu lazily
+    // zero-initializes a texture at its first tracked use, and these are
+    // written only by the untracked raw resolve — so RR's first tracked read
+    // would otherwise inject a zero-clear that wipes the resolved guides.
+    let bytes_per_pixel = format
+        .block_copy_size(None)
+        .expect("guide formats are uncompressed color");
+    render_queue.write_texture(
+        texture.as_image_copy(),
+        &vec![0u8; (size.x * size.y * bytes_per_pixel) as usize],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(size.x * bytes_per_pixel),
+            rows_per_image: None,
+        },
+        extent,
+    );
     let view = texture.create_view(&TextureViewDescriptor::default());
     (texture, view)
 }
 
-fn create_dlss_textures(render_device: &RenderDevice, size: UVec2) -> SolariDlssTextures {
+fn create_dlss_textures(
+    render_device: &RenderDevice,
+    render_queue: &RenderQueue,
+    size: UVec2,
+) -> SolariDlssTextures {
     let (t_depth, depth) = create_guide_texture(
         render_device,
+        render_queue,
         size,
         TextureFormat::R32Float,
         "solari_dlss_depth",
     );
     let (t_nr, normal_roughness) = create_guide_texture(
         render_device,
+        render_queue,
         size,
         TextureFormat::Rgba16Float,
         "solari_dlss_normal_roughness",
     );
     let (t_diff, diffuse_albedo) = create_guide_texture(
         render_device,
+        render_queue,
         size,
         TextureFormat::Rgba8Unorm,
         "solari_dlss_diffuse_albedo",
     );
     let (t_spec, specular_albedo) = create_guide_texture(
         render_device,
+        render_queue,
         size,
         TextureFormat::Rgba8Unorm,
         "solari_dlss_specular_albedo",
     );
     let (t_motion, motion) = create_guide_texture(
         render_device,
+        render_queue,
         size,
         TextureFormat::Rg16Float,
         "solari_dlss_motion",
     );
     let (t_shd, specular_hit_distance) = create_guide_texture(
         render_device,
+        render_queue,
         size,
         TextureFormat::R32Float,
         "solari_dlss_specular_hit_distance",
@@ -329,9 +378,11 @@ pub fn prepare_solari_dlss(
             &ExtractedCamera,
             Option<&mut SolariDlssContext>,
             Option<&SolariDlssTextures>,
+            Option<&SolariDlssResolveSlots>,
         ),
         With<SolariCamera>,
     >,
+    seam: Option<Res<BindingSeam>>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     frame_count: Res<FrameCount>,
@@ -353,10 +404,33 @@ pub fn prepare_solari_dlss(
     // implemented.
     let perf_quality = DlssPerfQualityMode::Dlaa;
 
-    for (entity, camera, context, textures) in &mut views {
+    for (entity, camera, context, textures, resolve_slots) in &mut views {
         let Some(upscaled) = camera.physical_viewport_size else {
             continue;
         };
+
+        // The resolve's per-view heap slots, once (4 buffers + 6 storage images).
+        if resolve_slots.is_none() {
+            if let Some(seam) = seam.as_deref() {
+                commands
+                    .entity(entity)
+                    .insert(SolariDlssResolveSlots(KernelSlots::new_mixed(
+                        seam,
+                        &[
+                            HeapKind::Buffer,
+                            HeapKind::Buffer,
+                            HeapKind::Buffer,
+                            HeapKind::Buffer,
+                            HeapKind::Image,
+                            HeapKind::Image,
+                            HeapKind::Image,
+                            HeapKind::Image,
+                            HeapKind::Image,
+                            HeapKind::Image,
+                        ],
+                    )));
+            }
+        }
 
         // CRITICAL: the NGX feature lifecycle (create/destroy) must NEVER run while
         // the raw trace is live — it hard-hangs the GPU. So the per-view context is
@@ -418,7 +492,11 @@ pub fn prepare_solari_dlss(
         if textures.map_or(true, |t| t.size != render_resolution) {
             commands
                 .entity(entity)
-                .insert(create_dlss_textures(&render_device, render_resolution));
+                .insert(create_dlss_textures(
+                    &render_device,
+                    &render_queue,
+                    render_resolution,
+                ));
         }
 
         // Jitter the trace only when DLSS is actually running; Off renders a fresh,
@@ -444,45 +522,89 @@ pub fn dlss_enabled(mode: Res<SolariDlssMode>) -> bool {
 
 /// `Core3d` (after `rt_pipeline`, before `solari_dlss_render`): unpack the trace's
 /// packed guide buffers into the guide textures RR consumes. Gated on
-/// [`dlss_enabled`]; the context + textures are always present.
+/// [`dlss_enabled`]; the context + textures are always present. A raw heap
+/// dispatch: the guide textures are first moved to their storage state
+/// (GENERAL) through wgpu's tracker, so RR's tracked reads transition out of
+/// it with the storage-write dependency that covers the raw writes.
 pub fn solari_dlss_resolve(
-    view: ViewQuery<(&RtOutputBuffer, &SolariDlssTextures)>,
-    resolve: Res<SolariDlssResolve>,
-    pipeline_cache: Res<PipelineCache>,
+    view: ViewQuery<(
+        &RtOutputBuffer,
+        &SolariDlssTextures,
+        Option<&SolariDlssResolveSlots>,
+    )>,
+    resolve: Option<Res<SolariDlssResolve>>,
+    seam: Option<Res<BindingSeam>>,
     render_device: Res<RenderDevice>,
     mut ctx: RenderContext,
 ) {
-    let (output, textures) = view.into_inner();
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(resolve.pipeline) else {
+    let (output, textures, slots) = view.into_inner();
+    let (Some(resolve), Some(seam), Some(slots)) = (resolve, seam.as_deref(), slots) else {
         return;
     };
 
-    let bind_group = render_device.create_bind_group(
-        "solari_dlss_resolve_bind_group",
-        &pipeline_cache.get_bind_group_layout(&resolve.layout),
-        &BindGroupEntries::sequential((
-            output.gbuffer[0].buffer.as_entire_binding(), // normal + roughness
-            output.gbuffer[1].buffer.as_entire_binding(), // diffuse + depth
-            output.gbuffer[2].buffer.as_entire_binding(), // specular + hit distance
-            output.gbuffer[3].buffer.as_entire_binding(), // motion
-            &textures.depth,
-            &textures.normal_roughness,
-            &textures.diffuse_albedo,
-            &textures.specular_albedo,
-            &textures.motion,
-            &textures.specular_hit_distance,
-        )),
+    // Move the guide textures to their storage state (GENERAL) through wgpu's
+    // tracker BEFORE the raw storage-image writes — the raw dispatch is
+    // invisible to wgpu, so the tracked state must match what the writes
+    // require, and RR's later tracked reads transition FROM it.
+    ctx.command_encoder().transition_resources(
+        core::iter::empty(),
+        textures._textures.iter().map(|texture| wgpu::TextureTransition {
+            // bevy `Texture` → the wrapped `wgpu::Texture`.
+            texture: &**texture,
+            selector: None,
+            state: wgpu::TextureUses::STORAGE_WRITE_ONLY,
+        }),
     );
 
-    let mut pass = ctx
-        .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("solari_dlss_resolve"),
-            timestamp_writes: None,
+    let blob = resolve.kernel.push_blob(
+        "solari_dlss_resolve",
+        &[],
+        &[
+            ("nr_buf", slots.0.buffer(seam, 0, &output.gbuffer[0].buffer)), // normal + roughness
+            ("diffuse_buf", slots.0.buffer(seam, 1, &output.gbuffer[1].buffer)), // diffuse + depth
+            ("specular_buf", slots.0.buffer(seam, 2, &output.gbuffer[2].buffer)), // specular + hit distance
+            ("motion_buf", slots.0.buffer(seam, 3, &output.gbuffer[3].buffer)), // motion
+            ("out_depth", slots.0.storage_image(seam, 4, &textures.depth)),
+            ("out_normal_roughness", slots.0.storage_image(seam, 5, &textures.normal_roughness)),
+            ("out_diffuse", slots.0.storage_image(seam, 6, &textures.diffuse_albedo)),
+            ("out_specular", slots.0.storage_image(seam, 7, &textures.specular_albedo)),
+            ("out_motion", slots.0.storage_image(seam, 8, &textures.motion)),
+            (
+                "out_spec_hit_distance",
+                slots.0.storage_image(seam, 9, &textures.specular_hit_distance),
+            ),
+        ],
+    );
+    // Own command buffer (the ctx encoder just recorded the wgpu transitions —
+    // the fork panics if one encoder mixes wgpu work with raw `as_hal_mut`);
+    // `add_command_buffer` flushes the transitions ahead of the dispatch.
+    let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("solari_dlss_resolve"),
+    });
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // pre-barrier orders prior compute writes before our buffer reads (the
+    // trace's own trailing barrier covers the RT-stage gbuffer writes).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &resolve.raw_device;
+            let pre = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ)];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&pre));
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, resolve.kernel.pipeline);
+            dev.cmd_dispatch(cb, textures.size.x.div_ceil(8), textures.size.y.div_ceil(8), 1);
+            // No trailing raw barrier: the resolve writes only the guide
+            // images, and RR's tracked reads transition out of the storage
+            // state with the storage-write dependency.
         });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(textures.size.x.div_ceil(8), textures.size.y.div_ceil(8), 1);
+    }
+    ctx.add_command_buffer(encoder.finish());
 }
 
 /// `Core3d` (after `solari_dlss_resolve`, before tonemapping): run DLSS Ray

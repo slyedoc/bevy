@@ -24,6 +24,9 @@
 //! it to the main world → an observer resolves the owning entity (carried in each
 //! record as `Entity::to_bits`) and writes its `GlobalTransform`.
 
+#![allow(unsafe_code)]
+
+use ash::vk;
 use bevy_app::{App, Startup};
 use bevy_asset::{Assets, Handle, RenderAssetUsages};
 use bevy_ecs::{
@@ -35,24 +38,21 @@ use bevy_ecs::{
 };
 use bevy_math::{DAffine3, DMat3, DVec3};
 use bevy_render::{
-    diagnostic::RecordDiagnostics as _,
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     gpu_readback::{Readback, ReadbackComplete},
     render_asset::RenderAssets,
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        BufferUsages, ComputePassDescriptor, PipelineCache, ShaderStages, ShaderType,
-    },
-    renderer::{RenderContext, RenderDevice, RenderQueue},
+    render_resource::BufferUsages,
+    renderer::RenderContext,
     storage::{GpuShaderBuffer, ShaderBuffer},
 };
 use bevy_transform::components::GlobalTransform;
 use bytemuck::{Pod, Zeroable};
+use wgpu::hal::api::Vulkan as VkApi;
 
 use crate::ecs_gpu::GpuColumn;
-use crate::pipelines::SolariPipelines;
-use crate::resource_manager::SolariResourceManager;
+use crate::gpu::allocator::Allocator;
+use crate::gpu::binding_seam::BindingSeam;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 
 use super::frontier::{TransformFrontier, CONSUMER_ARGS_OFFSET};
 use super::graph::{NoReadbackColumn, NodeEntityColumn, ParentColumn};
@@ -100,52 +100,49 @@ pub struct NoGpuGlobalTransformReadback;
 
 /// Main-world handle to the readback output `ShaderBuffer` (the gather writes it;
 /// bevy's [`Readback`] streams it back). Extracted to the render world so the
-/// gather bind group can resolve the prepared GPU buffer.
+/// gather dispatch can resolve the prepared GPU buffer.
 #[derive(Resource, Clone, ExtractResource)]
 pub struct TransformReadbackTarget {
     buffer: Handle<ShaderBuffer>,
 }
 
-/// Uniform shared with `transform_readback.wgsl::ReadbackParams`.
+/// Push params shared with `transform_readback.slang::ReadbackParams`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct ReadbackParams {
     /// World-buffer node coverage (out-of-range guard).
     node_count: u32,
     /// Max output records (overflow drops past this).
     capacity: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
-/// Render-world resource: the gather pipeline + its params/bind group.
+/// Render-world resource: the gather heap kernel + its slots.
 #[derive(Resource)]
 pub struct TransformReadback {
-    params: bevy_render::render_resource::UniformBuffer<ReadbackParams>,
-    bind_group: Option<BindGroup>,
+    params: ReadbackParams,
     changed_count: u32,
     /// Idle frames left to retain the last gather's records (see [`HEADER_RETAIN_FRAMES`]).
     header_retain: u32,
+    kernel: HeapKernel,
+    slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// The readback bind-group layout. Owned by
-/// [`SolariResourceManager`](crate::resource_manager::SolariResourceManager).
-pub fn transform_readback_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
-        "transform_readback",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 local delta (changed records)
-                storage_buffer_read_only_sized(false, None), // 1 world_abs_linear
-                storage_buffer_read_only_sized(false, None), // 2 world_abs_t (f64 bit pairs)
-                storage_buffer_sized(false, None),           // 3 out (rw, atomic count + records)
-                uniform_buffer::<ReadbackParams>(false),     // 4 params
-                storage_buffer_read_only_sized(false, None), // 5 no_readback (per-node opt-out flag)
-                storage_buffer_read_only_sized(false, None), // 6 parent (ancestor walk for cascade)
-                storage_buffer_read_only_sized(false, None), // 7 node_entity (owning entity bits)
-            ),
-        ),
-    )
+impl Drop for TransformReadback {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
 }
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for TransformReadback {}
+unsafe impl Sync for TransformReadback {}
 
 /// Main world: create the readback output buffer and spawn the [`Readback`] that
 /// streams it back, with the decode-and-write observer attached. Runs once.
@@ -166,17 +163,36 @@ pub fn setup_transform_readback(mut commands: Commands, mut buffers: ResMut<Asse
         .observe(write_readback_global_transforms);
 }
 
-/// `RenderStartup`: the readback pass owns only its params buffer + bind group;
-/// the layout lives in `SolariResourceManager`, the pipeline id in `SolariPipelines`.
-pub fn init_transform_readback(mut commands: Commands) {
-    let mut params = bevy_render::render_resource::UniformBuffer::<ReadbackParams>::default();
-    params.set_label(Some("transform_readback"));
-
+/// `RenderStartup` (after `SolariSetup`): compile the gather kernel — a
+/// layout-free heap pipeline ([`HeapKernel`]), Slang from source.
+pub fn init_transform_readback(
+    mut commands: Commands,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
+) {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "transform_readback.slang",
+        include_str!("transform_readback.slang"),
+        "readback",
+        &[],
+        &[],
+        "transform_readback",
+        size_of::<ReadbackParams>() as u32,
+    ) else {
+        return;
+    };
     commands.insert_resource(TransformReadback {
-        params,
-        bind_group: None,
+        params: ReadbackParams::default(),
         changed_count: 0,
         header_retain: 0,
+        kernel,
+        slots: KernelSlots::new(&seam, 7),
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -184,25 +200,27 @@ pub fn init_transform_readback(mut commands: Commands) {
 /// delta + reset the output count header to 0 (the gather atomic-appends from
 /// there). The readback set is the changed nodes — same delta propagation walks.
 pub fn prepare_transform_readback(
-    mut readback: ResMut<TransformReadback>,
+    mut readback: Option<ResMut<TransformReadback>>,
     frontier: Option<Res<TransformFrontier>>,
     propagate: Option<Res<TransformPropagate>>,
     target: Option<Res<TransformReadbackTarget>>,
     gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
+    render_queue: Res<bevy_render::renderer::RenderQueue>,
 ) {
-    let (Some(frontier), Some(propagate), Some(target)) = (frontier, propagate, target) else {
+    let (Some(readback), Some(frontier), Some(propagate), Some(target)) =
+        (readback.as_deref_mut(), frontier, propagate, target)
+    else {
         return;
     };
     // Seed count is the CPU-visible "anything moved?" gate; the true gather count
     // (seeds + GPU-expanded descendants) is in the frontier header, dispatched indirect.
     readback.changed_count = frontier.seed_count();
-    *readback.params.get_mut() = ReadbackParams {
+    readback.params = ReadbackParams {
         node_count: propagate.node_count(),
         capacity: READBACK_CAPACITY,
+        _pad0: 0,
+        _pad1: 0,
     };
-    readback.params.write_buffer(&render_device, &render_queue);
 
     // Reset the atomic count header before a gather that repopulates it; otherwise
     // RETAIN the last gather's records for a few idle frames so a transfer window that
@@ -224,107 +242,124 @@ pub fn prepare_transform_readback(
     }
 }
 
-/// `Render::PrepareBindGroups`: (re)build the gather bind group. Needs the
-/// prepared output `ShaderBuffer`; if it isn't ready, leaves `None` (skip).
-pub fn prepare_transform_readback_bind_group(
-    mut readback: ResMut<TransformReadback>,
-    resource_manager: Option<Res<SolariResourceManager>>,
-    frontier: Option<Res<TransformFrontier>>,
-    no_readback: Option<Res<GpuColumn<NoReadbackColumn>>>,
-    parent: Option<Res<GpuColumn<ParentColumn>>>,
-    entity: Option<Res<GpuColumn<NodeEntityColumn>>>,
-    propagate: Option<Res<TransformPropagate>>,
-    target: Option<Res<TransformReadbackTarget>>,
-    gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let (
-        Some(resource_manager),
-        Some(frontier),
-        Some(no_readback),
-        Some(parent),
-        Some(entity),
-        Some(propagate),
-        Some(target),
-    ) = (
-        resource_manager,
-        frontier,
-        no_readback,
-        parent,
-        entity,
-        propagate,
-        target,
-    )
-    else {
-        readback.bind_group = None;
-        return;
-    };
-    let (Some(out), Some(params)) = (gpu_buffers.get(&target.buffer), readback.params.binding())
-    else {
-        readback.bind_group = None;
-        return;
-    };
-    let layout = pipeline_cache.get_bind_group_layout(&resource_manager.transform_readback);
-    readback.bind_group = Some(render_device.create_bind_group(
-        "transform_readback",
-        &layout,
-        &BindGroupEntries::sequential((
-            frontier.frontier_buffer().as_entire_binding(),
-            propagate.world_abs_linear().as_entire_binding(),
-            propagate.world_abs_t().as_entire_binding(),
-            out.buffer.as_entire_binding(),
-            params,
-            no_readback.buffer().as_entire_binding(),
-            parent.buffer().as_entire_binding(),
-            entity.buffer().as_entire_binding(),
-        )),
-    ));
-}
-
-/// `RenderGraph` (`Propagate`, after the gather): walk the `local` delta and
+/// `RenderGraph` (`Propagate`, after the gather): walk the frontier worklist and
 /// atomic-append `(slot, world[slot])` for each changed node. bevy's `Readback`
 /// (`RenderSystems::Cleanup`, after this) streams the buffer to the main world.
+/// A raw heap dispatch: buffer slots rewritten per dispatch, params + slot array
+/// in push data, consuming the frontier's consumer indirect args.
 pub fn dispatch_transform_readback(
     readback: Option<Res<TransformReadback>>,
     frontier: Option<Res<TransformFrontier>>,
-    pipelines: Res<SolariPipelines>,
-    pipeline_cache: Res<PipelineCache>,
+    seam: Option<Res<BindingSeam>>,
+    propagate: Option<Res<TransformPropagate>>,
+    no_readback: Option<Res<GpuColumn<NoReadbackColumn>>>,
+    parent: Option<Res<GpuColumn<ParentColumn>>>,
+    entity: Option<Res<GpuColumn<NodeEntityColumn>>>,
+    target: Option<Res<TransformReadbackTarget>>,
+    gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
     mut ctx: RenderContext,
 ) {
     if !READBACK_ENABLED {
         return;
     }
-    let (Some(readback), Some(frontier)) = (readback, frontier) else {
+    let (
+        Some(readback),
+        Some(frontier),
+        Some(seam),
+        Some(propagate),
+        Some(no_readback),
+        Some(parent),
+        Some(entity),
+        Some(target),
+    ) = (
+        readback, frontier, seam, propagate, no_readback, parent, entity, target,
+    )
+    else {
         return;
     };
     if readback.changed_count == 0 {
         return; // nothing moved → the reset-to-0 header already says count = 0.
     }
     if !frontier.ran() {
-        return; // frontier pipelines still compiling — its indirect args are stale.
+        return; // the frontier chain skipped this frame — its indirect args are stale.
     }
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.transform_readback) else {
+    let Some(out) = gpu_buffers.get(&target.buffer) else {
         return;
     };
-    let Some(bind_group) = readback.bind_group.as_ref() else {
-        return;
-    };
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
+    let blob = readback.kernel.push_blob(
+        "transform_readback",
+        bytemuck::bytes_of(&readback.params),
+        &[
+            (
+                "frontier",
+                readback.slots.buffer(&seam, 0, frontier.frontier_buffer()),
+            ),
+            (
+                "world_abs_linear",
+                readback.slots.buffer(&seam, 1, propagate.world_abs_linear()),
+            ),
+            (
+                "world_abs_t",
+                readback.slots.buffer(&seam, 2, propagate.world_abs_t()),
+            ),
+            ("out", readback.slots.buffer(&seam, 3, &out.buffer)),
+            (
+                "no_readback",
+                readback.slots.buffer(&seam, 4, no_readback.buffer()),
+            ),
+            ("parent", readback.slots.buffer(&seam, 5, parent.buffer())),
+            ("node_entity", readback.slots.buffer(&seam, 6, entity.buffer())),
+        ],
+    );
     let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("transform_readback"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_group, &[]);
-    // Times the gather + ancestor-walk (the per-node `parent`-chain opt-out scan).
-    let d = diagnostics.time_span(&mut pass, "transform_readback");
-    // The gather set (seeds + GPU-expanded descendants) is GPU-sized — share the
-    // frontier's consumer indirect args with the propagate walk.
-    pass.dispatch_workgroups_indirect(frontier.indirect_buffer(), CONSUMER_ARGS_OFFSET);
-    d.end(&mut pass);
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket this dispatch against the surrounding passes (raw
+    // dispatches are invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &readback.raw_device;
+            let raw_indirect = frontier
+                .indirect_buffer()
+                .as_hal::<VkApi>()
+                .map(|b| b.raw_handle())
+                .expect("bevy_solari requires the Vulkan backend");
+            // The walk's world writes + the frontier's worklist/args writes ->
+            // our reads (and the args as indirect commands).
+            let pre = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER
+                        | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_READ
+                        | vk::AccessFlags2::SHADER_WRITE
+                        | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                )];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&pre));
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, readback.kernel.pipeline);
+            dev.cmd_dispatch_indirect(cb, raw_indirect, CONSUMER_ARGS_OFFSET);
+            // Our record writes -> the `Readback` transfer that streams the
+            // buffer to the CPU (and any downstream compute).
+            let post = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::COPY,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_READ
+                        | vk::AccessFlags2::SHADER_WRITE
+                        | vk::AccessFlags2::TRANSFER_READ,
+                )];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&post));
+        });
+    }
 }
 
 /// Main world: decode a delivered readback buffer and write `GlobalTransform` for

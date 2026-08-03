@@ -4,29 +4,26 @@
 //! `fill_incremental` and `finalize` passes) so the single GPU record count
 //! covers both.
 
+#![allow(unsafe_code)]
+
 use bevy_ecs::{
     resource::Resource,
     system::{Commands, Res, ResMut},
 };
-use bevy_render::{
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        PipelineCache, ShaderStages, ShaderType, UniformBuffer,
-    },
-    renderer::{RenderDevice, RenderQueue},
-};
+use bytemuck::{Pod, Zeroable};
 
-use crate::accel::ptlas::Ptlas;
+use crate::gpu::allocator::Allocator;
+use crate::gpu::binding_seam::BindingSeam;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::gpu::rt_pipeline::RtPipeline;
-use crate::resource_manager::SolariResourceManager;
-use crate::transform::TransformPropagate;
 
 use super::HairInstances;
 
-/// Uniform shared with `ptlas_hair_write.wgsl::HairWriteParams`.
+const WORKGROUP_SIZE: u32 = 64;
+
+/// Push params shared with `ptlas_hair_write.slang::HairWriteParams`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct HairWriteParams {
     pub hair_count: u32,
     pub hair_base: u32,
@@ -34,42 +31,66 @@ pub struct HairWriteParams {
     /// baked into each hair record's `instance_contribution_to_hit_group_index` so
     /// the trace reaches `chit_hair`. 0 until the RT pipeline exists (no trace yet).
     pub hair_sbt_record: u32,
-    pub pad1: u32,
+    /// X workgroup count of the 2D-split dispatch (flat-index reconstruction).
+    pub groups_x: u32,
 }
 
-/// Render-world resource: the hair PTLAS-write params + bind group.
+/// Render-world resource: the hair PTLAS-write heap kernel + its slots.
 #[derive(Resource)]
 pub struct HairPtlasWrite {
-    pub params: UniformBuffer<HairWriteParams>,
     pub hair_count: u32,
-    pub bind_group: Option<BindGroup>,
+    pub groups: (u32, u32, u32),
+    pub params: HairWriteParams,
+    pub kernel: HeapKernel,
+    pub slots: KernelSlots,
+    pub raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// The hair PTLAS-write `@group(0)` layout. Owned by [`SolariResourceManager`].
-pub fn ptlas_hair_write_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
+impl Drop for HairPtlasWrite {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for HairPtlasWrite {}
+unsafe impl Sync for HairPtlasWrite {}
+
+/// `RenderStartup` (after `SolariSetup`): compile the hair-write kernel — a
+/// layout-free heap pipeline ([`HeapKernel`]), Slang from source.
+pub fn init_hair_ptlas_write(
+    mut commands: Commands,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
+) {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "ptlas_hair_write.slang",
+        include_str!("ptlas_hair_write.slang"),
+        "hair_write",
+        &[],
+        &[],
         "ptlas_hair_write",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 hair_instances
-                storage_buffer_sized(false, None),           // 1 write_count (rw atomic)
-                storage_buffer_sized(false, None),           // 2 write_data (rw)
-                uniform_buffer::<HairWriteParams>(false),    // 3 params
-                storage_buffer_read_only_sized(false, None), // 4 world (transform table)
-            ),
-        ),
-    )
-}
-
-/// `RenderStartup`: the hair-write params buffer + resource.
-pub fn init_hair_ptlas_write(mut commands: Commands) {
-    let mut params = UniformBuffer::<HairWriteParams>::default();
-    params.set_label(Some("ptlas_hair_write"));
+        size_of::<HairWriteParams>() as u32,
+    ) else {
+        return;
+    };
+    let slots = KernelSlots::new(&seam, 4);
     commands.insert_resource(HairPtlasWrite {
-        params,
         hair_count: 0,
-        bind_group: None,
+        groups: (0, 0, 0),
+        params: HairWriteParams::default(),
+        kernel,
+        slots,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -77,12 +98,13 @@ pub fn init_hair_ptlas_write(mut commands: Commands) {
 /// is assigned by [`crate::accel::ptlas::prepare_ptlas_params`] onto
 /// [`HairInstances`] before this runs.
 pub fn prepare_hair_ptlas_write(
-    mut write: ResMut<HairPtlasWrite>,
+    write: Option<ResMut<HairPtlasWrite>>,
     instances: Option<Res<HairInstances>>,
     rt_pipeline: Option<Res<RtPipeline>>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
 ) {
+    let Some(mut write) = write else {
+        return;
+    };
     let Some(instances) = instances else {
         write.hair_count = 0;
         return;
@@ -93,48 +115,11 @@ pub fn prepare_hair_ptlas_write(
     // trace, so a stale index is never consumed.
     let hair_sbt_record = rt_pipeline.map_or(0, |rt| rt.hair_sbt_record());
     write.hair_count = instances.count;
-    *write.params.get_mut() = HairWriteParams {
+    write.groups = crate::ecs_gpu::linear_dispatch(instances.count.div_ceil(WORKGROUP_SIZE));
+    write.params = HairWriteParams {
         hair_count: instances.count,
         hair_base: instances.base,
         hair_sbt_record,
-        pad1: 0,
+        groups_x: write.groups.0,
     };
-    write.params.write_buffer(&render_device, &render_queue);
-}
-
-/// `Render::PrepareBindGroups`: build the hair-write bind group from the PTLAS
-/// record buffers + the hair instance buffer. Rebuilt each frame (the hair
-/// instance buffer can be reallocated by `RawBufferVec` growth).
-pub fn prepare_hair_ptlas_write_bind_group(
-    mut write: ResMut<HairPtlasWrite>,
-    resource_manager: Option<Res<SolariResourceManager>>,
-    ptlas: Option<Res<Ptlas>>,
-    instances: Option<Res<HairInstances>>,
-    propagate: Option<Res<TransformPropagate>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let (Some(resource_manager), Some(ptlas), Some(instances), Some(propagate)) =
-        (resource_manager, ptlas, instances, propagate)
-    else {
-        write.bind_group = None;
-        return;
-    };
-    let (Some(params), Some(hair_buffer)) = (write.params.binding(), instances.buffer.buffer())
-    else {
-        write.bind_group = None;
-        return;
-    };
-    let layout = pipeline_cache.get_bind_group_layout(&resource_manager.ptlas_hair_write);
-    write.bind_group = Some(render_device.create_bind_group(
-        "ptlas_hair_write",
-        &layout,
-        &BindGroupEntries::sequential((
-            hair_buffer.as_entire_binding(),
-            ptlas.write_count.as_entire_binding(),
-            ptlas.write_data.wgpu_buffer.as_entire_binding(),
-            params,
-            propagate.current_world().as_entire_binding(),
-        )),
-    ));
 }

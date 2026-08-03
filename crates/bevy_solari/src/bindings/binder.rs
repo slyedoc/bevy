@@ -173,7 +173,7 @@ fn sampler_key(info: &vk::SamplerCreateInfo) -> [u32; 16] {
 /// info (read-optimal by trace time — the wgpu bind group's usage keeps the
 /// layout transitions happening).
 #[allow(unsafe_code)]
-fn write_image_descriptor(seam: &BindingSeam, slot: u32, view: &wgpu::TextureView) {
+pub(crate) fn write_image_descriptor(seam: &BindingSeam, slot: u32, view: &wgpu::TextureView) {
     // SAFETY: the view is a live wgpu resource on the Vulkan backend; the
     // guard is dropped before anything can destroy it.
     if let Some(hal_view) = unsafe { view.as_hal::<VkApi>() } {
@@ -191,7 +191,7 @@ fn write_image_descriptor(seam: &BindingSeam, slot: u32, view: &wgpu::TextureVie
 
 /// Write one sampler heap descriptor from the sampler's recorded create info.
 #[allow(unsafe_code)]
-fn write_sampler_descriptor(seam: &BindingSeam, slot: u32, sampler: &wgpu::Sampler) {
+pub(crate) fn write_sampler_descriptor(seam: &BindingSeam, slot: u32, sampler: &wgpu::Sampler) {
     // SAFETY: as for the view above.
     if let Some(hal_sampler) = unsafe { sampler.as_hal::<VkApi>() } {
         let info = hal_sampler.create_info();

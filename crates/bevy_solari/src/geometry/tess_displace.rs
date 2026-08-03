@@ -6,8 +6,10 @@
 //! extracts it to the render world; [`hide_tessellated_base_instances`] masks the
 //! original flat cluster instance so only the tessellated version renders. The
 //! GPU tessellation itself lives in `tess_classify`; here the PTLAS-write
-//! ([`prepare_tess_ptlas_write`] / [`prepare_tess_ptlas_write_bind_group`]) reads
-//! the per-instance BLAS addresses it built and appends one PTLAS record each.
+//! ([`prepare_tess_ptlas_write`]) reads the per-instance BLAS addresses it
+//! built and appends one PTLAS record each.
+
+#![allow(unsafe_code)]
 
 use bevy_asset::AssetId;
 use bevy_asset::{Assets, Handle};
@@ -21,13 +23,16 @@ use bevy_image::Image;
 use bevy_math::Vec4;
 use bevy_render::{
     extract_resource::ExtractResource,
-    render_resource::{binding_types::*, *},
+    render_resource::*,
     renderer::{RenderDevice, RenderQueue},
 };
+use bytemuck::{Pod, Zeroable};
 
 use super::asset::ClusterMesh;
 use crate::bindings::RaytracingMesh3d;
 use crate::gpu::allocator::Allocator;
+use crate::gpu::binding_seam::BindingSeam;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::material::{SolariMaterial3d, StandardSolariMaterial};
 
 /// One real displacement-mapped scene instance the tessellation path tessellates
@@ -167,10 +172,10 @@ pub fn hide_tessellated_base_instances(
 
 // ── PTLAS injection (mirrors `hair/ptlas_hair.rs`) ────────────────────────────
 
-/// Shared PTLAS-write params (mirrors `tess_ptlas_write.wgsl::TessWriteParams`);
+/// Push params shared with `tess_ptlas_write.slang::TessWriteParams`;
 /// the per-instance transform / AABB / BLAS ride in the `instances` buffer.
 #[repr(C)]
-#[derive(Copy, Clone, Default, ShaderType)]
+#[derive(Copy, Clone, Default, Pod, Zeroable)]
 pub struct TessWriteParams {
     pub tess_count: u32,
     pub tess_base: u32,
@@ -180,7 +185,7 @@ pub struct TessWriteParams {
     pub partition_index: u32,
 }
 
-/// One injected tessellated instance (mirrors `tess_ptlas_write.wgsl::TessInstance`).
+/// One injected tessellated instance (mirrors `tess_ptlas_write.slang::TessInstance`).
 /// The BLAS is baked in OBJECT space, so both the PTLAS instance transform and the
 /// explicit AABB the partitioned build requires (a zero/NaN BLAS-derived AABB hangs
 /// it) are computed GPU-side in the write shader from `transforms[instance_id]` (the
@@ -204,76 +209,66 @@ pub struct TessInstanceGpu {
     pub instance_id: u32,
 }
 
-/// Render-world resource: the tessellation PTLAS-write pipeline, shared params +
-/// the per-instance buffer + bind group. Self-contained (its own pipeline id), so
-/// it touches neither `SolariPipelines` nor `SolariResourceManager`.
+/// Render-world resource: the tessellation PTLAS-write heap kernel, shared
+/// params + the per-instance buffer. Self-contained, so it touches neither
+/// `SolariPipelines` nor `SolariResourceManager`.
 #[derive(Resource)]
 pub struct TessPtlasWrite {
-    pub pipeline: CachedComputePipelineId,
-    pub layout: BindGroupLayoutDescriptor,
-    pub params: UniformBuffer<TessWriteParams>,
+    pub params: TessWriteParams,
     pub instances: StorageBuffer<Vec<TessInstanceGpu>>,
     pub tess_count: u32,
-    pub bind_group: Option<BindGroup>,
+    pub kernel: HeapKernel,
+    pub slots: KernelSlots,
+    pub raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// The tessellation PTLAS-write `@group(0)` layout: the shared PTLAS record
-/// buffers + the params UBO + the per-instance buffer (one record per tessellated
-/// instance, like hair's per-instance buffer).
-fn tess_ptlas_write_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
-        "tess_ptlas_write",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_sized(false, None), // 0 write_count (rw atomic)
-                storage_buffer_sized(false, None), // 1 write_data (rw)
-                uniform_buffer::<TessWriteParams>(false), // 2 params
-                storage_buffer_read_only_sized(false, None), // 3 instances
-                storage_buffer_read_only_sized(false, None), // 4 blas_addresses
-                storage_buffer_read_only_sized(false, None), // 5 transforms (world_rel)
-            ),
-        ),
-    )
+impl Drop for TessPtlasWrite {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
 }
 
-/// `RenderStartup`: queue the PTLAS-write pipeline + the params buffer.
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for TessPtlasWrite {}
+unsafe impl Sync for TessPtlasWrite {}
+
+/// `RenderStartup` (after `SolariSetup`): compile the PTLAS-write kernel — a
+/// layout-free heap pipeline ([`HeapKernel`]), Slang from source.
 pub fn init_tess_ptlas_write(
     mut commands: Commands,
-    pipeline_cache: Res<PipelineCache>,
-    asset_server: Res<bevy_asset::AssetServer>,
+    seam: Option<Res<BindingSeam>>,
     allocator: Option<Res<Allocator>>,
-    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
 ) {
-    if allocator.is_none() {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
         return;
-    }
-    let layout = tess_ptlas_write_layout();
-    let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("tess_ptlas_write".into()),
-        layout: vec![layout.clone()],
-        // Path is relative to THIS file's dir (`src/geometry/`), so the asset
-        // `pipelines.rs` registered as `geometry/tess_ptlas_write.wgsl` loads
-        // from here by its bare name.
-        shader: bevy_asset::load_embedded_asset!(asset_server.as_ref(), "tess_ptlas_write.wgsl"),
-        shader_defs: vec![],
-        entry_point: Some("tess_write".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
-    registry.register("tess_ptlas_write", pipeline);
-    let mut params = UniformBuffer::<TessWriteParams>::default();
-    params.set_label(Some("tess_ptlas_write"));
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "tess_ptlas_write.slang",
+        include_str!("tess_ptlas_write.slang"),
+        "tess_write",
+        &[],
+        &[],
+        "tess_ptlas_write",
+        size_of::<TessWriteParams>() as u32,
+    ) else {
+        return;
+    };
+    let slots = KernelSlots::new(&seam, 5);
     let mut instances = StorageBuffer::<Vec<TessInstanceGpu>>::default();
     instances.set_label(Some("tess_ptlas_write.instances"));
     commands.insert_resource(TessPtlasWrite {
-        pipeline,
-        layout,
-        params,
+        params: TessWriteParams::default(),
         instances,
         tess_count: 0,
-        bind_group: None,
+        kernel,
+        slots,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -361,7 +356,7 @@ pub fn prepare_tess_ptlas_write(
     write.instances.set(gpu_instances);
     write.instances.write_buffer(&render_device, &render_queue);
 
-    *write.params.get_mut() = TessWriteParams {
+    write.params = TessWriteParams {
         tess_count,
         tess_base: cluster_high_water + hair_count,
         // Unused by the write shader — each instance carries its own `sbt_record`.
@@ -371,82 +366,4 @@ pub fn prepare_tess_ptlas_write(
         // cluster instances (the global partition hangs the build with a lone occupant).
         partition_index: 0,
     };
-    write.params.write_buffer(&render_device, &render_queue);
-}
-
-/// `Render::PrepareBindGroups`: build the PTLAS-write bind group from the shared
-/// PTLAS record buffers + the params UBO.
-pub fn prepare_tess_ptlas_write_bind_group(
-    write: Option<ResMut<TessPtlasWrite>>,
-    ptlas: Option<Res<crate::accel::ptlas::Ptlas>>,
-    classify: Option<Res<super::tess_classify::TessClassify>>,
-    transforms_col: Option<Res<crate::ecs_gpu::GpuColumn<crate::instance::TransformColumn>>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let Some(mut write) = write else {
-        return;
-    };
-    let (fp, fi, fpt, fc) = (
-        write.params.binding().is_some(),
-        write.instances.binding().is_some(),
-        ptlas.is_some(),
-        classify.is_some(),
-    );
-    let (Some(ptlas), Some(params), Some(instances), Some(classify)) = (
-        ptlas,
-        write.params.binding(),
-        write.instances.binding(),
-        classify.as_ref(),
-    ) else {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) % 180 == 0 {
-            tracing::debug!(
-                "tess_ptlas_write_bind_group: bail A — ptlas={fpt} params={fp} instances={fi} classify={fc}",
-            );
-        }
-        write.bind_group = None;
-        return;
-    };
-    // The GPU per-instance BLAS-address buffer (built by `tess_classify`); absent until
-    // the CLAS pool is first sized, in which case there's nothing to inject yet.
-    let Some(blas_addresses) = classify.blas_addresses.as_ref() else {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) % 180 == 0 {
-            tracing::debug!("tess_ptlas_write_bind_group: bail B (classify.blas_addresses None)");
-        }
-        write.bind_group = None;
-        return;
-    };
-    // Gathered cluster-indexed origin-relative world column (the same buffer the
-    // closest-hit's `transforms` reads) — the write shader derives each instance's
-    // PTLAS transform + explicit AABB from `transforms[instance_id]`, so both rebase
-    // with the floating origin. NOT `current_world()` (that is NODE-indexed).
-    let Some(transforms_col) = transforms_col.as_ref() else {
-        write.bind_group = None;
-        return;
-    };
-    let transforms = transforms_col.buffer();
-    {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) % 180 == 0 {
-            tracing::debug!("tess_ptlas_write_bind_group: BUILT (tess write dispatches)");
-        }
-    }
-    let layout = pipeline_cache.get_bind_group_layout(&write.layout);
-    write.bind_group = Some(render_device.create_bind_group(
-        "tess_ptlas_write",
-        &layout,
-        &BindGroupEntries::sequential((
-            ptlas.write_count.as_entire_binding(),
-            ptlas.write_data.wgpu_buffer.as_entire_binding(),
-            params,
-            instances,
-            blas_addresses.as_entire_binding(),
-            transforms.as_entire_binding(),
-        )),
-    ));
 }

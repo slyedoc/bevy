@@ -1,6 +1,6 @@
 //! Self-contained single-scattering atmosphere → sky cubemap for the pathtracer.
 //!
-//! A compute pre-pass ([`atmosphere_bake.wgsl`](mod@self)) bakes the atmosphere
+//! A compute pre-pass (`atmosphere_bake.slang`) bakes the atmosphere
 //! into a cube from [`SolariAtmosphere`] + the primary [`SolariDirectionLight`];
 //! the pathtracer samples that cube on a ray miss (the skybox path).
 //! The cube persists, so the bake re-runs only when its inputs change (a moving
@@ -8,6 +8,9 @@
 //! atmosphere / raster `GpuLights` coupling — so it works with `PbrPlugin`
 //! disabled.
 
+#![allow(unsafe_code)]
+
+use ash::vk;
 use bevy_app::{App, Plugin};
 use bevy_core_pipeline::{
     core_3d::main_opaque_pass_3d,
@@ -23,25 +26,24 @@ use bevy_ecs::{
 use bevy_math::{Mat3, Quat, Vec3};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_render::{
-    diagnostic::RecordDiagnostics as _,
     render_resource::{
-        binding_types::{texture_storage_2d_array, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        ComputePassDescriptor, PipelineCache,
-        ShaderStages, ShaderType, StorageTextureAccess, TextureDescriptor, TextureDimension,
-        TextureFormat, TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension,
-        UniformBuffer,
+        CommandEncoderDescriptor, ShaderType, TextureDescriptor, TextureDimension, TextureFormat,
+        TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension,
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
     sync_world::RenderEntity,
     Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_transform::components::GlobalTransform;
+use wgpu::hal::api::Vulkan as VkApi;
 
+use crate::gpu::allocator::Allocator;
+use crate::gpu::binding_seam::{BindingSeam, HeapKind};
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::lights::SolariDirectionLight;
 use crate::pipelines::SolariPipelines;
-use crate::resource_manager::SolariResourceManager;
 use crate::render::SolariCamera;
+use crate::SolariSetup;
 
 /// Opt-in atmosphere support: registers the [`SolariAtmosphere`] /
 /// [`SolariGlobalFog`] / [`SolariAtmosphereVolume`] extract → bake → bind
@@ -62,7 +64,10 @@ impl Plugin for SolariAtmospherePlugin {
         render_app
             .init_resource::<SolariAtmosphereGpu>()
             .init_resource::<SolariAtmosphereVolumesGpu>()
-            .add_systems(RenderStartup, init_atmosphere_pipeline)
+            .add_systems(
+                RenderStartup,
+                (init_atmosphere_bake, init_atmosphere_lut_bake).after(SolariSetup),
+            )
             .add_systems(
                 ExtractSchedule,
                 (extract_solari_atmosphere, extract_atmosphere_volumes),
@@ -71,10 +76,6 @@ impl Plugin for SolariAtmospherePlugin {
                 Render,
                 (prepare_atmosphere_sky, prepare_atmosphere_volumes)
                     .in_set(RenderSystems::PrepareResources),
-            )
-            .add_systems(
-                Render,
-                prepare_atmosphere_bind_group.in_set(RenderSystems::PrepareBindGroups),
             )
             // Bake before the trace consumes the cube (same MainPass slot as the
             // trace; see `SolarRenderPlugin`'s compose-first ordering).
@@ -189,8 +190,7 @@ impl Default for SolariAtmosphere {
 }
 
 /// GPU mirror of [`SolariAtmosphere`] + the sun — matches `Atmosphere` in
-/// `atmosphere.wgsl`. `Default` is the "disabled" state (`aerial_enabled = 0`),
-/// bound by the pathtracer when no view has an atmosphere.
+/// `atmosphere.slang`. `Default` is the "disabled" state (`aerial_enabled = 0`).
 #[derive(Clone, Copy, Default, PartialEq, ShaderType)]
 pub struct GpuSolariAtmosphere {
     bottom_radius: f32,
@@ -213,17 +213,17 @@ pub struct GpuSolariAtmosphere {
     aerial_enabled: f32,
 }
 
-/// Render-world resource: the extracted atmosphere uniform + whether any solari
+/// Render-world resource: the extracted atmosphere params + whether any solari
 /// camera enabled it this frame.
 #[derive(Resource, Default)]
 pub struct SolariAtmosphereGpu {
-    uniform: UniformBuffer<GpuSolariAtmosphere>,
     pub enabled: bool,
-    /// The last extracted uniform value, to detect changes.
+    /// The last extracted params value, to detect changes; the bake pushes its
+    /// encase-encoded bytes as the kernel's push params.
     current: GpuSolariAtmosphere,
-    /// The sky cube is stale: the uniform changed while enabled. Cleared by
+    /// The sky cube is stale: the params changed while enabled. Cleared by
     /// [`dispatch_atmosphere_bake`] only once a bake is actually encoded, so a
-    /// pending bake survives pipeline compilation.
+    /// pending bake survives the kernel/cube coming up late.
     needs_bake: bool,
     /// World→bake rotation for cube sampling (see [`SolariAtmosphere::up`]).
     /// Changes freely per frame WITHOUT re-baking — it rides `RtCamera` to the
@@ -292,7 +292,7 @@ struct GpuAtmosphereVolumes {
 pub const MAX_ATMOSPHERE_VOLUMES: usize = 4;
 
 // Transmittance LUT: T(radius, sun-zenith cosine) per volume, baked by
-// `atmosphere_lut_bake.wgsl` into the SAME device-address buffer after the
+// `atmosphere_lut_bake.slang` into the SAME device-address buffer after the
 // header+volumes block — the march does one bilinear buffer lookup per step
 // instead of an inner sun integral. Layout constants mirror `raygen.slang` /
 // the bake shader.
@@ -316,8 +316,60 @@ pub struct SolariAtmosphereVolumesGpu {
     baked_params: GpuAtmosphereVolumes,
     /// LUT region is stale (params changed) — cleared once a bake is encoded.
     needs_lut_bake: bool,
-    /// The bake pass's bind group (recreated with the buffer).
-    lut_bind_group: Option<BindGroup>,
+}
+
+/// Render-world resource: the LUT-bake heap kernel + its slot.
+#[derive(Resource)]
+pub struct AtmosphereLutBake {
+    kernel: HeapKernel,
+    slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
+}
+
+impl Drop for AtmosphereLutBake {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for AtmosphereLutBake {}
+unsafe impl Sync for AtmosphereLutBake {}
+
+/// `RenderStartup` (after `SolariSetup`): compile the LUT-bake kernel — a
+/// layout-free heap pipeline ([`HeapKernel`]), Slang from source. No push
+/// params: the layout constants are baked into the kernel.
+pub fn init_atmosphere_lut_bake(
+    mut commands: Commands,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
+) {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "atmosphere_lut_bake.slang",
+        include_str!("atmosphere_lut_bake.slang"),
+        "bake",
+        &[],
+        &[],
+        "solari_atmosphere_lut_bake",
+        0,
+    ) else {
+        return;
+    };
+    let slots = KernelSlots::new(&seam, 1);
+    commands.insert_resource(AtmosphereLutBake {
+        kernel,
+        slots,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
+    });
 }
 
 /// `ExtractSchedule`: gather atmosphere volumes, centers relative to the
@@ -391,7 +443,7 @@ pub fn prepare_atmosphere_volumes(
     mut gpu: ResMut<SolariAtmosphereVolumesGpu>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    allocator: Option<Res<crate::gpu::allocator::Allocator>>,
+    allocator: Option<Res<Allocator>>,
 ) {
     if gpu.count == 0 && gpu.buffer.is_none() {
         return; // feature idle, never used
@@ -402,7 +454,7 @@ pub fn prepare_atmosphere_volumes(
     if gpu.buffer.is_none() {
         let Some(allocator) = allocator else { return };
         // Header + volumes at the front; the transmittance-LUT region (baked
-        // by `atmosphere_lut_bake.wgsl`, read by raygen via device address)
+        // by `atmosphere_lut_bake.slang`, read by raygen via device address)
         // follows at `ATMO_LUT_OFFSET`.
         let size = ATMO_LUT_OFFSET + MAX_ATMOSPHERE_VOLUMES as u64 * ATMO_LUT_LAYER_BYTES;
         let buffer =
@@ -414,7 +466,6 @@ pub fn prepare_atmosphere_volumes(
                 mapped_at_creation: false,
             });
         gpu.address = allocator.wgpu_buffer_device_address(&buffer).get();
-        gpu.lut_bind_group = None;
         gpu.buffer = Some(buffer);
     }
     if let Some(buffer) = &gpu.buffer {
@@ -426,64 +477,54 @@ pub fn prepare_atmosphere_volumes(
 
 /// `Core3d` (before the trace, next to the sky-cube bake): re-bake the
 /// transmittance LUT region when volume params changed. Reads params from and
-/// writes texels into the same storage buffer.
+/// writes texels into the same storage buffer. A raw heap dispatch: the buffer
+/// slot rewritten per dispatch, the slot array in push data (no params).
 pub fn dispatch_atmosphere_lut_bake(
     mut gpu: ResMut<SolariAtmosphereVolumesGpu>,
-    pipelines: Res<SolariPipelines>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-    resource_manager: Res<SolariResourceManager>,
+    bake: Option<Res<AtmosphereLutBake>>,
+    seam: Option<Res<BindingSeam>>,
     mut ctx: RenderContext,
 ) {
     if !gpu.needs_lut_bake || gpu.count == 0 {
         return;
     }
-    let Some(compute) = pipeline_cache.get_compute_pipeline(pipelines.atmosphere_lut) else {
-        return; // still compiling — flag stays set, retried next frame
+    // Kernel/seam/buffer not up yet — flag stays set, retried next frame.
+    let (Some(bake), Some(seam)) = (bake, seam) else {
+        return;
     };
-    if gpu.lut_bind_group.is_none() {
-        let Some(buffer) = &gpu.buffer else { return };
-        let layout = pipeline_cache.get_bind_group_layout(&resource_manager.atmosphere_lut);
-        gpu.lut_bind_group = Some(render_device.create_bind_group(
-            "solari_atmosphere_lut",
-            &layout,
-            &BindGroupEntries::single(buffer.as_entire_binding()),
-        ));
-    }
+    let Some(buffer) = &gpu.buffer else { return };
+    let blob = bake.kernel.push_blob(
+        "solari_atmosphere_lut_bake",
+        &[],
+        &[("buf", bake.slots.buffer(&seam, 0, buffer))],
+    );
     let count = gpu.count;
     gpu.needs_lut_bake = false;
-    let bind_group = gpu.lut_bind_group.as_ref().unwrap();
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
     let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("solari_atmosphere_lut_bake"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(compute);
-    pass.set_bind_group(0, bind_group, &[]);
-    let d = diagnostics.time_span(&mut pass, "solari_atmosphere_lut_bake");
-    pass.dispatch_workgroups(ATMO_LUT_W.div_ceil(8), ATMO_LUT_H.div_ceil(8), count);
-    d.end(&mut pass);
-}
-
-/// The LUT bake's bind-group layout (one read-write storage buffer). Owned by
-/// [`SolariResourceManager`](crate::resource_manager::SolariResourceManager).
-pub(crate) fn atmosphere_lut_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
-        "solari_atmosphere_lut",
-        &BindGroupLayoutEntries::single(
-            ShaderStages::COMPUTE,
-            bevy_render::render_resource::binding_types::storage_buffer_sized(false, None),
-        ),
-    )
-}
-
-impl SolariAtmosphereGpu {
-    /// The atmosphere uniform's binding, for the pathtracer's group(1) slot 6.
-    /// `Some` once [`prepare_atmosphere_sky`] has created the buffer.
-    pub fn binding(&self) -> Option<bevy_render::render_resource::BindingResource<'_>> {
-        self.uniform.binding()
+    // SAFETY: Vulkan backend; the slot references a live heap descriptor; the
+    // barriers bracket this dispatch against the surrounding wgpu compute
+    // passes (raw dispatches are invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &bake.raw_device;
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+            // Prior compute writes -> our header reads + LUT writes.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, bake.kernel.pipeline);
+            dev.cmd_dispatch(cb, ATMO_LUT_W.div_ceil(8), ATMO_LUT_H.div_ceil(8), count);
+            // Our LUT writes -> downstream compute reads; the trace's own
+            // pre-barrier covers RT-stage visibility.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+        });
     }
 }
 
@@ -499,31 +540,64 @@ pub struct AtmosphereSky {
     pub cube_view: TextureView,
     array_view: TextureView,
     /// The backing storage texture (kept so consumers can transition its layout
-    /// — it's written as a STORAGE image so wgpu leaves it in `GENERAL`).
+    /// — the bake moves it to its storage state through wgpu's tracker, so
+    /// wgpu leaves it in `GENERAL`).
     pub texture: bevy_render::render_resource::Texture,
 }
 
-/// Render-world resource: the bake's per-frame bind group. The bind-group layout
-/// lives in [`SolariResourceManager`](crate::resource_manager::SolariResourceManager)
-/// and the compiled pipeline id in [`crate::pipelines::SolariPipelines`].
+/// Render-world resource: the sky-bake heap kernel + its storage-image slot.
 #[derive(Resource)]
-pub struct AtmospherePipeline {
-    bind_group: Option<BindGroup>,
+pub struct AtmosphereBake {
+    kernel: HeapKernel,
+    slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// The atmosphere-bake bind-group layout. Owned by
-/// [`SolariResourceManager`](crate::resource_manager::SolariResourceManager).
-pub(crate) fn atmosphere_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
-        "solari_atmosphere",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                uniform_buffer::<GpuSolariAtmosphere>(false),
-                texture_storage_2d_array(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
-            ),
-        ),
-    )
+impl Drop for AtmosphereBake {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for AtmosphereBake {}
+unsafe impl Sync for AtmosphereBake {}
+
+/// `RenderStartup` (after `SolariSetup`): compile the sky-bake kernel — a
+/// layout-free heap pipeline ([`HeapKernel`]), Slang from source with the
+/// shared `atmosphere` physics module. The `Atmosphere` params (96 B) ride
+/// the push block.
+pub fn init_atmosphere_bake(
+    mut commands: Commands,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
+) {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "atmosphere_bake.slang",
+        include_str!("atmosphere_bake.slang"),
+        "bake",
+        &[("atmosphere", include_str!("atmosphere.slang"))],
+        &[],
+        "solari_atmosphere_bake",
+        GpuSolariAtmosphere::min_size().get() as u32,
+    ) else {
+        return;
+    };
+    let slots = KernelSlots::new_mixed(&seam, &[HeapKind::Image]);
+    commands.insert_resource(AtmosphereBake {
+        kernel,
+        slots,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
+    });
 }
 
 /// `ExtractSchedule`: gather the primary `SolariAtmosphere` + the primary sun into
@@ -599,15 +673,11 @@ pub fn extract_solari_atmosphere(
             aerial_enabled: f32::from(fog.is_some()),
         };
     }
-    // No atmosphere view: a disabled (default) uniform keeps the pathtracer's
-    // binding valid (it gates aerial perspective on `aerial_enabled`).
-    //
-    // Touch the uniform only when its contents actually changed — `get_mut`
-    // marks it for re-upload, and an unchanged sky needs no re-bake. A typical
-    // frame (static sun + params) costs one compare here and nothing on the GPU.
+    // Re-bake only when the params actually changed — an unchanged sky needs
+    // no re-bake. A typical frame (static sun + params) costs one compare here
+    // and nothing on the GPU.
     if next != gpu.current {
         gpu.current = next;
-        *gpu.uniform.get_mut() = next;
         if any {
             gpu.needs_bake = true;
         }
@@ -618,24 +688,13 @@ pub fn extract_solari_atmosphere(
     gpu.enabled = any;
 }
 
-/// `RenderStartup`: the bake owns only its per-frame bind group; the layout lives
-/// in `SolariResourceManager`, the pipeline id in `SolariPipelines`.
-pub fn init_atmosphere_pipeline(mut commands: Commands) {
-    commands.insert_resource(AtmospherePipeline { bind_group: None });
-}
-
-/// `Render::PrepareResources`: allocate the sky cube once, upload the uniform.
+/// `Render::PrepareResources`: allocate the sky cube once.
 pub fn prepare_atmosphere_sky(
     mut commands: Commands,
     sky: Option<Res<AtmosphereSky>>,
     render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut gpu: ResMut<SolariAtmosphereGpu>,
+    gpu: Res<SolariAtmosphereGpu>,
 ) {
-    // Keep the uniform binding valid every frame (the pathtracer binds it even
-    // with no atmosphere view); `UniformBuffer` skips the upload when unchanged.
-    gpu.uniform.write_buffer(&render_device, &render_queue);
-
     if !gpu.enabled || sky.is_some() {
         return;
     }
@@ -670,59 +729,72 @@ pub fn prepare_atmosphere_sky(
     });
 }
 
-/// `Render::PrepareBindGroups`: (re)build the bake bind group. Rebuilt every
-/// frame — cheap, and immune to a bound resource changing allocation later.
-pub fn prepare_atmosphere_bind_group(
-    mut pipeline: ResMut<AtmospherePipeline>,
-    resource_manager: Option<Res<SolariResourceManager>>,
-    sky: Option<Res<AtmosphereSky>>,
-    gpu: Res<SolariAtmosphereGpu>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let (Some(resource_manager), Some(sky), Some(uniform)) =
-        (resource_manager, sky, gpu.uniform.binding())
-    else {
-        return;
-    };
-    let layout = pipeline_cache.get_bind_group_layout(&resource_manager.atmosphere);
-    pipeline.bind_group = Some(render_device.create_bind_group(
-        "solari_atmosphere",
-        &layout,
-        &BindGroupEntries::sequential((uniform, &sky.array_view)),
-    ));
-}
-
 /// `RenderGraph` (before the pathtracer): bake the sky cube, but only when its
 /// inputs changed — the cube persists, so a static sun + params re-bakes nothing.
+/// A raw heap dispatch: the cube's storage-image slot rewritten per bake, the
+/// `Atmosphere` params in push data.
 pub fn dispatch_atmosphere_bake(
-    pipeline: Res<AtmospherePipeline>,
-    pipelines: Res<SolariPipelines>,
+    bake: Option<Res<AtmosphereBake>>,
+    seam: Option<Res<BindingSeam>>,
+    sky: Option<Res<AtmosphereSky>>,
     mut gpu: ResMut<SolariAtmosphereGpu>,
-    pipeline_cache: Res<PipelineCache>,
+    render_device: Res<RenderDevice>,
     mut ctx: RenderContext,
 ) {
     if !gpu.enabled || !gpu.needs_bake {
         return;
     }
-    let (Some(compute), Some(bind_group)) = (
-        pipeline_cache.get_compute_pipeline(pipelines.atmosphere),
-        pipeline.bind_group.as_ref(),
-    ) else {
+    // Kernel/seam/cube not up yet — flag stays set, retried next frame.
+    let (Some(bake), Some(seam), Some(sky)) = (bake, seam, sky) else {
         return;
     };
     gpu.needs_bake = false;
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-    let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+    // Push params: the encase std140 bytes of `GpuSolariAtmosphere` — identical
+    // to the shader's std430 push block for this flat f32/vec3 struct.
+    let mut params = bevy_render::render_resource::encase::UniformBuffer::new(Vec::<u8>::new());
+    params.write(&gpu.current).expect("atmosphere params encode");
+    let blob = bake.kernel.push_blob(
+        "solari_atmosphere_bake",
+        &params.into_inner(),
+        &[("sky", bake.slots.storage_image(&seam, 0, &sky.array_view))],
+    );
+    // Move the cube to its storage state (GENERAL) through wgpu's tracker
+    // BEFORE the raw storage write: nothing wgpu-side ever touches this
+    // texture otherwise (only the raw trace samples it, with its own
+    // GENERAL↔READ_ONLY round trip), so this both performs the initial
+    // UNDEFINED→GENERAL transition and keeps the tracked state matching the
+    // "wgpu leaves it in GENERAL" contract the trace relies on.
+    ctx.command_encoder().transition_resources(
+        core::iter::empty(),
+        core::iter::once(wgpu::TextureTransition {
+            // bevy `Texture` → the wrapped `wgpu::Texture`.
+            texture: &*sky.texture,
+            selector: None,
+            state: wgpu::TextureUses::STORAGE_WRITE_ONLY,
+        }),
+    );
+    // Own command buffer (the ctx encoder just recorded the wgpu transition —
+    // the fork panics if one encoder mixes wgpu work with raw `as_hal_mut`);
+    // `add_command_buffer` flushes the transition ahead of the dispatch.
+    let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("solari_atmosphere_bake"),
-        timestamp_writes: None,
     });
-    pass.set_pipeline(compute);
-    pass.set_bind_group(0, bind_group, &[]);
-    let d = diagnostics.time_span(&mut pass, "solari_atmosphere_bake");
-    pass.dispatch_workgroups(SKY_SIZE.div_ceil(8), SKY_SIZE.div_ceil(8), 6);
-    d.end(&mut pass);
+    // SAFETY: Vulkan backend; the slot references a live heap descriptor. No
+    // raw barriers: the bake reads only push data, ordering against the prior
+    // frame's trace comes from the trace's own cube restore barrier
+    // (RT→COMPUTE, dst SHADER_WRITE), and this frame's trace read is covered
+    // by its GENERAL→READ_ONLY barrier (src COMPUTE SHADER_WRITE).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &bake.raw_device;
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, bake.kernel.pipeline);
+            dev.cmd_dispatch(cb, SKY_SIZE.div_ceil(8), SKY_SIZE.div_ceil(8), 6);
+        });
+    }
+    ctx.add_command_buffer(encoder.finish());
 }
 

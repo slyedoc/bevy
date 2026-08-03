@@ -35,16 +35,16 @@ use bevy_ecs::{
     resource::Resource,
     system::{Commands, Res, ResMut},
 };
-use bevy_render::render_resource::{ComputePassDescriptor, PipelineCache};
 use bevy_render::renderer::{RenderContext, RenderDevice};
-use bevy_render::camera::ExtractedCamera;
-use bevy_render::view::ViewUniformOffset;
+use wgpu::hal::api::Vulkan as VkApi;
 use wgpu::CommandEncoderDescriptor;
 
-use crate::instance::InstanceManager;
+use crate::ecs_gpu::GpuColumn;
+use crate::instance::{GeometryIdColumn, InstanceManager};
 
 use crate::gpu::allocator::{Allocator, SparseBuffer};
 use super::blas_sharing::BlasSharing;
+use crate::gpu::binding_seam::BindingSeam;
 use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
 use super::selector::Selector;
 
@@ -141,10 +141,8 @@ pub fn dispatch_blas_rebuild(
     selector: Option<Res<Selector>>,
     sharing: Option<Res<BlasSharing>>,
     instances: Option<Res<InstanceManager>>,
-    pipeline_cache: Res<PipelineCache>,
-    pipelines: Res<crate::pipelines::SolariPipelines>,
-    scene_bind_group: Res<crate::bindings::ClusterSceneBindGroup>,
-    view_query: bevy_ecs::system::Query<&ViewUniformOffset, bevy_ecs::query::With<ExtractedCamera>>,
+    seam: Option<Res<BindingSeam>>,
+    geometry_ids: Option<Res<GpuColumn<GeometryIdColumn>>>,
     mut ctx: RenderContext,
 ) {
     let (
@@ -317,28 +315,63 @@ pub fn dispatch_blas_rebuild(
             AsSeams::BUILD_TO_BUILD_INPUT | AsSeams::BUILD_TO_TRACE,
         );
     }
-    ctx.add_command_buffer(encoder.finish());
 
     // The build is truly recorded — commit each dirty geometry's `built_level`
     // (elect no longer commits optimistically; a bailed chain must re-elect).
-    // Recorded into the ctx encoder AFTER `add_command_buffer`, so it lands in
-    // a fresh encoder submitted after the build on the single queue.
-    let (Some(commit_pipe), Some(scene_bg), Some(sharing_bg), Some(view_offset)) = (
-        pipeline_cache.get_compute_pipeline(pipelines.blas_sharing_commit_built),
-        scene_bind_group.bind_group.as_ref(),
-        sharing.bind_group.as_ref(),
-        view_query.iter().next(),
+    // A raw heap dispatch appended to the same encoder, after the post-build
+    // seam, so it lands after the build on the single queue.
+    let (Some(seam), Some(geometry_ids), Some(kernels), Some(active_to_slot)) = (
+        seam,
+        geometry_ids,
+        sharing.kernels.as_ref(),
+        sharing.active_to_slot.buffer(),
     ) else {
-        tracing::debug!("blas_rebuild: commit_built skipped (pipeline/bind groups cold)");
+        tracing::debug!("blas_rebuild: commit_built skipped (kernels/columns cold)");
+        ctx.add_command_buffer(encoder.finish());
         return;
     };
-    let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("blas_sharing.commit_built"),
-        timestamp_writes: None,
-    });
-    pass.set_bind_group(0, scene_bg, &[]);
-    pass.set_bind_group(1, sharing_bg, &[view_offset.offset]);
-    pass.set_pipeline(commit_pipe);
-    pass.dispatch_workgroups(bucket_capacity.div_ceil(64), 1, 1);
+    let table = super::blas_sharing::sharing_slot_table(
+        &seam,
+        kernels,
+        &sharing,
+        geometry_ids.buffer(),
+        active_to_slot,
+        &selector,
+    );
+    let blob = super::blas_sharing::sharing_push_blob(
+        &kernels.commit_built,
+        "blas_sharing_commit_built",
+        &sharing.params,
+        &table,
+    );
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket the dispatch against the sharing/selector compute
+    // producers and the PTLAS fill consumer (raw dispatches are invisible to
+    // wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = allocator.device();
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+            seam.bind_heaps(cb);
+            // The sharing/selector chain's dirty-list + args writes -> our reads.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                kernels.commit_built.pipeline,
+            );
+            dev.cmd_dispatch(cb, bucket_capacity.div_ceil(64), 1, 1);
+            // Our `geometry_built_level` write -> the PTLAS fill's read.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+        });
+    }
+    ctx.add_command_buffer(encoder.finish());
 }

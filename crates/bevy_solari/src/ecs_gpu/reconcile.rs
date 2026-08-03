@@ -2,106 +2,103 @@
 //! ([`crate::instance::RtJournal`]) into the per-instance GPU columns. One thread
 //! per journal record writes **all** of a slot's columns from the single record,
 //! so a reused slot is re-initialized atomically (no partial/stale column).
-//! See `reconcile.wgsl`.
+//! See `reconcile.slang`.
 //!
-//! The pass is self-contained: it owns its bind-group layout, pipeline id, and
-//! params buffer. The reconcile is the sole writer of the bind-only instance
-//! columns (journal `UPSERT`/`REMOVE` is GPU-reconcile-authoritative).
+//! The pass is self-contained: it owns its heap kernel and slots. The reconcile
+//! is the sole writer of the bind-only instance columns (journal
+//! `UPSERT`/`REMOVE` is GPU-reconcile-authoritative).
 
+#![allow(unsafe_code)]
+
+use ash::vk;
 use bevy_app::{App, Plugin};
-use bevy_asset::{load_embedded_asset, AssetServer};
 use bevy_ecs::{
     resource::Resource,
     schedule::IntoScheduleConfigs,
     system::{Commands, Res, ResMut},
 };
-use bevy_render::{
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
-        ShaderStages, ShaderType, UniformBuffer,
-    },
-    renderer::{RenderContext, RenderDevice, RenderQueue},
-    Render, RenderApp, RenderStartup, RenderSystems,
-};
+use bevy_render::{renderer::RenderContext, Render, RenderApp, RenderStartup, RenderSystems};
 use bytemuck::{Pod, Zeroable};
+use wgpu::hal::api::Vulkan as VkApi;
 
-use crate::instance::{PartitionColumn, 
-    GeometryIdColumn, GroupBaseColumn, LodInputColumn, NodeSlotColumn, RtJournal,
-};
 use crate::ecs_gpu::GpuColumn;
+use crate::gpu::allocator::Allocator;
+use crate::gpu::binding_seam::BindingSeam;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
+use crate::instance::{
+    GeometryIdColumn, GroupBaseColumn, LodInputColumn, NodeSlotColumn, PartitionColumn, RtJournal,
+};
 
 const WORKGROUP_SIZE: u32 = 64;
 
-/// Uniform shared with `reconcile.wgsl::ReconcileParams`.
+/// Push params shared with `reconcile.slang::ReconcileParams`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct ReconcileParams {
     count: u32,
+    groups_x: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
-/// Render-world resource: the reconcile pipeline + its bind group.
+/// Render-world resource: the reconcile heap kernel + its slots.
 #[derive(Resource)]
 pub struct RtReconcile {
-    layout: BindGroupLayoutDescriptor,
-    pipeline: CachedComputePipelineId,
-    params: UniformBuffer<ReconcileParams>,
-    bind_group: Option<BindGroup>,
     /// Journal record count this frame (dispatch bound).
     count: u32,
+    groups: (u32, u32, u32),
+    params: ReconcileParams,
+    kernel: HeapKernel,
+    slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-fn reconcile_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
-        "rt_reconcile",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 journal
-                uniform_buffer::<ReconcileParams>(false),    // 1 params
-                storage_buffer_sized(false, None),           // 2 node_slots (rw)
-                storage_buffer_sized(false, None),           // 3 geometry_ids (rw)
-                storage_buffer_sized(false, None),           // 4 group_bases (rw)
-                storage_buffer_sized(false, None),           // 5 lod_inputs (rw)
-                storage_buffer_sized(false, None),           // 6 partition_hints (rw)
-            ),
-        ),
-    )
+impl Drop for RtReconcile {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
 }
 
-/// `RenderStartup`: create the layout + queue the pipeline + insert [`RtReconcile`].
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for RtReconcile {}
+unsafe impl Sync for RtReconcile {}
+
+/// `RenderStartup`: compile the reconcile kernel + insert [`RtReconcile`].
 /// No-op when the journal is absent (non-solari device → reconcile guards on it).
 pub fn init_rt_reconcile(
     mut commands: Commands,
     journal: Option<Res<RtJournal>>,
-    pipeline_cache: Res<PipelineCache>,
-    asset_server: Res<AssetServer>,
-    mut registry: ResMut<super::SolariPipelineRegistry>,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
 ) {
-    if journal.is_none() {
+    let (Some(_journal), Some(seam), Some(allocator)) = (journal, seam, allocator) else {
         return;
-    }
-    let layout = reconcile_bind_group_layout();
-    let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("rt_reconcile".into()),
-        layout: vec![layout.clone()],
-        shader: load_embedded_asset!(asset_server.as_ref(), "reconcile.wgsl"),
-        entry_point: Some("reconcile_apply".into()),
-        ..Default::default()
-    });
-    registry.register("rt_reconcile", pipeline);
-    let mut params = UniformBuffer::<ReconcileParams>::default();
-    params.set_label(Some("rt_reconcile"));
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "reconcile.slang",
+        include_str!("reconcile.slang"),
+        "reconcile_apply",
+        &[],
+        &[],
+        "rt_reconcile",
+        size_of::<ReconcileParams>() as u32,
+    ) else {
+        return;
+    };
+    let slots = KernelSlots::new(&seam, 6);
     commands.insert_resource(RtReconcile {
-        layout,
-        pipeline,
-        params,
-        bind_group: None,
         count: 0,
+        groups: (0, 0, 0),
+        params: ReconcileParams::default(),
+        kernel,
+        slots,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -109,116 +106,111 @@ pub fn init_rt_reconcile(
 pub fn prepare_rt_reconcile(
     reconcile: Option<ResMut<RtReconcile>>,
     journal: Option<Res<RtJournal>>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
 ) {
     let (Some(mut reconcile), Some(journal)) = (reconcile, journal) else {
         return;
     };
     reconcile.count = journal.count;
-    *reconcile.params.get_mut() = ReconcileParams {
+    reconcile.groups = crate::ecs_gpu::linear_dispatch(journal.count.div_ceil(WORKGROUP_SIZE));
+    reconcile.params = ReconcileParams {
         count: journal.count,
-        ..Default::default()
+        groups_x: reconcile.groups.0,
+        _pad0: 0,
+        _pad1: 0,
     };
-    reconcile.params.write_buffer(&render_device, &render_queue);
 }
 
-/// `Render::PrepareBindGroups`: build the reconcile bind group. The journal ring and
-/// every column buffer are stable-address (sparse), so the group is always valid.
+/// `RenderGraph` (`Propagate`, before the gather): apply this frame's journal to
+/// the columns. A raw heap dispatch — the journal ring and every column buffer
+/// are slot-indexed, so descriptors cover the whole (stable-address sparse)
+/// buffers. Clears the journal's pending records (`mark_folded`) after the
+/// dispatch records; the records stay live on frames where the kernel is absent.
 #[allow(clippy::too_many_arguments)]
-pub fn prepare_rt_reconcile_bind_group(
-    reconcile: Option<ResMut<RtReconcile>>,
-    journal: Option<Res<RtJournal>>,
+pub fn dispatch_rt_reconcile(
+    reconcile: Option<Res<RtReconcile>>,
+    journal: Option<ResMut<RtJournal>>,
+    seam: Option<Res<BindingSeam>>,
     node_slots: Option<Res<GpuColumn<NodeSlotColumn>>>,
     geometry_ids: Option<Res<GpuColumn<GeometryIdColumn>>>,
     group_bases: Option<Res<GpuColumn<GroupBaseColumn>>>,
     lod_inputs: Option<Res<GpuColumn<LodInputColumn>>>,
     partition_hints: Option<Res<GpuColumn<PartitionColumn>>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
+    mut ctx: RenderContext,
 ) {
     let (
-        Some(mut reconcile),
-        Some(journal),
+        Some(reconcile),
+        Some(mut journal),
+        Some(seam),
         Some(node_slots),
         Some(geometry_ids),
         Some(group_bases),
         Some(lod_inputs),
         Some(partition_hints),
-    ) = (reconcile, journal, node_slots, geometry_ids, group_bases, lod_inputs, partition_hints)
+    ) = (
+        reconcile,
+        journal,
+        seam,
+        node_slots,
+        geometry_ids,
+        group_bases,
+        lod_inputs,
+        partition_hints,
+    )
     else {
-        return;
-    };
-    let Some(params) = reconcile.params.binding() else {
-        return;
-    };
-    // Bind the WHOLE sparse buffer (stable handle) per column, not the committed
-    // range: the columns grow (regen), so a committed-sized binding would freeze
-    // at the first size and the reconcile couldn't write slots past it. The
-    // reconcile is slot-indexed and never calls `arrayLength`, so the whole-range
-    // bind is safe (no `arrayLength` hang) and growth-proof — every slot
-    // `< high_water` is always in range.
-    let layout = pipeline_cache.get_bind_group_layout(&reconcile.layout);
-    reconcile.bind_group = Some(render_device.create_bind_group(
-        "rt_reconcile",
-        &layout,
-        &BindGroupEntries::sequential((
-            journal.buffer.buffer().as_entire_binding(),
-            params,
-            node_slots.buffer().as_entire_binding(),
-            geometry_ids.buffer().as_entire_binding(),
-            group_bases.buffer().as_entire_binding(),
-            lod_inputs.buffer().as_entire_binding(),
-            partition_hints.buffer().as_entire_binding(),
-        )),
-    ));
-}
-
-/// `RenderGraph` (`Scatter`): apply this frame's journal to the columns. Clears the
-/// journal's pending records (`mark_folded`) **only** after a real dispatch, so a
-/// cold-pipeline frame retains them to retry next frame (the retain-until-folded latch).
-pub fn dispatch_rt_reconcile(
-    reconcile: Option<Res<RtReconcile>>,
-    journal: Option<ResMut<RtJournal>>,
-    pipeline_cache: Res<PipelineCache>,
-    mut ctx: RenderContext,
-) {
-    let Some(reconcile) = reconcile else {
         return;
     };
     if reconcile.count == 0 {
         return;
     }
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(reconcile.pipeline) else {
-        return;
-    };
-    let Some(bind_group) = reconcile.bind_group.as_ref() else {
-        return;
-    };
-    let groups = crate::ecs_gpu::linear_dispatch(reconcile.count.div_ceil(WORKGROUP_SIZE));
+    let blob = reconcile.kernel.push_blob(
+        "rt_reconcile",
+        bytemuck::bytes_of(&reconcile.params),
+        &[
+            ("journal", reconcile.slots.buffer(&seam, 0, journal.buffer.buffer())),
+            ("node_slots", reconcile.slots.buffer(&seam, 1, node_slots.buffer())),
+            ("geometry_ids", reconcile.slots.buffer(&seam, 2, geometry_ids.buffer())),
+            ("group_bases", reconcile.slots.buffer(&seam, 3, group_bases.buffer())),
+            ("lod_inputs", reconcile.slots.buffer(&seam, 4, lod_inputs.buffer())),
+            ("partition_hints", reconcile.slots.buffer(&seam, 5, partition_hints.buffer())),
+        ],
+    );
+    let (gx, gy, gz) = reconcile.groups;
     let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("rt_reconcile"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_group, &[]);
-    pass.dispatch_workgroups(groups.0, groups.1, groups.2);
-    drop(pass);
-    // Folded: the GPU consumed the journal from its buffer this frame, so the CPU
-    // staging can be dropped. Until this runs (cold pipeline / no bind group), the
-    // records stay live and are re-uploaded next frame.
-    if let Some(mut journal) = journal {
-        journal.mark_folded();
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket this dispatch against the surrounding wgpu compute
+    // passes (raw dispatches are invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &reconcile.raw_device;
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+            // The Scatter set's column zero-clears/writes -> our column writes.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, reconcile.kernel.pipeline);
+            dev.cmd_dispatch(cb, gx, gy, gz);
+            // Our column writes -> the gather's node_slot read + downstream.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+        });
     }
+    // Folded: the GPU consumed the journal from its buffer this frame, so the CPU
+    // staging can be dropped. Until this runs, the records stay live and are
+    // re-uploaded next frame.
+    journal.mark_folded();
 }
 
-/// Wires the reconcile pass (embedded shader + the prepare/dispatch systems).
+/// Wires the reconcile pass (kernel + the prepare/dispatch systems).
 pub struct ReconcilePlugin;
 
 impl Plugin for ReconcilePlugin {
     fn build(&self, app: &mut App) {
-        bevy_asset::embedded_asset!(app, "reconcile.wgsl");
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -232,15 +224,12 @@ impl Plugin for ReconcilePlugin {
             )
             .add_systems(
                 Render,
-                (
-                    // MUST run after the journal upload — it sets `journal.count`, which
-                    // this reads for the dispatch bound + params. Without the order, a
-                    // stale (0) count means the reconcile never dispatches.
-                    prepare_rt_reconcile
-                        .in_set(RenderSystems::PrepareResources)
-                        .after(crate::instance::upload_rt_journal),
-                    prepare_rt_reconcile_bind_group.in_set(RenderSystems::PrepareBindGroups),
-                ),
+                // MUST run after the journal upload — it sets `journal.count`, which
+                // this reads for the dispatch bound + params. Without the order, a
+                // stale (0) count means the reconcile never dispatches.
+                prepare_rt_reconcile
+                    .in_set(RenderSystems::PrepareResources)
+                    .after(crate::instance::upload_rt_journal),
             )
             // Dispatch in `Propagate` (after the whole `Scatter` set): `GpuColumn`'s
             // zero-clear of newly-committed pages runs in `Scatter`'s `dispatch_column`,

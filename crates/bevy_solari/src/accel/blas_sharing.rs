@@ -12,8 +12,8 @@
 // as a dirty-geometry build entry); `ptlas` reads the slot-indexed
 // `instance_blas_address`.
 //
-// See `blas_sharing.wgsl` for the pass algorithms.
-#![allow(unsafe_code, reason = "device-address plumbing for the geometry BLAS pool")]
+// See `blas_sharing.slang` for the pass algorithms.
+#![allow(unsafe_code, reason = "device-address plumbing + raw heap-kernel dispatch")]
 
 use ash::vk;
 use bevy_ecs::{
@@ -22,15 +22,12 @@ use bevy_ecs::{
 };
 use bevy_render::{
     camera::ExtractedCamera,
-    diagnostic::RecordDiagnostics as _,
-    render_resource::{
-        BindGroup, BindGroupEntries, Buffer, ComputePassDescriptor, PipelineCache, RawBufferVec,
-        ShaderType, UniformBuffer,
-    },
+    render_resource::{Buffer, RawBufferVec},
     renderer::{RenderContext, RenderDevice, RenderQueue},
-    view::{ViewUniformOffset, ViewUniforms},
+    view::ExtractedView,
 };
 use bytemuck::{Pod, Zeroable};
+use wgpu::hal::api::Vulkan as VkApi;
 
 use crate::bindings::ClusterSceneBindGroup;
 use crate::ecs_gpu::GpuColumn;
@@ -39,9 +36,9 @@ use crate::geometry::ClusterMeshManager;
 
 use crate::gpu::allocator::{Allocator, SparseBuffer};
 use super::blas_rebuild::{query_blas_size, BLAS_REGION_ALIGN};
-use crate::pipelines::SolariPipelines;
-use crate::resource_manager::SolariResourceManager;
+use crate::gpu::binding_seam::BindingSeam;
 use crate::gpu::extension::ClusterExtensionFns;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use super::selector::ClusterSelectorSettings;
 
 /// Max distinct resident geometries. The geometry-indexed scratch
@@ -70,9 +67,9 @@ const SLOT_BUFFER_VIRTUAL_BYTES: u64 = 1024 * 1024 * 1024;
 /// Virtual span for the geometry-indexed dst-address table.
 const GEOMETRY_DST_VIRTUAL_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Uniform mirror of `blas_sharing.wgsl::SharingParams` (48 B).
+/// Push mirror of `blas_sharing.slang::SharingParams` (64 B).
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct SharingParamsGpu {
     pub active_count: u32,
     pub geometry_count: u32,
@@ -85,10 +82,27 @@ pub struct SharingParamsGpu {
     pub pool_base_lo: u32,
     pub pool_base_hi: u32,
     pub geometry_stride: u32,
+    /// The camera's focal length in pixels — `viewport_height/2 · P[1][1]`,
+    /// the only View input the classify projection reads. Filled per
+    /// dispatch from [`ExtractedView`] (the same camera the old
+    /// dynamic-offset `View` uniform selected).
+    pub focal_px: f32,
+    /// X workgroup count of the per-instance 2D-split dispatches (filled
+    /// per dispatch).
+    pub groups_x: u32,
     pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
-const _: () = assert!(size_of::<SharingParamsGpu>() == 48);
+const _: () = assert!(size_of::<SharingParamsGpu>() == 64);
+
+/// The Slang modules `blas_sharing.slang` imports (referenced by the
+/// compile test too).
+pub(crate) const BLAS_SHARING_MODULES: &[(&str, &str)] = &[(
+    "cluster_bindings",
+    include_str!("../bindings/cluster_bindings.slang"),
+)];
 
 /// Render-world resource for the per-geometry BLAS-sharing pass.
 ///
@@ -147,7 +161,9 @@ pub struct BlasSharing {
     /// dense active index → real `GpuEntity`. Re-uploaded only when
     /// the active set changes.
     pub active_to_slot: RawBufferVec<u32>,
-    pub params: UniformBuffer<SharingParamsGpu>,
+    /// Per-frame push params, filled in `Render::Prepare`; `focal_px` /
+    /// `groups_x` are stamped per dispatch.
+    pub params: SharingParamsGpu,
 
     /// CPU-tracked geometry capacity (== resident geometry high-water,
     /// clamped to `MAX_GEOMETRIES`). Private — read it through
@@ -161,9 +177,58 @@ pub struct BlasSharing {
     cleared_slots: u64,
     cleared_geoms: u64,
 
-    /// Per-frame bind group, rebuilt in `Render::PrepareBindGroups`. The compute
-    /// pipeline ids live on [`SolariPipelines`], the layout on [`SolariResourceManager`].
-    pub bind_group: Option<BindGroup>,
+    /// The heap kernels, built lazily on the first ready dispatch (see
+    /// [`SharingKernels`]).
+    pub kernels: Option<SharingKernels>,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
+}
+
+impl Drop for BlasSharing {
+    fn drop(&mut self) {
+        if let Some(kernels) = self.kernels.take() {
+            self._device_keepalive.quiesce_before_raw_destroy();
+            // SAFETY: quiesced; handles exclusively owned here.
+            unsafe {
+                for kernel in kernels.all() {
+                    kernel.destroy(&self.raw_device);
+                }
+            }
+        }
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for BlasSharing {}
+unsafe impl Sync for BlasSharing {}
+
+/// The six BLAS-sharing heap kernels + the persistent slot table their set-1
+/// parameters are written through. `commit_built` is dispatched from
+/// [`super::blas_rebuild::dispatch_blas_rebuild`], after the raw BLAS build
+/// records; the other five run as one chain in [`dispatch_blas_sharing`].
+pub struct SharingKernels {
+    pub geom_reset: HeapKernel,
+    pub classify: HeapKernel,
+    pub elect_dirty: HeapKernel,
+    pub finalize_count: HeapKernel,
+    pub assign_address: HeapKernel,
+    pub commit_built: HeapKernel,
+    /// One slot per set-1 buffer, indexed by [`sharing_slot_table`]'s order.
+    pub slots: KernelSlots,
+}
+
+impl SharingKernels {
+    fn all(&self) -> [&HeapKernel; 6] {
+        [
+            &self.geom_reset,
+            &self.classify,
+            &self.elect_dirty,
+            &self.finalize_count,
+            &self.assign_address,
+            &self.commit_built,
+        ]
+    }
 }
 
 impl BlasSharing {
@@ -257,8 +322,6 @@ pub fn init_blas_sharing(
 
     let mut active_to_slot = RawBufferVec::<u32>::new(wgpu::BufferUsages::STORAGE);
     active_to_slot.set_label(Some("blas_sharing.active_to_slot"));
-    let mut params = UniformBuffer::<SharingParamsGpu>::default();
-    params.set_label(Some("blas_sharing.params"));
 
     commands.insert_resource(BlasSharing {
         geometry_blas_pool,
@@ -277,12 +340,14 @@ pub fn init_blas_sharing(
         instance_blas_address,
         instance_e_build,
         active_to_slot,
-        params,
+        params: SharingParamsGpu::default(),
         geometry_count: 1,
         needs_init: true,
         cleared_slots: 0,
         cleared_geoms: 0,
-        bind_group: None,
+        kernels: None,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -353,7 +418,8 @@ pub fn prepare_blas_sharing(
 
     let pool_base = resources.geometry_blas_pool.address;
     let stride = resources.worst_case_stride;
-    *resources.params.get_mut() = SharingParamsGpu {
+    // `focal_px` / `groups_x` are per-dispatch; the dispatches stamp them.
+    resources.params = SharingParamsGpu {
         active_count,
         geometry_count,
         geometry_capacity,
@@ -365,9 +431,12 @@ pub fn prepare_blas_sharing(
         pool_base_lo: (pool_base & 0xFFFF_FFFF) as u32,
         pool_base_hi: (pool_base >> 32) as u32,
         geometry_stride: stride as u32,
+        focal_px: 0.0,
+        groups_x: 0,
         _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     };
-    resources.params.write_buffer(&render_device, &render_queue);
 
     // Zero the per-frame dirty counters (desired_level + dirty flags are
     // reset GPU-side by `geom_reset`).
@@ -441,141 +510,227 @@ pub fn prepare_blas_sharing(
     }
 }
 
-/// `Render::PrepareBindGroups`: rebuild the sharing bind group.
-pub fn prepare_blas_sharing_bind_group(
-    mut sharing: Option<ResMut<BlasSharing>>,
-    resource_manager: Option<Res<SolariResourceManager>>,
-    pipeline_cache: Res<PipelineCache>,
-    geometry_ids: Option<Res<GpuColumn<GeometryIdColumn>>>,
-    selector: Option<Res<super::selector::Selector>>,
-    view_uniforms: Res<ViewUniforms>,
-    render_device: Res<RenderDevice>,
-) {
-    let Some(sharing) = sharing.as_deref_mut() else {
-        return;
-    };
-    let (Some(resource_manager), Some(geometry_ids), Some(selector)) =
-        (resource_manager, geometry_ids, selector)
-    else {
-        sharing.bind_group = None;
-        return;
-    };
-    let (Some(params_binding), Some(view_binding), Some(active_to_slot)) = (
-        sharing.params.binding(),
-        view_uniforms.uniforms.binding(),
-        sharing.active_to_slot.buffer(),
-    ) else {
-        sharing.bind_group = None;
-        return;
-    };
-    let geometry_ids = geometry_ids.buffer().as_entire_binding();
+const WORKGROUP_SIZE: u32 = 64;
 
-    let group = render_device.create_bind_group(
-        "blas_sharing_bind_group",
-        &pipeline_cache.get_bind_group_layout(&resource_manager.blas_sharing),
-        &BindGroupEntries::sequential((
-            view_binding,
-            params_binding,
-            active_to_slot.as_entire_binding(),
-            geometry_ids,
-            sharing.geometry_desired_level.as_entire_binding(),
-            sharing.geometry_built_level.as_entire_binding(),
-            sharing.geometry_dirty.as_entire_binding(),
-            sharing.dirty_build_count.as_entire_binding(),
-            sharing.dirty_gid.as_entire_binding(),
-            sharing.build_desc.as_entire_binding(),
-            sharing.geometry_dst_addresses.wgpu_buffer.as_entire_binding(),
-            sharing.instance_blas_address.wgpu_buffer.as_entire_binding(),
-            sharing.build_count.as_entire_binding(),
-            sharing.geometry_desc.as_entire_binding(),
-            sharing.instance_e_build.wgpu_buffer.as_entire_binding(),
-            selector.args_buf.wgpu_buffer.as_entire_binding(),
-            sharing.clas_ready.as_entire_binding(),
-        )),
-    );
-    sharing.bind_group = Some(group);
+/// Write the sharing set-1 descriptors into `slots` and return the
+/// `(parameter name, heap slot)` pairs every sharing entry's push blob is
+/// assembled from (each entry filters to the bindings surviving in its own
+/// SPIR-V). Shared with `dispatch_blas_rebuild`'s `commit_built` dispatch,
+/// so the name → slot-index assignment has one owner.
+pub(crate) fn sharing_slot_table<'a>(
+    seam: &BindingSeam,
+    kernels: &SharingKernels,
+    sharing: &BlasSharing,
+    geometry_ids: &Buffer,
+    active_to_slot: &Buffer,
+    selector: &super::selector::Selector,
+) -> Vec<(&'a str, u32)> {
+    let slots = &kernels.slots;
+    vec![
+        ("active_to_slot", slots.buffer(seam, 0, active_to_slot)),
+        ("instance_geometry_ids", slots.buffer(seam, 1, geometry_ids)),
+        (
+            "geometry_desired_level",
+            slots.buffer(seam, 2, &sharing.geometry_desired_level),
+        ),
+        (
+            "geometry_built_level",
+            slots.buffer(seam, 3, &sharing.geometry_built_level),
+        ),
+        ("geometry_dirty", slots.buffer(seam, 4, &sharing.geometry_dirty)),
+        ("dirty_count", slots.buffer(seam, 5, &sharing.dirty_build_count)),
+        ("dirty_gid", slots.buffer(seam, 6, &sharing.dirty_gid)),
+        ("bucket_desc", slots.buffer(seam, 7, &sharing.build_desc)),
+        (
+            "bucket_dst_addresses",
+            slots.buffer(seam, 8, &sharing.geometry_dst_addresses.wgpu_buffer),
+        ),
+        (
+            "instance_blas_address",
+            slots.buffer(seam, 9, &sharing.instance_blas_address.wgpu_buffer),
+        ),
+        ("build_count", slots.buffer(seam, 10, &sharing.build_count)),
+        ("geometry_desc", slots.buffer(seam, 11, &sharing.geometry_desc)),
+        (
+            "instance_e_build",
+            slots.buffer(seam, 12, &sharing.instance_e_build.wgpu_buffer),
+        ),
+        ("build_args", slots.buffer(seam, 13, &selector.args_buf.wgpu_buffer)),
+        ("clas_ready", slots.buffer(seam, 14, &sharing.clas_ready)),
+    ]
 }
 
-const WORKGROUP_SIZE: u32 = 64;
+/// A sharing entry's push blob: the shared params + the slot-table subset
+/// surviving in that entry's SPIR-V.
+pub(crate) fn sharing_push_blob(
+    kernel: &HeapKernel,
+    label: &str,
+    params: &SharingParamsGpu,
+    table: &[(&str, u32)],
+) -> Vec<u8> {
+    let named: Vec<(&str, u32)> = table
+        .iter()
+        .filter(|(name, _)| kernel.bindings.iter().any(|(n, _)| n == name))
+        .copied()
+        .collect();
+    kernel.push_blob(label, bytemuck::bytes_of(params), &named)
+}
 
 /// `Render::Render`: geom_reset → classify → elect_dirty →
 /// finalize_count → assign. Must run after the instance-column scatter
-/// (reads `transforms`) and before the selector / `blas_rebuild`.
+/// (reads `transforms`) and before the selector / `blas_rebuild`. A raw
+/// heap-kernel chain: buffer slots rewritten per dispatch, params + slot
+/// array in push data, explicit barriers between the dependent steps.
 pub fn dispatch_blas_sharing(
-    pipeline_cache: Res<PipelineCache>,
-    sharing: Option<Res<BlasSharing>>,
-    pipelines: Res<SolariPipelines>,
+    sharing: Option<ResMut<BlasSharing>>,
+    seam: Option<Res<BindingSeam>>,
     scene_bind_group: Res<ClusterSceneBindGroup>,
     instances: Option<Res<InstanceManager>>,
-    view_query: bevy_ecs::system::Query<&ViewUniformOffset, bevy_ecs::query::With<ExtractedCamera>>,
+    geometry_ids: Option<Res<GpuColumn<GeometryIdColumn>>>,
+    selector: Option<Res<super::selector::Selector>>,
+    view_query: bevy_ecs::system::Query<
+        &ExtractedView,
+        bevy_ecs::query::With<ExtractedCamera>,
+    >,
     mut ctx: RenderContext,
 ) {
-    let (Some(sharing), Some(instances)) = (sharing, instances) else {
+    let (Some(sharing), Some(seam), Some(instances), Some(geometry_ids), Some(selector)) =
+        (sharing, seam, instances, geometry_ids, selector)
+    else {
         return;
     };
+    let sharing = sharing.into_inner();
     let active_count = instances.active_count() as u32;
     if active_count == 0 {
         return;
     }
     let geometry_count = sharing.build_entry_capacity();
-    let (Some(scene_bg), Some(sharing_bg)) =
-        (scene_bind_group.bind_group.as_ref(), sharing.bind_group.as_ref())
-    else {
-        return;
-    };
-    let Some(view_offset) = view_query.iter().next() else {
-        return;
-    };
-    let view_offset = view_offset.offset;
-    let (
-        Some(geom_reset),
-        Some(classify),
-        Some(elect_dirty),
-        Some(finalize_count),
-        Some(assign_address),
-    ) = (
-        pipeline_cache.get_compute_pipeline(pipelines.blas_sharing_geom_reset),
-        pipeline_cache.get_compute_pipeline(pipelines.blas_sharing_classify),
-        pipeline_cache.get_compute_pipeline(pipelines.blas_sharing_elect_dirty),
-        pipeline_cache.get_compute_pipeline(pipelines.blas_sharing_finalize_count),
-        pipeline_cache.get_compute_pipeline(pipelines.blas_sharing_assign_address),
+    // The cluster-scene heap mirror is the set-0 surface (and doubles as the
+    // scene-ready signal).
+    let (Some(_), Some(heap_slots)) = (
+        scene_bind_group.bind_group.as_ref(),
+        scene_bind_group.heap_slots.as_ref(),
     ) else {
         return;
     };
+    let Some(active_to_slot) = sharing.active_to_slot.buffer() else {
+        return;
+    };
+    let Some(view) = view_query.iter().next() else {
+        return;
+    };
+    // The one View input the classify projection reads (what the old
+    // dynamic-offset `View` uniform supplied): focal length in pixels =
+    // `viewport_height/2 · clip_from_view[1][1]`.
+    let focal_px = view.viewport.w as f32 * 0.5 * view.clip_from_view.y_axis.y;
 
+    // Built lazily on the first ready frame (see `SelectorKernels`' rationale).
+    if sharing.kernels.is_none() {
+        let base = crate::gpu::rt_pipeline::cluster_heap_mappings(&seam, heap_slots);
+        let params_size = size_of::<SharingParamsGpu>() as u32;
+        let make = |entry: &str| {
+            HeapKernel::new_with_mappings(
+                &seam,
+                "blas_sharing.slang",
+                include_str!("blas_sharing.slang"),
+                entry,
+                BLAS_SHARING_MODULES,
+                &[],
+                &[],
+                &format!("blas_sharing_{entry}"),
+                params_size,
+                &base,
+            )
+        };
+        let (
+            Some(geom_reset),
+            Some(classify),
+            Some(elect_dirty),
+            Some(finalize_count),
+            Some(assign_address),
+            Some(commit_built),
+        ) = (
+            make("geom_reset"),
+            make("classify"),
+            make("elect_dirty"),
+            make("finalize_count"),
+            make("assign_address"),
+            make("commit_built"),
+        ) else {
+            return;
+        };
+        sharing.kernels = Some(SharingKernels {
+            geom_reset,
+            classify,
+            elect_dirty,
+            finalize_count,
+            assign_address,
+            commit_built,
+            slots: KernelSlots::new(&seam, 15),
+        });
+    }
+    let kernels = sharing.kernels.as_ref().unwrap();
+
+    let table = sharing_slot_table(
+        &seam,
+        kernels,
+        sharing,
+        geometry_ids.buffer(),
+        active_to_slot,
+        &selector,
+    );
     let active_groups = active_count.div_ceil(WORKGROUP_SIZE);
     let geom_groups = geometry_count.div_ceil(WORKGROUP_SIZE);
+    // Per-instance passes (classify / assign_address) 2D-split past 65535
+    // workgroups; the geometry passes stay 1D (no-op). The shaders that can
+    // exceed the limit reconstruct the flat index from `params.groups_x`.
+    let (agx, agy, agz) = crate::ecs_gpu::linear_dispatch(active_groups);
+    let mut params = sharing.params;
+    params.focal_px = focal_px;
+    params.groups_x = agx;
 
-    // Separate passes (one encoder) so wgpu inserts the producer→consumer
-    // barriers between them. Records into the shared `RenderContext`
-    // encoder — the graph submits once for the frame.
-    let steps: [(&wgpu::ComputePipeline, u32); 5] = [
-        (geom_reset, geom_groups),
-        (classify, active_groups),
-        (elect_dirty, geom_groups),
-        (finalize_count, 1),
-        (assign_address, active_groups),
+    // The dependent chain: each step reads the previous step's writes.
+    let steps: [(&HeapKernel, &str, (u32, u32, u32)); 5] = [
+        (&kernels.geom_reset, "blas_sharing_geom_reset", (geom_groups, 1, 1)),
+        (&kernels.classify, "blas_sharing_classify", (agx, agy, agz)),
+        (&kernels.elect_dirty, "blas_sharing_elect_dirty", (geom_groups, 1, 1)),
+        (&kernels.finalize_count, "blas_sharing_finalize_count", (1, 1, 1)),
+        (&kernels.assign_address, "blas_sharing_assign_address", (agx, agy, agz)),
     ];
+    let blobs: Vec<Vec<u8>> = steps
+        .iter()
+        .map(|(kernel, label, _)| sharing_push_blob(kernel, label, &params, &table))
+        .collect();
 
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
     let encoder = ctx.command_encoder();
-    // One span over the whole producer→consumer chain (separate passes, so the
-    // span is taken on the encoder rather than a single pass).
-    let d = diagnostics.time_span(encoder, "blas_sharing");
-    for (pipeline, groups) in steps {
-        let mut p = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("blas_sharing"),
-            timestamp_writes: None,
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket each step against its producers (raw dispatches are
+    // invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &sharing.raw_device;
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::ALL_TRANSFER,
+                )
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+            seam.bind_heaps(cb);
+            // Column scatter / gather writes + the counter-zeroing transfers
+            // -> our reads; then one barrier per producer→consumer step.
+            for ((kernel, _, (gx, gy, gz)), blob) in steps.iter().zip(&blobs) {
+                dev.cmd_pipeline_barrier2(cb, &dep);
+                seam.push_data(cb, blob);
+                dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
+                dev.cmd_dispatch(cb, *gx, *gy, *gz);
+            }
+            // Our writes (dirty list, addresses, counts) -> the selector /
+            // PTLAS fill compute readers.
+            dev.cmd_pipeline_barrier2(cb, &dep);
         });
-        p.set_bind_group(0, scene_bg, &[]);
-        p.set_bind_group(1, sharing_bg, &[view_offset]);
-        p.set_pipeline(pipeline);
-        // Per-instance passes (classify / assign_address) 2D-split past 65535
-        // workgroups; the geometry passes stay 1D (no-op). The shaders that can
-        // exceed the limit reconstruct the flat index from `num_workgroups`.
-        let (gx, gy, gz) = crate::ecs_gpu::linear_dispatch(groups);
-        p.dispatch_workgroups(gx, gy, gz);
     }
-    d.end(encoder);
 }

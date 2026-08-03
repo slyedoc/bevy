@@ -279,7 +279,7 @@ struct AtmoHeader
     uint pad_c;
 }
 
-// bevy_solari::atmosphere parity.
+// atmosphere.slang parity.
 float atmosphere_ray_sphere_far(float3 o, float3 d, float r)
 {
     let b = dot(o, d);
@@ -943,7 +943,7 @@ void raygen()
             // on room: raygen's live-across-trace state leaves no register
             // headroom, so a composite local spills to local memory, and
             // holding the merge state in scalars blows register allocation
-            // instead. The merge + shade run in `restir_spatial.wgsl`'s
+            // instead. The merge + shade run in `restir_spatial.slang`'s
             // `gi_finalize` dispatch (fresh register file); raygen writes the
             // canonical sample from values ALREADY LIVE in registers and
             // touches no other memory.

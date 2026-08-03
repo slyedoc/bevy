@@ -144,8 +144,6 @@ impl Plugin for GeometryPlugin {
                     tess_displace::prepare_tess_ptlas_write
                         .in_set(RenderSystems::PrepareResources)
                         .after(tess_classify::run_tess_classify),
-                    tess_displace::prepare_tess_ptlas_write_bind_group
-                        .in_set(RenderSystems::PrepareBindGroups),
                 ),
             );
     }

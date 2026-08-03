@@ -7,32 +7,31 @@
 //! seeds a worklist that expands level-by-level through the `first_child` /
 //! `next_sibling` columns, deduped by a per-node frame-epoch stamp. The result —
 //! `frontier[HEADER..HEADER+total]` — is the propagate/readback dispatch list,
-//! consumed via `dispatch_workgroups_indirect` with args this pass writes.
+//! consumed via indirect dispatch with args this pass writes.
 //!
-//! Kernel sequence (one compute pass; WebGPU orders storage/indirect access
-//! between dispatches): `seed` → (`finalize` → `expand`)×MAX_LEVELS → `finalize`.
-//! `finalize` (1 thread) closes the current level's bounds and writes the next
-//! expand's indirect args; empty levels dispatch zero workgroups.
+//! Kernel sequence (one raw command stream, barriers between each step):
+//! `seed` → (`finalize` → `expand`)×MAX_LEVELS → `finalize`. `finalize`
+//! (1 thread) closes the current level's bounds and writes the next expand's
+//! indirect args; empty levels dispatch zero workgroups.
 
+#![allow(unsafe_code)]
+
+use ash::vk;
 use bevy_ecs::{
     resource::Resource,
     system::{Commands, Res, ResMut},
 };
 use bevy_render::{
-    diagnostic::RecordDiagnostics as _,
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
-        BufferDescriptor, BufferUsages, ComputePassDescriptor, PipelineCache, ShaderStages,
-        ShaderType, StorageBuffer, UniformBuffer,
-    },
+    render_resource::{Buffer, BufferDescriptor, BufferUsages, StorageBuffer},
     renderer::{RenderContext, RenderDevice, RenderQueue},
 };
 use bytemuck::{Pod, Zeroable};
+use wgpu::hal::api::Vulkan as VkApi;
 
 use crate::ecs_gpu::{GpuColumn, GpuTable};
-use crate::pipelines::SolariPipelines;
-use crate::resource_manager::SolariResourceManager;
+use crate::gpu::allocator::Allocator;
+use crate::gpu::binding_seam::BindingSeam;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 
 use super::graph::{
     FirstChildColumn, GpuFrameSeeds, LocalTranslationColumn, NextSiblingColumn, ParentColumn,
@@ -54,10 +53,10 @@ pub(crate) fn xform_debug() -> bool {
     XFORM_DEBUG.get().copied().unwrap_or(false)
 }
 /// Max expansion depth (hierarchy levels below a moved node). Must match
-/// `transform_frontier.wgsl`; deeper descendants go stale (mirror of the walk's
+/// `transform_frontier.slang`; deeper descendants go stale (mirror of the walk's
 /// `MAX_DEPTH = 64` guard — realistic scenes are ≤ 8 deep).
 pub const MAX_LEVELS: u32 = 16;
-/// Header u32s at the front of the frontier buffer (must match the WGSL):
+/// Header u32s at the front of the frontier buffer (must match the Slang):
 /// `[total(atomic), total_plain, current_level, pad, level_begin[MAX_LEVELS+2], pad…]`.
 pub const FRONTIER_HEADER_WORDS: u32 = 4 + MAX_LEVELS + 2 + 2; // = 24, 16B-aligned
 /// Indirect-args u32s: `(x,y,z)` per expand level + one shared entry for the
@@ -66,9 +65,9 @@ const INDIRECT_WORDS: u64 = ((MAX_LEVELS + 1) * 3) as u64;
 /// Byte offset of the propagate/readback consumers' indirect args.
 pub const CONSUMER_ARGS_OFFSET: u64 = (MAX_LEVELS * 3) as u64 * 4;
 
-/// Uniform shared with `transform_frontier.wgsl::FrontierParams`.
+/// Push params shared with `transform_frontier.slang::FrontierParams`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct FrontierParams {
     /// Changed-`local` records this frame (seed source 0).
     changed_count: u32,
@@ -81,30 +80,29 @@ struct FrontierParams {
     frame_id: u32,
     /// Node coverage (out-of-range guard).
     node_count: u32,
+    /// X workgroup count of the seed's 2D-split dispatch.
+    groups_x: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 /// Render-world resource: the frontier worklist + epoch + indirect buffers and
-/// the seed/expand/finalize pipelines' shared bind group.
+/// the seed/finalize/expand heap kernels.
 #[derive(Resource)]
 pub struct TransformFrontier {
     /// `[header, nodes…]` worklist (see [`FRONTIER_HEADER_WORDS`]). Plain buffer,
-    /// pow2-regrown; consumers rebind every frame.
+    /// pow2-regrown; the heap descriptor is rewritten every dispatch.
     frontier: Buffer,
     /// Per-node frame-epoch stamp (dedupe). Zero-init on (re)creation; `frame_id`
     /// only grows, so recreation can't alias a live stamp.
     epoch: Buffer,
     /// Dispatch args: per-level expand + the shared consumer entry.
     indirect: Buffer,
-    /// Stand-in for the indirect binding in the seed/expand bind group: those
-    /// kernels never touch it, and binding the real one as `read_write` storage
-    /// would conflict with the same dispatch's INDIRECT usage (exclusive).
-    indirect_dummy: Buffer,
     /// [`GpuFrameSeeds`] uploaded for the seed kernel.
     extra_seeds: StorageBuffer<Vec<u32>>,
-    params: UniformBuffer<FrontierParams>,
+    params: FrontierParams,
+    /// 2D-split groups of the seed dispatch.
+    seed_groups: (u32, u32, u32),
     capacity_slots: u32,
     frame_id: u32,
     seed_count: u32,
@@ -113,11 +111,28 @@ pub struct TransformFrontier {
     /// they're stale (or zero), and the seeds' delta records are consumed by the
     /// column scatter this frame, so a silent skip loses those nodes for good.
     ran: bool,
-    /// seed/expand (dummy in the indirect slot).
-    bind_group_walk: Option<BindGroup>,
-    /// finalize (the real indirect-args buffer).
-    bind_group_finalize: Option<BindGroup>,
+    seed: HeapKernel,
+    finalize: HeapKernel,
+    expand: HeapKernel,
+    slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
+
+impl Drop for TransformFrontier {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        for kernel in [&self.seed, &self.finalize, &self.expand] {
+            // SAFETY: quiesced; handles exclusively owned here.
+            unsafe { kernel.destroy(&self.raw_device) };
+        }
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for TransformFrontier {}
+unsafe impl Sync for TransformFrontier {}
 
 impl TransformFrontier {
     /// The worklist buffer consumers (propagate/readback) bind: count at word 1,
@@ -148,42 +163,42 @@ impl TransformFrontier {
     }
 }
 
-/// The frontier bind-group layout (shared by seed/expand/finalize). Owned by
-/// [`SolariResourceManager`].
-pub fn transform_frontier_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
-        "transform_frontier",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 changed (local delta records)
-                storage_buffer_read_only_sized(false, None), // 1 extra seeds (gpu-frame slots)
-                storage_buffer_read_only_sized(false, None), // 2 first_child
-                storage_buffer_read_only_sized(false, None), // 3 next_sibling
-                storage_buffer_sized(false, None),           // 4 frontier (rw, atomic header)
-                storage_buffer_sized(false, None),           // 5 epoch (rw, atomic)
-                storage_buffer_sized(false, None),           // 6 indirect args (rw)
-                uniform_buffer::<FrontierParams>(false),     // 7 params
-            ),
-        ),
-    )
-}
-
-/// `RenderStartup`: params + the fixed-size indirect buffer; the worklist/epoch
-/// buffers are created on first growth in prepare.
-pub fn init_transform_frontier(mut commands: Commands, render_device: Res<RenderDevice>) {
-    let mut params = UniformBuffer::<FrontierParams>::default();
-    params.set_label(Some("transform_frontier"));
+/// `RenderStartup` (after `SolariSetup`): compile the seed/finalize/expand
+/// kernels — layout-free heap pipelines ([`HeapKernel`]), Slang from source —
+/// plus the fixed-size indirect buffer; the worklist/epoch buffers are created
+/// on first growth in prepare.
+pub fn init_transform_frontier(
+    mut commands: Commands,
+    render_device: Res<RenderDevice>,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
+) {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let make = |entry: &str, label: &str| {
+        HeapKernel::new(
+            &seam,
+            "transform_frontier.slang",
+            include_str!("transform_frontier.slang"),
+            entry,
+            &[],
+            &[],
+            label,
+            size_of::<FrontierParams>() as u32,
+        )
+    };
+    let (Some(seed), Some(finalize), Some(expand)) = (
+        make("seed", "transform_frontier_seed"),
+        make("finalize", "transform_frontier_finalize"),
+        make("expand", "transform_frontier_expand"),
+    ) else {
+        return;
+    };
     let indirect = render_device.create_buffer(&BufferDescriptor {
         label: Some("transform.frontier_indirect"),
         size: INDIRECT_WORDS * 4,
         usage: BufferUsages::STORAGE | BufferUsages::INDIRECT | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let indirect_dummy = render_device.create_buffer(&BufferDescriptor {
-        label: Some("transform.frontier_indirect_dummy"),
-        size: INDIRECT_WORDS * 4,
-        usage: BufferUsages::STORAGE,
         mapped_at_creation: false,
     });
     let mut extra_seeds = StorageBuffer::<Vec<u32>>::default();
@@ -192,15 +207,19 @@ pub fn init_transform_frontier(mut commands: Commands, render_device: Res<Render
         frontier: make_frontier_buffer(&render_device, 1),
         epoch: make_epoch_buffer(&render_device, 1),
         indirect,
-        indirect_dummy,
         extra_seeds,
-        params,
+        params: FrontierParams::default(),
+        seed_groups: (0, 0, 0),
         capacity_slots: 1,
         frame_id: 0,
         seed_count: 0,
         ran: false,
-        bind_group_walk: None,
-        bind_group_finalize: None,
+        seed,
+        finalize,
+        expand,
+        slots: KernelSlots::new(&seam, 7),
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -262,152 +281,160 @@ pub fn prepare_transform_frontier(
     frontier.extra_seeds.set(extra.to_vec());
     frontier.extra_seeds.write_buffer(&render_device, &render_queue);
 
-    *frontier.params.get_mut() = FrontierParams {
+    frontier.seed_groups =
+        crate::ecs_gpu::linear_dispatch(frontier.seed_count.div_ceil(WORKGROUP_SIZE));
+    frontier.params = FrontierParams {
         changed_count,
         record_stride: local_t.record_stride(),
         extra_count: extra.len() as u32,
         frame_id: frontier.frame_id,
         node_count,
+        groups_x: frontier.seed_groups.0,
         _pad0: 0,
         _pad1: 0,
-        _pad2: 0,
     };
-    frontier.params.write_buffer(&render_device, &render_queue);
-}
-
-/// `Render::PrepareBindGroups`: rebuild every frame (worklist/epoch/delta buffers
-/// can all reallocate).
-pub fn prepare_transform_frontier_bind_group(
-    mut frontier: Option<ResMut<TransformFrontier>>,
-    resource_manager: Option<Res<SolariResourceManager>>,
-    local_t: Option<Res<GpuColumn<LocalTranslationColumn>>>,
-    first_child: Option<Res<GpuColumn<FirstChildColumn>>>,
-    next_sibling: Option<Res<GpuColumn<NextSiblingColumn>>>,
-    parent: Option<Res<GpuColumn<ParentColumn>>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let (
-        Some(frontier),
-        Some(resource_manager),
-        Some(local_t),
-        Some(first_child),
-        Some(next_sibling),
-        Some(parent),
-    ) = (
-        frontier.as_deref_mut(),
-        resource_manager,
-        local_t,
-        first_child,
-        next_sibling,
-        parent,
-    )
-    else {
-        return;
-    };
-    let (Some(params), Some(extra)) = (frontier.params.binding(), frontier.extra_seeds.binding())
-    else {
-        frontier.bind_group_walk = None;
-        frontier.bind_group_finalize = None;
-        return;
-    };
-    // Empty-delta fallback: the shader never reads past `changed_count == 0`.
-    let changed = local_t.delta_buffer().unwrap_or_else(|| parent.buffer());
-    let layout = pipeline_cache.get_bind_group_layout(&resource_manager.transform_frontier);
-    let make = |indirect: &Buffer, label| {
-        render_device.create_bind_group(
-            label,
-            &layout,
-            &BindGroupEntries::sequential((
-                changed.as_entire_binding(),
-                extra.clone(),
-                first_child.buffer().as_entire_binding(),
-                next_sibling.buffer().as_entire_binding(),
-                frontier.frontier.as_entire_binding(),
-                frontier.epoch.as_entire_binding(),
-                indirect.as_entire_binding(),
-                params.clone(),
-            )),
-        )
-    };
-    let walk = make(&frontier.indirect_dummy, "transform_frontier_walk");
-    let finalize = make(&frontier.indirect, "transform_frontier_finalize");
-    frontier.bind_group_walk = Some(walk);
-    frontier.bind_group_finalize = Some(finalize);
 }
 
 /// `RenderGraph` (`Propagate`, before the walk): seed, then alternate finalize /
 /// indirect expand per level, then a final finalize that publishes the consumer
-/// count + indirect args.
+/// count + indirect args. One raw command stream — each step reads what the
+/// previous wrote (frontier/epoch/args), so a barrier separates every dispatch,
+/// and the expands consume the args `finalize` just wrote as indirect commands.
 pub fn dispatch_transform_frontier(
     frontier: Option<ResMut<TransformFrontier>>,
-    pipelines: Res<SolariPipelines>,
-    pipeline_cache: Res<PipelineCache>,
+    seam: Option<Res<BindingSeam>>,
+    local_t: Option<Res<GpuColumn<LocalTranslationColumn>>>,
+    first_child: Option<Res<GpuColumn<FirstChildColumn>>>,
+    next_sibling: Option<Res<GpuColumn<NextSiblingColumn>>>,
+    parent: Option<Res<GpuColumn<ParentColumn>>>,
     mut ctx: RenderContext,
 ) {
-    let Some(mut frontier) = frontier else {
+    let (
+        Some(mut frontier),
+        Some(seam),
+        Some(local_t),
+        Some(first_child),
+        Some(next_sibling),
+        Some(parent),
+    ) = (frontier, seam, local_t, first_child, next_sibling, parent)
+    else {
         return;
     };
     let frontier = &mut *frontier;
     if frontier.seed_count == 0 {
         return;
     }
-    let (Some(seed), Some(expand), Some(finalize)) = (
-        pipeline_cache.get_compute_pipeline(pipelines.transform_frontier_seed),
-        pipeline_cache.get_compute_pipeline(pipelines.transform_frontier_expand),
-        pipeline_cache.get_compute_pipeline(pipelines.transform_frontier_finalize),
-    ) else {
+    let Some(extra) = frontier.extra_seeds.buffer() else {
         if xform_debug() {
             bevy_log::info!(
-                "frontier: bail, pipelines cold (seed_count {})",
+                "frontier: bail, extra-seeds buffer missing (seed_count {})",
                 frontier.seed_count
             );
         }
         return;
     };
-    if xform_debug() && (frontier.bind_group_walk.is_none() || frontier.bind_group_finalize.is_none()) {
-        bevy_log::info!(
-            "frontier: bail, bind groups missing (seed_count {}, params {:?}, extra_seeds buffer {:?})",
-            frontier.seed_count,
-            frontier.params.binding().is_some(),
-            frontier.extra_seeds.buffer().map(|b| b.size()),
-        );
-    }
-    let (Some(walk_group), Some(finalize_group)) = (
-        frontier.bind_group_walk.as_ref(),
-        frontier.bind_group_finalize.as_ref(),
-    ) else {
-        return;
-    };
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
+    // Empty-delta fallback: the shader never reads past `changed_count == 0`.
+    let changed = local_t.delta_buffer().unwrap_or_else(|| parent.buffer());
+    let s_changed = frontier.slots.buffer(&seam, 0, changed);
+    let s_extra = frontier.slots.buffer(&seam, 1, extra);
+    let s_first_child = frontier.slots.buffer(&seam, 2, first_child.buffer());
+    let s_next_sibling = frontier.slots.buffer(&seam, 3, next_sibling.buffer());
+    let s_frontier = frontier.slots.buffer(&seam, 4, &frontier.frontier);
+    let s_epoch = frontier.slots.buffer(&seam, 5, &frontier.epoch);
+    let s_indirect = frontier.slots.buffer(&seam, 6, &frontier.indirect);
+    let params = bytemuck::bytes_of(&frontier.params);
+    let seed_blob = frontier.seed.push_blob(
+        "transform_frontier_seed",
+        params,
+        &[
+            ("changed", s_changed),
+            ("extra_seeds", s_extra),
+            ("frontier", s_frontier),
+            ("epoch", s_epoch),
+        ],
+    );
+    let finalize_blob = frontier.finalize.push_blob(
+        "transform_frontier_finalize",
+        params,
+        &[("frontier", s_frontier), ("indirect", s_indirect)],
+    );
+    let expand_blob = frontier.expand.push_blob(
+        "transform_frontier_expand",
+        params,
+        &[
+            ("first_child", s_first_child),
+            ("next_sibling", s_next_sibling),
+            ("frontier", s_frontier),
+            ("epoch", s_epoch),
+            ("indirect", s_indirect),
+        ],
+    );
+    let (gx, gy, gz) = frontier.seed_groups;
     let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("transform_frontier"),
-        timestamp_writes: None,
-    });
-    let d = diagnostics.time_span(&mut pass, "transform_frontier");
-
-    pass.set_pipeline(seed);
-    pass.set_bind_group(0, walk_group, &[]);
-    let (gx, gy, gz) =
-        crate::ecs_gpu::linear_dispatch(frontier.seed_count.div_ceil(WORKGROUP_SIZE));
-    pass.dispatch_workgroups(gx, gy, gz);
-
-    for level in 0..MAX_LEVELS {
-        pass.set_pipeline(finalize);
-        pass.set_bind_group(0, finalize_group, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
-        pass.set_pipeline(expand);
-        pass.set_bind_group(0, walk_group, &[]);
-        pass.dispatch_workgroups_indirect(&frontier.indirect, u64::from(level) * 12);
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket every dispatch (each step reads the previous step's
+    // frontier/epoch/args writes, invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &frontier.raw_device;
+            let raw_indirect = frontier
+                .indirect
+                .as_hal::<VkApi>()
+                .map(|b| b.raw_handle())
+                .expect("bevy_solari requires the Vulkan backend");
+            // One barrier serves every edge in the chain: compute writes → the
+            // next step's storage reads/writes AND its indirect-args read.
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER
+                        | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_READ
+                        | vk::AccessFlags2::SHADER_WRITE
+                        | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                )];
+            let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+            // Column-scatter writes -> the seed's delta/epoch access.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &seed_blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, frontier.seed.pipeline);
+            dev.cmd_dispatch(cb, gx, gy, gz);
+            for level in 0..MAX_LEVELS {
+                dev.cmd_pipeline_barrier2(cb, &dep);
+                seam.push_data(cb, &finalize_blob);
+                dev.cmd_bind_pipeline(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    frontier.finalize.pipeline,
+                );
+                dev.cmd_dispatch(cb, 1, 1, 1);
+                dev.cmd_pipeline_barrier2(cb, &dep);
+                seam.push_data(cb, &expand_blob);
+                dev.cmd_bind_pipeline(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    frontier.expand.pipeline,
+                );
+                dev.cmd_dispatch_indirect(cb, raw_indirect, u64::from(level) * 12);
+            }
+            // Close the last level + publish `total_plain` and the consumer indirect args.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+            seam.push_data(cb, &finalize_blob);
+            dev.cmd_bind_pipeline(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                frontier.finalize.pipeline,
+            );
+            dev.cmd_dispatch(cb, 1, 1, 1);
+            // The worklist + consumer args -> the propagate/readback dispatches.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+        });
     }
-    // Close the last level + publish `total_plain` and the consumer indirect args.
-    pass.set_pipeline(finalize);
-    pass.set_bind_group(0, finalize_group, &[]);
-    pass.dispatch_workgroups(1, 1, 1);
-
-    d.end(&mut pass);
-    drop(pass);
     frontier.ran = true;
 }

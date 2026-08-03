@@ -14,10 +14,12 @@
 //! - [`LightTransformSlotColumn`] holds the light's transform-table slot.
 //!
 //! Because the light is also a transform-table node, its world transform lives on
-//! the GPU, so its `direction_to_light` is resolved there ([`light_resolve.wgsl`])
+//! the GPU, so its `direction_to_light` is resolved there ([`light_resolve.slang`])
 //! from `world[transform_slot]` — the CPU never needs the light's `GlobalTransform`.
 //! The binder only enumerates the (few) active lights for its light-source index
 //! list ([`ActiveDirectionalLights`], rebuilt per frame — cheap).
+
+#![allow(unsafe_code)]
 
 use bevy_app::{App, Plugin};
 use bevy_asset::AssetId;
@@ -35,14 +37,8 @@ use bevy_math::{ops::cos, Vec3};
 use bevy_platform::{collections::{HashMap, HashSet}, hash::FixedHasher};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_render::{
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        ComputePassDescriptor,
-        PipelineCache,
-        ShaderStages, ShaderType, UniformBuffer,
-    },
-    renderer::{RenderContext, RenderDevice, RenderGraph, RenderQueue},
+    render_resource::ShaderType,
+    renderer::{RenderContext, RenderGraph},
     sync_world::{RenderEntity, SyncToRenderWorld},
     Extract, Render, RenderApp, RenderStartup, RenderSystems,
 };
@@ -50,12 +46,16 @@ use bevy_transform::components::Transform;
 use bytemuck::{Pod, Zeroable};
 use core::f32::consts::TAU;
 
+use ash::vk;
+use wgpu::hal::api::Vulkan as VkApi;
+
 use crate::bindings::SolariMaterialAssets;
 use crate::ecs_gpu::{GpuColumn, GpuSlot, GpuTable, SlotPool};
+use crate::gpu::allocator::Allocator;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::instance::InstanceManager;
 use crate::material::StandardSolariMaterial;
 use crate::pipelines::SolariPipelines;
-use crate::resource_manager::SolariResourceManager;
 use crate::transform::{dispatch_transform_subtract, TransformGraph, TransformPropagate};
 use crate::{SolariClusterSystems, SolariSetup};
 
@@ -371,137 +371,167 @@ pub fn prepare_light_sources(
     lights.cached_uniform = uniform;
 }
 
-/// Uniform shared with `light_resolve.wgsl::ResolveParams`.
+/// Push params shared with `light_resolve.slang::ResolveParams`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct ResolveParams {
     light_count: u32,
     node_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    /// X workgroup count of the 2D-split dispatch (flat-index reconstruction).
+    groups_x: u32,
+    _pad: u32,
 }
 
-/// Render-world resource: the direction-resolve pipeline + bind group.
+/// Render-world resource: the direction-resolve heap kernel + its slots.
 #[derive(Resource)]
 pub struct LightResolve {
     light_count: u32,
-    params: UniformBuffer<ResolveParams>,
-    bind_group: Option<BindGroup>,
+    groups: (u32, u32, u32),
+    params: ResolveParams,
+    kernel: HeapKernel,
+    slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// The light-resolve bind-group layout. Owned by
-/// [`SolariResourceManager`](crate::resource_manager::SolariResourceManager).
-pub(crate) fn light_resolve_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
+impl Drop for LightResolve {
+    fn drop(&mut self) {
+        // In-flight dispatches may still reference the kernel; drain first.
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for LightResolve {}
+unsafe impl Sync for LightResolve {}
+
+/// `RenderStartup` (after `SolariSetup`): compile the resolve kernel — a
+/// layout-free heap pipeline ([`HeapKernel`]), Slang from source.
+pub fn init_light_resolve(
+    mut commands: Commands,
+    seam: Option<Res<crate::gpu::binding_seam::BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
+) {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "light_resolve.slang",
+        include_str!("light_resolve.slang"),
+        "resolve",
+        &[],
+        &[],
         "light_resolve",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 world
-                storage_buffer_read_only_sized(false, None), // 1 transform slots
-                storage_buffer_sized(false, None),           // 2 directional_lights (rw)
-                uniform_buffer::<ResolveParams>(false),      // 3 params
-            ),
-        ),
-    )
-}
-
-/// `RenderStartup`: the resolve pass owns only its params buffer + bind group; the
-/// layout lives in `SolariResourceManager`, the pipeline id in `SolariPipelines`.
-pub fn init_light_resolve(mut commands: Commands) {
-    let mut params = UniformBuffer::<ResolveParams>::default();
-    params.set_label(Some("light_resolve"));
-
+        size_of::<ResolveParams>() as u32,
+    ) else {
+        return;
+    };
+    let slots = KernelSlots::new(&seam, 3);
     commands.insert_resource(LightResolve {
         light_count: 0,
-        params,
-        bind_group: None,
+        groups: (0, 0, 0),
+        params: ResolveParams::default(),
+        kernel,
+        slots,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
 /// `Render::Prepare`: set the resolve params (slot coverage + world coverage).
 pub fn prepare_light_resolve(
-    mut resolve: ResMut<LightResolve>,
+    resolve: Option<ResMut<LightResolve>>,
     table: Option<Res<SolariLights>>,
     propagate: Option<Res<TransformPropagate>>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
 ) {
-    let (Some(table), Some(propagate)) = (table, propagate) else {
+    let (Some(mut resolve), Some(table), Some(propagate)) = (resolve, table, propagate) else {
         return;
     };
     resolve.light_count = table.high_water();
-    *resolve.params.get_mut() = ResolveParams {
+    resolve.groups = crate::ecs_gpu::linear_dispatch(table.high_water().div_ceil(WORKGROUP_SIZE));
+    resolve.params = ResolveParams {
         light_count: table.high_water(),
         node_count: propagate.node_count(),
-        ..Default::default()
+        groups_x: resolve.groups.0,
+        _pad: 0,
     };
-    resolve.params.write_buffer(&render_device, &render_queue);
-}
-
-/// `Render::PrepareBindGroups`: (re)build the resolve bind group. Rebuilt every
-/// frame — cheap, and immune to a bound buffer changing allocation strategy later.
-pub fn prepare_light_resolve_bind_group(
-    mut resolve: ResMut<LightResolve>,
-    resource_manager: Option<Res<SolariResourceManager>>,
-    directional: Option<Res<GpuColumn<DirectionalLightColumn>>>,
-    transform_slot: Option<Res<GpuColumn<LightTransformSlotColumn>>>,
-    propagate: Option<Res<TransformPropagate>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let (Some(resource_manager), Some(directional), Some(transform_slot), Some(propagate), Some(params)) = (
-        resource_manager,
-        directional,
-        transform_slot,
-        propagate,
-        resolve.params.binding(),
-    ) else {
-        return;
-    };
-    let layout = pipeline_cache.get_bind_group_layout(&resource_manager.light_resolve);
-    resolve.bind_group = Some(render_device.create_bind_group(
-        "light_resolve",
-        &layout,
-        &BindGroupEntries::sequential((
-            propagate.current_world().as_entire_binding(),
-            transform_slot.buffer().as_entire_binding(),
-            directional.buffer().as_entire_binding(),
-            params,
-        )),
-    ));
 }
 
 /// `RenderGraph` (after transform propagation): fill each directional light's
 /// `direction_to_light` from `world[transform_slot]`. Runs after the column
 /// scatter (settings) and before the path tracer reads `directional_lights`.
+/// A raw heap dispatch: buffer slots rewritten per dispatch, params + slot
+/// array in push data.
 pub fn dispatch_light_resolve(
     resolve: Option<Res<LightResolve>>,
-    pipelines: Res<SolariPipelines>,
-    pipeline_cache: Res<PipelineCache>,
+    seam: Option<Res<crate::gpu::binding_seam::BindingSeam>>,
+    directional: Option<Res<GpuColumn<DirectionalLightColumn>>>,
+    transform_slot: Option<Res<GpuColumn<LightTransformSlotColumn>>>,
+    propagate: Option<Res<TransformPropagate>>,
     mut ctx: RenderContext,
 ) {
-    let Some(resolve) = resolve else {
+    let (Some(resolve), Some(seam), Some(directional), Some(transform_slot), Some(propagate)) =
+        (resolve, seam, directional, transform_slot, propagate)
+    else {
         return;
     };
     if resolve.light_count == 0 {
         return;
     }
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.light_resolve) else {
-        return;
-    };
-    let Some(bind_group) = resolve.bind_group.as_ref() else {
-        return;
-    };
-    let groups = crate::ecs_gpu::linear_dispatch(resolve.light_count.div_ceil(WORKGROUP_SIZE));
+    let blob = resolve.kernel.push_blob(
+        "light_resolve",
+        bytemuck::bytes_of(&resolve.params),
+        &[
+            ("world", resolve.slots.buffer(&seam, 0, propagate.current_world())),
+            ("slots", resolve.slots.buffer(&seam, 1, transform_slot.buffer())),
+            ("lights", resolve.slots.buffer(&seam, 2, directional.buffer())),
+        ],
+    );
+    let (gx, gy, gz) = resolve.groups;
     let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("light_resolve"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_group, &[]);
-    pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket this dispatch against the surrounding wgpu compute
+    // passes (raw dispatches are invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &resolve.raw_device;
+            let barrier = |src: vk::AccessFlags2, dst: vk::AccessFlags2| {
+                [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(src)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(dst)]
+            };
+            // Transform subtract / column scatter writes -> our reads.
+            dev.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().memory_barriers(&barrier(
+                    vk::AccessFlags2::SHADER_WRITE,
+                    vk::AccessFlags2::SHADER_READ,
+                )),
+            );
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, resolve.kernel.pipeline);
+            dev.cmd_dispatch(cb, gx, gy, gz);
+            // Our light writes -> downstream compute reads (the trace's own
+            // pre-barrier covers RT-stage visibility, as it did for the wgpu
+            // pass this replaced).
+            dev.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().memory_barriers(&barrier(
+                    vk::AccessFlags2::SHADER_WRITE,
+                    vk::AccessFlags2::SHADER_READ,
+                )),
+            );
+        });
+    }
 }
 
 /// Registers [`SolariDirectionLight`], its `gpu_table!` (columns + slot index +
@@ -511,7 +541,6 @@ pub struct SolariLightsPlugin;
 
 impl Plugin for SolariLightsPlugin {
     fn build(&self, app: &mut App) {
-        // `light_resolve.wgsl` is embedded centrally in `crate::pipelines`.
         app.register_type::<SolariDirectionLight>();
         // Columns, slot index, change-driven extract, Cleanup clear — all generated.
         app.add_plugins(SolariLightsTablePlugin);
@@ -531,7 +560,6 @@ impl Plugin for SolariLightsPlugin {
                 (
                     prepare_light_sources.in_set(RenderSystems::PrepareResources),
                     prepare_light_resolve.in_set(RenderSystems::PrepareResources),
-                    prepare_light_resolve_bind_group.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
             .add_systems(

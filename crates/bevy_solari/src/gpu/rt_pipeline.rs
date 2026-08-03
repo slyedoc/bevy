@@ -25,16 +25,14 @@ use ash::vk::{self, TaggedStructure};
 use bevy_ecs::component::Component;
 use bevy_ecs::resource::Resource;
 use core::ffi::CStr;
-#[cfg(test)]
-use wgpu::naga;
 
 use super::allocator::Allocator;
 use super::slang_sources::SlangSources;
 
-// RT-pipeline-private descriptor set (set 1). Set 0 is the shared scene bind
-// group (raytracing_scene_bindings, incl. the TLAS at its binding 9) and set 2
-// is the scene-columns bind group — both built by wgpu and bound raw via
-// `BindGroup::as_hal`, so the chits' `#import bevy_solari::scene_bindings` etc.
+// RT-pipeline-private descriptor set (set 1). Set 0 is the shared scene
+// surface and set 2 the scene columns — both heap-mirrored
+// (`SceneHeapSlots` / `SceneColumns::heap_slots`) and mapped by
+// `build_heap_mappings`, so the stages' `import scene_resolve` declarations
 // resolve real geometry/materials/lights/textures.
 const BINDING_OUTPUT: u32 = 0; // storage buffer, vec4<f32> per pixel (raygen writes)
 const BINDING_CAMERA: u32 = 1; // uniform buffer (ray gen inputs)
@@ -81,31 +79,26 @@ const PUSH_TLAS_ADDRESS_OFFSET: usize = 0;
 const PUSH_VIEW_SLOTS_OFFSET: usize = 8;
 const PUSH_DATA_SIZE: usize = PUSH_VIEW_SLOTS_OFFSET + (BINDING_NRC_QUERIES as usize + 1) * 4;
 
-/// Build the mapping table chained onto every RT stage: how each classic
-/// `[[vk::binding(b, set)]]` the shaders declare is sourced under the
-/// layout-free heap pipeline.
-///
-/// - Scene set 0 + columns set 2: constant heap offsets from the staging
-///   mirrors' slots ([`SceneHeapSlots`], [`SceneColumns::heap_slots`]) — both
-///   are allocated once and rewritten in place, so the baked offsets never go
-///   stale. The scene's non-buffer binding numbers (2/3/4/6/7/13/14) mirror
-///   `raytracing_scene_bindings.wgsl` / the binder's layout.
-/// - The TLAS (0,4): a device address in push data (`PUSH_ADDRESS`) — the
-///   PTLAS double-buffers, and shader-side heap AS access device-losts.
-/// - Set 1: heap indices read from push data (`HEAP_WITH_PUSH_INDEX`), so one
-///   pipeline serves every view and survives view rebuilds
-///   (resize/skybox swap) without a pipeline rebuild.
+/// The scene set-0 + columns set-2 mapping rows shared by everything that
+/// reads the shared scene heap surface — the RT stages (via
+/// [`build_heap_mappings`]) and the multi-set heap compute kernels
+/// (`restir_spatial`): constant heap offsets from the staging mirrors' slots
+/// ([`SceneHeapSlots`], [`SceneColumns::heap_slots`]) — both are allocated
+/// once and rewritten in place, so the baked offsets never go stale. The
+/// scene's non-buffer binding numbers (2/3/4/6/7/13/14) mirror
+/// `raytracing_scene_bindings.wgsl` / the binder's layout. The TLAS (0,4) is
+/// a device address in push data at offset 0 (`PUSH_ADDRESS`) — the PTLAS
+/// double-buffers, and shader-side heap AS access device-losts.
 ///
 /// [`SceneHeapSlots`]: crate::bindings::SceneHeapSlots
 /// [`SceneColumns::heap_slots`]: crate::ecs_gpu::SceneColumns
-pub fn build_heap_mappings(
+pub fn scene_heap_mappings(
     seam: &crate::gpu::binding_seam::BindingSeam,
     scene: &crate::bindings::SceneHeapSlots,
     columns: &[(u32, u32)],
 ) -> Vec<vk::DescriptorSetAndBindingMappingEXT<'static>> {
     use crate::gpu::binding_seam::HeapKind;
-    let mut mappings =
-        Vec::with_capacity(scene.buffers.len() + 7 + (BINDING_NRC_QUERIES as usize + 1) + columns.len());
+    let mut mappings = Vec::with_capacity(scene.buffers.len() + 7 + columns.len());
     for &(binding, slot) in &scene.buffers {
         mappings.push(seam.map_binding(0, binding, HeapKind::Buffer, slot));
     }
@@ -116,6 +109,47 @@ pub fn build_heap_mappings(
     mappings.push(seam.map_binding(0, 7, HeapKind::Sampler, scene.dfg_sampler));
     mappings.push(seam.map_binding(0, 13, HeapKind::Image, scene.texture_array_block));
     mappings.push(seam.map_binding(0, 14, HeapKind::Sampler, scene.array_sampler));
+    for &(binding, slot) in columns {
+        mappings.push(seam.map_binding(2, binding, HeapKind::Buffer, slot));
+    }
+    mappings
+}
+
+/// The CLUSTER-SCENE set-0 mapping rows shared by the cluster AS heap
+/// kernels (selector / BLAS sharing / PTLAS fill): constant heap offsets from
+/// the [`ClusterSceneBindGroup`] heap mirror's `(binding, slot)` pairs — 13
+/// read-only storage buffers at bindings 0..=12 (`cluster_bindings.slang`).
+/// The slots are allocated once and rewritten in place on the bind group's
+/// rebuild cadence, so the baked offsets never go stale.
+///
+/// [`ClusterSceneBindGroup`]: crate::bindings::ClusterSceneBindGroup
+pub fn cluster_heap_mappings(
+    seam: &crate::gpu::binding_seam::BindingSeam,
+    heap_slots: &[(u32, u32)],
+) -> Vec<vk::DescriptorSetAndBindingMappingEXT<'static>> {
+    use crate::gpu::binding_seam::HeapKind;
+    heap_slots
+        .iter()
+        .map(|&(binding, slot)| seam.map_binding(0, binding, HeapKind::Buffer, slot))
+        .collect()
+}
+
+/// Build the mapping table chained onto every RT stage: how each classic
+/// `[[vk::binding(b, set)]]` the shaders declare is sourced under the
+/// layout-free heap pipeline.
+///
+/// - Scene set 0 (incl. the push-address TLAS) + columns set 2:
+///   [`scene_heap_mappings`].
+/// - Set 1: heap indices read from push data (`HEAP_WITH_PUSH_INDEX`), so one
+///   pipeline serves every view and survives view rebuilds
+///   (resize/skybox swap) without a pipeline rebuild.
+pub fn build_heap_mappings(
+    seam: &crate::gpu::binding_seam::BindingSeam,
+    scene: &crate::bindings::SceneHeapSlots,
+    columns: &[(u32, u32)],
+) -> Vec<vk::DescriptorSetAndBindingMappingEXT<'static>> {
+    use crate::gpu::binding_seam::HeapKind;
+    let mut mappings = scene_heap_mappings(seam, scene, columns);
     for binding in 0..=BINDING_NRC_QUERIES {
         let kind = match binding {
             BINDING_ENV_MAP => HeapKind::Image,
@@ -128,9 +162,6 @@ pub fn build_heap_mappings(
             kind,
             (PUSH_VIEW_SLOTS_OFFSET + binding as usize * 4) as u32,
         ));
-    }
-    for &(binding, slot) in columns {
-        mappings.push(seam.map_binding(2, binding, HeapKind::Buffer, slot));
     }
     // Set 3: record-sourced bindings. (3,0) is the chits' per-material record
     // block (`SbtRecord` in chit_opaque/chit_glass), read inline from the hit
@@ -1524,136 +1555,6 @@ fn compile_group_shader(
     )
 }
 
-/// naga capabilities the WGSL RT-adjacent shaders need — used only by the
-/// headless `rt_shaders_compile` validation of the remaining stock-naga WGSL
-/// (`restir_spatial`, which traces inline ray queries); every runtime RT stage
-/// is Slang.
-#[cfg(test)]
-fn rt_capabilities() -> naga::valid::Capabilities {
-    // Ray queries for the inline visibility traces; f16-in-f32 for the
-    // `pack2x16float`/`unpack2x16float` G-buffer codecs. The runtime compile
-    // gets both from the device features via the wgpu pipeline cache.
-    naga::valid::Capabilities::RAY_QUERY
-        | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
-}
-
-/// Build a naga_oil composer pre-loaded with the built-in importable modules the
-/// remaining WGSL passes may `#import` — test-only: it backs the headless
-/// `rt_shaders_compile` check of `restir_spatial` (whose runtime compile goes
-/// through the wgpu `PipelineCache`).
-#[cfg(test)]
-fn rt_composer() -> Option<naga_oil::compose::Composer> {
-    use naga_oil::compose::{ComposableModuleDescriptor, Composer};
-
-    // Compose via naga_oil so the WGSL passes can `#import` solari's
-    // scene-binding / BRDF / sampling modules (raw `naga::parse_str` can't
-    // resolve `#import`). Composer validates the composed module, so it needs
-    // the same capabilities as the spv backend (ray query, binding arrays).
-    // `with_capabilities` purges modules, so set it first.
-    let mut composer = Composer::default().with_capabilities(rt_capabilities());
-    macro_rules! register {
-        ($path:expr, $source:expr) => {
-            if let Err(e) = composer.add_composable_module(ComposableModuleDescriptor {
-                source: $source,
-                file_path: $path,
-                ..Default::default()
-            }) {
-                bevy_log::error!("rt_pipeline: compose register {}: {e:?}", $path);
-                return None;
-            }
-        };
-        ($path:literal) => {
-            register!($path, include_str!($path))
-        };
-    }
-    // Registered leaf-first: naga_oil resolves each module's `#import`s at
-    // add-time, so every dependency must already be registered. This is
-    // `restir_spatial`'s import closure.
-    register!("../../../bevy_render/src/maths.wgsl"); // bevy_render::maths (leaf)
-    register!("../../../bevy_render/src/utils.wgsl"); // bevy_render::utils (leaf)
-    register!("../render/rt_pipeline/rt_payload.wgsl"); // bevy_solari::rt_payload (leaf)
-    register!("../bindings/pbr.wgsl"); // -> maths
-    register!("../bindings/raytracing_scene_bindings.wgsl"); // (leaf)
-    register!("../bindings/sampling.wgsl"); // -> pbr, scene_bindings, maths
-    register!("../bindings/brdf.wgsl"); // -> pbr, sampling, scene_bindings, maths
-    Some(composer)
-}
-
-/// Test-only compose→validate→SPIR-V of a WGSL shader (see [`rt_composer`]) —
-/// the headless shader test asserts on the failure value, so shader edits fail
-/// at `cargo test` with the real error.
-#[cfg(test)]
-fn try_compile_rt_wgsl(source: &str, file_path: &str) -> Result<Vec<u32>, String> {
-    use naga_oil::compose::{NagaModuleDescriptor, ShaderDefValue};
-
-    let mut composer =
-        rt_composer().ok_or_else(|| "composable module registration failed".to_string())?;
-
-    // Shader-def axes for the RT shaders. This is the "pipeline key": each def is a
-    // compile-out feature axis the raygen/chits can `#ifdef` on. Keep the axes few
-    // and orthogonal (debug views ride a runtime uniform, not a def, to avoid a
-    // variant explosion). `SOLARI_DLSS` is compile-time (tied to the cargo feature):
-    // when set, the trace emits the ray-reconstruction guide G-buffer.
-    #[allow(unused_mut)]
-    let mut shader_defs: std::collections::HashMap<String, ShaderDefValue> = [(
-        // The scene-columns bind-group index the scene bindings are written with.
-        "SOLARI_SCENE_COLUMNS_GROUP".to_string(),
-        ShaderDefValue::UInt(2),
-    )]
-    .into_iter()
-    .collect();
-    shader_defs.insert("SOLARI_DLSS".to_string(), ShaderDefValue::Bool(true));
-    // Compile in the `shader_clock()` reads only when the device enabled
-    // `VK_KHR_shader_clock`; otherwise the cost-heatmap path compiles out.
-    if crate::gpu::extension::shader_clock_available() {
-        shader_defs.insert("SOLARI_SHADER_CLOCK".to_string(), ShaderDefValue::Bool(true));
-    }
-
-    let module = composer
-        .make_naga_module(NagaModuleDescriptor {
-            source,
-            file_path,
-            shader_defs,
-            ..Default::default()
-        })
-        .map_err(|e| format!("compose: {e:?}"))?;
-    let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), rt_capabilities())
-        .validate(&module)
-        .map_err(|e| format!("WGSL validation failed: {e:?}"))?;
-    let mut options = naga::back::spv::Options::default();
-    options.lang_version = (1, 4);
-    // The scene `textures`/`samplers` are unsized `binding_array`s in WGSL. wgpu's
-    // own pipeline compile bakes a FIXED descriptor count into the SPIR-V (the
-    // device doesn't enable `runtimeDescriptorArray`, so an `OpTypeRuntimeArray`
-    // descriptor variable is invalid). Mirror that for every unsized binding
-    // array the composed module actually contains — derived from the module, not
-    // hardcoded group/binding numbers, so a scene-binding renumber can't silently
-    // reintroduce the illegal runtime-array variable. The substituted count must
-    // match the descriptor set layout, which sizes all of them `MAX_TEXTURE_COUNT`.
-    options.fake_missing_bindings = true;
-    for (_, var) in module.global_variables.iter() {
-        let Some(ref binding) = var.binding else {
-            continue;
-        };
-        if let naga::TypeInner::BindingArray {
-            size: naga::ArraySize::Dynamic,
-            ..
-        } = module.types[var.ty].inner
-        {
-            options.binding_map.insert(
-                binding.clone(),
-                naga::back::spv::BindingInfo {
-                    descriptor_set: binding.group,
-                    binding: binding.binding,
-                    binding_array_size: Some(crate::bindings::MAX_TEXTURE_COUNT.get()),
-                },
-            );
-        }
-    }
-    naga::back::spv::write_vec(&module, &info, &options, None)
-        .map_err(|e| format!("SPIR-V emit failed: {e:?}"))
-}
-
 fn create_shader_module(device: &ash::Device, spv: &[u32]) -> Option<vk::ShaderModule> {
     let info = vk::ShaderModuleCreateInfo::default().code(spv);
     // SAFETY: spv is valid SPIR-V words from naga; device live.
@@ -1779,39 +1680,6 @@ fn alloc_mapped_buffer(
 
 #[cfg(test)]
 mod tests {
-    use super::try_compile_rt_wgsl;
-
-    /// Rejects what VUID-StandaloneSpirv-OpTypeRuntimeArray-04680 rejects: a
-    /// descriptor variable instantiating `OpTypeRuntimeArray` (a `UniformConstant`
-    /// pointer to a runtime array). Happens when an unsized `binding_array` misses
-    /// the fixed-size substitution in the SPIR-V binding map.
-    /// `restir_spatial` is the one shader here that is NOT built through the raw
-    /// RT path — wgpu's `PipelineCache` compiles it as an ordinary compute
-    /// pipeline, without `rt_capabilities`. Reaching any bindless helper that does
-    /// a `physical_load` therefore builds fine in this test but fails at runtime
-    /// with "using physical_load requires ... PhysicalStorageBufferAddresses".
-    fn assert_no_physical_storage_buffer(file: &str, spv: &[u32]) {
-        const OP_CAPABILITY: u32 = 17;
-        const CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
-        let mut i = 5; // skip the SPIR-V header
-        while i < spv.len() {
-            let (opcode, word_count) = (spv[i] & 0xffff, (spv[i] >> 16) as usize);
-            assert!(word_count > 0, "{file}: malformed SPIR-V");
-            // Capabilities are all declared up front; stop at the first non-capability.
-            if opcode != OP_CAPABILITY {
-                break;
-            }
-            assert!(
-                spv[i + 1] != CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES,
-                "{file}: reaches a `physical_load` buffer-device-address helper \
-                 (e.g. `load_material_bindless` / `alpha_test` / `resolve_ray_hit_full`), \
-                 but it is built as a plain wgpu compute pipeline which has no \
-                 PhysicalStorageBufferAddresses capability"
-            );
-            i += word_count;
-        }
-    }
-
     /// Every `(set, binding)` a stage declares must be covered by the heap
     /// mapping surface (`build_heap_mappings` + the push blob): scene set 0
     /// bindings 0..=14, view set 1 bindings 0..=16, columns set 2 (mapped as
@@ -1819,7 +1687,7 @@ mod tests {
     /// binding without the table/push-blob growing would otherwise surface as
     /// a misrouted descriptor at runtime.
     fn assert_bindings_mapped(file: &str, spv: &[u32]) {
-        for (set, binding) in crate::gpu::binding_seam::spirv_descriptor_bindings(spv) {
+        for (set, binding, _) in crate::gpu::binding_seam::spirv_descriptor_bindings(spv) {
             let mapped = match set {
                 0 => binding <= 14,
                 1 => binding <= 16,
@@ -1889,30 +1757,11 @@ mod tests {
         }
     }
 
-    // Headless compose→validate→SPIR-V of every built-in RT shader — shader edits
-    // fail here at `cargo test` time instead of as a runtime pipeline-build black
+    // Headless Slang compile of every built-in RT shader — shader edits fail
+    // here at `cargo test` time instead of as a runtime pipeline-build black
     // screen.
     #[test]
     fn rt_shaders_compile() {
-        for (file, source) in [
-            // The wgpu spatial pass — composed via PipelineCache at runtime, but
-            // its imports are all registered here too, so validate it headlessly.
-            (
-                "restir_spatial.wgsl",
-                include_str!("../render/rt_pipeline/restir_spatial.wgsl"),
-            ),
-        ] {
-            match try_compile_rt_wgsl(source, file) {
-                Ok(spv) => {
-                    assert_no_runtime_descriptor_array(file, &spv);
-                    if file == "restir_spatial.wgsl" {
-                        assert_no_physical_storage_buffer(file, &spv);
-                    }
-                }
-                Err(e) => panic!("{file}: {e}"),
-            }
-        }
-
         // The primary miss composes the swappable `custom_sky` module. Compile
         // it with the default procedural sky AND a user-style replacement —
         // the `SolariSky::Shader` path — so both stay proven headlessly.
@@ -2030,10 +1879,13 @@ mod tests {
             // Reflection is what dispatch tables are assembled from; every
             // binding surviving in the SPIR-V must appear there (the reverse
             // need not hold — reflection also lists DCE'd parameters).
-            for pair in crate::gpu::binding_seam::spirv_descriptor_bindings(&spv.spirv) {
+            for (set, binding, _) in
+                crate::gpu::binding_seam::spirv_descriptor_bindings(&spv.spirv)
+            {
                 assert!(
-                    spv.bindings.iter().any(|&(_, s, b)| (s, b) == pair),
-                    "{file}: SPIR-V binding {pair:?} missing from slang reflection"
+                    spv.bindings.iter().any(|&(_, s, b)| (s, b) == (set, binding)),
+                    "{file}: SPIR-V binding (set {set}, binding {binding}) missing \
+                     from slang reflection"
                 );
             }
             // The target capability must pin SER to the NV flavor — the EXT

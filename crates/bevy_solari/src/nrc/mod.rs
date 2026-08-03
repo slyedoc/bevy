@@ -27,6 +27,7 @@ use bevy_render::{
 use half::f16;
 
 use crate::gpu::allocator::{Allocator, MemoryLocation};
+use crate::gpu::heap_kernel::HeapKernel;
 use ash::vk;
 use wgpu::hal::api::Vulkan as VkApi;
 
@@ -144,10 +145,10 @@ pub struct NrcPipelines {
     /// buffer set (adam runs twice, weights then biases, from one pipeline).
     ///
     /// [`BindingSeam::create_heap_compute_pipeline`]: crate::gpu::binding_seam::BindingSeam::create_heap_compute_pipeline
-    learn: NrcKernel,
-    adam: NrcKernel,
-    encode_records: NrcKernel,
-    query_infer: NrcKernel,
+    learn: HeapKernel,
+    adam: HeapKernel,
+    encode_records: HeapKernel,
+    query_infer: HeapKernel,
     seam: crate::gpu::binding_seam::BindingSeam,
     /// `VK_NV_cooperative_vector` fn table + the raw device — the per-layer
     /// TrainingOptimal→RowMajor dW conversion is a raw device command.
@@ -170,57 +171,8 @@ impl Drop for NrcPipelines {
             &self.query_infer,
         ] {
             // SAFETY: quiesced; handles exclusively owned here.
-            unsafe {
-                self.raw_device.destroy_pipeline(kernel.pipeline, None);
-                self.raw_device.destroy_shader_module(kernel.module, None);
-            }
+            unsafe { kernel.destroy(&self.raw_device) };
         }
-    }
-}
-
-/// One heap-flagged kernel plus its reflected set-0 parameter table — the
-/// contract [`push_slots`](Self::push_slots) assembles push data against.
-struct NrcKernel {
-    module: vk::ShaderModule,
-    pipeline: vk::Pipeline,
-    /// `(parameter name, binding)` from slang reflection of this kernel.
-    bindings: Vec<(String, u32)>,
-}
-
-impl NrcKernel {
-    /// Assemble the push-data slot array from `(parameter name, heap slot)`
-    /// pairs: `slots[binding] = slot`, with the binding read from the
-    /// shader's own reflected layout. Any mismatch — a missing, misnamed,
-    /// duplicated, or extra parameter — panics naming the kernel and the
-    /// parameter, so a shader binding edit can't silently desync a dispatch.
-    fn push_slots(&self, label: &str, named: &[(&str, u32)]) -> Vec<u32> {
-        let len = self
-            .bindings
-            .iter()
-            .map(|&(_, binding)| binding + 1)
-            .max()
-            .unwrap_or(0);
-        let mut slots = vec![u32::MAX; len as usize];
-        for &(name, slot) in named {
-            let Some(&(_, binding)) = self.bindings.iter().find(|(n, _)| n == name) else {
-                panic!(
-                    "nrc: {label} has no parameter `{name}` (shader declares {:?})",
-                    self.bindings
-                );
-            };
-            assert!(
-                slots[binding as usize] == u32::MAX,
-                "nrc: {label}: parameter `{name}` supplied twice"
-            );
-            slots[binding as usize] = slot;
-        }
-        for (name, binding) in &self.bindings {
-            assert!(
-                slots[*binding as usize] != u32::MAX,
-                "nrc: {label}: parameter `{name}` not supplied"
-            );
-        }
-        slots
     }
 }
 
@@ -342,31 +294,10 @@ pub fn init_nrc_pipelines(
     // table per kernel is derived from its compiled SPIR-V
     // (`create_heap_compute_pipeline`), and the dispatch slot arrays are
     // assembled by parameter NAME against the kernel's reflected layout
-    // ([`NrcKernel::push_slots`]).
+    // ([`HeapKernel::push_slots`]).
     let mlp: &[(&str, &str)] = &[("nrc_mlp", include_str!("nrc_mlp.slang"))];
     let make = |label: &'static str, file: &'static str, source: &'static str, entry: &'static str| {
-        let shader = crate::gpu::slang::compile_rt_slang(
-            file,
-            source,
-            entry,
-            mlp,
-            &[],
-            &[],
-        )
-        .map_err(|e| bevy_log::error!("nrc: {e}"))
-        .ok()?;
-        let entry_c = std::ffi::CString::new(entry).expect("entry name has interior NUL");
-        let (module, pipeline) = seam.create_heap_compute_pipeline(&shader.spirv, &entry_c, label)?;
-        Some(NrcKernel {
-            module,
-            pipeline,
-            bindings: shader
-                .bindings
-                .into_iter()
-                .filter(|&(_, set, _)| set == 0)
-                .map(|(name, _, binding)| (name, binding))
-                .collect(),
-        })
+        HeapKernel::new(&seam, file, source, entry, mlp, &[], label, 0)
     };
     let (Some(learn), Some(adam), Some(encode_records), Some(query_infer)) = (
         make(

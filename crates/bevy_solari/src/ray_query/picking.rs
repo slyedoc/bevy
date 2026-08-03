@@ -226,7 +226,7 @@ fn emit_pointer_hits(
             ray_id.camera,
             hit.t,
             Some(Vec3::from_array(hit.world_position)),
-            None, // normal not resolved GPU-side (see ray_query.wgsl).
+            None, // normal not resolved GPU-side (see ray_query.slang).
         );
         let entry = by_pointer
             .entry(ray_id.pointer)

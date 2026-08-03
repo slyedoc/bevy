@@ -2,6 +2,7 @@ pub mod epoch_table;
 pub mod allocator;
 pub mod binding_seam;
 pub mod extension;
+pub mod heap_kernel;
 pub mod raw_trace;
 pub mod rt_pipeline;
 pub mod slang;

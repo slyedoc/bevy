@@ -77,8 +77,8 @@ public float4 mat4_mul(Mat4 m, float4 v)
 }
 
 // The camera UBO layout the CPU writes (std140: matrices @0/64/128/192, vec4s
-// @256..368, world_from_view @384, vec4s @448..512). rt_payload.wgsl mirrors
-// this for the remaining wgpu compute passes — keep them field-for-field.
+// @256..368, world_from_view @384, vec4s @448..512). The Rust `RtCamera`
+// mirrors this — keep them field-for-field.
 public struct RtCamera
 {
     public Mat4 inverse_view_proj;

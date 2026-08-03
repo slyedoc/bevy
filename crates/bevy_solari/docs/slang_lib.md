@@ -1,9 +1,22 @@
 # Slang integration: current state + the RT debug-info attribution problem
 
-Written 2026-08-02, at the end of the slang-modernization arc
-(`chore/research-slang`, through commit `dab549340c`). The open problem at
-the bottom — Nsight shader-profiler attribution for the RT stages — is
-unresolved and is the subject for a follow-up session.
+Written 2026-08-02 at the end of the slang-modernization arc; updated
+2026-08-03 at the completion of the WGSL→Slang COMPUTE migration: **every
+solari compute dispatch is a layout-free Slang heap kernel** — zero wgpu
+compute pipelines, zero naga_oil, the `naga`/`naga_oil` dependencies are
+gone from the crate. The shared pattern is `gpu/heap_kernel.rs`
+(`HeapKernel` + `KernelSlots`: params ride push data as `[params | slot
+array]`, slot arrays assembled by reflected parameter name intersected with
+the SPIR-V's surviving bindings, descriptor kinds classified from the
+module's type graph). Multi-set kernels (restir_spatial, ray_query, the
+cluster passes, tess gen_verts with its 256-texture displacement array) use
+`new_with_mappings` over the mirrored scene/cluster/columns heap surfaces;
+the TLAS is always push-address-sourced. The only WGSL left is
+`gizmo_depth.wgsl` (the sole raster pass — kept wgpu per
+`docs/wgpu_inventory.md`, the drop-wgpu decision document). Encoder rule
+that cost a runtime panic: the fork forbids mixing wgpu passes with raw
+`as_hal_mut` on one encoder — raw segments get their own encoders, spliced
+via `add_command_buffer` (RenderContext is per-system).
 
 ## Current state
 

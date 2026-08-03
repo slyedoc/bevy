@@ -51,7 +51,6 @@ pub struct InstancePlugin;
 
 impl Plugin for InstancePlugin {
     fn build(&self, app: &mut App) {
-        bevy_shader::load_shader_library!(app, "instance_mask.wgsl");
         app.register_type::<RaytracingMesh3d>();
         // Each per-instance GPU column is its own `GpuColumnPlugin` (parallel
         // prepare + scatter). They schedule into `GpuColumnPrepareSet`, ordered

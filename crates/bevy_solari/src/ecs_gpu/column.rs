@@ -3,44 +3,43 @@
 //!
 //! A column is described once (its value type, where the value comes from,
 //! which entities changed this frame, and whether it keeps a previous-frame
-//! copy); [`GpuColumnPlugin<C>`] turns that into a **fully self-contained**
-//! scatter pipeline — its own bind-group layout, compute pipeline, buffers,
-//! and init/prepare/bind-group/dispatch systems, all generic over `C`. Each
-//! column is its own resource, so Bevy runs the per-column prepares in
-//! parallel.
+//! copy); [`GpuColumnPlugin<C>`] turns that into buffers + init / prepare /
+//! dispatch systems, all generic over `C`. Each column is its own resource,
+//! so Bevy runs the per-column prepares in parallel.
 //!
 //! Updates are scattered: only the entities that changed cross the bus as a
-//! compact `(slot, value)` delta, and the byte-wise scatter shader
-//! (`gpu_instances_scatter.wgsl`) places them. A `KEEP_PREVIOUS` column also
-//! shifts the current value into a previous-frame buffer on the GPU (the GPU
-//! already holds last frame's value — no second upload).
+//! compact `(slot, value)` delta, and the byte-wise scatter kernel
+//! (`gpu_instances_scatter.slang`) places them. Every column shares the same
+//! two heap pipelines ([`ColumnScatterKernels`]) — the buffers are
+//! per-dispatch heap slots, so nothing per-column is compiled. A
+//! `KEEP_PREVIOUS` column also shifts the current value into a previous-frame
+//! buffer on the GPU (the GPU already holds last frame's value — no second
+//! upload).
+
+#![allow(unsafe_code)]
 
 use core::marker::PhantomData;
 use core::num::NonZero;
 
 use bevy_app::{App, Plugin};
-use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer};
 use bevy_ecs::{
     resource::Resource,
     schedule::{IntoScheduleConfigs, SystemSet},
     system::{Commands, Res, ResMut},
 };
 use bevy_render::{
-    diagnostic::RecordDiagnostics as _,
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
-        BufferUsages, CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor,
-        PipelineCache, RawBufferVec, ShaderStages, ShaderType, UniformBuffer,
-    },
+    render_resource::{Buffer, BufferUsages, RawBufferVec},
     renderer::{RenderContext, RenderDevice, RenderQueue},
     Render, RenderApp, RenderStartup, RenderSystems,
 };
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use core::ops::Range;
+use wgpu::hal::api::Vulkan as VkApi;
 
 use crate::gpu::allocator::{Allocator, SparseBuffer};
+use crate::gpu::binding_seam::BindingSeam;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::{SolariClusterSystems, SolariSetup};
 
 /// Workgroup size of the scatter shader (`@workgroup_size(64)`).
@@ -54,12 +53,15 @@ const SCATTER_WORKGROUP_SIZE: u32 = 64;
 /// Matches the AS-side `*_VIRTUAL_BYTES` convention (`accel`/`geometry`).
 const COLUMN_VIRTUAL_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Uniform shared with `gpu_instances_scatter.wgsl::ScatterParams`.
+/// Push params shared with `gpu_instances_scatter.slang::ScatterParams`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct ScatterParams {
     count: u32,
     words_per_value: u32,
+    /// X workgroup count of the 2D-split dispatch (flat-index reconstruction).
+    groups_x: u32,
+    _pad: u32,
 }
 
 /// All `GpuColumn` prepare systems run in this set, so callers can order
@@ -79,15 +81,15 @@ pub trait GpuTable: Resource {
 
 /// Describes a per-[`GpuEntity`] GPU column: its value type, where the value
 /// is read from, which entities changed each frame, and whether it keeps a
-/// previous-frame copy. [`GpuColumnPlugin<C>`] turns this into a self-contained
-/// scatter pipeline.
+/// previous-frame copy. [`GpuColumnPlugin<C>`] turns this into a
+/// self-contained scattered column.
 pub trait GpuColumnDesc: Send + Sync + 'static {
     /// The per-slot value (`Pod`, size a multiple of 4 bytes).
     type Value: Pod;
     /// The table this column belongs to — its slot space and delta source.
     /// One scatter mechanism serves every table through this associated type.
     type Table: GpuTable;
-    /// Debug label for the GPU buffers + pipeline.
+    /// Debug label for the GPU buffers.
     const LABEL: &'static str;
     /// If set, the column keeps a previous-frame buffer; the scatter shifts
     /// `current → previous` on the GPU before writing (no `previous` upload).
@@ -108,8 +110,8 @@ pub trait GpuColumnDesc: Send + Sync + 'static {
     fn delta_records(table: &Self::Table) -> &[u32];
 }
 
-/// The GPU buffers + its own scatter pipeline for column `C`. One resource per
-/// column type.
+/// The GPU buffers + heap slots for column `C`. One resource per column type;
+/// the scatter pipelines are shared ([`ColumnScatterKernels`]).
 #[derive(Resource)]
 pub struct GpuColumn<C: GpuColumnDesc> {
     /// Slot-indexed `array<C::Value>`, a **sparse** buffer: a fixed virtual range
@@ -124,12 +126,9 @@ pub struct GpuColumn<C: GpuColumnDesc> {
     capacity_slots: u32,
     /// Packed delta: `pending` records of `[slot, value-words…]`.
     delta: RawBufferVec<u32>,
-    params: UniformBuffer<ScatterParams>,
-    /// This column's own bind-group layout (3 bindings, or 4 with `previous`).
-    layout: BindGroupLayoutDescriptor,
-    /// This column's own scatter pipeline (plain or `scatter_with_history`).
-    pipeline: CachedComputePipelineId,
-    bind_group: Option<BindGroup>,
+    /// This column's heap slots (delta / column / previous), rewritten per
+    /// dispatch — per-column so parallel column dispatches never share a slot.
+    slots: KernelSlots,
     /// Records to scatter this frame (the dispatch gates on this).
     pending: u32,
     /// Byte range of newly-committed sparse pages a growth needs zeroed (pages
@@ -213,15 +212,6 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
         Self::WORDS + 1
     }
 
-    /// Whether this column's scatter compute pipeline has finished compiling.
-    /// Until it has, [`dispatch_column`] can't scatter a delta, so binding new
-    /// instances must wait (a bind whose scatter is skipped would leave the
-    /// column zero — see [`prepare_column`]).
-    #[inline]
-    pub fn scatter_pipeline_ready(&self, cache: &PipelineCache) -> bool {
-        cache.get_compute_pipeline(self.pipeline).is_some()
-    }
-
     /// Commit more sparse pages if `high_water` outgrew capacity. The virtual
     /// address is fixed, so growth binds physical pages to the *same* handle — no
     /// realloc, no old→new copy, and consumer bind groups stay valid (existing
@@ -244,8 +234,9 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
 
     /// Upload a pre-built `[slot, words…]` delta straight to the GPU delta
     /// buffer. Sparse pages persist across growth, so the history scatter
-    /// always shifts `current → previous`. The bind group rebuilds each
-    /// scattering frame, picking up any buffer the `reserve` reallocated.
+    /// always shifts `current → previous`. The delta's heap descriptor is
+    /// rewritten each dispatch, picking up any buffer the `reserve`
+    /// reallocated.
     fn upload_prebuilt(&mut self, records: &[u32], device: &RenderDevice, queue: &RenderQueue) {
         self.pending = records.len() as u32 / (Self::WORDS + 1);
         self.delta.reserve(records.len(), device);
@@ -262,11 +253,6 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
                 .expect("column delta staging allocation failed");
             view.copy_from_slice(bytemuck::cast_slice(records));
         }
-        *self.params.get_mut() = ScatterParams {
-            count: self.pending,
-            words_per_value: Self::WORDS,
-        };
-        self.params.write_buffer(device, queue);
     }
 
     /// Like [`upload_prebuilt`](Self::upload_prebuilt), but the producer writes
@@ -298,41 +284,8 @@ impl<C: GpuColumnDesc> GpuColumn<C> {
                 .expect("delta staging allocation failed");
             fill(view.slice(..));
         }
-        *self.params.get_mut() = ScatterParams {
-            count: self.pending,
-            words_per_value: Self::WORDS,
-        };
-        self.params.write_buffer(device, queue);
     }
 
-    fn prepare_bind_group(&mut self, device: &RenderDevice, cache: &PipelineCache) {
-        let (Some(delta), Some(params)) = (self.delta.buffer(), self.params.binding()) else {
-            self.bind_group = None;
-            return;
-        };
-        let layout = cache.get_bind_group_layout(&self.layout);
-        self.bind_group = Some(match &self.previous {
-            Some(previous) => device.create_bind_group(
-                C::LABEL,
-                &layout,
-                &BindGroupEntries::sequential((
-                    delta.as_entire_binding(),
-                    self.buffer.buffer().as_entire_binding(),
-                    params,
-                    previous.buffer().as_entire_binding(),
-                )),
-            ),
-            None => device.create_bind_group(
-                C::LABEL,
-                &layout,
-                &BindGroupEntries::sequential((
-                    delta.as_entire_binding(),
-                    self.buffer.buffer().as_entire_binding(),
-                    params,
-                )),
-            ),
-        });
-    }
 }
 
 /// Registers column `C`: a `GpuColumn<C>` resource (with its own pipeline) and
@@ -348,11 +301,6 @@ impl<C: GpuColumnDesc> Default for GpuColumnPlugin<C> {
 
 impl<C: GpuColumnDesc> Plugin for GpuColumnPlugin<C> {
     fn build(&self, app: &mut App) {
-        // The byte-wise scatter shader every column shares. Registered here (next
-        // to the `load_embedded_asset!` site in `init_column`) so the embedded path
-        // resolves to `ecs_gpu/`. Idempotent across the many column plugins.
-        embedded_asset!(app, "gpu_instances_scatter.wgsl");
-
         // If this column is read by the RT scene shaders, register it into the
         // shared scene-columns bind group (a no-op unless `C::SCENE_BINDING` is set).
         super::scene_columns::register_scene_column::<C>(app);
@@ -360,17 +308,27 @@ impl<C: GpuColumnDesc> Plugin for GpuColumnPlugin<C> {
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
+        // The two scatter kernels every column shares — registered by the first
+        // column plugin, used by all.
+        if render_app
+            .world()
+            .get_resource::<ScatterKernelsRegistered>()
+            .is_none()
+        {
+            render_app.insert_resource(ScatterKernelsRegistered);
+            render_app.add_systems(
+                RenderStartup,
+                init_column_scatter_kernels.after(SolariSetup),
+            );
+        }
         render_app
             .init_resource::<super::SolariPipelineRegistry>()
             .add_systems(RenderStartup, init_column::<C>.after(SolariSetup))
             .add_systems(
                 Render,
-                (
-                    prepare_column::<C>
-                        .in_set(RenderSystems::PrepareResources)
-                        .in_set(GpuColumnPrepareSet),
-                    prepare_column_bind_group::<C>.in_set(RenderSystems::PrepareBindGroups),
-                ),
+                prepare_column::<C>
+                    .in_set(RenderSystems::PrepareResources)
+                    .in_set(GpuColumnPrepareSet),
             )
             .add_systems(
                 bevy_render::renderer::RenderGraph,
@@ -379,16 +337,78 @@ impl<C: GpuColumnDesc> Plugin for GpuColumnPlugin<C> {
     }
 }
 
-/// `RenderStartup`: build column `C`'s buffers + its own bind-group layout and
-/// scatter pipeline (the 4-binding `scatter_with_history` variant when it keeps
-/// a previous-frame copy).
+/// Marks the shared-kernel init as registered (the column plugins race to be
+/// first; exactly one registers it).
+#[derive(Resource)]
+struct ScatterKernelsRegistered;
+
+/// The two scatter kernels every [`GpuColumn`] shares: the buffers are
+/// per-dispatch heap slots, so one pipeline per entry point serves every
+/// column type.
+#[derive(Resource)]
+pub struct ColumnScatterKernels {
+    scatter: HeapKernel,
+    with_history: HeapKernel,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
+}
+
+impl Drop for ColumnScatterKernels {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        for kernel in [&self.scatter, &self.with_history] {
+            // SAFETY: quiesced; handles exclusively owned here.
+            unsafe { kernel.destroy(&self.raw_device) };
+        }
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for ColumnScatterKernels {}
+unsafe impl Sync for ColumnScatterKernels {}
+
+/// `RenderStartup` (after `SolariSetup`): compile the shared scatter kernels.
+fn init_column_scatter_kernels(
+    mut commands: Commands,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
+) {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let make = |entry: &str, label: &str| {
+        HeapKernel::new(
+            &seam,
+            "gpu_instances_scatter.slang",
+            include_str!("gpu_instances_scatter.slang"),
+            entry,
+            &[],
+            &[],
+            label,
+            size_of::<ScatterParams>() as u32,
+        )
+    };
+    let (Some(scatter), Some(with_history)) = (
+        make("scatter", "column_scatter"),
+        make("scatter_with_history", "column_scatter_with_history"),
+    ) else {
+        return;
+    };
+    commands.insert_resource(ColumnScatterKernels {
+        scatter,
+        with_history,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
+    });
+}
+
+/// `RenderStartup`: build column `C`'s buffers + heap slots.
 fn init_column<C: GpuColumnDesc>(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
-    asset_server: Res<AssetServer>,
-    pipeline_cache: Res<PipelineCache>,
     allocator: Option<Res<Allocator>>,
-    mut registry: ResMut<super::SolariPipelineRegistry>,
+    seam: Option<Res<BindingSeam>>,
 ) {
     debug_assert_eq!(
         size_of::<C::Value>() % 4,
@@ -399,7 +419,7 @@ fn init_column<C: GpuColumnDesc>(
     // allocator is created in `SolariSetup`, which this runs after; if it's
     // absent the device lacks the cluster/sparse support solari needs, so skip —
     // every consumer reads the column via `Option<Res<GpuColumn<C>>>`.
-    let Some(allocator) = allocator else {
+    let (Some(allocator), Some(seam)) = (allocator, seam) else {
         return;
     };
     let make_sparse = |label: &'static str| {
@@ -411,73 +431,22 @@ fn init_column<C: GpuColumnDesc>(
             label,
         )
     };
-    let (layout, entry_point, previous) = if C::KEEP_PREVIOUS {
-        (
-            BindGroupLayoutDescriptor::new(
-                C::LABEL,
-                &BindGroupLayoutEntries::sequential(
-                    ShaderStages::COMPUTE,
-                    (
-                        storage_buffer_read_only_sized(false, None), // 0 delta
-                        storage_buffer_sized(false, None),           // 1 column (rw)
-                        uniform_buffer::<ScatterParams>(false),      // 2 params
-                        storage_buffer_sized(false, None),           // 3 previous (rw)
-                    ),
-                ),
-            ),
-            "scatter_with_history",
-            // Distinct label: the Aftermath VA-map triage resolves faulting
-            // addresses by buffer label, and two buffers both named `C::LABEL`
-            // make the current/previous pair ambiguous. One leak per history
-            // column at startup, bounded by the column count.
-            Some(make_sparse(Box::leak(
-                format!("{}.previous", C::LABEL).into_boxed_str(),
-            ))),
-        )
-    } else {
-        (
-            BindGroupLayoutDescriptor::new(
-                C::LABEL,
-                &BindGroupLayoutEntries::sequential(
-                    ShaderStages::COMPUTE,
-                    (
-                        storage_buffer_read_only_sized(false, None), // 0 delta
-                        storage_buffer_sized(false, None),           // 1 column (rw)
-                        uniform_buffer::<ScatterParams>(false),      // 2 params
-                    ),
-                ),
-            ),
-            "scatter",
-            None,
-        )
-    };
-    let shader = load_embedded_asset!(asset_server.as_ref(), "gpu_instances_scatter.wgsl");
-    let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some(C::LABEL.into()),
-        layout: vec![layout.clone()],
-        shader,
-        shader_defs: vec![],
-        entry_point: Some(entry_point.into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
+    let previous = C::KEEP_PREVIOUS.then(|| {
+        // Distinct label: the Aftermath VA-map triage resolves faulting
+        // addresses by buffer label, and two buffers both named `C::LABEL`
+        // make the current/previous pair ambiguous. One leak per history
+        // column at startup, bounded by the column count.
+        make_sparse(Box::leak(format!("{}.previous", C::LABEL).into_boxed_str()))
     });
-    registry.register(C::LABEL, pipeline);
-
     let mut delta = RawBufferVec::<u32>::new(BufferUsages::STORAGE);
     delta.set_label(Some(C::LABEL));
-    let mut params = UniformBuffer::<ScatterParams>::default();
-    params.set_label(Some(C::LABEL));
 
     commands.insert_resource(GpuColumn::<C> {
         buffer: make_sparse(C::LABEL),
         previous,
         capacity_slots: 0,
         delta,
-        params,
-        layout,
-        pipeline,
-        bind_group: None,
+        slots: KernelSlots::new(&seam, 3),
         pending: 0,
         pending_clear: None,
         _marker: PhantomData,
@@ -519,96 +488,129 @@ fn prepare_column<C: GpuColumnDesc>(
     let records = C::delta_records(&table);
     if records.is_empty() {
         // Nothing new this frame. DON'T clear `pending` here: if a previous
-        // delta is still un-scattered (`dispatch_column` skipped it because its
-        // pipeline hadn't compiled), zeroing `pending` would abandon it forever
+        // delta is still un-scattered (`dispatch_column` skipped it because the
+        // kernels weren't ready), zeroing `pending` would abandon it forever
         // — fatal for a fully-static scene whose instances all bound before
-        // pipeline warmup. `dispatch_column` clears `pending` once it actually
+        // warmup. `dispatch_column` clears `pending` once it actually
         // scatters (retain-until-consumed).
         return;
     }
     column.upload_prebuilt(records, &render_device, &render_queue);
 }
 
-/// `Render::PrepareBindGroups`: (re)build column `C`'s scatter bind group.
-fn prepare_column_bind_group<C: GpuColumnDesc>(
-    mut column: Option<ResMut<GpuColumn<C>>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let Some(column) = column.as_deref_mut() else {
-        return;
-    };
-    // Nothing to scatter → the dispatch skips, so the bind group isn't used;
-    // don't rebuild it. (A `pending > 0` frame always rebuilds, which also
-    // covers the delta buffer reallocating.)
-    if column.pending == 0 {
-        return;
-    }
-    column.prepare_bind_group(&render_device, &pipeline_cache);
-}
-
 /// `RenderGraph` (`Scatter`): on a growth, zero the newly-committed pages, then
-/// scatter column `C`'s delta with its own pipeline. Both record into the shared
-/// `RenderContext` encoder.
+/// scatter column `C`'s delta with the shared kernel. One raw encoder segment:
+/// the fill (transfer) and the scatter (compute) with explicit barriers.
 fn dispatch_column<C: GpuColumnDesc>(
     column: Option<ResMut<GpuColumn<C>>>,
-    pipeline_cache: Res<PipelineCache>,
+    kernels: Option<Res<ColumnScatterKernels>>,
+    seam: Option<Res<BindingSeam>>,
     mut ctx: RenderContext,
 ) {
-    let Some(mut column) = column else {
+    let (Some(mut column), Some(kernels), Some(seam)) = (column, kernels, seam) else {
+        // `pending`/`pending_clear` stay live and retry next frame.
         return;
     };
     let column = &mut *column;
     let clear = column.pending_clear.take();
-    let scatter = if column.pending > 0 {
-        match (
-            pipeline_cache.get_compute_pipeline(column.pipeline),
-            column.bind_group.as_ref(),
-        ) {
-            (Some(pipeline), Some(bind_group)) => Some((pipeline, bind_group)),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    if clear.is_none() && scatter.is_none() {
+    let scatter = column.pending > 0 && column.delta.buffer().is_some();
+    if clear.is_none() && !scatter {
         return;
     }
 
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-    let encoder = ctx.command_encoder();
-    // Newly-committed sparse pages are UNDEFINED on first residency. Zero the
-    // grown `[old..new)` region before scattering so unscattered-but-active slots
-    // read 0 (and `scatter_with_history`'s `previous = old current` reads a
-    // defined 0 for a brand-new slot). Existing pages persist with their data,
-    // so only the new region is cleared. No pipeline needed, so a cold-pipeline
-    // frame still zeroes; `pending` stays live to scatter once the pipeline
-    // compiles.
-    if let Some(range) = clear {
-        let len = range.end - range.start;
-        if len > 0 {
-            encoder.clear_buffer(&column.buffer.wgpu_buffer, range.start, Some(len));
-            if let Some(previous) = column.previous.as_ref() {
-                encoder.clear_buffer(&previous.wgpu_buffer, range.start, Some(len));
-            }
+    let kernel = if C::KEEP_PREVIOUS {
+        &kernels.with_history
+    } else {
+        &kernels.scatter
+    };
+    let groups = super::linear_dispatch(column.pending.div_ceil(SCATTER_WORKGROUP_SIZE));
+    let blob = scatter.then(|| {
+        let params = ScatterParams {
+            count: column.pending,
+            words_per_value: GpuColumn::<C>::WORDS,
+            groups_x: groups.0,
+            _pad: 0,
+        };
+        let delta = column.delta.buffer().unwrap();
+        let mut named = vec![
+            ("delta", column.slots.buffer(&seam, 0, delta)),
+            ("column", column.slots.buffer(&seam, 1, column.buffer.buffer())),
+        ];
+        if let Some(previous) = column.previous.as_ref() {
+            named.push(("previous", column.slots.buffer(&seam, 2, previous.buffer())));
         }
-    }
-    if let Some((pipeline, bind_group)) = scatter {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some(C::LABEL),
-            timestamp_writes: None,
+        kernel.push_blob(C::LABEL, bytemuck::bytes_of(&params), &named)
+    });
+
+    let encoder = ctx.command_encoder();
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket the fill + scatter against the surrounding passes (raw
+    // commands are invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &kernels.raw_device;
+            // Newly-committed sparse pages are UNDEFINED on first residency.
+            // Zero the grown `[old..new)` region before scattering so
+            // unscattered-but-active slots read 0 (and the history scatter's
+            // `previous = old current` reads a defined 0 for a brand-new
+            // slot). Existing pages persist with their data, so only the new
+            // region is cleared. Runs even when the scatter skips, so
+            // `pending` stays live to scatter once ready.
+            if let Some(range) = clear {
+                let len = range.end - range.start;
+                if len > 0 {
+                    let pre = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
+                    dev.cmd_pipeline_barrier2(
+                        cb,
+                        &vk::DependencyInfo::default().memory_barriers(&pre),
+                    );
+                    dev.cmd_fill_buffer(cb, column.buffer.raw(), range.start, len, 0);
+                    if let Some(previous) = column.previous.as_ref() {
+                        dev.cmd_fill_buffer(cb, previous.raw(), range.start, len, 0);
+                    }
+                    let post = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(
+                            vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                        )];
+                    dev.cmd_pipeline_barrier2(
+                        cb,
+                        &vk::DependencyInfo::default().memory_barriers(&post),
+                    );
+                }
+            }
+            if let Some(blob) = blob.as_ref() {
+                let barrier = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                    )];
+                let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+                // Prior compute writes -> the scatter's reads/writes.
+                dev.cmd_pipeline_barrier2(cb, &dep);
+                seam.bind_heaps(cb);
+                seam.push_data(cb, blob);
+                dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
+                dev.cmd_dispatch(cb, groups.0, groups.1, groups.2);
+                // The scatter's column writes -> downstream compute reads.
+                dev.cmd_pipeline_barrier2(cb, &dep);
+            }
         });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        let d = diagnostics.time_span(&mut pass, C::LABEL);
-        let (gx, gy, gz) =
-            super::linear_dispatch(column.pending.div_ceil(SCATTER_WORKGROUP_SIZE));
-        pass.dispatch_workgroups(gx, gy, gz);
-        d.end(&mut pass);
-        // Delta is now consumed — clear so a later empty frame doesn't re-scatter
-        // it (and so `prepare_column`'s "retain un-scattered delta" guard
-        // releases). Until this runs, a cold-pipeline skip keeps `pending` live.
+    }
+    if scatter {
+        // Delta is now consumed — clear so a later empty frame doesn't
+        // re-scatter it (and so `prepare_column`'s "retain un-scattered delta"
+        // guard releases).
         column.pending = 0;
     }
 }

@@ -1,7 +1,7 @@
 // Animated per-instance CLAS instantiation + BLAS build.
 //
 // Three GPU steps per frame (only when animated instances are active):
-//   1. instantiate compute (`instantiate.wgsl`) — per active slot, emit
+//   1. instantiate compute (`instantiate.slang`) — per active slot, emit
 //      `InstantiateClusterInfoNV` records pointing each finest-LOD cluster's
 //      template at its deformed-position slice, plus a per-slot
 //      `BuildClustersBottomLevelInfoNV` arg.
@@ -25,26 +25,22 @@ use bevy_ecs::{
     system::{Commands, Res, ResMut},
 };
 use bevy_render::{
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
-        BufferDescriptor, BufferUsages, ComputePassDescriptor, PipelineCache, ShaderStages,
-        ShaderType, UniformBuffer,
-    },
+    render_resource::{Buffer, BufferDescriptor, BufferUsages},
     renderer::{RenderContext, RenderDevice, RenderQueue},
 };
 use bevy_math::UVec2;
 use bytemuck::{Pod, Zeroable};
+use wgpu::hal::api::Vulkan as VkApi;
 
 use super::blas_rebuild::query_blas_size;
 use super::deform::{Deform, MAX_ANIMATED_INSTANCES};
 use crate::ecs_gpu::GpuColumn;
 use crate::geometry::{ClusterMeshManager, ClusterTemplateArena};
 use crate::gpu::allocator::{Allocator, MemoryLocation, SparseBuffer};
+use crate::gpu::binding_seam::BindingSeam;
 use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::instance::{InstanceManager, LodInputColumn};
-use crate::pipelines::SolariPipelines;
-use crate::resource_manager::SolariResourceManager;
 
 /// Worst-case finest-LOD clusters per animated mesh (sizes the per-frame arenas).
 pub const MAX_CLUSTERS_PER_ANIMATED_MESH: u32 = 2048;
@@ -62,11 +58,10 @@ const INSTANTIATE_STORAGE_VIRTUAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const ANIMATED_BLAS_POOL_VIRTUAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const SCRATCH_VIRTUAL_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Uniform mirror of `instantiate.wgsl::InstantiateParams` (32 B). The address
-/// fields are `UVec2` (→ `vec2<u32>`); a `[u32; 2]` would make encase treat them
-/// as a stride-4 array, which is illegal in a uniform buffer.
+/// Push params shared with `instantiate.slang::InstantiateParams` (32 B). The
+/// address fields are `UVec2` (→ `uint2`), u64 device addresses split lo/hi.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct InstantiateParams {
     num_slots: u32,
     blas_stride: u32,
@@ -78,9 +73,13 @@ struct InstantiateParams {
 /// Render-world resource owning the animated instantiate + BLAS pipeline.
 #[derive(Resource)]
 pub struct AnimatedBlas {
-    // Instantiate compute.
-    params: UniformBuffer<InstantiateParams>,
-    bind_group: Option<BindGroup>,
+    // Instantiate compute (a layout-free heap kernel).
+    params: InstantiateParams,
+    kernel: HeapKernel,
+    slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 
     /// InstantiateClusterInfoNV records (GPU-written).
     instantiate_args: Buffer,
@@ -108,6 +107,18 @@ pub struct AnimatedBlas {
     pub blas_stride: u64,
 }
 
+impl Drop for AnimatedBlas {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for AnimatedBlas {}
+unsafe impl Sync for AnimatedBlas {}
+
 fn raw_storage(device: &RenderDevice, label: &'static str, size: u64) -> Buffer {
     device.create_buffer(&BufferDescriptor {
         label: Some(label),
@@ -117,42 +128,31 @@ fn raw_storage(device: &RenderDevice, label: &'static str, size: u64) -> Buffer 
     })
 }
 
-/// The animated-instantiate bind-group layout. Owned by
-/// [`SolariResourceManager`](crate::resource_manager::SolariResourceManager).
-pub fn animated_blas_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
-        "animated_instantiate",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 active_slots
-                storage_buffer_read_only_sized(false, None), // 1 clusters
-                storage_buffer_read_only_sized(false, None), // 2 cluster_template_addresses
-                storage_buffer_read_only_sized(false, None), // 3 instance_lod_inputs
-                uniform_buffer::<InstantiateParams>(false),  // 4 params
-                storage_buffer_sized(false, None),           // 5 instantiate_args (rw)
-                storage_buffer_sized(false, None),           // 6 count (rw)
-                storage_buffer_sized(false, None),           // 7 blas_args (rw)
-                storage_buffer_sized(false, None),           // 8 instance_blas_address (rw)
-                storage_buffer_read_only_sized(false, None), // 9 instance_e_build
-                storage_buffer_read_only_sized(false, None), // 10 cluster_groups
-                storage_buffer_read_only_sized(false, None), // 11 cluster_to_group
-            ),
-        ),
-    )
-}
-
-/// `RenderStartup`: allocate the instantiate/BLAS buffers. No-op when the raw-VK
-/// [`Allocator`] is absent. The bind-group layout lives in `SolariResourceManager`,
-/// the pipeline id in `SolariPipelines`.
+/// `RenderStartup` (after `SolariSetup`): compile the instantiate kernel — a
+/// layout-free heap pipeline ([`HeapKernel`]) — and allocate the
+/// instantiate/BLAS buffers. No-op when the raw-VK [`Allocator`] is absent.
 pub fn init_animated_blas(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
+    seam: Option<Res<BindingSeam>>,
     allocator: Option<Res<Allocator>>,
 ) {
-    let Some(allocator) = allocator else {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
         return;
     };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "instantiate.slang",
+        include_str!("instantiate.slang"),
+        "instantiate",
+        &[],
+        &[],
+        "animated_instantiate",
+        size_of::<InstantiateParams>() as u32,
+    ) else {
+        return;
+    };
+    let slots = KernelSlots::new(&seam, 11);
     let instantiate_args = raw_storage(
         &render_device,
         "animated.instantiate_args",
@@ -233,12 +233,12 @@ pub fn init_animated_blas(
         "animated.blas_scratch",
     );
 
-    let mut params = UniformBuffer::<InstantiateParams>::default();
-    params.set_label(Some("animated.instantiate_params"));
-
     commands.insert_resource(AnimatedBlas {
-        params,
-        bind_group: None,
+        params: InstantiateParams::default(),
+        kernel,
+        slots,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
         instantiate_args,
         count,
         blas_args,
@@ -255,7 +255,7 @@ pub fn init_animated_blas(
 }
 
 /// `Render::Prepare`: size the BLAS pool stride, write per-frame CPU inputs
-/// (count zero, blas_count, blas dst addresses, the params uniform), commit
+/// (count zero, blas_count, blas dst addresses, the push params), commit
 /// sparse pages.
 pub fn prepare_animated_blas(
     resources: Option<ResMut<AnimatedBlas>>,
@@ -263,7 +263,6 @@ pub fn prepare_animated_blas(
     instances: Option<Res<InstanceManager>>,
     fns: Option<Res<ClusterExtensionFns>>,
     allocator: Option<Res<Allocator>>,
-    render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
     let (Some(mut resources), Some(deform), Some(instances), Some(fns), Some(allocator)) =
@@ -309,7 +308,7 @@ pub fn prepare_animated_blas(
     // Params: deform pool + instantiated-CLAS-addr device addresses.
     let deform_addr = deform.positions.stable_addr().get();
     let clas_addrs = allocator.wgpu_buffer_device_address(&resources.instantiated_clas_addrs).get();
-    *resources.params.get_mut() = InstantiateParams {
+    resources.params = InstantiateParams {
         num_slots: active,
         blas_stride: stride as u32,
         deform_positions_addr: UVec2::new(
@@ -325,7 +324,6 @@ pub fn prepare_animated_blas(
             (pool_base >> 32) as u32,
         ),
     };
-    resources.params.write_buffer(&render_device, &render_queue);
 
     // Commit sparse pages for this frame's worst case.
     let total_clusters = MAX_TOTAL_ANIMATED_CLUSTERS as u64;
@@ -341,68 +339,21 @@ pub fn prepare_animated_blas(
     resources.blas_scratch.commit(0..(64 * 1024 * 1024));
 }
 
-/// `Render::PrepareBindGroups`: (re)build the instantiate bind group.
-pub fn prepare_animated_blas_bind_group(
-    resources: Option<ResMut<AnimatedBlas>>,
-    resource_manager: Option<Res<SolariResourceManager>>,
-    deform: Option<Res<Deform>>,
-    cluster_meshes: Option<Res<ClusterMeshManager>>,
-    templates: Option<Res<ClusterTemplateArena>>,
-    lod_inputs: Option<Res<GpuColumn<LodInputColumn>>>,
-    sharing: Option<Res<super::blas_sharing::BlasSharing>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let Some(mut resources) = resources else {
-        return;
-    };
-    let (Some(resource_manager), Some(deform), Some(cluster_meshes), Some(templates), Some(lod_inputs), Some(sharing)) =
-        (resource_manager, deform, cluster_meshes, templates, lod_inputs, sharing)
-    else {
-        resources.bind_group = None;
-        return;
-    };
-    if deform.active_count() == 0 {
-        resources.bind_group = None;
-        return;
-    }
-    let (Some(slots), Some(params)) = (deform.slots_buffer(), resources.params.binding()) else {
-        resources.bind_group = None;
-        return;
-    };
-    let layout = pipeline_cache.get_bind_group_layout(&resource_manager.animated_blas);
-    let bind_group = render_device.create_bind_group(
-        "animated_instantiate",
-        &layout,
-        &BindGroupEntries::sequential((
-            slots.as_entire_binding(),
-            cluster_meshes.clusters.buffer().as_entire_binding(),
-            templates.cluster_template_addresses.wgpu_buffer.as_entire_binding(),
-            lod_inputs.buffer().as_entire_binding(),
-            params,
-            resources.instantiate_args.as_entire_binding(),
-            resources.count.as_entire_binding(),
-            resources.blas_args.as_entire_binding(),
-            sharing.instance_blas_address.wgpu_buffer.as_entire_binding(),
-            sharing.instance_e_build.wgpu_buffer.as_entire_binding(),
-            cluster_meshes.groups.buffer().as_entire_binding(),
-            cluster_meshes.cluster_to_group.buffer().as_entire_binding(),
-        )),
-    );
-    resources.bind_group = Some(bind_group);
-}
-
 /// `RenderGraph` (`BuildAnimatedBlas`): instantiate compute → raw-VK INSTANTIATE
 /// build → raw-VK per-instance BLAS build.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_animated_blas(
     resources: Option<Res<AnimatedBlas>>,
     deform: Option<Res<Deform>>,
     instances: Option<Res<InstanceManager>>,
     fns: Option<Res<ClusterExtensionFns>>,
     allocator: Option<Res<Allocator>>,
-    pipelines: Res<SolariPipelines>,
+    seam: Option<Res<BindingSeam>>,
+    cluster_meshes: Option<Res<ClusterMeshManager>>,
+    templates: Option<Res<ClusterTemplateArena>>,
+    lod_inputs: Option<Res<GpuColumn<LodInputColumn>>>,
+    sharing: Option<Res<super::blas_sharing::BlasSharing>>,
     render_device: Res<RenderDevice>,
-    pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
     let (
@@ -411,7 +362,23 @@ pub fn dispatch_animated_blas(
         Some(instances),
         Some(fns),
         Some(allocator),
-    ) = (resources, deform, instances, fns, allocator)
+        Some(seam),
+        Some(cluster_meshes),
+        Some(templates),
+        Some(lod_inputs),
+        Some(sharing),
+    ) = (
+        resources,
+        deform,
+        instances,
+        fns,
+        allocator,
+        seam,
+        cluster_meshes,
+        templates,
+        lod_inputs,
+        sharing,
+    )
     else {
         return;
     };
@@ -422,23 +389,72 @@ pub fn dispatch_animated_blas(
     if active == 0 {
         return;
     }
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.animated_blas) else {
-        return;
-    };
-    let Some(bind_group) = resources.bind_group.as_ref() else {
+    let Some(slots_buffer) = deform.slots_buffer() else {
         return;
     };
 
-    // 1. Instantiate compute (wgpu) — writes instantiate_args + count + blas_args.
+    // 1. Instantiate compute — writes instantiate_args + count + blas_args. A raw
+    // heap dispatch: buffer slots rewritten per dispatch, params + slot array in
+    // push data.
+    let blob = resources.kernel.push_blob(
+        "animated_instantiate",
+        bytemuck::bytes_of(&resources.params),
+        &[
+            ("active_slots", resources.slots.buffer(&seam, 0, slots_buffer)),
+            ("clusters", resources.slots.buffer(&seam, 1, cluster_meshes.clusters.buffer())),
+            (
+                "cluster_template_addresses",
+                resources.slots.buffer(&seam, 2, &templates.cluster_template_addresses.wgpu_buffer),
+            ),
+            ("instance_lod_inputs", resources.slots.buffer(&seam, 3, lod_inputs.buffer())),
+            ("instantiate_args", resources.slots.buffer(&seam, 4, &resources.instantiate_args)),
+            ("count", resources.slots.buffer(&seam, 5, &resources.count)),
+            ("blas_args", resources.slots.buffer(&seam, 6, &resources.blas_args)),
+            (
+                "instance_blas_address",
+                resources.slots.buffer(&seam, 7, &sharing.instance_blas_address.wgpu_buffer),
+            ),
+            (
+                "instance_e_build",
+                resources.slots.buffer(&seam, 8, &sharing.instance_e_build.wgpu_buffer),
+            ),
+            ("cluster_groups", resources.slots.buffer(&seam, 9, cluster_meshes.groups.buffer())),
+            (
+                "cluster_to_group",
+                resources.slots.buffer(&seam, 10, cluster_meshes.cluster_to_group.buffer()),
+            ),
+        ],
+    );
     {
         let encoder = ctx.command_encoder();
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-            label: Some("animated_instantiate"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.dispatch_workgroups(active, 1, 1);
+        // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+        // barriers bracket this dispatch against the surrounding wgpu compute
+        // passes (raw dispatches are invisible to wgpu's tracking).
+        unsafe {
+            encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+                let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+                let cb = hal_encoder.raw_handle();
+                let dev = &resources.raw_device;
+                let barrier = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                    )];
+                let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+                // The classify/assign_address column writes -> our reads (and our
+                // overwrite of `instance_blas_address`).
+                dev.cmd_pipeline_barrier2(cb, &dep);
+                seam.bind_heaps(cb);
+                seam.push_data(cb, &blob);
+                dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, resources.kernel.pipeline);
+                dev.cmd_dispatch(cb, active, 1, 1);
+                // Our arg/count writes -> downstream compute reads; the builds'
+                // own seam covers build-input visibility.
+                dev.cmd_pipeline_barrier2(cb, &dep);
+            });
+        }
     }
 
     // 2 + 3. Raw-VK INSTANTIATE + BLAS builds in their own encoder (the fork

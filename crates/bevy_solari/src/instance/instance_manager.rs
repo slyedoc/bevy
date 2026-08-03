@@ -89,7 +89,7 @@ struct SlotMeshPointers {
 /// representative-sphere projection). WGSL-aligned (16 B); all fields
 /// are `u32` so the natural 4-byte alignment is preserved.
 ///
-/// Layout mirror in WGSL (`cluster_bindings.wgsl`):
+/// Layout mirror in WGSL (`cluster_bindings.slang`):
 /// ```wgsl
 /// struct InstanceLodInput {
 ///     cluster_base: u32,

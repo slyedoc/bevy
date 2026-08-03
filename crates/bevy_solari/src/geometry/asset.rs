@@ -83,7 +83,7 @@ pub struct OmmUsage {
 pub struct ClusterMesh {
     /// `[f32; 3]` positions, one entry per vertex. 12-byte stride
     /// keeps the stream tight; shaders read via an `array<f32>`
-    /// accessor function in `cluster_bindings.wgsl`.
+    /// accessor function in `cluster_bindings.slang`.
     pub vertex_positions: Arc<[Vec3]>,
     /// Octahedral-encoded normals packed as 2x16snorm in a `u32`,
     /// parallel to `vertex_positions`. Shaders decode via

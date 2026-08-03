@@ -36,12 +36,10 @@ mod subtract;
 pub(crate) use frontier::latch_xform_debug;
 pub use frontier::{
     dispatch_transform_frontier, init_transform_frontier, prepare_transform_frontier,
-    prepare_transform_frontier_bind_group, transform_frontier_bind_group_layout,
     TransformFrontier,
 };
 pub use gather::{
-    dispatch_transform_gather, init_transform_gather, prepare_transform_gather,
-    prepare_transform_gather_bind_group, transform_gather_bind_group_layout, TransformGather,
+    dispatch_transform_gather, init_transform_gather, prepare_transform_gather, TransformGather,
 };
 pub use graph::{
     clear_static_first_sight, enqueue_node_first_sight, enqueue_static_first_sight,
@@ -52,21 +50,13 @@ pub use graph::{
 };
 pub use propagate::{
     dispatch_transform_propagate, init_transform_propagate, prepare_transform_propagate,
-    prepare_transform_propagate_bind_groups, transform_propagate_bind_group_layout,
     TransformPropagate,
 };
-use readback::{
-    build_readback_main, dispatch_transform_readback, prepare_transform_readback,
-    prepare_transform_readback_bind_group,
-};
-pub use readback::{
-    init_transform_readback, transform_readback_bind_group_layout, NoGpuGlobalTransformReadback,
-    TransformReadback,
-};
+use readback::{build_readback_main, dispatch_transform_readback, prepare_transform_readback};
+pub use readback::{init_transform_readback, NoGpuGlobalTransformReadback, TransformReadback};
 pub use subtract::{
     dispatch_transform_subtract, extract_origin_slot, init_transform_subtract,
-    prepare_transform_subtract, prepare_transform_subtract_bind_group,
-    transform_subtract_bind_group_layout, SolariOriginSlot, TransformSubtract,
+    prepare_transform_subtract, SolariOriginSlot, TransformSubtract,
 };
 
 /// The transform-table plugin: the macro-generated table (`local`/`parent`
@@ -155,25 +145,15 @@ impl Plugin for SolariTransformPlugin {
             .add_systems(
                 Render,
                 (
-                    (
-                        prepare_transform_frontier,
-                        prepare_transform_propagate,
-                        prepare_transform_subtract,
-                        prepare_transform_gather,
-                        prepare_transform_readback,
-                    )
-                        .chain()
-                        .in_set(RenderSystems::PrepareResources)
-                        .after(GpuColumnPrepareSet),
-                    (
-                        prepare_transform_frontier_bind_group,
-                        prepare_transform_propagate_bind_groups,
-                        prepare_transform_subtract_bind_group,
-                        prepare_transform_gather_bind_group,
-                        prepare_transform_readback_bind_group,
-                    )
-                        .in_set(RenderSystems::PrepareBindGroups),
-                ),
+                    prepare_transform_frontier,
+                    prepare_transform_propagate,
+                    prepare_transform_subtract,
+                    prepare_transform_gather,
+                    prepare_transform_readback,
+                )
+                    .chain()
+                    .in_set(RenderSystems::PrepareResources)
+                    .after(GpuColumnPrepareSet),
             )
             .add_systems(
                 RenderGraph,

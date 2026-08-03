@@ -241,6 +241,11 @@ fn load_api() -> Result<Api, String> {
     })
 }
 
+/// Capability atoms for compute kernels tracing inline `RayQuery`s
+/// (`restir_spatial`, `ray_query`) — pins the target profile to the KHR
+/// ray-query SPIR-V flavor the device enables.
+pub const RAY_QUERY_CAPABILITIES: &[&str] = &["spvRayQueryKHR"];
+
 /// Compile one entry point to SPIR-V words + reflection.
 ///
 /// `entry_source` is a module named after `entry_file`; `entry_name` is the

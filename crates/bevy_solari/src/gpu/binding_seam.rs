@@ -617,37 +617,72 @@ impl BindingSeam {
     }
 
     /// Create a heap-flagged (layout-free) COMPUTE pipeline from SPIR-V whose
-    /// set-0 bindings are all buffers, each sourced by a heap-slot index read
-    /// from push data at `binding * 4`
-    /// ([`map_binding_push_index`](Self::map_binding_push_index)). The binding
-    /// list is read from the SPIR-V itself
+    /// set-0 bindings are each sourced by a heap-slot index read from push
+    /// data at `push_params_size + binding * 4`
+    /// ([`map_binding_push_index`](Self::map_binding_push_index)). The
+    /// binding list AND each binding's descriptor kind (buffer / image /
+    /// sampler) are read from the SPIR-V itself
     /// ([`spirv_descriptor_bindings`]) — the mapping table covers exactly
-    /// what the module declares, nothing hand-counted. Dispatch =
-    /// [`bind_heaps`](Self::bind_heaps) + [`push_data`](Self::push_data) with
-    /// the slot array (indexed by binding number) + `vkCmdDispatch`; the same
-    /// pipeline serves any buffer set (the slots are per-dispatch data, not
-    /// baked).
+    /// what the module declares, nothing hand-counted.
+    ///
+    /// The push blob is `[params | slot array]`: the kernel's
+    /// `[[vk::push_constant]]` block (size `push_params_size`, 0 if none)
+    /// reads the front, the mappings read the slot indices behind it — small
+    /// per-dispatch params ride the push path instead of a uniform buffer +
+    /// descriptor. Dispatch = [`bind_heaps`](Self::bind_heaps) +
+    /// [`push_data`](Self::push_data) with that blob + `vkCmdDispatch`; the
+    /// same pipeline serves any resource set (slots are per-dispatch data,
+    /// not baked).
+    ///
+    /// Kernels needing the scene/columns heap surface or a TLAS use
+    /// [`create_heap_compute_pipeline_with_mappings`](Self::create_heap_compute_pipeline_with_mappings)
+    /// with an explicit table instead.
     pub fn create_heap_compute_pipeline(
         &self,
         spirv: &[u32],
         entry: &std::ffi::CStr,
         label: &str,
+        push_params_size: u32,
     ) -> Option<(vk::ShaderModule, vk::Pipeline)> {
-        let device = self.inner.allocator.device();
+        assert_eq!(push_params_size % 4, 0, "binding_seam: {label}: params size unaligned");
         let bindings = spirv_descriptor_bindings(spirv);
         assert!(
-            !bindings.is_empty() && bindings.iter().all(|&(set, _)| set == 0),
+            !bindings.is_empty() && bindings.iter().all(|&(set, _, _)| set == 0),
             "binding_seam: {label}: heap compute kernels bind set 0 only (found {bindings:?})"
         );
+        assert!(
+            bindings
+                .iter()
+                .all(|&(_, _, k)| k != SpirvBindingKind::AccelerationStructure),
+            "binding_seam: {label}: the TLAS is push-address-mapped — build an explicit \
+             table and use create_heap_compute_pipeline_with_mappings"
+        );
+        let mappings: Vec<vk::DescriptorSetAndBindingMappingEXT> = bindings
+            .iter()
+            .map(|&(_, b, kind)| {
+                self.map_binding_push_index(0, b, kind.heap_kind(), push_params_size + b * 4)
+            })
+            .collect();
+        self.create_heap_compute_pipeline_with_mappings(spirv, entry, label, &mappings)
+    }
+
+    /// [`create_heap_compute_pipeline`](Self::create_heap_compute_pipeline)
+    /// with a caller-built mapping table, for kernels that read the shared
+    /// scene/columns heap surface (multi-set, RT-style constant-offset
+    /// entries) or take the TLAS by push address.
+    pub fn create_heap_compute_pipeline_with_mappings(
+        &self,
+        spirv: &[u32],
+        entry: &std::ffi::CStr,
+        label: &str,
+        mappings: &[vk::DescriptorSetAndBindingMappingEXT],
+    ) -> Option<(vk::ShaderModule, vk::Pipeline)> {
+        let device = self.inner.allocator.device();
         let module_info = vk::ShaderModuleCreateInfo::default().code(spirv);
         // SAFETY: spirv is a validated word slice; device live.
         let module = unsafe { device.create_shader_module(&module_info, None) }
             .map_err(|e| bevy_log::error!("binding_seam: {label}: create_shader_module: {e:?}"))
             .ok()?;
-        let mappings: Vec<vk::DescriptorSetAndBindingMappingEXT> = bindings
-            .iter()
-            .map(|&(_, b)| self.map_binding_push_index(0, b, HeapKind::Buffer, b * 4))
-            .collect();
         let mut mapping_info = vk::ShaderDescriptorSetAndBindingMappingInfoEXT::default();
         mapping_info.mapping_count = mappings.len() as u32;
         mapping_info.p_mappings = mappings.as_ptr();
@@ -896,25 +931,71 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
 }
 
-/// The `(descriptor set, binding)` pairs a SPIR-V module declares — every id
-/// carrying both a `DescriptorSet` and a `Binding` decoration, sorted and
-/// deduplicated. This is what a heap mapping table must cover, read from the
-/// exact artifact the driver sees (no hand-maintained binding counts, no
-/// reflection of sources that DCE may have diverged from).
-pub(crate) fn spirv_descriptor_bindings(spirv: &[u32]) -> Vec<(u32, u32)> {
+/// Descriptor kind of a scanned binding, classified from the module's type
+/// graph. Uniform and storage buffers both classify as `Buffer` — they share
+/// the heap's buffer region and the mapping's broad resource mask; which
+/// descriptor a slot holds is the dispatch side's choice
+/// ([`HeapResource::Buffer`] vs [`HeapResource::UniformBuffer`]).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum SpirvBindingKind {
+    Buffer,
+    Image,
+    Sampler,
+    AccelerationStructure,
+}
+
+impl SpirvBindingKind {
+    /// The heap region this binding's descriptor lives in. The TLAS never
+    /// comes from the heap (shader-side heap AS access device-losts on
+    /// current NVIDIA drivers) — map it with
+    /// [`map_binding_push_address`](BindingSeam::map_binding_push_address).
+    pub(crate) fn heap_kind(self) -> HeapKind {
+        match self {
+            SpirvBindingKind::Buffer => HeapKind::Buffer,
+            SpirvBindingKind::Image => HeapKind::Image,
+            SpirvBindingKind::Sampler => HeapKind::Sampler,
+            SpirvBindingKind::AccelerationStructure => {
+                panic!("acceleration structures are push-address-mapped, not heap slots")
+            }
+        }
+    }
+}
+
+/// The `(descriptor set, binding, kind)` triples a SPIR-V module declares —
+/// every id carrying both a `DescriptorSet` and a `Binding` decoration,
+/// sorted and deduplicated, with the descriptor kind classified from the
+/// variable's pointee type (arrays unwrapped to their element). This is what
+/// a heap mapping table must cover, read from the exact artifact the driver
+/// sees (no hand-maintained binding counts, no reflection of sources that
+/// DCE may have diverged from).
+pub(crate) fn spirv_descriptor_bindings(spirv: &[u32]) -> Vec<(u32, u32, SpirvBindingKind)> {
+    const OP_TYPE_IMAGE: u32 = 25;
+    const OP_TYPE_SAMPLER: u32 = 26;
+    const OP_TYPE_SAMPLED_IMAGE: u32 = 27;
+    const OP_TYPE_ARRAY: u32 = 28;
+    const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
+    const OP_TYPE_POINTER: u32 = 32;
+    const OP_VARIABLE: u32 = 59;
     const OP_DECORATE: u32 = 71;
+    const OP_TYPE_ACCELERATION_STRUCTURE_KHR: u32 = 5341;
     const DECORATION_BINDING: u32 = 33;
     const DECORATION_DESCRIPTOR_SET: u32 = 34;
     let mut sets = std::collections::HashMap::new();
     let mut bindings = std::collections::HashMap::new();
+    // Type graph: result id -> opcode, and result id -> referenced type id
+    // (pointee for pointers, element for arrays, image for sampled-image).
+    let mut type_op = std::collections::HashMap::new();
+    let mut type_target = std::collections::HashMap::new();
+    // Variable id -> its (pointer) type id.
+    let mut var_type = std::collections::HashMap::new();
     let mut i = 5; // past the SPIR-V header
     while i < spirv.len() {
         let word_count = (spirv[i] >> 16) as usize;
         if word_count == 0 || i + word_count > spirv.len() {
             break;
         }
-        if spirv[i] & 0xFFFF == OP_DECORATE && word_count == 4 {
-            match spirv[i + 2] {
+        match spirv[i] & 0xFFFF {
+            OP_DECORATE if word_count == 4 => match spirv[i + 2] {
                 DECORATION_DESCRIPTOR_SET => {
                     sets.insert(spirv[i + 1], spirv[i + 3]);
                 }
@@ -922,13 +1003,55 @@ pub(crate) fn spirv_descriptor_bindings(spirv: &[u32]) -> Vec<(u32, u32)> {
                     bindings.insert(spirv[i + 1], spirv[i + 3]);
                 }
                 _ => {}
+            },
+            op @ (OP_TYPE_IMAGE
+            | OP_TYPE_SAMPLER
+            | OP_TYPE_ACCELERATION_STRUCTURE_KHR) => {
+                type_op.insert(spirv[i + 1], op);
             }
+            op @ (OP_TYPE_SAMPLED_IMAGE | OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY) => {
+                type_op.insert(spirv[i + 1], op);
+                type_target.insert(spirv[i + 1], spirv[i + 2]);
+            }
+            OP_TYPE_POINTER => {
+                type_op.insert(spirv[i + 1], OP_TYPE_POINTER);
+                type_target.insert(spirv[i + 1], spirv[i + 3]);
+            }
+            OP_VARIABLE => {
+                var_type.insert(spirv[i + 2], spirv[i + 1]);
+            }
+            _ => {}
         }
         i += word_count;
     }
-    let mut out: Vec<(u32, u32)> = sets
+    let classify = |id: u32| -> SpirvBindingKind {
+        let mut ty = match var_type.get(&id) {
+            Some(&t) => t,
+            None => return SpirvBindingKind::Buffer,
+        };
+        // Unwrap the variable's pointer, then any array layers.
+        for _ in 0..8 {
+            match type_op.get(&ty) {
+                Some(&OP_TYPE_POINTER | &OP_TYPE_ARRAY | &OP_TYPE_RUNTIME_ARRAY) => {
+                    ty = type_target[&ty];
+                }
+                _ => break,
+            }
+        }
+        match type_op.get(&ty) {
+            Some(&OP_TYPE_SAMPLER) => SpirvBindingKind::Sampler,
+            Some(&OP_TYPE_IMAGE | &OP_TYPE_SAMPLED_IMAGE) => SpirvBindingKind::Image,
+            Some(&OP_TYPE_ACCELERATION_STRUCTURE_KHR) => {
+                SpirvBindingKind::AccelerationStructure
+            }
+            _ => SpirvBindingKind::Buffer, // block struct (uniform or storage)
+        }
+    };
+    let mut out: Vec<(u32, u32, SpirvBindingKind)> = sets
         .iter()
-        .filter_map(|(id, &set)| bindings.get(id).map(|&binding| (set, binding)))
+        .filter_map(|(&id, &set)| {
+            bindings.get(&id).map(|&binding| (set, binding, classify(id)))
+        })
         .collect();
     out.sort_unstable();
     out.dedup();

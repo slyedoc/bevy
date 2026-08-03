@@ -17,7 +17,7 @@
 //! height comes from [`SolariSettings::tess_displacement_scale`].
 
 use bevy::{
-    camera::Hdr, camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig}, diagnostic::FrameTimeDiagnosticsPlugin, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, math::DQuat, pbr::PbrPlugin, prelude::*, solari::prelude::*,
+    camera::Hdr, camera_controller::free_camera::{FreeCamera, FreeCameraPlugin}, dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig}, diagnostic::FrameTimeDiagnosticsPlugin, feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme}, math::DQuat, pbr::PbrPlugin, prelude::*,
 };
 
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]

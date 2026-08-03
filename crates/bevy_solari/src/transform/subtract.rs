@@ -11,26 +11,22 @@
 //! moves, but re-relativizing is a flat one-op-per-node kernel (no chain walk), so the camera
 //! can be the live origin without forcing the expensive walk to re-run over static nodes.
 
+#![allow(unsafe_code)]
+
+use ash::vk;
 use bevy_ecs::{
     resource::Resource,
     system::{Commands, Res, ResMut},
 };
-use bevy_render::{
-    diagnostic::RecordDiagnostics as _,
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        ComputePassDescriptor, PipelineCache, ShaderStages, ShaderType, UniformBuffer,
-    },
-    renderer::{RenderContext, RenderDevice, RenderQueue},
-    Extract,
-};
+use bevy_render::{renderer::RenderContext, Extract};
 use bytemuck::{Pod, Zeroable};
+use wgpu::hal::api::Vulkan as VkApi;
 
 use crate::ecs_gpu::GpuSlot;
-use crate::pipelines::SolariPipelines;
+use crate::gpu::allocator::Allocator;
+use crate::gpu::binding_seam::BindingSeam;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::render::SolariCamera;
-use crate::resource_manager::SolariResourceManager;
 
 use super::graph::TransformGraph;
 use super::propagate::TransformPropagate;
@@ -65,54 +61,82 @@ pub fn extract_origin_slot(
     }
 }
 
-/// Uniform shared with `transform_subtract.wgsl::SubtractParams`.
+/// Push params shared with `transform_subtract.slang::SubtractParams`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Pod, Zeroable, ShaderType)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct SubtractParams {
     count: u32,
     camera_slot: u32,
     node_count: u32,
     origin_valid: u32,
+    groups_x: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
-/// Render-world resource: the subtract pipeline + its params/bind group.
+/// Render-world resource: the subtract heap kernel + its slots.
 #[derive(Resource)]
 pub struct TransformSubtract {
     count: u32,
     /// The walk wrote `world_abs` and the subtract hasn't consumed it yet. Retained
-    /// until the dispatch *actually* runs (a cold pipeline or missing bind group must
-    /// not drop it — the scene could go idle and leave `world_rel` stale/zero forever).
-    /// Same retain-until-consumed rule as the propagate's `needs_full_rebuild`.
+    /// until the dispatch *actually* runs (an idle scene must not drop it — that
+    /// would leave `world_rel` stale/zero forever). Same retain-until-consumed rule
+    /// as the propagate's `needs_full_rebuild`.
     dirty: bool,
-    params: UniformBuffer<SubtractParams>,
-    bind_group: Option<BindGroup>,
+    groups: (u32, u32, u32),
+    params: SubtractParams,
+    kernel: HeapKernel,
+    slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// The subtract bind-group layout. Owned by [`SolariResourceManager`].
-pub fn transform_subtract_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
+impl Drop for TransformSubtract {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for TransformSubtract {}
+unsafe impl Sync for TransformSubtract {}
+
+/// `RenderStartup` (after `SolariSetup`): compile the subtract kernel — a
+/// layout-free heap pipeline ([`HeapKernel`]), Slang from source.
+pub fn init_transform_subtract(
+    mut commands: Commands,
+    seam: Option<Res<BindingSeam>>,
+    allocator: Option<Res<Allocator>>,
+) {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
+        return;
+    };
+    let Some(kernel) = HeapKernel::new(
+        &seam,
+        "transform_subtract.slang",
+        include_str!("transform_subtract.slang"),
+        "subtract",
+        &[],
+        &[],
         "transform_subtract",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 world_abs_linear
-                storage_buffer_read_only_sized(false, None), // 1 world_abs_t (array<f64>)
-                storage_buffer_sized(false, None),           // 2 world_rel (rw)
-                uniform_buffer::<SubtractParams>(false),     // 3 params
-            ),
-        ),
-    )
-}
-
-/// `RenderStartup`: the subtract pass owns only its params buffer + bind group.
-pub fn init_transform_subtract(mut commands: Commands) {
-    let mut params = UniformBuffer::<SubtractParams>::default();
-    params.set_label(Some("transform_subtract"));
+        size_of::<SubtractParams>() as u32,
+    ) else {
+        return;
+    };
+    let slots = KernelSlots::new(&seam, 3);
     commands.insert_resource(TransformSubtract {
         count: 0,
         dirty: false,
-        params,
-        bind_group: None,
+        groups: (0, 0, 0),
+        params: SubtractParams::default(),
+        kernel,
+        slots,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -121,8 +145,6 @@ pub fn prepare_transform_subtract(
     mut subtract: Option<ResMut<TransformSubtract>>,
     propagate: Option<Res<TransformPropagate>>,
     origin: Option<Res<SolariOriginSlot>>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
 ) {
     let (Some(subtract), Some(propagate)) = (subtract.as_deref_mut(), propagate) else {
         return;
@@ -130,81 +152,71 @@ pub fn prepare_transform_subtract(
     let (slot, valid) = origin.map(|o| (o.slot, o.valid)).unwrap_or((0, false));
     subtract.count = propagate.node_count();
     subtract.dirty |= propagate.world_dirty();
-    *subtract.params.get_mut() = SubtractParams {
+    subtract.groups = crate::ecs_gpu::linear_dispatch(subtract.count.div_ceil(WORKGROUP_SIZE));
+    subtract.params = SubtractParams {
         count: subtract.count,
         camera_slot: slot,
         node_count: propagate.node_count(),
         origin_valid: valid as u32,
+        groups_x: subtract.groups.0,
+        ..Default::default()
     };
-    subtract.params.write_buffer(&render_device, &render_queue);
-}
-
-/// `Render::PrepareBindGroups`: (re)build the subtract bind group. Rebuilt every
-/// frame — cheap, and immune to a bound buffer changing allocation strategy later.
-pub fn prepare_transform_subtract_bind_group(
-    mut subtract: Option<ResMut<TransformSubtract>>,
-    resource_manager: Option<Res<SolariResourceManager>>,
-    propagate: Option<Res<TransformPropagate>>,
-    pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
-) {
-    let (Some(subtract), Some(resource_manager), Some(propagate)) =
-        (subtract.as_deref_mut(), resource_manager, propagate)
-    else {
-        return;
-    };
-    let Some(params) = subtract.params.binding() else {
-        return;
-    };
-    let layout = pipeline_cache.get_bind_group_layout(&resource_manager.transform_subtract);
-    subtract.bind_group = Some(render_device.create_bind_group(
-        "transform_subtract",
-        &layout,
-        &BindGroupEntries::sequential((
-            propagate.world_abs_linear().as_entire_binding(),
-            propagate.world_abs_t().as_entire_binding(),
-            propagate.current_world().as_entire_binding(),
-            params,
-        )),
-    ));
 }
 
 /// `RenderGraph` (`Propagate`, between the walk and the gather): subtract the origin,
 /// producing the origin-relative `world_rel`. Skipped on an idle frame (nothing walked).
+/// A raw heap dispatch: buffer slots rewritten per dispatch, params + slot array in
+/// push data.
 pub fn dispatch_transform_subtract(
     subtract: Option<ResMut<TransformSubtract>>,
-    pipelines: Res<SolariPipelines>,
-    pipeline_cache: Res<PipelineCache>,
+    seam: Option<Res<BindingSeam>>,
+    propagate: Option<Res<TransformPropagate>>,
     mut ctx: RenderContext,
 ) {
-    let Some(mut subtract) = subtract else {
+    let (Some(mut subtract), Some(seam), Some(propagate)) = (subtract, seam, propagate) else {
         return;
     };
     if !subtract.dirty || subtract.count == 0 {
         return;
     }
-    // A cold pipeline / missing bind group bails WITHOUT clearing `dirty` — the
-    // pending subtract is retained until it actually runs.
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.transform_subtract) else {
-        return;
-    };
-    if subtract.bind_group.is_none() {
-        return;
-    }
     subtract.dirty = false;
     let subtract = subtract.into_inner();
-    let bind_group = subtract.bind_group.as_ref().unwrap();
-    let groups = crate::ecs_gpu::linear_dispatch(subtract.count.div_ceil(WORKGROUP_SIZE));
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
+    let blob = subtract.kernel.push_blob(
+        "transform_subtract",
+        bytemuck::bytes_of(&subtract.params),
+        &[
+            (
+                "world_abs_linear",
+                subtract.slots.buffer(&seam, 0, propagate.world_abs_linear()),
+            ),
+            ("world_abs_t", subtract.slots.buffer(&seam, 1, propagate.world_abs_t())),
+            ("world_rel", subtract.slots.buffer(&seam, 2, propagate.current_world())),
+        ],
+    );
+    let (gx, gy, gz) = subtract.groups;
     let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("transform_subtract"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_group, &[]);
-    let d = diagnostics.time_span(&mut pass, "transform_subtract");
-    pass.dispatch_workgroups(groups.0, groups.1, groups.2);
-    d.end(&mut pass);
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket this dispatch against the surrounding wgpu compute
+    // passes (raw dispatches are invisible to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &subtract.raw_device;
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+            // The walk's world_abs writes -> our reads.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, subtract.kernel.pipeline);
+            dev.cmd_dispatch(cb, gx, gy, gz);
+            // Our world_rel writes -> the gather / light-resolve reads.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+        });
+    }
 }

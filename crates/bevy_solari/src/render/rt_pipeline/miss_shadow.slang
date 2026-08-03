@@ -7,7 +7,7 @@
 // closest-hit's registers.
 //
 
-// MUST MATCH ShadowPayload in rt_payload.wgsl: two u32 words at offsets 0/4.
+// MUST MATCH ShadowPayload in rt_payload.slang: two u32 words at offsets 0/4.
 // Payload linkage across the naga/Slang stage boundary is by trace-call
 // operand + struct layout only (naga emits no payload Location decorations).
 struct ShadowPayload

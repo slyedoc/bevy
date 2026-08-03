@@ -1,6 +1,6 @@
 //! Bind group layout + cached bind group for the cluster
 //! scene state. Matches the `@group(0)` declarations in
-//! `cluster_bindings.wgsl`.
+//! `cluster_bindings.slang`.
 //!
 //! Skips bind-group creation while any required buffer hasn't been
 //! populated yet (scene has no `RaytracingMesh3d` entities, or no
@@ -22,15 +22,11 @@ use bevy_render::{
     renderer::RenderDevice,
 };
 
-/// Bind group layout descriptor for `cluster_bindings.wgsl`'s
-/// `@group(0)`. Holds the [`BindGroupLayoutDescriptor`] used both
-/// for pipeline construction (passed to `ComputePipelineDescriptor.layout`)
-/// and for materializing the actual `BindGroupLayout` at bind-group
-/// creation time via [`PipelineCache::get_bind_group_layout`].
+/// Bind group layout descriptor for the cluster-scene set 0
+/// (`cluster_bindings.slang`), materialized at bind-group creation time via
+/// [`PipelineCache::get_bind_group_layout`].
 ///
-/// All [`BIND_GROUP_BUFFER_COUNT`] entries are read-only storage buffers;
-/// all are visible in `COMPUTE` and `FRAGMENT` so the same layout serves
-/// selector compute passes and ray-hit shading.
+/// All [`BIND_GROUP_BUFFER_COUNT`] entries are read-only storage buffers.
 #[derive(Resource, Clone)]
 pub struct ClusterSceneBindGroupLayout(pub BindGroupLayoutDescriptor);
 
@@ -65,7 +61,9 @@ pub fn init_cluster_scene_bind_group_layout(mut commands: Commands) {
     commands.insert_resource(ClusterSceneBindGroupLayout(descriptor));
 }
 
-/// Cached bind group for the cluster scene `@group(0)`.
+/// Cached bind group for the cluster scene `@group(0)`, plus its descriptor-
+/// heap mirror (the set-0 surface the cluster AS heap kernels map at constant
+/// offsets — see `gpu::rt_pipeline::cluster_heap_mappings`).
 ///
 /// The bind group is byte-identical frame-to-frame unless one of its
 /// buffer *handles* changes — and a handle only changes when that buffer
@@ -73,7 +71,8 @@ pub fn init_cluster_scene_bind_group_layout(mut commands: Commands) {
 /// a slot-buffer resize), which is rare. So we cache the materialized
 /// group + a signature of its handle ids and rebuild only when the
 /// signature moves; a static frame skips both the rebuild and the
-/// `PipelineCache` layout lock entirely.
+/// `PipelineCache` layout lock entirely. The heap mirror is rewritten on
+/// the same cadence.
 ///
 /// `bind_group` is `None` when the scene has no `RaytracingMesh3d`
 /// instances or the asset hasn't loaded yet (a required buffer wasn't
@@ -86,6 +85,13 @@ pub struct ClusterSceneBindGroup {
     /// build. `None` forces a rebuild (and is reset on every early-out so
     /// a later valid frame rebuilds).
     buffer_ids: Option<[BufferId; BIND_GROUP_BUFFER_COUNT]>,
+    /// The buffers mirrored into the descriptor heap as
+    /// `(binding, heap buffer-region slot)` pairs, rewritten on the same
+    /// signature cadence as the bind group. The slots are allocated once
+    /// (the binding count is fixed) and rewritten in place, so the mapping
+    /// tables the AS kernels baked from them never go stale — this field
+    /// survives the early-out resets above.
+    pub heap_slots: Option<Vec<(u32, u32)>>,
 }
 
 /// Rebuild the scene bind group when a buffer handle changed. Runs in
@@ -100,19 +106,24 @@ pub fn prepare_cluster_scene_bind_group(
     transforms: Option<Res<GpuColumn<TransformColumn>>>,
     group_bases: Option<Res<GpuColumn<GroupBaseColumn>>>,
     lod_inputs: Option<Res<GpuColumn<LodInputColumn>>>,
+    seam: Option<Res<crate::gpu::binding_seam::BindingSeam>>,
     render_device: Res<RenderDevice>,
 ) {
+    // Early-outs clear only the bind group + signature: `heap_slots` must
+    // survive (the AS kernels' mapping tables bake those slot offsets).
     let (Some(transforms), Some(group_bases), Some(lod_inputs)) =
         (transforms, group_bases, lod_inputs)
     else {
-        *bind_group = ClusterSceneBindGroup::default();
+        bind_group.bind_group = None;
+        bind_group.buffer_ids = None;
         return;
     };
     // Mesh-pool buffers have no committed sparse pages until the first
     // `perform_pending_cluster_mesh_writes` runs — binding/reading them then would
     // fault on unbacked memory. Bail until something is uploaded.
     if mesh_manager.vertex_positions.is_empty() {
-        *bind_group = ClusterSceneBindGroup::default();
+        bind_group.bind_group = None;
+        bind_group.buffer_ids = None;
         return;
     }
 
@@ -162,6 +173,55 @@ pub fn prepare_cluster_scene_bind_group(
             lod_inputs.buffer().as_entire_binding(),
         )),
     );
+
+    // Mirror the same 13 buffers into the descriptor heap on the same
+    // signature cadence as the bind group — the cluster AS heap kernels map
+    // set 0 from these slots at constant offsets. Rewritten in place so the
+    // baked mapping tables stay valid across buffer reallocation; slots are
+    // re-allocated only if the binding count itself changes. Each descriptor
+    // covers the entire (sparse, stable-address) buffer, matching the
+    // `as_entire` bind-group entries above.
+    if let Some(seam) = seam.as_deref() {
+        use crate::gpu::binding_seam::{HeapKind, HeapResource};
+        let buffers: [&bevy_render::render_resource::Buffer; BIND_GROUP_BUFFER_COUNT] = [
+            mesh_manager.vertex_positions.buffer(),
+            mesh_manager.vertex_normals.buffer(),
+            mesh_manager.vertex_tangents.buffer(),
+            mesh_manager.vertex_uvs.buffer(),
+            mesh_manager.indices.buffer(),
+            mesh_manager.child_table.buffer(),
+            mesh_manager.clusters.buffer(),
+            mesh_manager.groups.buffer(),
+            mesh_manager.nodes.buffer(),
+            mesh_manager.cluster_to_group.buffer(),
+            transforms.buffer(),
+            group_bases.buffer(),
+            lod_inputs.buffer(),
+        ];
+        let slots: Vec<(u32, u32)> = match bind_group.heap_slots.take() {
+            Some(slots) if slots.len() == buffers.len() => slots,
+            stale => {
+                for (_, slot) in stale.into_iter().flatten() {
+                    seam.free_heap_index(HeapKind::Buffer, slot);
+                }
+                (0..buffers.len() as u32)
+                    .map(|binding| (binding, seam.alloc_heap_block(HeapKind::Buffer, 1)))
+                    .collect()
+            }
+        };
+        for (buffer, &(_, slot)) in buffers.iter().zip(&slots) {
+            seam.rewrite_heap_index(
+                HeapKind::Buffer,
+                slot,
+                HeapResource::Buffer {
+                    address: seam.device_address(buffer).get(),
+                    size: buffer.size(),
+                },
+            );
+        }
+        bind_group.heap_slots = Some(slots);
+    }
+
     bind_group.bind_group = Some(group);
     bind_group.buffer_ids = Some(buffer_ids);
 }

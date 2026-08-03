@@ -31,11 +31,11 @@ use crate::ecs_gpu::{push_record, GpuColumn, GpuSlot};
 use super::readback::NoGpuGlobalTransformReadback;
 
 /// Root sentinel in the `parent` column: no parent, so propagation takes
-/// `world = local`. Must match `ROOT_PARENT` in `transform_propagate.wgsl`.
+/// `world = local`. Must match `ROOT_PARENT` in `transform_propagate.slang`.
 pub const ROOT_PARENT: u32 = u32::MAX;
 
 /// Chain sentinel in the `first_child`/`next_sibling` columns: end of the sibling
-/// list / childless node. Must match `NO_NODE` in `transform_frontier.wgsl`.
+/// list / childless node. Must match `NO_NODE` in `transform_frontier.slang`.
 pub const NO_NODE: u32 = u32::MAX;
 
 /// A node's local translation on the wire: 3×`f64` = 24 B, bound as `array<f64>`

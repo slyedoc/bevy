@@ -428,8 +428,6 @@ impl Plugin for HairPlugin {
                     ptlas_hair::prepare_hair_ptlas_write
                         .in_set(RenderSystems::PrepareResources)
                         .after(prepare_hair_instances),
-                    ptlas_hair::prepare_hair_ptlas_write_bind_group
-                        .in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
             .add_systems(

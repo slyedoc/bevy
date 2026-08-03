@@ -119,11 +119,6 @@ ash = { version = "0.38", features = ["provisional"] }
 wgpu = { version = "29.0.3", default-features = false }
 # Optional — only pulled in by `bevy_solari_debug` (`cli::SolariCameraArgs`).
 clap = { version = "4", features = ["derive"], optional = true }
-# Shader composition for the raw-VK RT-pipeline shaders: they `#import` solari's
-# scene-binding / BRDF / sampling modules, which need naga_oil's composer (raw
-# naga::parse_str can't resolve `#import`). Patched to the SER-aware fork.
-naga_oil = { version = "0.22", default-features = false }
-naga = { version = "29", features = ["wgsl-in", "spv-out"] }
 # Runtime Slang→SPIR-V for the RT stages that compose runtime-swappable
 # modules (the primary miss's custom sky, downstream Slang closest-hits):
 # libslang.so is dlopen'd from the pinned toolchain (see `gpu/slang.rs`).

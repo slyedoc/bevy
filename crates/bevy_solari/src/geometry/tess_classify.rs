@@ -1,38 +1,42 @@
 // GPU per-base-triangle classification for the adaptive tessellation path.
 //
-// A self-contained compute pass (own bind group + submit) that classifies every
-// tessellated instance's base triangles into per-edge tessellation factors and
-// emits a work list (`part_triangles`) keyed to the [`TessellationTable`]
+// A self-contained pass chain (raw heap dispatches + submit) that classifies
+// every tessellated instance's base triangles into per-edge tessellation factors
+// and emits a work list (`part_triangles`) keyed to the [`TessellationTable`]
 // patterns, consumed by the displace + instantiate passes. See
-// `tess_classify.wgsl` for the per-triangle math.
+// `tess_classify.slang` for the per-triangle math.
 #![allow(clippy::type_complexity)]
 // Some render-resource types are also glob-re-exported via `render_resource::*`;
 // keep the explicit `wgpu::` prefix at call sites.
 #![allow(unused_qualifications)]
-#![allow(unsafe_code, reason = "raw VK cluster-AS instantiate via the extension fns")]
+#![allow(unsafe_code, reason = "raw VK heap dispatches + cluster-AS instantiate")]
 
 use bevy_ecs::{
+    change_detection::DetectChanges,
     query::With,
     resource::Resource,
     system::{Commands, Query, Res, ResMut},
 };
-use bevy_math::{Mat4, Vec2};
 use bevy_render::{
     camera::ExtractedCamera,
     render_asset::RenderAssets,
-    render_resource::{binding_types::*, *},
+    render_resource::*,
     renderer::{RenderDevice, RenderQueue},
     sync_world::MainEntity,
-    texture::GpuImage,
+    texture::{FallbackImage, GpuImage},
     view::ExtractedView,
 };
 use bytemuck::{Pod, Zeroable};
 
 use ash::vk::{self, TaggedStructure};
 
+use wgpu::hal::api::Vulkan as VkApi;
+
 use crate::gpu::retire::GpuRetire;
 use crate::gpu::allocator::{Allocator, MemoryLocation};
+use crate::gpu::binding_seam::{BindingSeam, HeapKind};
 use crate::gpu::extension::{AsSeams, ClusterExtensionFns};
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::ecs_gpu::GpuColumn;
 use crate::instance::{RaytracingGpuEntity, TransformColumn};
 use super::clas_arena::CLAS_SCRATCH_ALIGN;
@@ -54,18 +58,21 @@ fn align_up(addr: u64, align: u64) -> u64 {
 const GEN_CAPACITY: u32 = 1 << 18; // 262144 parts
 /// Fixed micro-vertices per part slot (the table's max).
 const MAX_VERTS: u32 = 78;
-/// Max distinct tessellated instances the per-instance displacement binding array
-/// reserves (partially bound — only the live instances are filled). The gen pass
-/// indexes it by `instance_index`, so it must cover the showcase instance count.
-/// MUST equal the sized `binding_array<texture_2d<f32>, N>` in `tess_gen_verts.wgsl`.
+/// Max distinct tessellated instances the per-instance displacement heap block
+/// reserves. The gen pass indexes it by `instance_index`, so it must cover the
+/// showcase instance count; unused slots hold fallback descriptors (a heap
+/// array has no "partially bound" — an unwritten descriptor is garbage).
+/// MUST equal the sized `Texture2D displacement_maps[N]` in `tess_gen_verts.slang`.
 const MAX_TESS_DISPLACEMENT_MAPS: u32 = 256;
 
-/// `tess_classify.wgsl::Params` mirror. `ShaderType` lays it out std140 to match
-/// the uniform on the shader side.
-#[derive(Clone, Copy, ShaderType, Default)]
+/// Push params shared with `tess_classify.slang::ClassifyParams` (96 B).
+/// `clip_from_world` is `Mat4::to_cols_array` — the shader applies the four
+/// columns explicitly, so no matrix-layout convention crosses the boundary.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct ClassifyParams {
-    pub clip_from_world: Mat4,
-    pub viewport: Vec2,
+    pub clip_from_world: [f32; 16],
+    pub viewport: [f32; 2],
     pub px_per_segment: f32,
     pub work_cluster_count: u32,
     pub max_size: u32,
@@ -74,7 +81,7 @@ pub struct ClassifyParams {
     pub _pad: u32,
 }
 
-/// `tess_classify.wgsl::WorkCluster`.
+/// `tess_classify.slang::WorkCluster`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 struct WorkClusterGpu {
@@ -94,8 +101,9 @@ struct WorkClusterGpu {
     part_base: u32,
 }
 
-/// `tess_gen_verts.wgsl::GenParams` mirror.
-#[derive(Clone, Copy, ShaderType, Default)]
+/// Push params shared with `tess_gen_verts.slang::GenParams` (32 B).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct GenParams {
     pub displacement_scale: f32,
     pub displacement_bias: f32,
@@ -110,8 +118,9 @@ pub struct GenParams {
     pub _pad2: u32,
 }
 
-/// `tess_gen_attrs.wgsl::AttrParams` mirror.
-#[derive(Clone, Copy, ShaderType, Default)]
+/// Push params shared with `tess_gen_attrs.slang::AttrParams` (16 B).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct AttrParams {
     pub attr_addr_lo: u32,
     pub attr_addr_hi: u32,
@@ -119,8 +128,9 @@ pub struct AttrParams {
     pub part_capacity: u32,
 }
 
-/// `tess_instantiate.wgsl::InstParams` mirror.
-#[derive(Clone, Copy, ShaderType, Default)]
+/// Push params shared with `tess_instantiate.slang::InstParams`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct InstParams {
     pub gen_base_lo: u32,
     pub gen_base_hi: u32,
@@ -133,13 +143,16 @@ pub struct InstParams {
 }
 
 /// Render-world resource for the classify + downstream tessellation passes.
+/// Every dispatch is a layout-free heap kernel ([`HeapKernel`]), Slang from
+/// source, recorded raw into one encoder by [`run_tess_classify`].
 #[derive(Resource)]
 pub struct TessClassify {
-    pub pipeline: CachedComputePipelineId,
-    pub layout: BindGroupLayoutDescriptor,
-    /// `finalize` entry of the classify shader → writes `gen_dispatch` indirect args.
-    finalize_pipeline: CachedComputePipelineId,
-    params: UniformBuffer<ClassifyParams>,
+    /// `classify` entry of `tess_classify.slang` + its buffer slots (shared
+    /// with `finalize` — the two entries name overlapping parameters).
+    classify_kernel: HeapKernel,
+    /// `finalize` entry → writes `gen_dispatch` indirect args.
+    finalize_kernel: HeapKernel,
+    classify_slots: KernelSlots,
     /// Per-tess-instance cluster slot (tess index → RT instance slot), rebuilt each
     /// frame from the render-world slot map. Classify reads the origin-relative world
     /// as `transforms[slots[instance_idx]]` (the gathered, cluster-indexed column), so
@@ -148,28 +161,37 @@ pub struct TessClassify {
     work_clusters: RawBufferVec<WorkClusterGpu>,
     /// `counts[0]` = emitted part count (the indirect INSTANTIATE's `src_infos_count`).
     counts: Buffer,
-    /// Emitted [`tess_classify.wgsl::TessTriangleInfo`] work list (gen-pass input).
+    /// Emitted `tess_classify.slang::TessTriangleInfo` work list (gen-pass input).
     pub part_triangles: Buffer,
     /// `DispatchIndirectCommand` for the gen pass (one workgroup per part).
     gen_dispatch: Buffer,
     /// Work clusters this resource's CPU lists were last built for (rebuilt when
     /// the instance set changes — the showcase instance set is latch-stable).
     built_instances: usize,
-    bind_group: Option<BindGroup>,
 
     // ── Micro-vertex generation ──────────────────────────────────────────────
-    gen_pipeline: CachedComputePipelineId,
-    gen_layout: BindGroupLayoutDescriptor,
-    gen_params: StorageBuffer<GenParams>,
+    /// `tess_gen_verts.slang` — set-1 buffers push-indexed, set-0 displacement
+    /// array + sampler constant-offset over [`disp_block`](Self::disp_block).
+    gen_kernel: HeapKernel,
+    gen_slots: KernelSlots,
+    /// Heap image block backing `displacement_maps[256]`: slot `base + i` is
+    /// instance i's map, every unused slot a fallback descriptor. The block
+    /// base is baked into the gen kernel's mapping table at init, so it never
+    /// moves; content rewrites are change-driven ([`run_tess_classify`]).
+    disp_block: u32,
+    /// Sampler-heap slot for the shared filtering `displacement_sampler`.
+    disp_sampler_slot: u32,
+    /// Whether the displacement block currently mirrors the instance set's
+    /// maps (false until first write; re-cleared when the set rebuilds).
+    disp_written: bool,
     /// World-space micro-vertices, stride 3 f32, slot `part*MAX_VERTS + v`. The
     /// instantiate pass builds each part's CLAS against its slice of this.
     pub gen_vertices: Buffer,
-    gen_bind_group: Option<BindGroup>,
 
     // ── Per-micro-triangle smooth normals + UVs ──────────────────────────────
-    attr_pipeline: CachedComputePipelineId,
-    attr_layout: BindGroupLayoutDescriptor,
-    attr_params: UniformBuffer<AttrParams>,
+    /// `tess_gen_attrs.slang` (entry `gen_attrs_main`).
+    attr_kernel: HeapKernel,
+    attr_slots: KernelSlots,
     /// Denormalized per-micro-triangle attrs (3 × {packed normal, uv} = 36 B), fixed
     /// `max_tris` stride per part, read by the closest-hit's smooth-tess branch.
     /// `None` until sized for the instance set (allocator-backed for a stable trace
@@ -180,16 +202,14 @@ pub struct TessClassify {
     pub gen_attrs_meta: Option<Buffer>,
     gen_attrs_addr: u64,
     pub gen_attrs_meta_addr: u64,
-    attr_bind_group: Option<BindGroup>,
 
     // ── Per-part CLAS instantiate descriptors ────────────────────────────────
-    instantiate_pipeline: CachedComputePipelineId,
-    instantiate_layout: BindGroupLayoutDescriptor,
-    inst_params: UniformBuffer<InstParams>,
+    /// Descriptor-builder heap kernel ([`HeapKernel`]) + its buffer slots.
+    inst_kernel: HeapKernel,
+    inst_slots: KernelSlots,
     /// One `VkClusterAccelerationStructureInstantiateClusterInfoNV` (8 u32 / 32 B)
     /// per emitted part — consumed by the raw-VK indirect INSTANTIATE.
     pub instantiate_infos: Buffer,
-    instantiate_bind_group: Option<BindGroup>,
     /// Device address of `gen_vertices` (resolved once the allocator is present);
     /// baked into each descriptor's `vertex_buffer.start_address`.
     gen_vertices_addr: u64,
@@ -232,92 +252,103 @@ pub struct TessClassify {
     /// Counts every entry into `run_tess_classify` (incl. early-bail frames) so the
     /// guard diagnostics can fire only on the first few frames instead of spamming.
     diag: u32,
+
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// `RenderStartup`: layout + pipeline + persistent output buffers.
+impl Drop for TessClassify {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe {
+            self.classify_kernel.destroy(&self.raw_device);
+            self.finalize_kernel.destroy(&self.raw_device);
+            self.gen_kernel.destroy(&self.raw_device);
+            self.attr_kernel.destroy(&self.raw_device);
+            self.inst_kernel.destroy(&self.raw_device);
+        }
+    }
+}
+
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for TessClassify {}
+unsafe impl Sync for TessClassify {}
+
+/// `RenderStartup`: heap kernels + persistent output buffers.
 pub fn init_tess_classify(
     mut commands: Commands,
-    pipeline_cache: Res<PipelineCache>,
-    asset_server: Res<bevy_asset::AssetServer>,
     render_device: Res<RenderDevice>,
+    seam: Option<Res<BindingSeam>>,
     allocator: Option<Res<Allocator>>,
-    mut registry: ResMut<crate::ecs_gpu::SolariPipelineRegistry>,
 ) {
-    if allocator.is_none() {
+    let (Some(seam), Some(allocator)) = (seam, allocator) else {
         return;
-    }
-    let layout = BindGroupLayoutDescriptor::new(
-        "tess_classify_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                uniform_buffer_sized(false, None),           // 0 params
-                storage_buffer_read_only_sized(false, None), // 1 work_clusters
-                storage_buffer_read_only_sized(false, None), // 2 vertex_positions
-                storage_buffer_read_only_sized(false, None), // 3 indices
-                storage_buffer_sized(false, None),           // 4 counts (rw)
-                storage_buffer_sized(false, None),           // 5 part_triangles (rw)
-                storage_buffer_sized(false, None),           // 6 gen_dispatch (rw)
-                storage_buffer_read_only_sized(false, None), // 7 transforms (gathered column)
-                storage_buffer_read_only_sized(false, None), // 8 slots (tess idx → cluster slot)
-            ),
-        ),
-    );
-    let classify_shader =
-        bevy_asset::load_embedded_asset!(asset_server.as_ref(), "tess_classify.wgsl");
-    let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("tess_classify".into()),
-        layout: vec![layout.clone()],
-        shader: classify_shader.clone(),
-        shader_defs: vec![],
-        entry_point: Some("classify".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
-    let finalize_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("tess_classify_finalize".into()),
-        layout: vec![layout.clone()],
-        shader: classify_shader,
-        shader_defs: vec![],
-        entry_point: Some("finalize".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
+    };
+    let Some(classify_kernel) = HeapKernel::new(
+        &seam,
+        "tess_classify.slang",
+        include_str!("tess_classify.slang"),
+        "classify",
+        &[],
+        &[],
+        "tess_classify",
+        size_of::<ClassifyParams>() as u32,
+    ) else {
+        return;
+    };
+    let Some(finalize_kernel) = HeapKernel::new(
+        &seam,
+        "tess_classify.slang",
+        include_str!("tess_classify.slang"),
+        "finalize",
+        &[],
+        &[],
+        "tess_classify_finalize",
+        size_of::<ClassifyParams>() as u32,
+    ) else {
+        return;
+    };
 
-    // Vertex-gen layout + pipeline.
-    let gen_layout = BindGroupLayoutDescriptor::new(
-        "tess_gen_verts_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                // Storage, not uniform: a bind group can't mix a uniform buffer with
-                // the binding array at slot 6.
-                storage_buffer_read_only_sized(false, None), // 0 gen params
-                storage_buffer_read_only_sized(false, None), // 1 part_triangles
-                storage_buffer_read_only_sized(false, None), // 2 configs
-                storage_buffer_read_only_sized(false, None), // 3 table_vertices
-                storage_buffer_read_only_sized(false, None), // 4 base_positions
-                storage_buffer_read_only_sized(false, None), // 5 base_packed
-                // 6 per-instance displacement maps (binding array, partially bound).
-                texture_2d(TextureSampleType::Float { filterable: true })
-                    .count(core::num::NonZero::new(MAX_TESS_DISPLACEMENT_MAPS).unwrap()),
-                sampler(SamplerBindingType::Filtering),      // 7 sampler
-                storage_buffer_sized(false, None),           // 8 gen_vertices (rw)
-            ),
-        ),
-    );
-    let gen_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("tess_gen_verts".into()),
-        layout: vec![gen_layout.clone()],
-        shader: bevy_asset::load_embedded_asset!(asset_server.as_ref(), "tess_gen_verts.wgsl"),
-        shader_defs: vec![],
-        entry_point: Some("gen_verts".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
+    // Vertex-gen kernel. The set-1 buffers ride the push-indexed slot array;
+    // the displacement-map array + sampler are constant-offset rows over a
+    // heap block/slot allocated here, so their bases are baked into the
+    // mapping table (blocks never move — content rewrites are change-driven).
+    let disp_block = seam.alloc_heap_block(HeapKind::Image, MAX_TESS_DISPLACEMENT_MAPS);
+    let disp_sampler_slot = seam.alloc_heap_block(HeapKind::Sampler, 1);
+    let gen_base_mappings = [
+        seam.map_binding(0, 6, HeapKind::Image, disp_block),
+        seam.map_binding(0, 7, HeapKind::Sampler, disp_sampler_slot),
+    ];
+    let Some(gen_kernel) = HeapKernel::new_with_mappings(
+        &seam,
+        "tess_gen_verts.slang",
+        include_str!("tess_gen_verts.slang"),
+        "gen_verts",
+        crate::bindings::OCTAHEDRAL_MODULES,
+        &[],
+        &[],
+        "tess_gen_verts",
+        size_of::<GenParams>() as u32,
+        &gen_base_mappings,
+    ) else {
+        return;
+    };
+
+    // Per-micro-triangle smooth-normal/UV kernel.
+    let Some(attr_kernel) = HeapKernel::new(
+        &seam,
+        "tess_gen_attrs.slang",
+        include_str!("tess_gen_attrs.slang"),
+        "gen_attrs_main",
+        crate::bindings::OCTAHEDRAL_MODULES,
+        &[],
+        "tess_gen_attrs",
+        size_of::<AttrParams>() as u32,
+    ) else {
+        return;
+    };
 
     let counts = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tess_classify.counts"),
@@ -355,58 +386,21 @@ pub fn init_tess_classify(
         mapped_at_creation: false,
     });
 
-    // Per-micro-triangle smooth-normal/UV layout + pipeline.
-    let attr_layout = BindGroupLayoutDescriptor::new(
-        "tess_gen_attrs_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                uniform_buffer_sized(false, None),           // 0 attr params
-                storage_buffer_read_only_sized(false, None), // 1 part_triangles
-                storage_buffer_read_only_sized(false, None), // 2 configs
-                storage_buffer_read_only_sized(false, None), // 3 table_indices
-                storage_buffer_read_only_sized(false, None), // 4 table_vertices
-                storage_buffer_read_only_sized(false, None), // 5 base_packed
-                storage_buffer_sized(false, None),           // 6 gen_attrs (rw)
-                storage_buffer_sized(false, None),           // 7 meta (rw)
-            ),
-        ),
-    );
-    let attr_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("tess_gen_attrs".into()),
-        layout: vec![attr_layout.clone()],
-        shader: bevy_asset::load_embedded_asset!(asset_server.as_ref(), "tess_gen_attrs.wgsl"),
-        shader_defs: vec![],
-        entry_point: Some("gen_attrs_main".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
-
-    // Per-part CLAS-instantiate descriptor builder.
-    let instantiate_layout = BindGroupLayoutDescriptor::new(
-        "tess_instantiate_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                uniform_buffer_sized(false, None),           // 0 inst params
-                storage_buffer_read_only_sized(false, None), // 1 part_triangles
-                storage_buffer_read_only_sized(false, None), // 2 counts
-                storage_buffer_read_only_sized(false, None), // 3 template_addresses
-                storage_buffer_sized(false, None),           // 4 instantiate_infos (rw)
-            ),
-        ),
-    );
-    let instantiate_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("tess_instantiate".into()),
-        layout: vec![instantiate_layout.clone()],
-        shader: bevy_asset::load_embedded_asset!(asset_server.as_ref(), "tess_instantiate.wgsl"),
-        shader_defs: vec![],
-        entry_point: Some("build_infos".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
+    // Per-part CLAS-instantiate descriptor builder — a layout-free heap
+    // pipeline ([`HeapKernel`]), Slang from source.
+    let Some(inst_kernel) = HeapKernel::new(
+        &seam,
+        "tess_instantiate.slang",
+        include_str!("tess_instantiate.slang"),
+        "build_infos",
+        &[],
+        &[],
+        "tess_instantiate",
+        size_of::<InstParams>() as u32,
+    ) else {
+        return;
+    };
+    let inst_slots = KernelSlots::new(&seam, 4);
     let instantiate_infos = render_device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tess_classify.instantiate_infos"),
         // VkClusterAccelerationStructureInstantiateClusterInfoNV = 32 B / part.
@@ -418,59 +412,36 @@ pub fn init_tess_classify(
         mapped_at_creation: false,
     });
 
-    let mut params = UniformBuffer::<ClassifyParams>::default();
-    params.set_label(Some("tess_classify.params"));
-    let mut gen_params = StorageBuffer::<GenParams>::default();
-    gen_params.set_label(Some("tess_classify.gen_params"));
-    let mut attr_params = UniformBuffer::<AttrParams>::default();
-    attr_params.set_label(Some("tess_classify.attr_params"));
-    let mut inst_params = UniformBuffer::<InstParams>::default();
-    inst_params.set_label(Some("tess_classify.inst_params"));
     let mut slots = RawBufferVec::<u32>::new(wgpu::BufferUsages::STORAGE);
     slots.set_label(Some("tess_classify.slots"));
     let mut work_clusters = RawBufferVec::<WorkClusterGpu>::new(wgpu::BufferUsages::STORAGE);
     work_clusters.set_label(Some("tess_classify.work_clusters"));
 
-    for (label, id) in [
-        ("tess_classify", pipeline),
-        ("tess_classify_finalize", finalize_pipeline),
-        ("tess_gen_verts", gen_pipeline),
-        ("tess_gen_attrs", attr_pipeline),
-        ("tess_instantiate", instantiate_pipeline),
-    ] {
-        registry.register(label, id);
-    }
-
     commands.insert_resource(TessClassify {
-        pipeline,
-        layout,
-        finalize_pipeline,
-        params,
+        classify_kernel,
+        finalize_kernel,
+        classify_slots: KernelSlots::new(&seam, 8),
         slots,
         work_clusters,
         counts,
         part_triangles,
         gen_dispatch,
         built_instances: usize::MAX,
-        bind_group: None,
-        gen_pipeline,
-        gen_layout,
-        gen_params,
+        gen_kernel,
+        gen_slots: KernelSlots::new(&seam, 6),
+        disp_block,
+        disp_sampler_slot,
+        disp_written: false,
         gen_vertices,
-        gen_bind_group: None,
-        attr_pipeline,
-        attr_layout,
-        attr_params,
+        attr_kernel,
+        attr_slots: KernelSlots::new(&seam, 7),
         gen_attrs: None,
         gen_attrs_meta: None,
         gen_attrs_addr: 0,
         gen_attrs_meta_addr: 0,
-        attr_bind_group: None,
-        instantiate_pipeline,
-        instantiate_layout,
-        inst_params,
+        inst_kernel,
+        inst_slots,
         instantiate_infos,
-        instantiate_bind_group: None,
         gen_vertices_addr: 0,
         total_base_tris: 0,
         tess_clas_storage: None,
@@ -488,6 +459,8 @@ pub fn init_tess_classify(
         blas_sized_for: 0,
         blas_ready: false,
         diag: 0,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -524,14 +497,15 @@ fn tess_instantiate_input<'a>(
         .op_input(op_input)
 }
 
-/// `Render::Prepare`: build the CPU work lists (cached), write params from the
-/// camera, (re)build the bind group, then record + submit the classify dispatch.
-/// Self-submitting, so no render-graph wiring is needed.
+/// `Render::Prepare`: build the CPU work lists (cached), derive params from the
+/// camera, refresh the heap descriptors, then record + submit the whole raw
+/// dispatch chain (classify → finalize → gen verts/attrs → instantiate → CLAS
+/// build → per-instance BLAS). Self-submitting, so no render-graph wiring is
+/// needed.
 pub fn run_tess_classify(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut retire: ResMut<GpuRetire>,
-    pipeline_cache: Res<PipelineCache>,
     mut classify: Option<ResMut<TessClassify>>,
     showcase: Option<Res<TessShowcaseInstances>>,
     mesh_manager: Option<Res<ClusterMeshManager>>,
@@ -548,6 +522,8 @@ pub fn run_tess_classify(
     // NODE-indexed, so `transforms[cluster_slot]` there would read the wrong node).
     transforms_col: Option<Res<GpuColumn<TransformColumn>>>,
     gpu_entities: Query<(&MainEntity, &RaytracingGpuEntity)>,
+    seam: Option<Res<BindingSeam>>,
+    fallback_texture: Res<FallbackImage>,
 ) {
     let (present, sc, mm, tb) =
         (classify.is_some(), showcase.is_some(), mesh_manager.is_some(), table.is_some());
@@ -577,10 +553,10 @@ pub fn run_tess_classify(
         }
         return;
     }
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(classify.pipeline) else {
-        if chatty {
-            tracing::debug!("tess_classify bail: classify pipeline not ready (still compiling/failed)");
-        }
+    // Every dispatch here is a raw heap kernel; without the seam (non-solari
+    // device) `init_tess_classify` never inserted the resource, so this only
+    // guards resource-order races.
+    let Some(seam) = seam.as_deref() else {
         return;
     };
     // Geometry pools must be resident (binder bails the same way on cold start).
@@ -684,6 +660,9 @@ pub fn run_tess_classify(
         classify.per_instance_offsets = offsets;
         classify.work_clusters.write_buffer(&render_device, &render_queue);
         classify.built_instances = showcase.instances.len();
+        // The displacement heap block is indexed by `instance_idx` — remirror
+        // it for the new instance order.
+        classify.disp_written = false;
         tracing::debug!(
             "tess_classify: built work lists — {} instances, {} work clusters, {} base tris",
             showcase.instances.len(),
@@ -844,10 +823,9 @@ pub fn run_tess_classify(
         return;
     }
 
-    let viewport = Vec2::new(view.viewport.z as f32, view.viewport.w as f32);
-    *classify.params.get_mut() = ClassifyParams {
-        clip_from_world,
-        viewport,
+    let classify_params = ClassifyParams {
+        clip_from_world: clip_from_world.to_cols_array(),
+        viewport: [view.viewport.z as f32, view.viewport.w as f32],
         // Live density dial (the shader clamps to `max(_, 1.0)` px/segment).
         px_per_segment: settings.tess_px_per_segment,
         work_cluster_count,
@@ -856,7 +834,6 @@ pub fn run_tess_classify(
         part_capacity: GEN_CAPACITY,
         _pad: 0,
     };
-    classify.params.write_buffer(&render_device, &render_queue);
 
     // Clear the counters each frame (CPU write — tiny).
     render_queue.write_buffer(&classify.counts, 0, &[0u8; 16]);
@@ -887,44 +864,10 @@ pub fn run_tess_classify(
     }
     classify.slots.write_buffer(&render_device, &render_queue);
 
-    // (Re)build the bind group (cheap; the buffers are stable, but the geometry
-    // pool buffers can grow/realloc, so rebuild each run).
-    let (Some(params_binding), Some(work_buf), Some(slots_buf)) = (
-        classify.params.binding(),
-        classify.work_clusters.buffer(),
-        classify.slots.buffer(),
-    ) else {
-        if chatty {
-            tracing::debug!("tess_classify bail: classify bind-group buffers not allocated yet");
-        }
-        return;
-    };
-    let bind_group = render_device.create_bind_group(
-        "tess_classify_bind_group",
-        &pipeline_cache.get_bind_group_layout(&classify.layout),
-        &BindGroupEntries::sequential((
-            params_binding,
-            work_buf.as_entire_binding(),
-            positions.as_entire_binding(),
-            indices.as_entire_binding(),
-            classify.counts.as_entire_binding(),
-            classify.part_triangles.as_entire_binding(),
-            classify.gen_dispatch.as_entire_binding(),
-            transforms.as_entire_binding(),
-            slots_buf.as_entire_binding(),
-        )),
-    );
-    classify.bind_group = Some(bind_group);
-
-    // Vertex-gen wiring: resolve the displacement maps + build the gen-verts bind
-    // group. Gated on the displacements being resident; without them classify still
-    // runs but vertex gen is skipped.
-    let gen_pipeline = pipeline_cache.get_compute_pipeline(classify.gen_pipeline);
-    let finalize_pipeline = pipeline_cache.get_compute_pipeline(classify.finalize_pipeline);
-    // Per-instance displacement: gather EVERY instance's own map into the binding
-    // array (indexed by `instance_index` in the gen shader). All must be resident —
-    // the showcase latches only once materials load, so they are; otherwise skip the
-    // gen this frame and retry. A shared filtering sampler serves all maps.
+    // Per-instance displacement: every instance's own map, indexed by
+    // `instance_index` in the gen shader. All must be resident — the showcase
+    // latches only once materials load, so they are; otherwise skip the gen
+    // this frame and retry. A shared filtering sampler serves all maps.
     let disp_views: Option<Vec<&wgpu::TextureView>> = showcase
         .instances
         .iter()
@@ -935,128 +878,45 @@ pub fn run_tess_classify(
         .first()
         .and_then(|inst| images.get(&inst.displacement))
         .map(|img| &img.sampler);
-    let gen_ready = match (gen_pipeline, finalize_pipeline, disp_views, disp_sampler) {
-        (Some(_), Some(_), Some(disp_views), Some(disp_sampler))
-            if !disp_views.is_empty() && disp_views.len() <= MAX_TESS_DISPLACEMENT_MAPS as usize =>
-        {
-            *classify.gen_params.get_mut() = GenParams {
-                displacement_scale: settings.tess_displacement_scale,
-                displacement_bias: 0.0,
-                max_verts: MAX_VERTS,
-                has_displacement: 1,
-                part_capacity: GEN_CAPACITY,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-            };
-            classify.gen_params.write_buffer(&render_device, &render_queue);
-            if let Some(gp) = classify.gen_params.binding() {
-                let gbg = render_device.create_bind_group(
-                    "tess_gen_verts_bind_group",
-                    &pipeline_cache.get_bind_group_layout(&classify.gen_layout),
-                    &BindGroupEntries::sequential((
-                        gp,
-                        classify.part_triangles.as_entire_binding(),
-                        table.configs.as_entire_binding(),
-                        table.vertices.as_entire_binding(),
-                        positions.as_entire_binding(),
-                        mesh_manager.vertex_packed.buffer().as_entire_binding(),
-                        disp_views.as_slice(),
-                        disp_sampler,
-                        classify.gen_vertices.as_entire_binding(),
-                    )),
-                );
-                classify.gen_bind_group = Some(gbg);
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
-    };
+    let gen_ready = matches!(
+        (&disp_views, disp_sampler),
+        (Some(views), Some(_))
+            if !views.is_empty() && views.len() <= MAX_TESS_DISPLACEMENT_MAPS as usize
+    );
 
-    // Attr pass: build the bind group + params. Produces the smooth normals + UVs
-    // (denormalized per micro-triangle) + the per-part metadata the closest-hit
-    // reads via `geometry_addresses.tess_clusters`. Gated on the gen pass (shares
-    // its inputs + indirect grid) + the attr buffers being sized. Clone the buffer
-    // handles (Arc) so they don't borrow `classify` across the params write.
+    // Mirror the maps into the displacement heap block: slot `base + i` is
+    // instance i's view, EVERY remaining slot a fallback descriptor (a heap
+    // array has no "partially bound" — an unwritten descriptor is garbage).
+    // Rewritten only when the instance set rebuilt or `RenderAssets` changed
+    // (a replaced asset swaps the underlying view); a steady-state frame
+    // writes nothing.
+    if gen_ready && (!classify.disp_written || images.is_changed()) {
+        let views = disp_views.as_ref().unwrap();
+        let fallback = &*fallback_texture.d2.texture_view;
+        for i in 0..MAX_TESS_DISPLACEMENT_MAPS {
+            let view = views.get(i as usize).copied().unwrap_or(fallback);
+            crate::bindings::write_image_descriptor(seam, classify.disp_block + i, view);
+        }
+        crate::bindings::write_sampler_descriptor(
+            seam,
+            classify.disp_sampler_slot,
+            disp_sampler.unwrap(),
+        );
+        classify.disp_written = true;
+    }
+
+    // Attr pass readiness: produces the smooth normals + UVs (denormalized per
+    // micro-triangle) + the per-part metadata the closest-hit reads via
+    // `geometry_addresses.tess_clusters`. Gated on the gen pass (shares its
+    // inputs + indirect grid) + the attr buffers being sized. Clone the buffer
+    // handles (Arc) so they don't borrow `classify` across the slot writes.
     let gen_attrs_buf = classify.gen_attrs.clone();
     let gen_attrs_meta_buf = classify.gen_attrs_meta.clone();
-    let attr_pipeline_ready = pipeline_cache.get_compute_pipeline(classify.attr_pipeline).is_some();
-    let attr_ready = if gen_ready && attr_pipeline_ready {
-        if let (Some(gen_attrs), Some(meta)) = (gen_attrs_buf.as_ref(), gen_attrs_meta_buf.as_ref()) {
-            *classify.attr_params.get_mut() = AttrParams {
-                attr_addr_lo: classify.gen_attrs_addr as u32,
-                attr_addr_hi: (classify.gen_attrs_addr >> 32) as u32,
-                max_tris: table.max_triangles.max(1),
-                part_capacity: classify.total_base_tris,
-            };
-            classify.attr_params.write_buffer(&render_device, &render_queue);
-            if let Some(ap) = classify.attr_params.binding() {
-                let abg = render_device.create_bind_group(
-                    "tess_gen_attrs_bind_group",
-                    &pipeline_cache.get_bind_group_layout(&classify.attr_layout),
-                    &BindGroupEntries::sequential((
-                        ap,
-                        classify.part_triangles.as_entire_binding(),
-                        table.configs.as_entire_binding(),
-                        table.indices.as_entire_binding(),
-                        table.vertices.as_entire_binding(),
-                        mesh_manager.vertex_packed.buffer().as_entire_binding(),
-                        gen_attrs.as_entire_binding(),
-                        meta.as_entire_binding(),
-                    )),
-                );
-                classify.attr_bind_group = Some(abg);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let attr_ready = gen_ready && gen_attrs_buf.is_some() && gen_attrs_meta_buf.is_some();
 
     // Build one CLAS-instantiate descriptor per emitted part. Gated on the gen pass
     // running (it fills `gen_vertices`) + the allocator-resolved gen address.
-    let instantiate_pipeline = pipeline_cache.get_compute_pipeline(classify.instantiate_pipeline);
-    let inst_ready = match (gen_ready, instantiate_pipeline, classify.gen_vertices_addr) {
-        (true, Some(_), addr) if addr != 0 => {
-            *classify.inst_params.get_mut() = InstParams {
-                gen_base_lo: addr as u32,
-                gen_base_hi: (addr >> 32) as u32,
-                max_verts: MAX_VERTS,
-                part_capacity: GEN_CAPACITY,
-                // Sentinel ClusterIDNV base above the real cluster pool, so the
-                // closest-hit detects tess hits.
-                cluster_id_base: TESS_CLUSTER_ID_BASE,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-            };
-            classify.inst_params.write_buffer(&render_device, &render_queue);
-            if let Some(ip) = classify.inst_params.binding() {
-                let ibg = render_device.create_bind_group(
-                    "tess_instantiate_bind_group",
-                    &pipeline_cache.get_bind_group_layout(&classify.instantiate_layout),
-                    &BindGroupEntries::sequential((
-                        ip,
-                        classify.part_triangles.as_entire_binding(),
-                        classify.counts.as_entire_binding(),
-                        table.template_addresses.as_entire_binding(),
-                        classify.instantiate_infos.as_entire_binding(),
-                    )),
-                );
-                classify.instantiate_bind_group = Some(ibg);
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
-    };
+    let inst_ready = gen_ready && classify.gen_vertices_addr != 0;
 
     // CLAS-build readiness: the descriptors built (inst_ready), the cluster-AS fns
     // loaded, and the CLAS pool sized for the current part count.
@@ -1066,74 +926,281 @@ pub fn run_tess_classify(
         && classify.tess_clas_sized_for == classify.total_base_tris
         && allocator.is_some();
 
-    // Record classify → finalize → gen (separate passes, so wgpu inserts the
-    // storage→indirect barriers) and submit once.
+    let (Some(work_buf), Some(slots_buf)) =
+        (classify.work_clusters.buffer(), classify.slots.buffer())
+    else {
+        if chatty {
+            tracing::debug!("tess_classify bail: classify list buffers not allocated yet");
+        }
+        return;
+    };
+
+    // Assemble the push blobs (slot rewrites are host memcpys into the heap;
+    // the pool buffers can grow/realloc, so rewrite each run). `counts` /
+    // `gen_dispatch` slots are shared between the classify and finalize
+    // entries — each entry's blob names exactly the bindings surviving in its
+    // SPIR-V.
+    let s_counts = classify.classify_slots.buffer(seam, 3, &classify.counts);
+    let s_gen_dispatch = classify.classify_slots.buffer(seam, 5, &classify.gen_dispatch);
+    let classify_blob = classify.classify_kernel.push_blob(
+        "tess_classify",
+        bytemuck::bytes_of(&classify_params),
+        &[
+            ("work_clusters", classify.classify_slots.buffer(seam, 0, work_buf)),
+            ("vertex_positions", classify.classify_slots.buffer(seam, 1, positions)),
+            ("indices", classify.classify_slots.buffer(seam, 2, indices)),
+            ("counts", s_counts),
+            (
+                "part_triangles",
+                classify.classify_slots.buffer(seam, 4, &classify.part_triangles),
+            ),
+            ("transforms", classify.classify_slots.buffer(seam, 6, transforms)),
+            ("slots", classify.classify_slots.buffer(seam, 7, slots_buf)),
+        ],
+    );
+    let finalize_blob = classify.finalize_kernel.push_blob(
+        "tess_classify_finalize",
+        bytemuck::bytes_of(&classify_params),
+        &[("counts", s_counts), ("gen_dispatch", s_gen_dispatch)],
+    );
+    let gen_blob = gen_ready.then(|| {
+        let gen_params = GenParams {
+            displacement_scale: settings.tess_displacement_scale,
+            displacement_bias: 0.0,
+            max_verts: MAX_VERTS,
+            has_displacement: 1,
+            part_capacity: GEN_CAPACITY,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        classify.gen_kernel.push_blob(
+            "tess_gen_verts",
+            bytemuck::bytes_of(&gen_params),
+            &[
+                (
+                    "part_triangles",
+                    classify.gen_slots.buffer(seam, 0, &classify.part_triangles),
+                ),
+                ("configs", classify.gen_slots.buffer(seam, 1, &table.configs)),
+                ("table_vertices", classify.gen_slots.buffer(seam, 2, &table.vertices)),
+                ("base_positions", classify.gen_slots.buffer(seam, 3, positions)),
+                (
+                    "base_packed",
+                    classify.gen_slots.buffer(seam, 4, mesh_manager.vertex_packed.buffer()),
+                ),
+                ("gen_vertices", classify.gen_slots.buffer(seam, 5, &classify.gen_vertices)),
+            ],
+        )
+    });
+    let attr_blob = attr_ready.then(|| {
+        let attr_params = AttrParams {
+            attr_addr_lo: classify.gen_attrs_addr as u32,
+            attr_addr_hi: (classify.gen_attrs_addr >> 32) as u32,
+            max_tris: table.max_triangles.max(1),
+            part_capacity: classify.total_base_tris,
+        };
+        classify.attr_kernel.push_blob(
+            "tess_gen_attrs",
+            bytemuck::bytes_of(&attr_params),
+            &[
+                (
+                    "part_triangles",
+                    classify.attr_slots.buffer(seam, 0, &classify.part_triangles),
+                ),
+                ("configs", classify.attr_slots.buffer(seam, 1, &table.configs)),
+                ("table_indices", classify.attr_slots.buffer(seam, 2, &table.indices)),
+                ("table_vertices", classify.attr_slots.buffer(seam, 3, &table.vertices)),
+                (
+                    "base_packed",
+                    classify.attr_slots.buffer(seam, 4, mesh_manager.vertex_packed.buffer()),
+                ),
+                ("gen_attrs", classify.attr_slots.buffer(seam, 5, gen_attrs_buf.as_ref().unwrap())),
+                ("part_meta", classify.attr_slots.buffer(seam, 6, gen_attrs_meta_buf.as_ref().unwrap())),
+            ],
+        )
+    });
+    // Per-part CLAS-instantiate descriptors. Bounded by the CPU-known
+    // base-tri count (the shader still guards `p >= counts[0]`); 64-wide.
+    let inst_blob = inst_ready.then(|| {
+        let addr = classify.gen_vertices_addr;
+        let inst_params = InstParams {
+            gen_base_lo: addr as u32,
+            gen_base_hi: (addr >> 32) as u32,
+            max_verts: MAX_VERTS,
+            part_capacity: GEN_CAPACITY,
+            // Sentinel ClusterIDNV base above the real cluster pool, so the
+            // closest-hit detects tess hits.
+            cluster_id_base: TESS_CLUSTER_ID_BASE,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        classify.inst_kernel.push_blob(
+            "tess_instantiate",
+            bytemuck::bytes_of(&inst_params),
+            &[
+                (
+                    "part_triangles",
+                    classify.inst_slots.buffer(seam, 0, &classify.part_triangles),
+                ),
+                ("counts", classify.inst_slots.buffer(seam, 1, &classify.counts)),
+                (
+                    "template_addresses",
+                    classify.inst_slots.buffer(seam, 2, &table.template_addresses),
+                ),
+                (
+                    "instantiate_infos",
+                    classify.inst_slots.buffer(seam, 3, &classify.instantiate_infos),
+                ),
+            ],
+        )
+    });
+
+    // The encoders below go out in ONE submit. Submission order within a
+    // `vkQueueSubmit` is guaranteed, so each raw segment's leading barrier still
+    // covers the segments recorded before it. The wgpu transition encoder stays
+    // separate because the fork panics if one encoder mixes wgpu commands with
+    // raw `as_hal_mut`.
+    let mut submission = Vec::new();
+
+    // Move the displacement textures to their sampled state (read-only optimal)
+    // through wgpu's tracker BEFORE the raw gen dispatch samples them: their
+    // last tracked use is the upload copy (COPY_DST), and with the gen pass now
+    // raw no wgpu pass transitions them — the heap descriptors declare
+    // SHADER_READ_ONLY_OPTIMAL. A no-op once the state already matches (same
+    // idiom as the trace's skybox transition in `render/rt_pipeline/mod.rs`).
+    if gen_ready {
+        let mut transition_encoder =
+            render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tess_classify.transitions"),
+            });
+        let mut seen = Vec::new();
+        transition_encoder.transition_resources(
+            core::iter::empty(),
+            showcase
+                .instances
+                .iter()
+                .filter(|inst| {
+                    let id = inst.displacement.id();
+                    !seen.contains(&id) && {
+                        seen.push(id);
+                        true
+                    }
+                })
+                .filter_map(|inst| images.get(&inst.displacement))
+                .map(|img| wgpu::TextureTransition {
+                    // bevy `Texture` → the wrapped `wgpu::Texture`.
+                    texture: &*img.texture,
+                    selector: None,
+                    state: wgpu::TextureUses::RESOURCE,
+                }),
+        );
+        submission.push(transition_encoder.finish());
+    }
+
+    // Record the whole raw chain into ONE encoder: classify → finalize →
+    // gen_verts (indirect) → gen_attrs (indirect) → instantiate.
     let groups = work_cluster_count.min(65535);
+    let inst_groups = classify.total_base_tris.div_ceil(64).min(65535);
     let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("tess_classify.dispatch"),
     });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("tess_classify"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, classify.bind_group.as_ref().unwrap(), &[]);
-        pass.dispatch_workgroups(groups, 1, 1);
-    }
-    if gen_ready {
-        // finalize: part count → gen_dispatch indirect args.
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("tess_classify.finalize"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(finalize_pipeline.unwrap());
-            pass.set_bind_group(0, classify.bind_group.as_ref().unwrap(), &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-        // gen verts: one workgroup per part (indirect).
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("tess_gen_verts"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(gen_pipeline.unwrap());
-            pass.set_bind_group(0, classify.gen_bind_group.as_ref().unwrap(), &[]);
-            pass.dispatch_workgroups_indirect(&classify.gen_dispatch, 0);
-        }
-        // shading: per-micro-triangle smooth normals + UVs + per-part metadata. Same
-        // indirect grid as gen_verts (one workgroup per part); reads part_triangles +
-        // the table topology, independent of the gen_verts positions.
-        if attr_ready {
-            if let Some(attr_pipeline) = pipeline_cache.get_compute_pipeline(classify.attr_pipeline) {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("tess_gen_attrs"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(attr_pipeline);
-                pass.set_bind_group(0, classify.attr_bind_group.as_ref().unwrap(), &[]);
-                pass.dispatch_workgroups_indirect(&classify.gen_dispatch, 0);
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket every dispatch (each step reads the previous step's
+    // writes — and the indirect args — invisibly to wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &classify.raw_device;
+            let raw_gen_dispatch = classify
+                .gen_dispatch
+                .as_hal::<VkApi>()
+                .map(|b| b.raw_handle())
+                .expect("bevy_solari requires the Vulkan backend");
+            // One barrier serves every edge in the chain: the queue's counts
+            // clear + list uploads (transfer) and each step's compute writes →
+            // the next step's storage access AND its indirect-args read.
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::TRANSFER | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                )
+                .src_access_mask(
+                    vk::AccessFlags2::TRANSFER_WRITE | vk::AccessFlags2::SHADER_WRITE,
+                )
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER
+                        | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_READ
+                        | vk::AccessFlags2::SHADER_WRITE
+                        | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                )];
+            let dep = vk::DependencyInfo::default().memory_barriers(&barrier);
+            // The counts clear + work/slot-list uploads -> classify's access.
+            dev.cmd_pipeline_barrier2(cb, &dep);
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &classify_blob);
+            dev.cmd_bind_pipeline(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                classify.classify_kernel.pipeline,
+            );
+            dev.cmd_dispatch(cb, groups, 1, 1);
+            if let Some(gen_blob) = gen_blob.as_ref() {
+                // classify's counts write -> finalize's read.
+                dev.cmd_pipeline_barrier2(cb, &dep);
+                seam.push_data(cb, &finalize_blob);
+                dev.cmd_bind_pipeline(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    classify.finalize_kernel.pipeline,
+                );
+                dev.cmd_dispatch(cb, 1, 1, 1);
+                // finalize's indirect args + classify's part list -> gen verts:
+                // one workgroup per part (indirect).
+                dev.cmd_pipeline_barrier2(cb, &dep);
+                seam.push_data(cb, gen_blob);
+                dev.cmd_bind_pipeline(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    classify.gen_kernel.pipeline,
+                );
+                dev.cmd_dispatch_indirect(cb, raw_gen_dispatch, 0);
+                // shading: per-micro-triangle smooth normals + UVs + per-part
+                // metadata. Same indirect grid as gen_verts (one workgroup per
+                // part); reads part_triangles + the table topology, independent
+                // of the gen_verts positions.
+                if let Some(attr_blob) = attr_blob.as_ref() {
+                    dev.cmd_pipeline_barrier2(cb, &dep);
+                    seam.push_data(cb, attr_blob);
+                    dev.cmd_bind_pipeline(
+                        cb,
+                        vk::PipelineBindPoint::COMPUTE,
+                        classify.attr_kernel.pipeline,
+                    );
+                    dev.cmd_dispatch_indirect(cb, raw_gen_dispatch, 0);
+                }
+                if let Some(inst_blob) = inst_blob.as_ref() {
+                    // The gen passes' part/vertex writes -> the descriptor build.
+                    dev.cmd_pipeline_barrier2(cb, &dep);
+                    seam.push_data(cb, inst_blob);
+                    dev.cmd_bind_pipeline(
+                        cb,
+                        vk::PipelineBindPoint::COMPUTE,
+                        classify.inst_kernel.pipeline,
+                    );
+                    dev.cmd_dispatch(cb, inst_groups, 1, 1);
+                }
+                // The chain's writes -> the raw INSTANTIATE build's input (its
+                // own seam covers build-input visibility on top).
+                dev.cmd_pipeline_barrier2(cb, &dep);
             }
-        }
-        // Build per-part CLAS-instantiate descriptors. Bounded by the CPU-known
-        // base-tri count (the shader still guards `p >= counts[0]`); 64-wide.
-        if inst_ready {
-            let inst_groups = classify.total_base_tris.div_ceil(64).min(65535);
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("tess_instantiate"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(instantiate_pipeline.unwrap());
-            pass.set_bind_group(0, classify.instantiate_bind_group.as_ref().unwrap(), &[]);
-            pass.dispatch_workgroups(inst_groups, 1, 1);
-        }
+        });
     }
-    // The encoders below go out in ONE submit. Submission order within a
-    // `vkQueueSubmit` is guaranteed, so each raw segment's leading seam still
-    // covers the segments recorded before it. They stay separate encoders because
-    // the fork panics if one encoder mixes wgpu passes with raw `as_hal_mut`.
-    let mut submission = vec![encoder.finish()];
+    submission.push(encoder.finish());
 
     // Raw-VK indirect INSTANTIATE_TRIANGLE_CLUSTER — turn each part's GPU-built
     // descriptor + gen_vertices slice into a CLAS in the persistent pool. Must be its

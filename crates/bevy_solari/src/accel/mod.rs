@@ -10,7 +10,7 @@
 //!    count) into the shared per-geometry BLAS pool.
 //! 4. [`ptlas`] — incremental partitioned-TLAS fill + build.
 //!
-//! Each pass owns one resource (buffers + pipelines + bind group); the
+//! Each pass owns one resource (buffers + lazily-built heap kernels); the
 //! `RaytracingScenePlugin` in [`crate::scene`] schedules them.
 
 use bevy_app::{App, Plugin};
@@ -29,22 +29,15 @@ pub mod blas_rebuild;
 pub mod blas_sharing;
 pub mod deform;
 pub mod partition_alloc;
-pub mod pipelines;
 pub mod ptlas;
 pub mod selector;
 
 pub use blas_rebuild::{dispatch_blas_rebuild, init_blas_rebuild};
-pub use pipelines::{
-    blas_sharing_bind_group_layout, ptlas_bind_group_layout, selector_bind_group_layout,
-};
-pub use blas_sharing::{
-    dispatch_blas_sharing, init_blas_sharing, prepare_blas_sharing, prepare_blas_sharing_bind_group,
-};
+pub use blas_sharing::{dispatch_blas_sharing, init_blas_sharing, prepare_blas_sharing};
 pub use partition_alloc::{block_of, PartitionAllocator, BLOCK_SHIFT};
-pub use ptlas::{dispatch_ptlas, init_ptlas, prepare_ptlas_fill_bind_group, prepare_ptlas_params};
+pub use ptlas::{dispatch_ptlas, init_ptlas, prepare_ptlas_params};
 pub use selector::{
-    dispatch_selector, init_selector, prepare_selector_bind_group, prepare_selector_params,
-    ClusterSelectorSettings,
+    dispatch_selector, init_selector, prepare_selector_params, ClusterSelectorSettings,
 };
 
 
@@ -114,14 +107,8 @@ impl Plugin for AccelPlugin {
                         // and `prepare_tess_ptlas_write`'s record count never disagree on
                         // the transition frame (mismatch → out-of-bounds PTLAS write).
                         .after(crate::geometry::tess_classify::run_tess_classify),
-                    prepare_selector_bind_group.in_set(RenderSystems::PrepareBindGroups),
-                    prepare_blas_sharing_bind_group.in_set(RenderSystems::PrepareBindGroups),
-                    prepare_ptlas_fill_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     deform::prepare_deform.in_set(RenderSystems::PrepareResources),
-                    deform::prepare_deform_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     animated_blas::prepare_animated_blas.in_set(RenderSystems::PrepareResources),
-                    animated_blas::prepare_animated_blas_bind_group
-                        .in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
             .add_systems(

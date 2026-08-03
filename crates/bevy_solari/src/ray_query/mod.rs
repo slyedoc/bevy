@@ -1,19 +1,18 @@
-//! Reusable inline-`rayQuery` batch trace — a wgpu compute pass that traces a
-//! buffer of [`Ray`]s against the scene TLAS and writes a buffer of [`Hit`]s.
+//! Reusable inline-`RayQuery` batch trace — a heap-kernel compute pass that
+//! traces a buffer of [`Ray`]s against the scene TLAS and writes a buffer of
+//! [`Hit`]s.
 //!
-//! The shader is **self-contained**: it imports only `tlas` from the scene
-//! bindings and traces inline, so it pulls in none of the bindless `physical_load`
-//! resolve path (`resolve_ray_hit_full` / `load_material_bindless` / the shared
-//! `trace_ray`). `physical_load` needs the `PhysicalStorageBufferAddresses` SPIR-V
-//! capability, which only the rt_pipeline's hand-rolled WGSL→SPIR-V enables — a
-//! plain wgpu compute pipeline can't, so it stays out. Two bind groups:
-//!
-//! - `@group(0)` — the scene group ([`RaytracingSceneBindings`]), for `tlas`.
-//! - `@group(1)` — this pass's own I/O: `rays` (in), `hits` (out), `params`.
+//! The shader (`ray_query.slang`) is **self-contained**: it declares the TLAS
+//! locally (at the scene surface's (0,4) binding number, push-address-mapped)
+//! and traces inline, importing nothing from `scene_resolve` — so the kernel
+//! builds at startup with no scene heap slots, via
+//! [`HeapKernel::new_with_mappings`]. Set 1 is this pass's own I/O: `rays`
+//! (in), `hits` (out), `params`, plus the two entity-indirection columns
+//! (`node_slots`, `node_entity`), all pushed as heap slots per dispatch.
 //!
 //! Each hit carries `t` + `world_position` + the `instance` / `primitive` /
 //! `geometry` indices; the `world_normal` is left zero (resolving it would need
-//! vertex data via `physical_load` or a vertex-pool storage binding — deferred).
+//! the scene's vertex pools — deferred).
 //!
 //! There is no built-in producer: `ray_count` defaults to 0, so the pass is a
 //! wired no-op until something fills [`SolariRayQuery::rays`] and sets
@@ -22,35 +21,30 @@
 //!
 //! Runs in [`SolariClusterSystems::RayQueries`], after `BuildTlas` (it needs the
 //! built TLAS) and before `Cleanup`.
+#![allow(unsafe_code)]
 
 pub mod picking;
 
 use ash::vk;
 use bevy_app::{App, Plugin};
-use bevy_asset::{load_embedded_asset, AssetServer};
 use bevy_core_pipeline::schedule::camera_driver;
 use bevy_ecs::{
     resource::Resource,
-    schedule::{common_conditions::resource_exists, IntoScheduleConfigs},
+    schedule::IntoScheduleConfigs,
     system::{Commands, Res, ResMut},
 };
 use bevy_render::{
-    diagnostic::RecordDiagnostics as _,
-    render_resource::{
-        binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized},
-        BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
-        CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, PipelineCache,
-        ShaderStages,
-    },
+    render_resource::{Buffer, CommandEncoderDescriptor},
     renderer::{RenderContext, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue},
     Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bytemuck::{Pod, Zeroable};
-use core::num::NonZeroU64;
+use wgpu::hal::api::Vulkan as VkApi;
 
-use crate::bindings::RaytracingSceneBindings;
 use crate::ecs_gpu::GpuColumn;
 use crate::gpu::allocator::{Allocator, MemoryLocation, SparseBuffer};
+use crate::gpu::binding_seam::BindingSeam;
+use crate::gpu::heap_kernel::{HeapKernel, KernelSlots};
 use crate::instance::NodeSlotColumn;
 use crate::transform::NodeEntityColumn;
 use crate::{SolariClusterSystems, SolariSetup};
@@ -62,11 +56,11 @@ const RAYS_VIRTUAL_BYTES: u64 = 256 * 1024 * 1024;
 const HITS_VIRTUAL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default ray `t_min` / `t_max` for a producer with no closer bound — mirrors
-/// `scene_bindings::RAY_T_MIN` / `RAY_T_MAX`.
+/// `scene_resolve::RAY_T_MIN` / `RAY_T_MAX`.
 pub const RAY_T_MIN_DEFAULT: f32 = 0.001;
 pub const RAY_T_MAX_DEFAULT: f32 = 1.0e30;
 
-/// One ray to trace — mirrors `ray_query.wgsl::Ray` (std430, 32 B).
+/// One ray to trace — mirrors `ray_query.slang::Ray` (std430, 32 B).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct Ray {
@@ -78,7 +72,7 @@ pub struct Ray {
 
 const _: () = assert!(size_of::<Ray>() == 32);
 
-/// One resolved hit — mirrors `ray_query.wgsl::Hit` (std430, 48 B). A miss has
+/// One resolved hit — mirrors `ray_query.slang::Hit` (std430, 48 B). A miss has
 /// `t < 0.0`; the indices + entity bits are only meaningful on a hit. `entity_lo` /
 /// `entity_hi` are the picked entity's `Entity::to_bits` as `[lo, hi]` (resolved
 /// GPU-side via the instance-slot → node-slot → entity indirection); reconstruct
@@ -98,7 +92,7 @@ pub struct Hit {
 
 const _: () = assert!(size_of::<Hit>() == 48);
 
-/// Dispatch parameters — mirrors `ray_query.wgsl::Params` (uniform, 16 B).
+/// Dispatch parameters — mirrors `ray_query.slang::Params` (uniform, 16 B).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 pub struct Params {
@@ -110,10 +104,8 @@ pub struct Params {
 
 const _: () = assert!(size_of::<Params>() == 16);
 
-/// Render-world resource for the batch ray-query pass — its sparse I/O buffers,
-/// the `params` uniform, and the per-frame I/O bind group. The compute pipeline id
-/// lives on [`SolariPipelines`](crate::pipelines::SolariPipelines) and the layout on
-/// [`SolariResourceManager`](crate::resource_manager).
+/// Render-world resource for the batch ray-query pass — the heap kernel, its
+/// slots, the sparse I/O buffers, and the `params` uniform.
 ///
 /// A producer writes `rays[0..ray_count]`, sets `ray_count`, and reads `hits`.
 #[derive(Resource)]
@@ -122,47 +114,66 @@ pub struct SolariRayQuery {
     pub rays: SparseBuffer,
     /// Output hits — sparse `array<Hit>`, one per input ray.
     pub hits: SparseBuffer,
-    /// `@group(1) @binding(2)` dispatch params (ray count + flags) — a raw uniform.
+    /// Dispatch params (ray count + flags) — a uniform-buffer heap slot (a
+    /// `[[vk::push_constant]]` block would collide with the push blob's TLAS
+    /// address at offset 0).
     params: Buffer,
     /// How many leading rays to trace this frame. Defaults to 0 (no producer yet),
     /// making the pass a no-op. A producer sets it after filling `rays`.
     pub ray_count: u32,
-    /// `RayDesc` flag word for every traced ray (e.g. `RAY_FLAG_NONE`). Set by the
-    /// producer alongside `ray_count`.
+    /// Per-ray flag word (e.g. `RAY_FLAG_NONE`). Set by the producer alongside
+    /// `ray_count`.
     pub ray_flags: u32,
-    /// Per-frame I/O bind group (`@group(1)`), rebuilt in `Render::PrepareBindGroups`.
-    pub bind_group: Option<BindGroup>,
+    kernel: HeapKernel,
+    /// rays, hits, params, node_slots, node_entity — rewritten per dispatch.
+    slots: KernelSlots,
+    raw_device: ash::Device,
+    /// Pins the `VkDevice` across [`Drop`]'s raw destroys (teardown order).
+    _device_keepalive: Allocator,
 }
 
-/// The batch ray-query `@group(1)` I/O layout: rays (in), hits (out), params, plus
-/// the two entity-indirection columns (`node_slots`, `node_entity`).
-pub fn ray_query_io_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
-        "ray_query_io_bind_group_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                storage_buffer_read_only_sized(false, None), // 0 rays
-                storage_buffer_sized(false, None),           // 1 hits
-                uniform_buffer_sized(false, NonZeroU64::new(size_of::<Params>() as u64)), // 2 params
-                storage_buffer_read_only_sized(false, None), // 3 node_slots (NodeSlotColumn)
-                storage_buffer_read_only_sized(false, None), // 4 node_entity (NodeEntityColumn)
-            ),
-        ),
-    )
+impl Drop for SolariRayQuery {
+    fn drop(&mut self) {
+        self._device_keepalive.quiesce_before_raw_destroy();
+        // SAFETY: quiesced; handles exclusively owned here.
+        unsafe { self.kernel.destroy(&self.raw_device) };
+    }
 }
 
-/// `RenderStartup`: allocate the batch ray-query I/O buffers + the params uniform
-/// and insert [`SolariRayQuery`]. No-op without the raw-VK [`Allocator`]; downstream
-/// systems guard on the resource's presence.
+// SAFETY: plain Vulkan handles; used solely from the render schedule.
+unsafe impl Send for SolariRayQuery {}
+unsafe impl Sync for SolariRayQuery {}
+
+/// `RenderStartup` (after `SolariSetup`): compile the kernel — a layout-free
+/// heap pipeline whose only non-set-1 binding is the push-address TLAS —
+/// allocate the I/O buffers + the params uniform, and insert [`SolariRayQuery`].
+/// No-op without the raw-VK [`Allocator`]; downstream systems guard on the
+/// resource's presence.
 pub fn init_ray_query(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     allocator: Option<Res<Allocator>>,
+    seam: Option<Res<BindingSeam>>,
 ) {
-    let Some(allocator) = allocator else {
+    let (Some(allocator), Some(seam)) = (allocator, seam) else {
         return;
     };
+    let Some(kernel) = HeapKernel::new_with_mappings(
+        &seam,
+        "ray_query.slang",
+        include_str!("ray_query.slang"),
+        "query_rays",
+        &[],
+        &[],
+        crate::gpu::slang::RAY_QUERY_CAPABILITIES,
+        "ray_query",
+        // The 8-byte TLAS device address leads the push blob.
+        8,
+        &[seam.map_binding_push_address(0, 4, 0)],
+    ) else {
+        return;
+    };
+    let slots = KernelSlots::new(&seam, 5);
     let rays = allocator.create_sparse_buffer(
         &render_device,
         vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -198,7 +209,10 @@ pub fn init_ray_query(
         params,
         ray_count: 0,
         ray_flags: 0,
-        bind_group: None,
+        kernel,
+        slots,
+        raw_device: allocator.device().clone(),
+        _device_keepalive: allocator.clone(),
     });
 }
 
@@ -232,127 +246,131 @@ pub fn prepare_ray_query(
         .commit(0..resources.ray_count as u64 * size_of::<Hit>() as u64);
 }
 
-/// `Render::PrepareBindGroups`: rebuild this pass's `@group(1)` I/O bind group from
-/// the rays / hits / params + the two entity-indirection columns.
+/// `RenderGraph`: dispatch the batch ray-query — one thread per ray, a raw heap
+/// dispatch on its own command buffer. Early-returns when there's nothing to
+/// trace or the TLAS/columns aren't built yet.
 ///
-/// The columns are bound at their **committed** sizes (via [`GpuColumn::binding`]),
-/// not the full sparse reservation, so a shader `arrayLength()` / out-of-range index
-/// is bounds-checked rather than a page fault — mirroring the scene-columns builder's
-/// committed-bytes guard. If either column hasn't committed any pages yet (`binding`
-/// returns `None`), the bind group is left `None` and the dispatch skips this frame.
-pub fn prepare_ray_query_bind_group(
-    ray_query: Option<ResMut<SolariRayQuery>>,
-    resource_manager: Option<Res<crate::resource_manager::SolariResourceManager>>,
+/// The entity-indirection columns are bound at their **committed** sizes, not
+/// the full sparse reservation, so a shader out-of-range index is
+/// bounds-checked rather than a page fault — mirroring the scene-columns
+/// builder's committed-bytes guard. If either column hasn't committed any
+/// pages yet, the dispatch skips this frame.
+pub fn dispatch_ray_query(
+    ray_query: Option<Res<SolariRayQuery>>,
+    seam: Option<Res<BindingSeam>>,
     node_slots: Option<Res<GpuColumn<NodeSlotColumn>>>,
     node_entity: Option<Res<GpuColumn<NodeEntityColumn>>>,
-    pipeline_cache: Res<PipelineCache>,
+    ptlas: Option<Res<crate::accel::ptlas::Ptlas>>,
     render_device: Res<RenderDevice>,
-) {
-    let Some(ray_query) = ray_query else {
-        return;
-    };
-    let ray_query = ray_query.into_inner();
-    let (Some(resource_manager), Some(node_slots), Some(node_entity)) =
-        (resource_manager, node_slots, node_entity)
-    else {
-        ray_query.bind_group = None;
-        return;
-    };
-    // Bind each column to exactly its committed range; `None` until the first page
-    // is committed → skip this frame (no stale-buffer read, no page fault).
-    let (Some(node_slots_binding), Some(node_entity_binding)) =
-        (node_slots.binding(), node_entity.binding())
-    else {
-        ray_query.bind_group = None;
-        return;
-    };
-
-    let group = render_device.create_bind_group(
-        "ray_query_io_bind_group",
-        &pipeline_cache.get_bind_group_layout(&resource_manager.ray_query_io),
-        &BindGroupEntries::sequential((
-            ray_query.rays.wgpu_buffer.as_entire_binding(),
-            ray_query.hits.wgpu_buffer.as_entire_binding(),
-            ray_query.params.as_entire_binding(),
-            node_slots_binding,
-            node_entity_binding,
-        )),
-    );
-    ray_query.bind_group = Some(group);
-}
-
-/// `RenderGraph`: dispatch the batch ray-query — one thread per ray. Early-returns
-/// when there's nothing to trace or the scene group / pipeline isn't ready.
-pub fn dispatch_ray_query(
-    pipeline_cache: Res<PipelineCache>,
-    ray_query: Option<Res<SolariRayQuery>>,
-    pipelines: Res<crate::pipelines::SolariPipelines>,
-    scene_bindings: Res<RaytracingSceneBindings>,
     mut ctx: RenderContext,
 ) {
-    let Some(ray_query) = ray_query else {
+    let (Some(ray_query), Some(seam), Some(node_slots), Some(node_entity)) =
+        (ray_query, seam, node_slots, node_entity)
+    else {
         return;
     };
     if ray_query.ray_count == 0 {
         return;
     }
-    let (Some(io_bg), Some(scene_bg)) = (
-        ray_query.bind_group.as_ref(),
-        scene_bindings.bind_group.as_ref(),
-    ) else {
-        return;
+    // The current PTLAS's device address, pushed for the TLAS's `PUSH_ADDRESS`
+    // mapping.
+    let tlas_address = match ptlas.as_deref() {
+        Some(p) if p.has_built && p.as_handle_device_address[p.current] != 0 => {
+            p.as_handle_device_address[p.current]
+        }
+        _ => return,
     };
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(pipelines.ray_query) else {
+    let (node_slots_bytes, node_entity_bytes) =
+        (node_slots.committed_bytes(), node_entity.committed_bytes());
+    if node_slots_bytes == 0 || node_entity_bytes == 0 {
         return;
-    };
+    }
 
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-    let encoder = ctx.command_encoder();
-    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+    let blob = ray_query.kernel.push_blob(
+        "ray_query",
+        &tlas_address.to_le_bytes(),
+        &[
+            ("rays", ray_query.slots.buffer(&seam, 0, &ray_query.rays.wgpu_buffer)),
+            ("hits", ray_query.slots.buffer(&seam, 1, &ray_query.hits.wgpu_buffer)),
+            ("params", ray_query.slots.uniform(&seam, 2, &ray_query.params)),
+            (
+                "node_slots",
+                ray_query
+                    .slots
+                    .buffer_sized(&seam, 3, node_slots.buffer(), node_slots_bytes),
+            ),
+            (
+                "node_entity",
+                ray_query
+                    .slots
+                    .buffer_sized(&seam, 4, node_entity.buffer(), node_entity_bytes),
+            ),
+        ],
+    );
+
+    // Own command buffer — the fork panics if one encoder mixes wgpu passes
+    // with raw as_hal_mut; `add_command_buffer` flushes pending ctx work first.
+    let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("ray_query"),
-        timestamp_writes: None,
     });
-    // Scene group (0) for `tlas`; this pass's I/O (1).
-    pass.set_bind_group(0, scene_bg, &[]);
-    pass.set_bind_group(1, io_bg, &[]);
-
-    let d = diagnostics.time_span(&mut pass, "ray_query");
-    pass.set_pipeline(pipeline);
-    pass.dispatch_workgroups(ray_query.ray_count.div_ceil(64), 1, 1);
-    d.end(&mut pass);
+    // SAFETY: Vulkan backend; the slots reference live heap descriptors; the
+    // barriers bracket this dispatch against the AS build, the producer's ray
+    // upload, and the consumer's hit readback (raw dispatches are invisible to
+    // wgpu's tracking).
+    unsafe {
+        encoder.as_hal_mut::<VkApi, _, _>(|hal_encoder| {
+            let hal_encoder = hal_encoder.expect("bevy_solari requires the Vulkan backend");
+            let cb = hal_encoder.raw_handle();
+            let dev = &ray_query.raw_device;
+            // AS build + column scatters + the ray/params transfers → our
+            // inline-query traversal and buffer reads.
+            let pre = [vk::MemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR
+                        | vk::PipelineStageFlags2::COMPUTE_SHADER
+                        | vk::PipelineStageFlags2::ALL_TRANSFER,
+                )
+                .src_access_mask(
+                    vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR
+                        | vk::AccessFlags2::SHADER_WRITE
+                        | vk::AccessFlags2::TRANSFER_WRITE,
+                )
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(
+                    vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR
+                        | vk::AccessFlags2::SHADER_READ
+                        | vk::AccessFlags2::SHADER_WRITE,
+                )];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&pre));
+            seam.bind_heaps(cb);
+            seam.push_data(cb, &blob);
+            dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, ray_query.kernel.pipeline);
+            dev.cmd_dispatch(cb, ray_query.ray_count.div_ceil(64), 1, 1);
+            // Hit writes → the consumer's readback copy / compute reads.
+            let post = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER
+                        | vk::PipelineStageFlags2::ALL_TRANSFER,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::TRANSFER_READ,
+                )];
+            dev.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&post));
+        });
+    }
+    ctx.add_command_buffer(encoder.finish());
 }
 
-/// Queue the batch ray-query compute pipeline. Called from
-/// [`init_solari_pipelines`](crate::pipelines::init_solari_pipelines) with the
-/// composited layout `[scene (group 0), I/O (group 1)]` so the two bound groups
-/// match the WGSL's `@group` numbers.
-pub fn queue_ray_query_pipeline(
-    pipeline_cache: &PipelineCache,
-    asset_server: &AssetServer,
-    layout: Vec<BindGroupLayoutDescriptor>,
-) -> CachedComputePipelineId {
-    pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("ray_query".into()),
-        layout,
-        shader: load_embedded_asset!(asset_server, "ray_query.wgsl"),
-        shader_defs: vec![],
-        entry_point: Some("query_rays".into()),
-        immediate_size: 0,
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    })
-}
-
-/// Batch ray-query plugin: embeds the shader, registers the resource + bind-group
-/// resource, and schedules the pass in [`SolariClusterSystems::RayQueries`].
+/// Batch ray-query plugin: registers the resource and schedules the pass in
+/// [`SolariClusterSystems::RayQueries`].
 pub struct RayQueryPlugin;
 
 impl Plugin for RayQueryPlugin {
     fn build(&self, app: &mut App) {
-        // The shader is embedded centrally in `crate::pipelines::embed_solari_shaders`,
-        // co-located with the rest of the solari compute shaders. This plugin wires only
-        // the trace SERVICE; a consumer (e.g. `picking::SolariPickingPlugin`) drives it.
+        // This plugin wires only the trace SERVICE; a consumer (e.g.
+        // `picking::SolariPickingPlugin`) drives it.
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -369,16 +387,11 @@ impl Plugin for RayQueryPlugin {
             .add_systems(RenderStartup, init_ray_query.after(SolariSetup))
             .add_systems(
                 Render,
-                (
-                    prepare_ray_query.in_set(RenderSystems::PrepareResources),
-                    prepare_ray_query_bind_group.in_set(RenderSystems::PrepareBindGroups),
-                ),
+                prepare_ray_query.in_set(RenderSystems::PrepareResources),
             )
             .add_systems(
                 RenderGraph,
-                dispatch_ray_query
-                    .run_if(resource_exists::<crate::pipelines::SolariPipelines>)
-                    .in_set(SolariClusterSystems::RayQueries),
+                dispatch_ray_query.in_set(SolariClusterSystems::RayQueries),
             );
     }
 }
