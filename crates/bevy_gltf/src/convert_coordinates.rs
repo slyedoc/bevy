@@ -2,7 +2,7 @@
 //! to Bevy's.
 use serde::{Deserialize, Serialize};
 
-use bevy_math::{Mat4, Quat, Vec3};
+use bevy_math::{Mat4, TQuat, Vec3};
 use bevy_transform::components::Transform;
 
 pub(crate) trait ConvertCoordinates {
@@ -84,7 +84,7 @@ pub struct GltfConvertCoordinates {
 
 impl GltfConvertCoordinates {
     const CONVERSION_TRANSFORM: Transform =
-        Transform::from_rotation(Quat::from_xyzw(0.0, 1.0, 0.0, 0.0));
+        Transform::from_rotation(TQuat::from_xyzw(0.0, 1.0, 0.0, 0.0));
 
     fn conversion_mat4() -> Mat4 {
         Mat4::from_scale(Vec3::new(-1.0, 1.0, -1.0))

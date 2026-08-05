@@ -15,7 +15,7 @@ use bevy_ecs::{
     world::DeferredWorld,
 };
 use bevy_image::Image;
-use bevy_math::{primitives::Rectangle, UVec2};
+use bevy_math::{primitives::Rectangle, ToPrecision, UVec2, Vec3};
 use bevy_mesh::{Mesh, Mesh2d};
 use bevy_platform::collections::HashMap;
 use bevy_reflect::{prelude::*, Reflect};
@@ -66,9 +66,10 @@ pub struct TilemapChunk {
 
 impl TilemapChunk {
     pub fn calculate_tile_transform(&self, position: UVec2) -> Transform {
-        Transform::from_xyz(
-            // tile position
-            position.x as f32
+        Transform::from_translation(
+            Vec3::new(
+                // tile position
+                position.x as f32
             // times display size for a tile
             * self.tile_display_size.x as f32
             // plus 1/2 the tile_display_size to correct the center
@@ -76,8 +77,8 @@ impl TilemapChunk {
             // minus 1/2 the tilechunk size, in terms of the tile_display_size,
             // to place the 0 at left of tilemapchunk
             - self.tile_display_size.x as f32 * self.chunk_size.x as f32 / 2.,
-            // tile position
-            position.y as f32
+                // tile position
+                position.y as f32
             // times display size for a tile
             * self.tile_display_size.y as f32
             // minus 1/2 the tile_display_size to correct the center
@@ -85,7 +86,9 @@ impl TilemapChunk {
             // plus 1/2 the tilechunk size, in terms of the tile_display_size,
             // to place the 0 at bottom of tilemapchunk
             - self.tile_display_size.y as f32 * self.chunk_size.y as f32 / 2.,
-            0.,
+                0.,
+            )
+            .to_precision(),
         )
     }
 }

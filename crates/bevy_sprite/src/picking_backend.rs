@@ -271,8 +271,9 @@ fn sprite_picking(
                     blocked = cursor_in_valid_pixels_of_sprite && pickable.should_block_lower;
 
                     cursor_in_valid_pixels_of_sprite.then(|| {
-                        let hit_pos_world =
-                            sprite_transform.transform_point(cursor_pos_sprite.extend(0.0));
+                        let hit_pos_world = sprite_transform
+                            .transform_point(cursor_pos_sprite.extend(0.0).to_precision())
+                            .to_render();
                         // Transform point from world to camera space to get the Z distance
                         let hit_pos_cam = cam_transform
                             .affine()

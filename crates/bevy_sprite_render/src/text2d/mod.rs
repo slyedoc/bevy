@@ -9,7 +9,7 @@ use bevy_ecs::{
     query::Has,
     system::{Commands, Query, ResMut},
 };
-use bevy_math::{Vec2, Vec3};
+use bevy_math::{ToPrecision, Vec2, Vec3};
 use bevy_render::sync_world::TemporaryRenderEntity;
 use bevy_render::Extract;
 use bevy_sprite::{Anchor, Text2dShadow};
@@ -68,8 +68,9 @@ pub fn extract_text2d_sprite(
         }
 
         let inverse_scale_factor = text_layout_info.scale_factor.recip();
-        let scaling =
-            GlobalTransform::from_scale(Vec3::new(inverse_scale_factor, -inverse_scale_factor, 1.));
+        let scaling = GlobalTransform::from_scale(
+            Vec3::new(inverse_scale_factor, -inverse_scale_factor, 1.).to_precision(),
+        );
         let size = Vec2::new(
             text_bounds
                 .width
@@ -89,9 +90,9 @@ pub fn extract_text2d_sprite(
             let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
             let offset = run.bounds.center();
             let transform = *global_transform
-                * GlobalTransform::from_translation(top_left.extend(0.))
+                * GlobalTransform::from_translation(top_left.extend(0.).to_precision())
                 * scaling
-                * GlobalTransform::from_translation(offset.extend(0.));
+                * GlobalTransform::from_translation(offset.extend(0.).to_precision());
             extracted_sprites.sprites.push(ExtractedSprite {
                 main_entity,
                 render_entity,
@@ -111,7 +112,9 @@ pub fn extract_text2d_sprite(
 
         if let Some(shadow) = maybe_shadow {
             let shadow_transform = *global_transform
-                * GlobalTransform::from_translation((top_left + shadow.offset).extend(0.))
+                * GlobalTransform::from_translation(
+                    (top_left + shadow.offset).extend(0.).to_precision(),
+                )
                 * scaling;
             let color = shadow.color.into();
 
@@ -165,8 +168,8 @@ pub fn extract_text2d_sprite(
                 if has_strikethrough {
                     let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
                     let offset = run.strikethrough_position();
-                    let transform =
-                        shadow_transform * GlobalTransform::from_translation(offset.extend(0.));
+                    let transform = shadow_transform
+                        * GlobalTransform::from_translation(offset.extend(0.).to_precision());
                     extracted_sprites.sprites.push(ExtractedSprite {
                         main_entity,
                         render_entity,
@@ -187,8 +190,8 @@ pub fn extract_text2d_sprite(
                 if has_underline {
                     let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
                     let offset = run.underline_position();
-                    let transform =
-                        shadow_transform * GlobalTransform::from_translation(offset.extend(0.));
+                    let transform = shadow_transform
+                        * GlobalTransform::from_translation(offset.extend(0.).to_precision());
                     extracted_sprites.sprites.push(ExtractedSprite {
                         main_entity,
                         render_entity,
@@ -208,8 +211,9 @@ pub fn extract_text2d_sprite(
             }
         }
 
-        let transform =
-            *global_transform * GlobalTransform::from_translation(top_left.extend(0.)) * scaling;
+        let transform = *global_transform
+            * GlobalTransform::from_translation(top_left.extend(0.).to_precision())
+            * scaling;
         let mut color = LinearRgba::WHITE;
         let mut current_section = u32::MAX;
 
@@ -285,9 +289,9 @@ pub fn extract_text2d_sprite(
                 let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
                 let offset = run.strikethrough_position();
                 let transform = *global_transform
-                    * GlobalTransform::from_translation(top_left.extend(0.))
+                    * GlobalTransform::from_translation(top_left.extend(0.).to_precision())
                     * scaling
-                    * GlobalTransform::from_translation(offset.extend(0.));
+                    * GlobalTransform::from_translation(offset.extend(0.).to_precision());
                 extracted_sprites.sprites.push(ExtractedSprite {
                     main_entity,
                     render_entity,
@@ -313,9 +317,9 @@ pub fn extract_text2d_sprite(
                 let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
                 let offset = run.underline_position();
                 let transform = *global_transform
-                    * GlobalTransform::from_translation(top_left.extend(0.))
+                    * GlobalTransform::from_translation(top_left.extend(0.).to_precision())
                     * scaling
-                    * GlobalTransform::from_translation(offset.extend(0.));
+                    * GlobalTransform::from_translation(offset.extend(0.).to_precision());
                 extracted_sprites.sprites.push(ExtractedSprite {
                     main_entity,
                     render_entity,

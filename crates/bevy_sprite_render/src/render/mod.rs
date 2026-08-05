@@ -18,7 +18,7 @@ use bevy_ecs::{
     system::{lifetimeless::*, SystemParamItem},
 };
 use bevy_image::{Image, TextureAtlasLayout};
-use bevy_math::{Affine3A, FloatOrd, Quat, Rect, Vec2, Vec4};
+use bevy_math::{Affine3A, FloatOrd, Quat, Rect, ToRender, Vec2, Vec4};
 use bevy_mesh::VertexBufferLayout;
 use bevy_platform::collections::HashMap;
 use bevy_render::{
@@ -584,7 +584,7 @@ pub fn queue_sprites(
             }
 
             // These items will be sorted by depth with other phase items
-            let sort_key = FloatOrd(extracted_sprite.transform.translation().z);
+            let sort_key = FloatOrd(extracted_sprite.transform.translation().z.to_render());
 
             // Add the item to the render phase
             transparent_phase.add_transient(Transparent2d {

@@ -6,7 +6,7 @@ use bevy_camera::{
 use bevy_color::Color;
 use bevy_ecs::prelude::*;
 use bevy_image::Image;
-use bevy_math::{primitives::ViewFrustum, Affine3A, Dir3, Mat3, Mat4, Vec3};
+use bevy_math::{primitives::ViewFrustum, Affine3A, Dir3, Mat3, Mat4, ToRender, Vec3};
 use bevy_reflect::prelude::*;
 use bevy_transform::components::{GlobalTransform, Transform};
 
@@ -196,7 +196,7 @@ pub fn spot_light_world_from_view(transform: &GlobalTransform) -> Affine3A {
     let fwd_dir = transform.back();
 
     let basis = orthonormalize(fwd_dir);
-    Affine3A::from_mat3_translation(basis, transform.translation())
+    Affine3A::from_mat3_translation(basis, transform.translation().to_render())
 }
 
 /// Creates the projection matrix that transforms the light's view space into the light's clip space.
@@ -267,7 +267,7 @@ pub fn update_spot_light_frusta(
 
         *frustum = Frustum(ViewFrustum::from_clip_from_world_custom_far(
             &clip_from_world,
-            &transform.translation(),
+            &transform.translation().to_render(),
             &view_backward,
             spot_light.range,
         ));

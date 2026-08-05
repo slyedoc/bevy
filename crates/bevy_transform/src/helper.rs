@@ -86,7 +86,7 @@ mod tests {
 
     use bevy_app::App;
     use bevy_ecs::{hierarchy::ChildOf, system::SystemState};
-    use bevy_math::{Quat, Vec3};
+    use bevy_math::{Quat, ToPrecision, Vec3};
 
     use crate::{
         components::{GlobalTransform, Transform},
@@ -97,21 +97,23 @@ mod tests {
     #[test]
     fn match_transform_propagation_systems() {
         // Single transform
-        match_transform_propagation_systems_inner(vec![Transform::from_translation(Vec3::X)
-            .with_rotation(Quat::from_rotation_y(TAU / 4.))
-            .with_scale(Vec3::splat(2.))]);
+        match_transform_propagation_systems_inner(vec![Transform::from_translation(
+            Vec3::X.to_precision(),
+        )
+        .with_rotation(Quat::from_rotation_y(TAU / 4.).to_precision())
+        .with_scale(Vec3::splat(2.).to_precision())]);
 
         // Transform hierarchy
         match_transform_propagation_systems_inner(vec![
-            Transform::from_translation(Vec3::X)
-                .with_rotation(Quat::from_rotation_y(TAU / 4.))
-                .with_scale(Vec3::splat(2.)),
-            Transform::from_translation(Vec3::Y)
-                .with_rotation(Quat::from_rotation_z(TAU / 3.))
-                .with_scale(Vec3::splat(1.5)),
-            Transform::from_translation(Vec3::Z)
-                .with_rotation(Quat::from_rotation_x(TAU / 2.))
-                .with_scale(Vec3::splat(0.3)),
+            Transform::from_translation(Vec3::X.to_precision())
+                .with_rotation(Quat::from_rotation_y(TAU / 4.).to_precision())
+                .with_scale(Vec3::splat(2.).to_precision()),
+            Transform::from_translation(Vec3::Y.to_precision())
+                .with_rotation(Quat::from_rotation_z(TAU / 3.).to_precision())
+                .with_scale(Vec3::splat(1.5).to_precision()),
+            Transform::from_translation(Vec3::Z.to_precision())
+                .with_rotation(Quat::from_rotation_x(TAU / 2.).to_precision())
+                .with_scale(Vec3::splat(0.3).to_precision()),
         ]);
     }
 

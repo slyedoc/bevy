@@ -22,7 +22,7 @@ use bevy_ecs::{
         SystemParamItem,
     },
 };
-use bevy_math::{Mat3, Vec3, Vec4};
+use bevy_math::{Mat3, ToRender, Vec3, Vec4};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
     camera::ExtractedCamera,
@@ -295,9 +295,9 @@ fn prepare_infinite_grids(
     settings_uniforms.uniforms.clear();
     for (entity, transform, settings) in &grids {
         let t = transform.compute_transform();
-        let offset = transform.translation();
+        let offset = transform.translation().to_render();
         let normal = transform.up();
-        let rot_matrix = Mat3::from_quat(t.rotation.inverse());
+        let rot_matrix = Mat3::from_quat(t.rotation.inverse().to_render());
         commands.entity(entity).insert(InfiniteGridUniformOffsets {
             position_offset: position_uniforms.uniforms.push(&InfiniteGridUniform {
                 rot_matrix,
@@ -401,7 +401,7 @@ fn queue_infinite_grids(
                 continue;
             };
             // Don't render if the view is directly on the plane
-            if !plane_check(transform, view.world_from_view.translation()) {
+            if !plane_check(transform, view.world_from_view.translation().to_render()) {
                 continue;
             }
             phase.add_retained(Transparent3d {
@@ -423,7 +423,11 @@ fn queue_infinite_grids(
 
 /// Checks if the point is on the plane
 fn plane_check(plane: &GlobalTransform, point: Vec3) -> bool {
-    plane.up().dot(plane.translation() - point).abs() > f32::EPSILON
+    plane
+        .up()
+        .dot(plane.translation().to_render() - point)
+        .abs()
+        > f32::EPSILON
 }
 
 #[derive(Resource)]

@@ -37,6 +37,7 @@ mod float_ord;
 mod isometry;
 mod mat3;
 pub mod ops;
+pub mod precision;
 pub mod primitives;
 mod ray;
 mod rects;
@@ -57,6 +58,7 @@ pub use float_ord::*;
 pub use isometry::{Isometry2d, Isometry3d};
 pub use mat3::*;
 pub use ops::FloatPow;
+pub use precision::{TAffine3, TMat3, TMat4, TQuat, TReal, TVec2, TVec3, ToPrecision, ToRender};
 pub use ray::{Ray2d, Ray3d};
 pub use rects::*;
 pub use rotation2d::Rot2;
@@ -82,6 +84,11 @@ pub mod prelude {
         EulerRot, FloatExt, IRect, IVec2, IVec3, IVec4, Isometry2d, Isometry3d, Mat2, Mat3, Mat3A,
         Mat4, Quat, Ray2d, Ray3d, Rect, Rot2, StableInterpolate, URect, UVec2, UVec3, UVec4, Vec2,
         Vec2Swizzles, Vec3, Vec3A, Vec3Swizzles, Vec4, Vec4Swizzles,
+    };
+
+    #[doc(hidden)]
+    pub use crate::precision::{
+        TAffine3, TMat3, TMat4, TQuat, TReal, TVec2, TVec3, ToPrecision, ToRender,
     };
 
     #[doc(hidden)]

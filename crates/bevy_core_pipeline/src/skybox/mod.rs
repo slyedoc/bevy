@@ -26,7 +26,6 @@ use bevy_render::{
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::Shader;
-use bevy_transform::components::Transform;
 use bevy_utils::default;
 
 use crate::core_3d::CORE_3D_DEPTH_FORMAT;
@@ -77,7 +76,7 @@ pub fn extract_skybox(
             .unwrap_or_else(|| Exposure::default().exposure());
         let uniforms = SkyboxUniforms {
             brightness: skybox.brightness * exposure,
-            transform: Transform::from_rotation(skybox.rotation.inverse()).to_matrix(),
+            transform: Mat4::from_quat(skybox.rotation.inverse()),
             #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
             _webgl2_padding_8b: 0,
             #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]

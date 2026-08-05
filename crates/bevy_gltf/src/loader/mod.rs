@@ -314,7 +314,7 @@ impl GltfLoader {
             };
             use bevy_math::{
                 curve::{ConstantCurve, Interval, UnevenSampleAutoCurve},
-                Quat, Vec4,
+                Quat, TQuat, TVec3, ToPrecision, ToRender, Vec4,
             };
             use gltf::animation::util::ReadOutputs;
             let mut animations = vec![];
@@ -350,7 +350,8 @@ impl GltfLoader {
                         match outputs {
                             ReadOutputs::Translations(tr) => {
                                 let translation_property = animated_field!(Transform::translation);
-                                let translations: Vec<Vec3> = tr.map(Vec3::from).collect();
+                                let translations: Vec<TVec3> =
+                                    tr.map(|t| Vec3::from(t).to_precision()).collect();
                                 if keyframe_timestamps.len() == 1 {
                                     Some(VariableCurve::new(AnimatableCurve::new(
                                         translation_property,
@@ -406,8 +407,10 @@ impl GltfLoader {
                             }
                             ReadOutputs::Rotations(rots) => {
                                 let rotation_property = animated_field!(Transform::rotation);
-                                let rotations: Vec<Quat> =
-                                    rots.into_f32().map(Quat::from_array).collect();
+                                let rotations: Vec<TQuat> = rots
+                                    .into_f32()
+                                    .map(|r| Quat::from_array(r).to_precision())
+                                    .collect();
                                 if keyframe_timestamps.len() == 1 {
                                     Some(VariableCurve::new(AnimatableCurve::new(
                                         rotation_property,
@@ -446,7 +449,9 @@ impl GltfLoader {
                                         gltf::animation::Interpolation::CubicSpline => {
                                             CubicRotationCurve::new(
                                                 keyframe_timestamps,
-                                                rotations.into_iter().map(Vec4::from),
+                                                rotations
+                                                    .into_iter()
+                                                    .map(|r| Vec4::from(r.to_render())),
                                             )
                                             .ok()
                                             .map(
@@ -463,7 +468,8 @@ impl GltfLoader {
                             }
                             ReadOutputs::Scales(scale) => {
                                 let scale_property = animated_field!(Transform::scale);
-                                let scales: Vec<Vec3> = scale.map(Vec3::from).collect();
+                                let scales: Vec<TVec3> =
+                                    scale.map(|v| Vec3::from(v).to_precision()).collect();
                                 if keyframe_timestamps.len() == 1 {
                                     Some(VariableCurve::new(AnimatableCurve::new(
                                         scale_property,

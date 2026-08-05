@@ -817,7 +817,7 @@ mod test {
     use alloc::{vec, vec::Vec};
     use bevy_app::prelude::*;
     use bevy_ecs::world::CommandQueue;
-    use bevy_math::{vec3, Vec3};
+    use bevy_math::{vec3, ToPrecision, Vec3};
     use bevy_tasks::{ComputeTaskPool, TaskPool};
 
     use crate::systems::*;
@@ -1059,7 +1059,7 @@ mod test {
         )
         .insert_resource(StaticTransformOptimizations::default());
 
-        let translation = vec3(1.0, 0.0, 0.0);
+        let translation = vec3(1.0, 0.0, 0.0).to_precision();
 
         // These will be overwritten.
         let mut child = Entity::from_raw_u32(0).unwrap();
@@ -1164,7 +1164,7 @@ mod test {
 
     #[test]
     fn global_transform_should_not_be_overwritten_after_reparenting() {
-        let translation = Vec3::ONE;
+        let translation = Vec3::ONE.to_precision();
         let mut world = World::new();
 
         // Create transform propagation schedule

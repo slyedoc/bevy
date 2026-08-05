@@ -33,7 +33,7 @@ use bevy_ecs::{
 };
 use bevy_image::Image;
 use bevy_light::{ClusteredDecal, DirectionalLightTexture, PointLightTexture, SpotLightTexture};
-use bevy_math::{Mat4, Vec3};
+use bevy_math::{Mat4, ToRender, Vec3};
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     render_asset::RenderAssets,
@@ -312,8 +312,8 @@ fn extract_clustered_decals(
                 clustered_decal.emissive_texture.as_ref().map(Handle::id),
             ],
             global_transform.affine().inverse().into(),
-            global_transform.translation(),
-            (global_transform.scale() * Vec3::ONE).length(),
+            global_transform.translation().to_render(),
+            (global_transform.scale().to_render() * Vec3::ONE).length(),
             clustered_decal.tag,
         );
     }
@@ -342,8 +342,8 @@ fn extract_spot_light_textures(
             decal_entity,
             [Some(texture.image.id()), None, None, None],
             global_transform.affine().inverse().into(),
-            global_transform.translation(),
-            (global_transform.scale() * Vec3::ONE).length(),
+            global_transform.translation().to_render(),
+            (global_transform.scale().to_render() * Vec3::ONE).length(),
             0,
         );
     }
@@ -372,8 +372,8 @@ fn extract_point_light_textures(
             decal_entity,
             [Some(texture.image.id()), None, None, None],
             global_transform.affine().inverse().into(),
-            global_transform.translation(),
-            (global_transform.scale() * Vec3::ONE).length(),
+            global_transform.translation().to_render(),
+            (global_transform.scale().to_render() * Vec3::ONE).length(),
             texture.cubemap_layout as u32,
         );
     }
@@ -402,8 +402,8 @@ fn extract_directional_light_textures(
             decal_entity,
             [Some(texture.image.id()), None, None, None],
             global_transform.affine().inverse().into(),
-            global_transform.translation(),
-            (global_transform.scale() * Vec3::ONE).length(),
+            global_transform.translation().to_render(),
+            (global_transform.scale().to_render() * Vec3::ONE).length(),
             if texture.tiled { 1 } else { 0 },
         );
     }

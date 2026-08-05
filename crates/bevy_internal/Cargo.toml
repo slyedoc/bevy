@@ -10,6 +10,13 @@ keywords = ["game", "engine", "gamedev", "graphics", "bevy"]
 categories = ["game-engines", "graphics", "gui", "rendering"]
 
 [features]
+# Switches Transform/GlobalTransform (and the bevy_math transform-precision
+# aliases) to f64 for very large worlds. Single additive opt-in; absence = f32.
+transform_f64 = [
+  "bevy_math/transform_f64",
+  "bevy_transform/transform_f64",
+  "bevy_animation?/transform_f64",
+]
 trace = [
   "bevy_app/trace",
   "bevy_asset?/trace",

@@ -102,6 +102,10 @@ alloc = ["serde?/alloc"]
 ## Uses the `libm` maths library instead of the one provided in `std` and `core`.
 libm = ["bevy_math/libm"]
 
+## Switches Transform/GlobalTransform to double-precision translation/rotation/scale
+## (via bevy_math's transform-precision aliases). Single additive opt-in; absence = f32.
+transform_f64 = ["bevy_math/transform_f64"]
+
 [lints]
 workspace = true
 

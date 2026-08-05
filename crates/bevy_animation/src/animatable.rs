@@ -133,12 +133,14 @@ impl Animatable for bool {
 impl Animatable for Transform {
     fn interpolate(a: &Self, b: &Self, t: f32) -> Self {
         Self {
-            translation: Vec3::interpolate(&a.translation, &b.translation, t),
-            rotation: Quat::interpolate(&a.rotation, &b.rotation, t),
-            scale: Vec3::interpolate(&a.scale, &b.scale, t),
+            translation: TVec3::interpolate(&a.translation, &b.translation, t),
+            rotation: TQuat::interpolate(&a.rotation, &b.rotation, t),
+            scale: TVec3::interpolate(&a.scale, &b.scale, t),
         }
     }
 
+    // Vec3 fields blend through SIMD Vec3A accumulators.
+    #[cfg(not(feature = "transform_f64"))]
     fn blend(inputs: impl Iterator<Item = BlendInput<Self>>) -> Self {
         let mut translation = Vec3A::ZERO;
         let mut scale = Vec3A::ZERO;
@@ -167,6 +169,37 @@ impl Animatable for Transform {
             scale: Vec3::from(scale),
         }
     }
+
+    // DVec3 has no SIMD accumulator type; blend directly in f64.
+    #[cfg(feature = "transform_f64")]
+    fn blend(inputs: impl Iterator<Item = BlendInput<Self>>) -> Self {
+        let mut translation = DVec3::ZERO;
+        let mut scale = DVec3::ZERO;
+        let mut rotation = DQuat::IDENTITY;
+
+        for input in inputs {
+            if input.additive {
+                translation += f64::from(input.weight) * input.value.translation;
+                scale += f64::from(input.weight) * input.value.scale;
+                rotation = DQuat::slerp(
+                    DQuat::IDENTITY,
+                    input.value.rotation,
+                    f64::from(input.weight),
+                ) * rotation;
+            } else {
+                translation =
+                    DVec3::interpolate(&translation, &input.value.translation, input.weight);
+                scale = DVec3::interpolate(&scale, &input.value.scale, input.weight);
+                rotation = DQuat::interpolate(&rotation, &input.value.rotation, input.weight);
+            }
+        }
+
+        Self {
+            translation,
+            rotation,
+            scale,
+        }
+    }
 }
 
 impl Animatable for Quat {
@@ -189,6 +222,34 @@ impl Animatable for Quat {
         {
             if additive {
                 value = Self::slerp(Self::IDENTITY, incoming_value, weight) * value;
+            } else {
+                value = Self::interpolate(&value, &incoming_value, weight);
+            }
+        }
+        value
+    }
+}
+
+impl Animatable for DQuat {
+    /// Performs a slerp to smoothly interpolate between quaternions.
+    #[inline]
+    fn interpolate(a: &Self, b: &Self, t: f32) -> Self {
+        // We want to smoothly interpolate between the two quaternions by default,
+        // rather than using a quicker but less correct linear interpolation.
+        a.slerp(*b, f64::from(t))
+    }
+
+    #[inline]
+    fn blend(inputs: impl Iterator<Item = BlendInput<Self>>) -> Self {
+        let mut value = Self::IDENTITY;
+        for BlendInput {
+            weight,
+            value: incoming_value,
+            additive,
+        } in inputs
+        {
+            if additive {
+                value = Self::slerp(Self::IDENTITY, incoming_value, f64::from(weight)) * value;
             } else {
                 value = Self::interpolate(&value, &incoming_value, weight);
             }

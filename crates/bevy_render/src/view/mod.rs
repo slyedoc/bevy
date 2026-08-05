@@ -30,7 +30,7 @@ use bevy_color::{LinearRgba, Oklaba, Srgba};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{prelude::*, VariantDefaults};
 use bevy_image::ToExtents;
-use bevy_math::{mat3, vec2, vec3, Mat3, Mat4, UVec4, Vec2, Vec3, Vec4, Vec4Swizzles};
+use bevy_math::{mat3, vec2, vec3, Mat3, Mat4, ToRender, UVec4, Vec2, Vec3, Vec4, Vec4Swizzles};
 use bevy_platform::collections::{hash_map::Entry, HashMap};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render_macros::ExtractComponent;
@@ -1069,7 +1069,7 @@ pub fn prepare_view_uniforms(
                 // If we're rendering a camera directly (i.e. we're not
                 // rendering a shadow map), we use this camera's position as the
                 // LOD view position.
-                extracted_view.world_from_view.translation()
+                extracted_view.world_from_view.translation().to_render()
             }
             (None, Some(shadow_lod_origin))
                 if extracted_view.retained_view_entity.auxiliary_entity
@@ -1092,7 +1092,7 @@ pub fn prepare_view_uniforms(
                         .entity(),
                 ) {
                     Ok((_, _, camera_view, _, _, _, _)) => {
-                        camera_view.world_from_view.translation()
+                        camera_view.world_from_view.translation().to_render()
                     }
                     Err(_) => shadow_lod_origin.0,
                 }
@@ -1108,7 +1108,7 @@ pub fn prepare_view_uniforms(
                 view_from_world,
                 clip_from_view,
                 view_from_clip,
-                world_position: extracted_view.world_from_view.translation(),
+                world_position: extracted_view.world_from_view.translation().to_render(),
                 exposure: extracted_camera
                     .map(|c| c.exposure)
                     .unwrap_or_else(|| Exposure::default().exposure()),

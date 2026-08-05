@@ -19,7 +19,6 @@ use bevy_ecs::{entity::EntityHashSet, prelude::*, system::QueryLens};
 #[cfg(feature = "bevy_gizmos")]
 use bevy_gizmos::frustum::FrustumGizmoSystems;
 use bevy_log::warn_once;
-use bevy_math::Vec3A;
 use bevy_mesh::Mesh3d;
 use bevy_reflect::prelude::*;
 use bevy_transform::{components::GlobalTransform, TransformSystems};
@@ -574,7 +573,7 @@ pub fn check_point_light_mesh_visibility(
 
                 let view_mask = maybe_view_mask.unwrap_or_default();
                 let light_sphere = Sphere {
-                    center: Vec3A::from(transform.translation()),
+                    center: transform.translation_vec3a(),
                     radius: point_light.range,
                 };
 
@@ -665,7 +664,7 @@ pub fn check_point_light_mesh_visibility(
 
                 let view_mask = maybe_view_mask.unwrap_or_default();
                 let light_sphere = Sphere {
-                    center: Vec3A::from(transform.translation()),
+                    center: transform.translation_vec3a(),
                     radius: point_light.range,
                 };
 

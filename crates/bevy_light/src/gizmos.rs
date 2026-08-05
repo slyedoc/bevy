@@ -21,7 +21,7 @@ use bevy_ecs::{
 use bevy_math::{
     ops,
     primitives::{Cone, Sphere},
-    Isometry3d, Quat, Vec3,
+    Isometry3d, Quat, ToRender, Vec3,
 };
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_transform::{components::GlobalTransform, TransformSystems};
@@ -39,7 +39,7 @@ fn point_light_gizmo(
     color: Color,
     gizmos: &mut Gizmos<LightGizmoConfigGroup>,
 ) {
-    let position = transform.translation();
+    let position = transform.translation().to_render();
     gizmos
         .primitive_3d(&Sphere::new(point_light.radius), position, color)
         .resolution(16);
@@ -57,6 +57,7 @@ fn spot_light_gizmo(
     gizmos: &mut Gizmos<LightGizmoConfigGroup>,
 ) {
     let (_, rotation, translation) = transform.to_scale_rotation_translation();
+    let (rotation, translation) = (rotation.to_render(), translation.to_render());
     gizmos
         .primitive_3d(&Sphere::new(spot_light.radius), translation, color)
         .resolution(16);
@@ -105,6 +106,7 @@ fn directional_light_gizmo(
     gizmos: &mut Gizmos<LightGizmoConfigGroup>,
 ) {
     let (_, rotation, translation) = transform.to_scale_rotation_translation();
+    let (rotation, translation) = (rotation.to_render(), translation.to_render());
     gizmos
         .arrow(translation, translation + rotation * Vec3::NEG_Z, color)
         .with_tip_length(0.3);
@@ -118,6 +120,7 @@ fn rect_light_gizmo(
     gizmos: &mut Gizmos<LightGizmoConfigGroup>,
 ) {
     let (_, rotation, translation) = transform.to_scale_rotation_translation();
+    let (rotation, translation) = (rotation.to_render(), translation.to_render());
     let size = bevy_math::Vec2::new(rect_light.width, rect_light.height);
     gizmos.rect(Isometry3d::new(translation, rotation), size, color);
     gizmos

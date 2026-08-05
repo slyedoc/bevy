@@ -4,7 +4,7 @@ use crate::{
 };
 use bevy_asset::{Asset, Assets};
 use bevy_ecs::{prelude::*, system::SystemParam};
-use bevy_math::Vec3;
+use bevy_math::{ToPrecision, ToRender, Vec3};
 use bevy_transform::prelude::GlobalTransform;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source, SpatialPlayer};
 use tracing::warn;
@@ -57,8 +57,12 @@ impl<'w, 's> EarPositions<'w, 's> {
             .next()
             .map(|(_, transform, settings)| {
                 (
-                    transform.transform_point(settings.left_ear_offset),
-                    transform.transform_point(settings.right_ear_offset),
+                    transform
+                        .transform_point(settings.left_ear_offset.to_precision())
+                        .to_render(),
+                    transform
+                        .transform_point(settings.right_ear_offset.to_precision())
+                        .to_render(),
                 )
             })
             .unwrap_or_else(|| {
@@ -126,7 +130,7 @@ pub(crate) fn play_queued_audio_system<Source: Asset + Decodable>(
             let scale = settings.spatial_scale.unwrap_or(default_spatial_scale.0).0;
 
             let emitter_translation = if let Some(emitter_transform) = maybe_emitter_transform {
-                (emitter_transform.translation() * scale).into()
+                (emitter_transform.translation().to_render() * scale).into()
             } else {
                 warn!("Spatial AudioPlayer with no GlobalTransform component. Using zero.");
                 Vec3::ZERO.into()
@@ -348,7 +352,7 @@ pub(crate) fn update_emitter_positions(
     for (transform, sink, settings) in emitters.iter_mut() {
         let scale = settings.spatial_scale.unwrap_or(default_spatial_scale.0).0;
 
-        let translation = transform.translation() * scale;
+        let translation = transform.translation().to_render() * scale;
         sink.set_emitter_position(translation);
     }
 }

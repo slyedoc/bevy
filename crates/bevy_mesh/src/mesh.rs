@@ -2235,10 +2235,14 @@ impl Mesh {
     ///
     /// `Aabb` of entities with modified mesh are not updated automatically.
     pub fn try_transform_by(&mut self, transform: Transform) -> Result<(), MeshAccessError> {
+        // Vertex data is f32; apply the transform at f32 precision.
+        let rotation = transform.rotation.to_render();
+        let scale = transform.scale.to_render();
+        let translation = transform.translation.to_render();
         // Needed when transforming normals and tangents
-        let scale_recip = 1. / transform.scale;
+        let scale_recip = 1. / scale;
         debug_assert!(
-            transform.scale.yzx() * transform.scale.zxy() != Vec3::ZERO,
+            scale.yzx() * scale.zxy() != Vec3::ZERO,
             "mesh transform scale cannot be zero on more than one axis"
         );
 
@@ -2246,16 +2250,13 @@ impl Mesh {
             self.try_attribute_mut_option(Mesh::ATTRIBUTE_POSITION)?
         {
             // Apply scale, rotation, and translation to vertex positions
-            positions
-                .iter_mut()
-                .for_each(|pos| *pos = transform.transform_point(Vec3::from_slice(pos)).to_array());
+            positions.iter_mut().for_each(|pos| {
+                *pos = (rotation * (scale * Vec3::from_slice(pos)) + translation).to_array();
+            });
         }
 
         // No need to transform normals or tangents if rotation is near identity and scale is uniform
-        if transform.rotation.is_near_identity()
-            && transform.scale.x == transform.scale.y
-            && transform.scale.y == transform.scale.z
-        {
+        if rotation.is_near_identity() && scale.x == scale.y && scale.y == scale.z {
             return Ok(());
         }
 
@@ -2264,9 +2265,8 @@ impl Mesh {
         {
             // Transform normals, taking into account non-uniform scaling and rotation
             normals.iter_mut().for_each(|normal| {
-                *normal = (transform.rotation
-                    * scale_normal(Vec3::from_array(*normal), scale_recip))
-                .to_array();
+                *normal =
+                    (rotation * scale_normal(Vec3::from_array(*normal), scale_recip)).to_array();
             });
         }
 
@@ -2276,8 +2276,8 @@ impl Mesh {
             // Transform tangents, taking into account non-uniform scaling and rotation
             tangents.iter_mut().for_each(|tangent| {
                 let handedness = tangent[3];
-                let scaled_tangent = Vec3::from_slice(tangent) * transform.scale;
-                *tangent = (transform.rotation * scaled_tangent.normalize_or_zero())
+                let scaled_tangent = Vec3::from_slice(tangent) * scale;
+                *tangent = (rotation * scaled_tangent.normalize_or_zero())
                     .extend(handedness)
                     .to_array();
             });

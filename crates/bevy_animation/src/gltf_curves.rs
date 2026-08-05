@@ -2,7 +2,7 @@
 
 use bevy_math::{
     curve::{cores::*, iterable::IterableCurve, *},
-    vec4, Quat, Vec4, VectorSpace,
+    vec4, Quat, TQuat, ToPrecision, Vec4, VectorSpace,
 };
 use bevy_reflect::Reflect;
 use either::Either;
@@ -55,7 +55,8 @@ pub struct CubicKeyframeCurve<T> {
 
 impl<V> Curve<V> for CubicKeyframeCurve<V>
 where
-    V: VectorSpace<Scalar = f32>,
+    V: VectorSpace,
+    V::Scalar: From<f32>,
 {
     #[inline]
     fn domain(&self) -> Interval {
@@ -117,14 +118,14 @@ pub struct CubicRotationCurve {
     core: ChunkedUnevenCore<Vec4>,
 }
 
-impl Curve<Quat> for CubicRotationCurve {
+impl Curve<TQuat> for CubicRotationCurve {
     #[inline]
     fn domain(&self) -> Interval {
         self.core.domain()
     }
 
     #[inline]
-    fn sample_clamped(&self, t: f32) -> Quat {
+    fn sample_clamped(&self, t: f32) -> TQuat {
         let vec = match self.core.sample_interp_timed(t) {
             // In all the cases where only one frame matters, defer to the position within it.
             InterpolationDatum::Exact((_, v))
@@ -135,11 +136,11 @@ impl Curve<Quat> for CubicRotationCurve {
                 cubic_spline_interpolation(u[1], u[2], v[0], v[1], s, t1 - t0)
             }
         };
-        Quat::from_vec4(vec.normalize())
+        Quat::from_vec4(vec.normalize()).to_precision()
     }
 
     #[inline]
-    fn sample_unchecked(&self, t: f32) -> Quat {
+    fn sample_unchecked(&self, t: f32) -> TQuat {
         self.sample_clamped(t)
     }
 }
@@ -380,13 +381,14 @@ fn cubic_spline_interpolation<T>(
     step_duration: f32,
 ) -> T
 where
-    T: VectorSpace<Scalar = f32>,
+    T: VectorSpace,
+    T::Scalar: From<f32>,
 {
     let coeffs = (vec4(2.0, 1.0, -2.0, 1.0) * lerp + vec4(-3.0, -2.0, 3.0, -1.0)) * lerp;
-    value_start * (coeffs.x * lerp + 1.0)
-        + tangent_out_start * step_duration * lerp * (coeffs.y + 1.0)
-        + value_end * lerp * coeffs.z
-        + tangent_in_end * step_duration * lerp * coeffs.w
+    value_start * T::Scalar::from(coeffs.x * lerp + 1.0)
+        + tangent_out_start * T::Scalar::from(step_duration * lerp * (coeffs.y + 1.0))
+        + value_end * T::Scalar::from(lerp * coeffs.z)
+        + tangent_in_end * T::Scalar::from(step_duration * lerp * coeffs.w)
 }
 
 fn cubic_spline_interpolate_slices<'a, T: VectorSpace<Scalar = f32>>(

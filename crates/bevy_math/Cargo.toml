@@ -85,6 +85,10 @@ bevy_reflect = ["dep:bevy_reflect", "alloc"]
 # Enable libm mathematical functions as a fallback for no_std environments.
 # Can be overridden with std feature.
 nostd-libm = ["dep:libm", "glam/nostd-libm"]
+# Switch the transform-precision aliases (TReal/TVec3/TQuat/TAffine3/...) — and
+# with them Transform/GlobalTransform — from f32 to f64 (Godot precision=double /
+# Unreal LWC model). Single additive opt-in; absence means f32.
+transform_f64 = []
 
 [lints]
 workspace = true

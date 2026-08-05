@@ -1,6 +1,8 @@
 //! This module contains abstract mathematical traits shared by types used in `bevy_math`.
 
-use crate::{ops, DVec2, DVec3, DVec4, Dir2, Dir3, Dir3A, Quat, Rot2, Vec2, Vec3, Vec3A, Vec4};
+use crate::{
+    ops, DQuat, DVec2, DVec3, DVec4, Dir2, Dir3, Dir3A, Quat, Rot2, Vec2, Vec3, Vec3A, Vec4,
+};
 use core::{
     convert::Infallible,
     fmt::Debug,
@@ -479,6 +481,29 @@ where
     #[inline]
     fn interpolate_stable(&self, other: &Self, t: f32) -> Self {
         self.lerp(*other, t)
+    }
+}
+
+// The f64 vector types can't ride the blanket impl (its bound is `Scalar = f32`,
+// and a second blanket for f64 would be rejected by coherence), so they get
+// concrete impls with the same lerp semantics.
+macro_rules! impl_stable_interpolate_f64_lerp {
+    ($($ty:ty),*) => {
+        $(impl StableInterpolate for $ty {
+            #[inline]
+            fn interpolate_stable(&self, other: &Self, t: f32) -> Self {
+                self.lerp(*other, t as f64)
+            }
+        })*
+    };
+}
+
+impl_stable_interpolate_f64_lerp!(DVec2, DVec3, DVec4, f64);
+
+impl StableInterpolate for DQuat {
+    #[inline]
+    fn interpolate_stable(&self, other: &Self, t: f32) -> Self {
+        self.slerp(*other, t as f64)
     }
 }
 

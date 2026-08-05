@@ -6,7 +6,7 @@ use bevy_app::{App, Plugin, PostUpdate, Update};
 use bevy_camera::Camera;
 use bevy_ecs::prelude::*;
 use bevy_input::{common_conditions::input_just_pressed, keyboard::KeyCode};
-use bevy_math::{Quat, StableInterpolate, Vec3};
+use bevy_math::{Quat, StableInterpolate, ToPrecision, Vec3};
 use bevy_render::view::screenshot::{save_to_disk, Screenshot};
 use bevy_time::Time;
 use bevy_transform::{components::Transform, TransformSystems};
@@ -377,12 +377,12 @@ impl Plugin for EasyCameraMovementPlugin {
                     {
                         let target = query.1;
                         query.0.translation.smooth_nudge(
-                            &target.translation,
+                            &target.translation.to_precision(),
                             decay_rate,
                             time.delta_secs(),
                         );
                         query.0.rotation.smooth_nudge(
-                            &target.rotation,
+                            &target.rotation.to_precision(),
                             decay_rate,
                             time.delta_secs(),
                         );
