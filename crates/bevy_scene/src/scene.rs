@@ -163,6 +163,17 @@ pub enum ResolveSceneError {
     /// Caused when a [`Scene`]/[`SceneList`] is not present on the scene asset.
     #[error("The Scene/SceneList is not present on the scene asset. This is likely because the scene has already been resolved, which consumed the source scene")]
     MissingScene,
+    /// Caused when a [`Scene`] describes a relationship that the resolver does not support
+    /// (currently only [`ChildOf`](bevy_ecs::hierarchy::ChildOf) relationships are supported by the BSN asset loader).
+    #[error("Unsupported relationship in scene")]
+    UnsupportedRelationship,
+    /// Caused when a [`Scene`] references a type that is not present in the [`AppTypeRegistry`](bevy_ecs::reflect::AppTypeRegistry)
+    /// or does not implement the reflection traits required to resolve it.
+    #[error("Type is not reflectable / registered")]
+    TypeNotReflectable,
+    /// Caused when a [`Scene`] references a type that does not register [`ReflectDefault`](bevy_reflect::std_traits::ReflectDefault).
+    #[error("Type does not register `ReflectDefault`")]
+    TypeDoesntReflectDefault,
 }
 
 /// Context used by [`Scene`] implementations during [`Scene::resolve`].

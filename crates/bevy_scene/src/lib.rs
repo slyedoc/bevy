@@ -910,6 +910,8 @@ pub mod macro_utils;
 
 extern crate alloc;
 
+pub mod dynamic_bsn;
+pub mod dynamic_bsn_lexer;
 mod resolved_scene;
 mod scene;
 mod scene_component;
@@ -930,6 +932,127 @@ use bevy_app::{App, Plugin, SceneSpawnerSystems, SpawnScene};
 use bevy_asset::AssetApp;
 use bevy_ecs::prelude::*;
 
+use crate::dynamic_bsn::DynamicBsnLoader;
+use lalrpop_util::lalrpop_mod;
+
+lalrpop_mod!(
+    #[allow(unused_qualifications, missing_docs)]
+    pub(crate) dynamic_bsn_grammar
+);
+
+/// Creates a `Scene` using BSN (Bevy Scene Notation) syntax.
+///
+/// These docs primarily contain syntax
+/// See [`bevy_scene`](crate) module-level docs for in-depth details about usage and interactions.
+///
+///
+/// ## Syntax Reference
+///
+/// The syntax consists of scene entries which are listed below, which all act on the scene in some way.
+/// Often, this is by inserting/patching a component or its values or including other scenes.
+/// Scene entries can have prefix characters which specify/disambiguate the following entry.
+///
+/// ```text
+/// bsn! {
+///     <scene entry>
+///     :<cached scene include>
+///     #<name>
+///     @<SceneComponent>
+///     ~<custom Template>
+/// }
+/// ```
+///
+/// ### Scene entries
+/// | Examples                                   | Explanation                                                                                                    |
+/// | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+/// | `CompA`                                    | A unit or default component. Fields, if any exist, will be default                                             |
+/// | `CompA(val)`<br>`CompA(val, val)`          | Tuple Component with some fields specified. Unspecified fields will be default, see [patching](self#patching)  |
+/// | `CompA { name: val }`                      | Component with some fields specified. Unspecified fields will be default, see [patching](self#patching)        |
+/// | `mymodule::CompA { name: val }`            | Same as above, but referring to the component by module path                                                   |
+/// | `CompA { name }`                           | Component with Rust's "field assignment shorthand". Evaluates to `CompA { name: name.into() }`                 |
+/// | `MyEnum::Variant`                          | Enum Component `MyEnum` with the `Variant` variant                                                             |
+/// | `template_value(component)`                | Insert the component value from a variable `component`                                                         |
+/// | `template_value(CompA::from_str("foo"))`   | Insert the component value by immediately calling the constructor                                              |
+/// | `template(|context| { ... })`              | Register a function/closure returning a Template (eg. Component). Its passed [`context`] allowing World access |
+/// | `~MyType`<br>`~MyType {name: var}`         | Type implementing [`Template`], the prefix is used to distinguish it from Components which use [`FromTemplate`]|
+/// | **Including Scenes**                       |                                                                                                                |
+/// | `scene()`<br>`scene(val)`                  | Include the result of a `impl `[`Scene`] function                                                              |
+/// | `{ expr }`                                 | Include the result of `expr`, which should be a [`Scene`]                                                      |
+/// | `@MySceneComp`                             | Include a [`SceneComponent`]. Fields, if any exist, will be default                                            |
+/// | `@MySceneComp { @prop: val }`              | Include a [`SceneComponent`] with a `prop` field, passed to this components scene function                     |
+/// | `@MySceneComp { name: val }`               | Include a [`SceneComponent`] with a normal field, works the same as it does for normal components              |
+/// | `@MySceneComp { @prop: val1, name: val2 }` | Include a [`SceneComponent`] with both a `prop` and a field                                                    |
+/// | `:"scene.bsn"`                             | <div class="warning">Asset format not yet implemented!</div> Include a cached scene asset file                  |
+/// | `:scene()`<br>`:@MySceneComp`              | <div class="warning">Caching for scene includes not yet implemented!</div> Include a cached scene function     |
+/// | **Named entity references**                |                                                                                                                |
+/// | `#MyName`                                  | Becomes `Name("MyName")` when used as a `part` of a scene                                                      |
+/// | `CompA(#MyName)`<br>`scene(#MyName)`       | Referring to the entity which was named `MyName` in this scope, results in an [`EntityTemplate`] being passed  |
+/// | `Name("Foo")`                              | Manually sets the Name component, can be put after a `#MyName` to use a custom name while allowing references  |
+/// | **Observers**                              |                                                                                                                |
+/// | `on(\|ev: On<Ev>\| { … })`                 | Attaches an entity [`observer`] for the [`EntityEvent`] `Ev` to this entity. In this example, using a closure  |
+/// | `on(my_observer)`                          | Attaches an entity [`observer`] for the [`EntityEvent`] `Ev` to this entity. In this example, using a function |
+/// | **Relationships**                          |                                                                                                                |
+/// | `Children []`                              | Spawns each entry as a child of this entity, see **Scene Lists** below for details                             |
+/// | `ChildOf(entity)`                          | Makes **this** entity a child of `entity`, accepts an [`Entity`] or a `#Name` reference ([`EntityTemplate`])    |
+/// | `MyRel []`                                 | Like `Children`, but uses any `RelationshipTarget` component                                                   |
+///
+/// [`context`]: bevy_ecs::template::TemplateContext
+/// [`EntityTemplate`]: bevy_ecs::template::EntityTemplate
+/// ### Scene Lists
+///
+/// In `bsn_list!` and Relationships a list of scenes delimited by `[]` is allowed.
+/// Unlike parts of a scene, which are whitespace-separated, the scenes in a scene list are comma-separated.
+///
+/// Note: examples are part of a relationship like `Children [<example here>]` or a list macro like `bsn_list![<example here>]`
+///
+/// | Example                      | Meaning                                                                                                               |
+/// | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+/// | `[ #Child1 CompA, #Child2 ]`     | Spawns 2 children, one with `(Name("Child1"), CompA::default())` and the other with `Name("Child2")`              |
+/// | `[ (#Child1 CompA), (#Child2) ]` | Same as above, with explicit parentheses                                                                          |
+/// | `[ #First, { expr }, #Last ]`   | Spawns an entity with name `First`, then every entity from the `SceneList` returned by expr, then one named `Last` |
+/// | `[ #First, ({ expr }), #Last ]` | Same as above, but the `expr` should result in a `Scene` and will only spawn one entity using it                   |
+///
+/// ### Values
+///
+/// Values in BSN (as in `val`,`val1` etc used above) are generally any literal Rust values, plus a few bsn-specific quirks.
+///
+///
+/// | Example                          | Meaning       | Explanation                                                                             |
+/// | -------------------------------- | ------------- | --------------------------------------------------------------------------------------- |
+/// | `1`                              | Unsigned int  | Positive number, common types: [`usize`], [`u8`], [`u32`], [`u64`]                      |
+/// | `1` or `-1`                      | Signed int    | Positive or negative number, common types: `i32`, `i64`                                 |
+/// | `1.1` or `-0.1` or `1.` or `-2.` | Float         | Floating point number, common types: `f32`, `f64`                                       |
+/// | `true` or `false`                | Bool          | Boolean, type: [`bool`]                                                                 |
+/// | `"somename"`                     | String        | Text, types: `String` or `&'static str`                                                 |
+/// | `"mypicture.png"`                | Asset path    | Asset, when used in a field which expects a [`Handle`] to the matching `Asset` type     |
+/// | `some_function(1)`                        | Function call | Calls a function with the provided arguments                                            |
+/// | `GREEN`                          | Constant      | Fixed value, must be in scope                                                           |
+/// | `std::f32::consts::PI`           | Constant      | Fixed value, uses full path so doesn't need to be in scope                              |
+/// | **Expression syntax**            |               |                                                                                         |
+/// | `{ 1 + 2 }`                      | Expression    | Any rust expression works in `{}`, in this case addition of 2 integers                  |
+/// | `{ vec![true, false] }`          | Vector        | An expression returning a [`Vec`], a collection of multiple items of one specific type. |
+/// | `{ bsn!{ Text("foo") Style } }`  | Scene         | Sometimes, you may need to pass a small `Scene` as a value to something else            |
+///
+/// ### Other Rust syntax
+///
+/// If you're new to Rust, you might struggle with some of its syntax when you see it in or around BSN.
+/// Here are some syntax snippets which haven't been shown so far:
+///
+/// | Syntax            | Meaning       | Explanation                                                     |
+/// | ----------------- | ------------- | --------------------------------------------------------------- |
+/// | `\|param\| { … }` | Closure       | A closure; effectively an unnamed function                      |
+/// | `Vec<T>`          | Generic type  | A type with a generic type parameter `T`                        |
+/// | `//`              | Comment       | Line comment; all text after `//` on the same line is ignored   |
+/// | `/* */`           | Block comment | Standard Rust block comment; all text inside `/* */` is ignored |
+/// | `bsn! { … }`      | Macro call    | Calls a macro on the value inside of the braces                 |
+///
+/// ### Syntax example
+// Note: the actual syntax example comes from the original bevy_scene_macros::bsn docs.
+// rustdoc appends these #[doc(inline)] docs before those
+// rust-analyzer ignores these docs and only shows the original ones, see https://github.com/rust-lang/rust-analyzer/issues/14079
+// despite those being #[doc(hidden)]
+//
+#[doc(inline)]
 pub use bevy_scene_macros::bsn;
 
 pub use bevy_scene_macros::bsn_list;
@@ -946,6 +1069,7 @@ impl Plugin for ScenePlugin {
             .init_resource::<WaitingScenes>()
             .init_asset::<ScenePatch>()
             .init_asset::<SceneListPatch>()
+            .init_asset_loader::<DynamicBsnLoader>()
             .add_systems(
                 SpawnScene,
                 (resolve_scene_patches, spawn_queued)
@@ -980,7 +1104,7 @@ mod tests {
     use bevy_ecs::relationship::Relationship;
     use bevy_ecs::system::{system_value, SystemHandle};
     use bevy_ecs::world::DeferredWorld;
-    use bevy_reflect::TypePath;
+    use bevy_reflect::{prelude::ReflectDefault, Reflect, TypePath};
     use bevy_scene_macros::SceneComponent;
     use std::path::Path;
     use std::sync::Mutex;
@@ -1193,6 +1317,335 @@ mod tests {
         let x = world.entity(children[0]);
         let name = x.get::<Name>().unwrap();
         assert_eq!(name.as_str(), "X");
+    }
+
+    // Asset + component used to exercise inline asset values in dynamic `.bsn`: a `Handle<T>` field
+    // given a `T { .. }` struct literal (instead of a string path) is added to `Assets<T>` and
+    // resolved to a handle by the loader.
+    #[derive(Asset, Reflect, Clone, Default)]
+    #[reflect(Default, Clone)]
+    struct InlineTestAsset {
+        value: u32,
+    }
+
+    #[derive(Component, FromTemplate, Reflect, Clone, Default)]
+    #[reflect(Component, Default, Clone)]
+    struct InlineTestHandle(Handle<InlineTestAsset>);
+
+    #[test]
+    fn dynamic_bsn_inline_asset_value() {
+        let mut app = App::new();
+        let dir = Dir::default();
+        let dir_clone = dir.clone();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || {
+                Box::new(MemoryAssetReader {
+                    root: dir_clone.clone(),
+                })
+            }),
+        );
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin::default(),
+            ScenePlugin,
+        ));
+        app.init_asset::<InlineTestAsset>()
+            .register_type::<InlineTestAsset>()
+            .register_asset_reflect::<InlineTestAsset>()
+            .register_type::<InlineTestHandle>();
+        app.finish();
+        app.cleanup();
+
+        // A `.bsn` whose `Handle<InlineTestAsset>` field is given an inline asset value.
+        dir.insert_asset_text(
+            Path::new("inline.bsn"),
+            "bevy_scene::tests::InlineTestHandle(\
+             bevy_scene::tests::InlineTestAsset { value: 7 })",
+        );
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let handle = asset_server.load::<ScenePatch>("inline.bsn");
+        run_app_until(&mut app, || asset_server.is_loaded(&handle));
+
+        // Inherit the loaded scene and spawn it; the inline asset is resolved during apply.
+        fn scene() -> impl Scene {
+            bsn! { :"inline.bsn" }
+        }
+        let world = app.world_mut();
+        let asset_handle = {
+            let root = world.spawn_scene(scene()).unwrap();
+            root.get::<InlineTestHandle>()
+                .expect("spawned entity should have `InlineTestHandle`")
+                .0
+                .clone()
+        };
+
+        let asset = world
+            .resource::<Assets<InlineTestAsset>>()
+            .get(&asset_handle)
+            .expect("inline asset value should have been added to `Assets`");
+        assert_eq!(asset.value, 7);
+    }
+
+    #[test]
+    fn dynamic_bsn_string_path_handle() {
+        let mut app = App::new();
+        let dir = Dir::default();
+        let dir_clone = dir.clone();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || {
+                Box::new(MemoryAssetReader {
+                    root: dir_clone.clone(),
+                })
+            }),
+        );
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin::default(),
+            ScenePlugin,
+        ));
+        app.init_asset::<InlineTestAsset>()
+            .register_type::<InlineTestAsset>()
+            .register_asset_reflect::<InlineTestAsset>()
+            .register_type::<InlineTestHandle>();
+        app.finish();
+        app.cleanup();
+
+        // A `.bsn` whose `Handle<InlineTestAsset>` field is given a string asset path. The loader
+        // converts the string into a `HandleTemplate::Path` and resolves it to a `Handle` (pointing
+        // at that path) at spawn time via the `AssetServer`.
+        dir.insert_asset_text(
+            Path::new("string_path.bsn"),
+            "bevy_scene::tests::InlineTestHandle(\"some/asset/path.inlinetestasset\")",
+        );
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let handle = asset_server.load::<ScenePatch>("string_path.bsn");
+        run_app_until(&mut app, || asset_server.is_loaded(&handle));
+
+        fn scene() -> impl Scene {
+            bsn! { :"string_path.bsn" }
+        }
+        let world = app.world_mut();
+        let root = world.spawn_scene(scene()).unwrap();
+        let asset_handle = root
+            .get::<InlineTestHandle>()
+            .expect("spawned entity should have `InlineTestHandle`")
+            .0
+            .clone();
+
+        // The handle must point at the asset path given in the `.bsn` string literal.
+        assert_eq!(
+            asset_handle.path().map(|p| p.to_string()),
+            Some("some/asset/path.inlinetestasset".to_string()),
+            "string-path handle field should resolve to a handle for that path"
+        );
+    }
+
+    // Mirrors the real San Miguel `SolariMaterial` shape: an inline asset (`InlineTestMat`, a
+    // reflect-built `Asset`) whose texture field is an `Option<Handle<T>>`. Present textures are
+    // written as a bare string path (`tex: "..."`) and must resolve to `Some(handle)`; omitted
+    // textures default to `None`. The wrapper must be an `Asset` (reflect-built), never a
+    // `FromTemplate` component, because `Option<Handle<T>>` does not implement `Template`.
+    #[derive(Asset, Reflect, Clone, Default)]
+    #[reflect(Default, Clone)]
+    struct InlineTestMat {
+        tex: Option<Handle<InlineTestAsset>>,
+    }
+
+    #[derive(Component, FromTemplate, Reflect, Clone, Default)]
+    #[reflect(Component, Default, Clone)]
+    struct InlineTestMatHolder(Handle<InlineTestMat>);
+
+    // Enum with a tuple variant + a holder component, to exercise enum-tuple-variant *field values*
+    // in dynamic `.bsn` (the `AlphaMode::Mask(0.5)` shape): the loader must switch the field's enum
+    // to the named variant and fill its tuple fields, not just handle tuple *structs*.
+    #[derive(Reflect, Clone, Default, PartialEq, Debug)]
+    #[reflect(Default, Clone)]
+    enum TestAlpha {
+        #[default]
+        Opaque,
+        Mask(f32),
+    }
+
+    #[derive(Component, FromTemplate, Reflect, Clone, Default)]
+    #[reflect(Component, Default, Clone)]
+    struct TestAlphaHolder {
+        mode: TestAlpha,
+    }
+
+    #[test]
+    fn dynamic_bsn_nested_option_handle() {
+        let mut app = App::new();
+        let dir = Dir::default();
+        let dir_clone = dir.clone();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || {
+                Box::new(MemoryAssetReader {
+                    root: dir_clone.clone(),
+                })
+            }),
+        );
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin::default(),
+            ScenePlugin,
+        ));
+        app.init_asset::<InlineTestAsset>()
+            .register_type::<InlineTestAsset>()
+            .register_asset_reflect::<InlineTestAsset>()
+            .init_asset::<InlineTestMat>()
+            .register_type::<InlineTestMat>()
+            .register_asset_reflect::<InlineTestMat>()
+            .register_type::<Option<Handle<InlineTestAsset>>>()
+            .register_type::<InlineTestMatHolder>();
+        app.finish();
+        app.cleanup();
+
+        // Present texture: the `Option<Handle<_>>` field is given a bare string path.
+        dir.insert_asset_text(
+            Path::new("mat_with_tex.bsn"),
+            "bevy_scene::tests::InlineTestMatHolder(\
+             bevy_scene::tests::InlineTestMat { tex: \"tex/wall.inlinetestasset\" })",
+        );
+        // Absent texture: the field is omitted entirely (must default to `None`).
+        dir.insert_asset_text(
+            Path::new("mat_no_tex.bsn"),
+            "bevy_scene::tests::InlineTestMatHolder(bevy_scene::tests::InlineTestMat {})",
+        );
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let with_tex = asset_server.load::<ScenePatch>("mat_with_tex.bsn");
+        let no_tex = asset_server.load::<ScenePatch>("mat_no_tex.bsn");
+        run_app_until(&mut app, || {
+            asset_server.is_loaded(&with_tex) && asset_server.is_loaded(&no_tex)
+        });
+
+        fn with_tex_scene() -> impl Scene {
+            bsn! { :"mat_with_tex.bsn" }
+        }
+        fn no_tex_scene() -> impl Scene {
+            bsn! { :"mat_no_tex.bsn" }
+        }
+
+        // Present texture: the inline material's `tex` must be `Some(handle)` pointing at the path.
+        {
+            let world = app.world_mut();
+            let mat_handle = world
+                .spawn_scene(with_tex_scene())
+                .unwrap()
+                .get::<InlineTestMatHolder>()
+                .expect("spawned entity should have `InlineTestMatHolder`")
+                .0
+                .clone();
+            let mat = world
+                .resource::<Assets<InlineTestMat>>()
+                .get(&mat_handle)
+                .expect("inline material should have been added to `Assets`");
+            let tex = mat
+                .tex
+                .as_ref()
+                .expect("present texture should resolve to `Some`");
+            assert_eq!(
+                tex.path().map(|p| p.to_string()),
+                Some("tex/wall.inlinetestasset".to_string()),
+                "nested `Option<Handle>` string path should resolve to a handle for that path"
+            );
+        }
+
+        // Absent texture: the inline material's `tex` must be `None`.
+        {
+            let world = app.world_mut();
+            let mat_handle = world
+                .spawn_scene(no_tex_scene())
+                .unwrap()
+                .get::<InlineTestMatHolder>()
+                .expect("spawned entity should have `InlineTestMatHolder`")
+                .0
+                .clone();
+            let mat = world
+                .resource::<Assets<InlineTestMat>>()
+                .get(&mat_handle)
+                .expect("inline material should have been added to `Assets`");
+            assert!(
+                mat.tex.is_none(),
+                "omitted texture field should default to `None`"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_bsn_enum_tuple_variant_field() {
+        let mut app = App::new();
+        let dir = Dir::default();
+        let dir_clone = dir.clone();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || {
+                Box::new(MemoryAssetReader {
+                    root: dir_clone.clone(),
+                })
+            }),
+        );
+        app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default(), ScenePlugin));
+        app.register_type::<TestAlpha>()
+            .register_type::<TestAlphaHolder>();
+        app.finish();
+        app.cleanup();
+
+        // A tuple-variant field value (`Mask(0.5)`) and an omitted field (must default to `Opaque`).
+        dir.insert_asset_text(
+            Path::new("masked.bsn"),
+            "bevy_scene::tests::TestAlphaHolder { mode: bevy_scene::tests::TestAlpha::Mask(0.5) }",
+        );
+        dir.insert_asset_text(
+            Path::new("opaque.bsn"),
+            "bevy_scene::tests::TestAlphaHolder {}",
+        );
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let masked = asset_server.load::<ScenePatch>("masked.bsn");
+        let opaque = asset_server.load::<ScenePatch>("opaque.bsn");
+        run_app_until(&mut app, || {
+            asset_server.is_loaded(&masked) && asset_server.is_loaded(&opaque)
+        });
+
+        fn masked_scene() -> impl Scene {
+            bsn! { :"masked.bsn" }
+        }
+        fn opaque_scene() -> impl Scene {
+            bsn! { :"opaque.bsn" }
+        }
+
+        let world = app.world_mut();
+        let masked_mode = world
+            .spawn_scene(masked_scene())
+            .unwrap()
+            .get::<TestAlphaHolder>()
+            .expect("spawned entity should have `TestAlphaHolder`")
+            .mode
+            .clone();
+        assert_eq!(
+            masked_mode,
+            TestAlpha::Mask(0.5),
+            "enum tuple-variant field value should resolve to the named variant with its field"
+        );
+
+        let opaque_mode = world
+            .spawn_scene(opaque_scene())
+            .unwrap()
+            .get::<TestAlphaHolder>()
+            .expect("spawned entity should have `TestAlphaHolder`")
+            .mode
+            .clone();
+        assert_eq!(
+            opaque_mode,
+            TestAlpha::Opaque,
+            "omitted enum field should keep its default variant"
+        );
     }
 
     #[test]
@@ -3056,6 +3509,14 @@ mod tests {
             load_context: &mut bevy_asset::LoadContext<'_>,
         ) -> Result<Self::Asset, Self::Error> {
             Ok(ScenePatch::load_with(load_context, (self.0)()))
+        }
+
+        // Claim the `.bsn` extension so this fake loader (registered after
+        // `ScenePlugin`'s real `DynamicBsnLoader`) wins for the tests' fake
+        // `.bsn` files: the last-registered loader for an extension takes
+        // precedence.
+        fn extensions(&self) -> &[&str] {
+            &["bsn"]
         }
     }
 }
