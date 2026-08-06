@@ -473,6 +473,7 @@ Example | Description
 Example | Description
 --- | ---
 [BSN example](../examples/scene/bsn.rs) | Demonstrates how to use BSN to compose scenes
+[Dynamic BSN](../examples/scene/dynamic_bsn.rs) | Demonstrates how to load and spawn BSN assets at runtime
 [World Serialization](../examples/scene/world_serialization.rs) | Demonstrates loading from and saving world to files
 
 ### Shaders

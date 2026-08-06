@@ -3108,6 +3108,17 @@ description = "Demonstrates how to use BSN to compose scenes"
 category = "Scene"
 wasm = true
 
+[[example]]
+name = "dynamic_bsn"
+path = "examples/scene/dynamic_bsn.rs"
+doc-scrape-examples = true
+
+[package.metadata.example.dynamic_bsn]
+name = "Dynamic BSN"
+description = "Demonstrates how to load and spawn BSN assets at runtime"
+category = "Scene"
+wasm = false
+
 # Shaders
 [[package.metadata.example_category]]
 name = "Shaders"
