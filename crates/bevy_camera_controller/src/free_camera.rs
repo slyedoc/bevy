@@ -24,7 +24,6 @@ use bevy_input::mouse::{
 };
 use bevy_input::touch::Touches;
 use bevy_input::ButtonInput;
-use bevy_log::info;
 use bevy_math::curve::{Interval, SampleAutoCurve};
 use bevy_math::Curve;
 use bevy_math::{ops::exp, Dir3, EulerRot, Quat, StableInterpolate, Vec2, Vec3};
@@ -38,6 +37,7 @@ use core::{f32::consts::*, fmt};
 ///
 /// Use the [`FreeCamera`] struct to add and customize the controller for a camera entity.
 /// The camera's dynamic state is managed by the [`FreeCameraState`] struct.
+#[derive(Default)]
 pub struct FreeCameraPlugin;
 
 impl Plugin for FreeCameraPlugin {
@@ -286,7 +286,6 @@ pub fn run_freecamera_controller(
         state.yaw = yaw;
         state.pitch = pitch;
         state.initialized = true;
-        info!("{}", *config);
     }
 
     if !state.enabled {
