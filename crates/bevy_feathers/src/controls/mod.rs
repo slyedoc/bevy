@@ -3,6 +3,7 @@
 
 mod button;
 mod checkbox;
+#[cfg(feature = "render_materials")]
 mod color_plane;
 mod color_slider;
 mod color_swatch;
@@ -20,6 +21,7 @@ mod virtual_keyboard;
 
 pub use button::*;
 pub use checkbox::*;
+#[cfg(feature = "render_materials")]
 pub use color_plane::*;
 pub use color_slider::*;
 pub use color_swatch::*;
@@ -35,6 +37,7 @@ pub use text_input::*;
 pub use toggle_switch::*;
 pub use virtual_keyboard::*;
 
+#[cfg(feature = "render_materials")]
 use crate::alpha_pattern::AlphaPatternPlugin;
 use bevy_app::Plugin;
 
@@ -44,10 +47,8 @@ pub struct ControlsPlugin;
 impl Plugin for ControlsPlugin {
     fn build(&self, app: &mut bevy_app::App) {
         app.add_plugins((
-            AlphaPatternPlugin,
             ButtonPlugin,
             CheckboxPlugin,
-            ColorPlanePlugin,
             ColorSliderPlugin,
             ColorSwatchPlugin,
             DisclosureTogglePlugin,
@@ -60,5 +61,8 @@ impl Plugin for ControlsPlugin {
             TextInputPlugin,
             ToggleSwitchPlugin,
         ));
+
+        #[cfg(feature = "render_materials")]
+        app.add_plugins((AlphaPatternPlugin, ColorPlanePlugin));
     }
 }

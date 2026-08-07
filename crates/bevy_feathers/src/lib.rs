@@ -19,6 +19,20 @@
 //!
 //! For more guidance on this, see the documentation for [`EntityEvent`](bevy_ecs::event::EntityEvent).
 //!
+//! ## Using feathers without `bevy_render`
+//!
+//! Almost all of feathers is renderer-agnostic: it is themes, layout, cursors and observers on top
+//! of `bevy_ui` and `bevy_ui_widgets`. Only two pieces actually draw: the checkerboard alpha
+//! pattern behind color swatches and color sliders, and the `color_plane` color-picker control.
+//! Both are `UiMaterial`s, so both need `bevy_render`.
+//!
+//! Those two live behind the `render_materials` crate feature, which is on by default. Turn it off
+//! (`bevy` feature `bevy_feathers_core` instead of `bevy_feathers`) and `bevy_render`,
+//! `bevy_shader` and `bevy_ui_render` leave the dependency graph entirely: `color_plane` is not
+//! compiled, and color swatches / sliders lose the checkerboard behind their translucent colors but
+//! otherwise work as normal. This is meant for projects that drive `bevy_ui` with their own
+//! rendering backend.
+//!
 //! ## Warning: Experimental!
 //! All that said, this crate is still experimental and unfinished!
 //! It will change in breaking ways, and there will be both bugs and limitations.
@@ -36,10 +50,12 @@ use bevy_ecs::{query::With, schedule::IntoScheduleConfigs};
 use bevy_input_focus::tab_navigation::TabNavigationPlugin;
 use bevy_text::{TextColor, TextFont};
 use bevy_ui::UiSystems;
+#[cfg(feature = "render_materials")]
 use bevy_ui_render::UiMaterialPlugin;
 
+#[cfg(feature = "render_materials")]
+use crate::alpha_pattern::{AlphaPatternMaterial, AlphaPatternResource};
 use crate::{
-    alpha_pattern::{AlphaPatternMaterial, AlphaPatternResource},
     controls::ControlsPlugin,
     cursor::{CursorIconPlugin, DefaultCursor, EntityCursor},
     theme::{ThemedText, UiTheme},
@@ -79,17 +95,22 @@ impl Plugin for FeathersCorePlugin {
         embedded_asset!(app, "assets/icons/x.png");
 
         // Embedded shader
-        embedded_asset!(app, "assets/shaders/alpha_pattern.wgsl");
-        embedded_asset!(app, "assets/shaders/color_plane.wgsl");
+        #[cfg(feature = "render_materials")]
+        {
+            embedded_asset!(app, "assets/shaders/alpha_pattern.wgsl");
+            embedded_asset!(app, "assets/shaders/color_plane.wgsl");
+        }
 
         app.add_plugins((
             ControlsPlugin,
             CursorIconPlugin,
             HierarchyPropagatePlugin::<TextColor, With<ThemedText>>::new(PostUpdate),
             HierarchyPropagatePlugin::<TextFont, With<ThemedText>>::new(PostUpdate),
-            UiMaterialPlugin::<AlphaPatternMaterial>::default(),
             focus::FocusOutlinesPlugin,
         ));
+
+        #[cfg(feature = "render_materials")]
+        app.add_plugins(UiMaterialPlugin::<AlphaPatternMaterial>::default());
 
         // This needs to run in UiSystems::Propagate so the fonts are up-to-date for `measure_text_system`
         // and `detect_text_needs_rerender` in UiSystems::Content
@@ -115,6 +136,7 @@ impl Plugin for FeathersCorePlugin {
         .add_observer(theme::on_changed_text_color)
         .add_observer(font_styles::on_changed_font);
 
+        #[cfg(feature = "render_materials")]
         app.init_resource::<AlphaPatternResource>();
     }
 }
@@ -127,5 +149,42 @@ impl PluginGroup for FeathersPlugins {
         PluginGroupBuilder::start::<Self>()
             .add(TabNavigationPlugin)
             .add(FeathersCorePlugin)
+    }
+}
+
+// Feathers without its render half is a configuration nothing else in the workspace exercises,
+// so guard it with a smoke test: the whole plugin group has to build and tick with no
+// `bevy_render` in the process at all.
+#[cfg(all(test, not(feature = "render_materials")))]
+mod no_render_tests {
+    use super::*;
+    use bevy_asset::AssetApp;
+
+    /// `FeathersPlugins` builds and runs a frame with no renderer behind it.
+    #[test]
+    fn feathers_plugins_run_without_bevy_render() {
+        let mut app = bevy_app::App::new();
+        app.add_plugins((
+            bevy_app::TaskPoolPlugin::default(),
+            bevy_time::TimePlugin,
+            bevy_asset::AssetPlugin::default(),
+            bevy_window::WindowPlugin::default(),
+            bevy_input::InputPlugin,
+            bevy_picking::PickingPlugin,
+            bevy_picking::InteractionPlugin,
+            bevy_text::TextPlugin,
+            bevy_ui::UiPlugin,
+            bevy_input_focus::InputFocusPlugin,
+            bevy_input_focus::InputDispatchPlugin,
+            FeathersPlugins,
+        ));
+        // Normally initialized by `RenderPlugin` / `ImagePlugin`, which are exactly what this
+        // configuration does without.
+        app.init_asset::<bevy_image::Image>();
+        app.init_asset::<bevy_image::TextureAtlasLayout>();
+
+        app.finish();
+        app.cleanup();
+        app.update();
     }
 }

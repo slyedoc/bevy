@@ -41,7 +41,7 @@ pub use bevy_core_pipeline as core_pipeline;
 pub use bevy_dev_tools as dev_tools;
 pub use bevy_diagnostic as diagnostic;
 pub use bevy_ecs as ecs;
-#[cfg(feature = "bevy_feathers")]
+#[cfg(feature = "bevy_feathers_core")]
 pub use bevy_feathers as feathers;
 #[cfg(feature = "bevy_gilrs")]
 pub use bevy_gilrs as gilrs;

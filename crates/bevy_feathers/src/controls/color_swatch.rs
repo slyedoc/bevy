@@ -1,5 +1,4 @@
 use bevy_app::{Plugin, PostUpdate};
-use bevy_asset::Handle;
 use bevy_color::{Alpha, Color};
 use bevy_ecs::{
     bundle::Bundle,
@@ -13,10 +12,9 @@ use bevy_ecs::{
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_scene::prelude::*;
 use bevy_ui::{percent, px, BackgroundColor, BorderRadius, Node, PositionType, ZIndex};
-use bevy_ui_render::ui_material::MaterialNode;
 
 use crate::{
-    alpha_pattern::{AlphaPattern, AlphaPatternMaterial},
+    alpha_pattern::{alpha_pattern, alpha_pattern_bundle},
     constants::size,
     palette,
 };
@@ -77,8 +75,7 @@ impl FeathersColorSwatch {
             }
             FeathersColorSwatch
             ColorSwatchValue
-            AlphaPattern
-            MaterialNode::<AlphaPatternMaterial>
+            alpha_pattern()
             Children [
                 (
                     Node {
@@ -113,8 +110,7 @@ pub fn color_swatch_bundle<B: Bundle>(overrides: B) -> impl Bundle {
         },
         FeathersColorSwatch,
         ColorSwatchValue::default(),
-        AlphaPattern,
-        MaterialNode::<AlphaPatternMaterial>(Handle::default()),
+        alpha_pattern_bundle(),
         overrides,
         children![(
             Node {
