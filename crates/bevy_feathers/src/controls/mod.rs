@@ -3,7 +3,6 @@
 
 mod button;
 mod checkbox;
-#[cfg(feature = "render_materials")]
 mod color_plane;
 mod color_slider;
 mod color_swatch;
@@ -21,7 +20,6 @@ mod virtual_keyboard;
 
 pub use button::*;
 pub use checkbox::*;
-#[cfg(feature = "render_materials")]
 pub use color_plane::*;
 pub use color_slider::*;
 pub use color_swatch::*;
@@ -49,6 +47,7 @@ impl Plugin for ControlsPlugin {
         app.add_plugins((
             ButtonPlugin,
             CheckboxPlugin,
+            ColorPlanePlugin,
             ColorSliderPlugin,
             ColorSwatchPlugin,
             DisclosureTogglePlugin,
@@ -63,6 +62,6 @@ impl Plugin for ControlsPlugin {
         ));
 
         #[cfg(feature = "render_materials")]
-        app.add_plugins((AlphaPatternPlugin, ColorPlanePlugin));
+        app.add_plugins(AlphaPatternPlugin);
     }
 }

@@ -22,16 +22,20 @@
 //! ## Using feathers without `bevy_render`
 //!
 //! Almost all of feathers is renderer-agnostic: it is themes, layout, cursors and observers on top
-//! of `bevy_ui` and `bevy_ui_widgets`. Only two pieces actually draw: the checkerboard alpha
-//! pattern behind color swatches and color sliders, and the `color_plane` color-picker control.
-//! Both are `UiMaterial`s, so both need `bevy_render`.
+//! of `bevy_ui` and `bevy_ui_widgets`. Only two pieces actually draw with a `UiMaterial`, and so
+//! need `bevy_render`: the checkerboard alpha pattern behind color swatches and color sliders, and
+//! the two-channel gradient inside the `color_plane` color-picker control.
 //!
 //! Those two live behind the `render_materials` crate feature, which is on by default. Turn it off
 //! (`bevy` feature `bevy_feathers_core` instead of `bevy_feathers`) and `bevy_render`,
-//! `bevy_shader` and `bevy_ui_render` leave the dependency graph entirely: `color_plane` is not
-//! compiled, and color swatches / sliders lose the checkerboard behind their translucent colors but
-//! otherwise work as normal. This is meant for projects that drive `bevy_ui` with their own
-//! rendering backend.
+//! `bevy_shader` and `bevy_ui_render` leave the dependency graph entirely. Every control is still
+//! compiled, spawnable and interactive — what is lost is exactly the two fills: color swatches and
+//! sliders lose the checkerboard behind their translucent colors, and a
+//! [`FeathersColorPlane`](controls::FeathersColorPlane) keeps its thumb, its drag handling and its
+//! [`ValueChange<Vec2>`](bevy_ui_widgets::ValueChange) output over a transparent
+//! [`ColorPlaneInner`](controls::ColorPlaneInner) rectangle. This is meant for projects that drive
+//! `bevy_ui` with their own rendering backend, which can paint those two surfaces themselves — the
+//! markers are public and carry everything the shaders were given.
 //!
 //! ## Warning: Experimental!
 //! All that said, this crate is still experimental and unfinished!
@@ -160,7 +164,9 @@ mod no_render_tests {
     use super::*;
     use bevy_asset::AssetApp;
 
-    /// `FeathersPlugins` builds and runs a frame with no renderer behind it.
+    /// `FeathersPlugins` builds and runs a frame with no renderer behind it, and a `color_plane`
+    /// — the one control whose fill is a `UiMaterial` — spawns, lays out and drives its thumb
+    /// with no material behind it.
     #[test]
     fn feathers_plugins_run_without_bevy_render() {
         let mut app = bevy_app::App::new();
@@ -172,6 +178,7 @@ mod no_render_tests {
             bevy_input::InputPlugin,
             bevy_picking::PickingPlugin,
             bevy_picking::InteractionPlugin,
+            bevy_scene::ScenePlugin,
             bevy_text::TextPlugin,
             bevy_ui::UiPlugin,
             bevy_input_focus::InputFocusPlugin,
@@ -185,6 +192,31 @@ mod no_render_tests {
 
         app.finish();
         app.cleanup();
+
+        // The control that used to be compiled out entirely. Spawning it through its own scene
+        // template is what pins the split: the widget half must not reach for `MaterialNode`.
+        use crate::controls::{ColorPlaneInner, ColorPlaneValue, FeathersColorPlane};
+        use bevy_ecs::hierarchy::Children;
+        use bevy_math::Vec3;
+        use bevy_scene::{bsn, WorldSceneExt};
+
+        let plane = app
+            .world_mut()
+            .spawn_scene(bsn! { @FeathersColorPlane::RedBlue })
+            .expect("color_plane spawns without a renderer")
+            .id();
+        app.world_mut()
+            .entity_mut(plane)
+            .insert(ColorPlaneValue(Vec3::new(0.25, 0.75, 0.5)));
+
         app.update();
+
+        // Inner rectangle present and plain, thumb moved to the value.
+        let inner = app.world().get::<Children>(plane).unwrap()[0];
+        assert!(app.world().get::<ColorPlaneInner>(inner).is_some());
+        let thumb = app.world().get::<Children>(inner).unwrap()[0];
+        let thumb_node = app.world().get::<bevy_ui::Node>(thumb).unwrap();
+        assert_eq!(thumb_node.left, bevy_ui::percent(25.0));
+        assert_eq!(thumb_node.top, bevy_ui::percent(75.0));
     }
 }

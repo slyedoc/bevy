@@ -47,14 +47,15 @@ bevy_time = { path = "../bevy_time", version = "0.20.0-dev" }
 default = ["render_materials"]
 custom_cursor = ["bevy_window/custom_cursor"]
 
-# The parts of feathers that need a `bevy_render`-based renderer: the
-# checkerboard alpha-pattern `UiMaterial` behind color swatches / sliders, and
-# the `color_plane` control (a 2D color-picker plane drawn by a WGSL shader).
+# The parts of feathers that need a `bevy_render`-based renderer: exactly two
+# `UiMaterial` fills, the checkerboard alpha pattern behind color swatches /
+# sliders and the two-channel gradient inside the `color_plane` control.
 #
 # Turning this off drops `bevy_render`, `bevy_shader` and `bevy_ui_render` from
-# the dependency graph entirely, so themes, layout, and every non-material
-# control can be used on top of a custom render backend. Enabled by default, so
-# a plain `bevy_feathers` build is unchanged.
+# the dependency graph entirely. EVERY control still compiles and works — the
+# two fills simply go transparent, and their marker components (`AlphaPattern`,
+# `ColorPlaneInner`) are what a custom render backend paints instead. Enabled by
+# default, so a plain `bevy_feathers` build is unchanged.
 render_materials = ["dep:bevy_render", "dep:bevy_shader", "dep:bevy_ui_render"]
 
 # Consumed only by the `render_materials` half (the `color_plane` uniform
