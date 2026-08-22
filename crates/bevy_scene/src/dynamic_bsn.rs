@@ -1028,9 +1028,18 @@ impl BsnSymbol {
         type_registry: &TypeRegistry,
         is_template: bool,
     ) -> Result<ResolvedSymbol, DynamicBsnLoaderError> {
+        // A symbol resolves by full type path first, then by unambiguous
+        // short path, so authors can write `Node` instead of
+        // `bevy_ui::ui_node::Node` (mirroring the `bsn!` macro).
+        let lookup = |path: &str| {
+            type_registry
+                .get_with_type_path(path)
+                .or_else(|| type_registry.get_with_short_type_path(path))
+        };
+
         // First, look for a unit struct.
         let unit_struct_type_path = self.as_path();
-        if let Some(type_registration) = type_registry.get_with_type_path(&unit_struct_type_path) {
+        if let Some(type_registration) = lookup(&unit_struct_type_path) {
             return Ok(ResolvedSymbol::new(type_registration, false, is_template));
         }
 
@@ -1040,7 +1049,7 @@ impl BsnSymbol {
                 unit_struct_type_path.to_owned(),
             ));
         };
-        let Some(type_registration) = type_registry.get_with_type_path(&enum_type_path) else {
+        let Some(type_registration) = lookup(&enum_type_path) else {
             return Err(DynamicBsnLoaderError::UnknownType(
                 enum_type_path.to_owned(),
             ));
