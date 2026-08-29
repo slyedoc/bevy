@@ -17,9 +17,7 @@ use crate::binding::{
 
 /// Push source values into slider and checkbox widgets when they drift from the data.
 pub fn sync_inspector_widgets(world: &mut World) {
-    let focused = world
-        .get_resource::<InputFocus>()
-        .and_then(bevy_input_focus::InputFocus::get);
+    let focused = world.get_resource::<InputFocus>().and_then(InputFocus::get);
 
     sync_sliders(world, focused);
     sync_checkboxes(world, focused);
