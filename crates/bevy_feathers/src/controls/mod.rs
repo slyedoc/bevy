@@ -37,6 +37,7 @@ pub use text_input::*;
 pub use toggle_switch::*;
 pub use virtual_keyboard::*;
 
+#[cfg(feature = "render_materials")]
 use crate::alpha_pattern::AlphaPatternPlugin;
 use bevy_app::Plugin;
 
@@ -61,12 +62,10 @@ impl Plugin for ControlsPlugin {
                 TextInputPlugin,
                 ToggleSwitchPlugin,
             ),
-            (
-                AlphaPatternPlugin,
-                ColorPlanePlugin,
-                ColorSliderPlugin,
-                ColorSwatchPlugin,
-            ),
+            (ColorPlanePlugin, ColorSliderPlugin, ColorSwatchPlugin),
         ));
+
+        #[cfg(feature = "render_materials")]
+        app.add_plugins(AlphaPatternPlugin);
     }
 }

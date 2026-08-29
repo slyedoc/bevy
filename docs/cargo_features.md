@@ -81,6 +81,7 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
 |bevy_dev_tools|Provides a collection of developer tools|
 |bevy_extract|Provides the ability to extract entities from an ECS main world to a sub world|
 |bevy_feathers|Feathers widget collection.|
+|bevy_feathers_core|Feathers widget collection, minus the parts that require `bevy_render`: for projects that render Bevy UI with their own backend|
 |bevy_gilrs|Adds gamepad support|
 |bevy_gizmos|Adds support for gizmos|
 |bevy_gizmos_render|Adds support for rendering gizmos|

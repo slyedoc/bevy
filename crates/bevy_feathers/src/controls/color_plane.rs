@@ -1,5 +1,4 @@
 use bevy_app::{Plugin, PostUpdate};
-use bevy_asset::{Asset, Assets};
 use bevy_ecs::{
     bundle::Bundle,
     children,
@@ -10,7 +9,7 @@ use bevy_ecs::{
     query::{Changed, Has, Or, With},
     reflect::ReflectComponent,
     schedule::IntoScheduleConfigs,
-    system::{Commands, Query, Res, ResMut},
+    system::{Commands, Query, Res},
     template::FromTemplate,
 };
 use bevy_math::{Vec2, Vec3};
@@ -19,16 +18,13 @@ use bevy_picking::{
     events::{PointerCancel, PointerDrag, PointerDragEnd, PointerDragStart, PointerPress},
     Pickable,
 };
-use bevy_reflect::{prelude::ReflectDefault, Reflect, TypePath};
-use bevy_render::render_resource::AsBindGroup;
+use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_scene::prelude::*;
-use bevy_shader::{ShaderDefVal, ShaderRef};
 use bevy_ui::{
     percent, px, AlignSelf, BorderColor, BorderRadius, ComputedNode, ComputedUiRenderTargetInfo,
     Display, InteractionDisabled, Node, Outline, PositionType, UiGlobalTransform, UiRect, UiScale,
     UiSystems, UiTransform, Val2,
 };
-use bevy_ui_render::{prelude::UiMaterial, ui_material::MaterialNode, UiMaterialPlugin};
 use bevy_ui_widgets::ValueChange;
 
 use crate::{palette, theme::ThemeBackgroundColor, tokens};
@@ -78,10 +74,24 @@ pub enum FeathersColorPlane {
 #[reflect(Component, Clone, Default)]
 pub struct ColorPlaneValue(pub Vec3);
 
-/// Marker identifying the inner element of the color plane.
+/// Marker identifying the inner element of the color plane: the rectangle the two-channel
+/// gradient covers, and the only part of the widget that needs a renderer.
+///
+/// It is always the first child of the [`FeathersColorPlane`] entity, and it is always a plain
+/// [`Node`] in the layout. What fills it depends on the `render_materials` feature:
+///
+/// * with it, [`ColorPlanePlugin`] keeps a `MaterialNode<ColorPlaneMaterial>` on this entity in
+///   sync with the parent's plane and [`ColorPlaneValue`] — the shader draws the gradient;
+/// * without it, the node stays transparent and this marker is the whole contract. A renderer
+///   of its own can paint the gradient by joining this entity's [`ComputedNode`] against its
+///   [`ChildOf`] parent's [`FeathersColorPlane`] (which permutation) and [`ColorPlaneValue`]
+///   (whose `z` is the fixed channel).
+///
+/// The thumb, the border, the outline and the padded backdrop are ordinary `bevy_ui` in both
+/// configurations.
 #[derive(Component, Default, Clone, Reflect)]
 #[reflect(Component, Clone, Default)]
-struct ColorPlaneInner;
+pub struct ColorPlaneInner;
 
 /// Marker identifying the thumb element of the color plane.
 #[derive(Component, Default, Clone, Reflect)]
@@ -92,56 +102,6 @@ struct ColorPlaneThumb;
 #[derive(Component, Default, Reflect)]
 #[reflect(Component)]
 struct ColorPlaneDragState(bool);
-
-#[repr(C)]
-#[derive(Eq, PartialEq, Hash, Copy, Clone)]
-struct ColorPlaneMaterialKey {
-    plane: FeathersColorPlane,
-}
-
-#[derive(AsBindGroup, Asset, TypePath, Default, Debug, Clone)]
-#[bind_group_data(ColorPlaneMaterialKey)]
-struct ColorPlaneMaterial {
-    plane: FeathersColorPlane,
-
-    #[uniform(0)]
-    fixed_channel: f32,
-
-    #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
-    #[uniform(0)]
-    _webgl2_padding_12b: Vec3,
-}
-
-impl From<&ColorPlaneMaterial> for ColorPlaneMaterialKey {
-    fn from(material: &ColorPlaneMaterial) -> Self {
-        Self {
-            plane: material.plane,
-        }
-    }
-}
-
-impl UiMaterial for ColorPlaneMaterial {
-    fn fragment_shader() -> ShaderRef {
-        "embedded://bevy_feathers/assets/shaders/color_plane.wesl".into()
-    }
-
-    fn specialize(
-        descriptor: &mut bevy_render::render_resource::RenderPipelineDescriptor,
-        key: bevy_ui_render::prelude::UiMaterialKey<Self>,
-    ) {
-        let plane_def = match key.bind_group_data.plane {
-            FeathersColorPlane::RedGreen => "PLANE_RG",
-            FeathersColorPlane::RedBlue => "PLANE_RB",
-            FeathersColorPlane::GreenBlue => "PLANE_GB",
-            FeathersColorPlane::HueSaturation => "PLANE_HS",
-            FeathersColorPlane::HueLightness => "PLANE_HL",
-            FeathersColorPlane::OkhslHueSaturation => "PLANE_OKHS",
-            FeathersColorPlane::OkhslHueLightness => "PLANE_OKHL",
-        };
-        descriptor.fragment.as_mut().unwrap().shader_defs =
-            vec![ShaderDefVal::Bool(plane_def.into(), true)];
-    }
-}
 
 impl FeathersColorPlane {
     fn scene() -> impl Scene {
@@ -248,53 +208,36 @@ pub fn color_plane_bundle<B: Bundle>(plane: FeathersColorPlane, overrides: B) ->
     )
 }
 
-fn update_plane_color(
+/// The thumb follows the x/y of [`ColorPlaneValue`]. Pure layout — no renderer involved, so this
+/// half of the control runs in every configuration.
+fn update_plane_thumb(
     q_color_plane: Query<
-        (Entity, &FeathersColorPlane, &ColorPlaneValue),
-        Or<(Changed<FeathersColorPlane>, Changed<ColorPlaneValue>)>,
+        (Entity, &ColorPlaneValue),
+        (
+            With<FeathersColorPlane>,
+            Or<(Changed<FeathersColorPlane>, Changed<ColorPlaneValue>)>,
+        ),
     >,
     q_children: Query<&Children>,
-    q_material_node: Query<&MaterialNode<ColorPlaneMaterial>>,
     mut q_node: Query<&mut Node>,
-    mut r_materials: ResMut<Assets<ColorPlaneMaterial>>,
-    mut commands: Commands,
 ) {
-    for (plane_ent, plane, plane_value) in q_color_plane.iter() {
-        // Find the inner entity
-        let Ok(children) = q_children.get(plane_ent) else {
+    for (plane_ent, plane_value) in q_color_plane.iter() {
+        // Find the inner entity, then the thumb inside it.
+        let Some(inner_ent) = q_children
+            .get(plane_ent)
+            .ok()
+            .and_then(|c| c.first().copied())
+        else {
             continue;
         };
-        let Some(inner_ent) = children.first() else {
+        let Some(thumb_ent) = q_children
+            .get(inner_ent)
+            .ok()
+            .and_then(|c| c.first().copied())
+        else {
             continue;
         };
-
-        if let Ok(material_node) = q_material_node.get(*inner_ent) {
-            // Node component exists, update it
-            if let Some(mut material) = r_materials.get_mut(material_node.id()) {
-                // Update properties
-                material.plane = *plane;
-                material.fixed_channel = plane_value.0.z;
-            }
-        } else {
-            // Insert new node component
-            let material = r_materials.add(ColorPlaneMaterial {
-                plane: *plane,
-                fixed_channel: plane_value.0.z,
-                #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
-                _webgl2_padding_12b: Default::default(),
-            });
-            commands.entity(*inner_ent).insert(MaterialNode(material));
-        }
-
-        // Find the thumb.
-        let Ok(children_inner) = q_children.get(*inner_ent) else {
-            continue;
-        };
-        let Some(thumb_ent) = children_inner.first() else {
-            continue;
-        };
-
-        let Ok(mut thumb_node) = q_node.get_mut(*thumb_ent) else {
+        let Ok(mut thumb_node) = q_node.get_mut(thumb_ent) else {
             continue;
         };
 
@@ -466,18 +409,138 @@ fn on_drag_cancel(
     }
 }
 
+/// The `UiMaterial` that fills [`ColorPlaneInner`], and the system that keeps it in sync with the
+/// control's plane and fixed channel. `render_materials` only: everything above compiles and runs
+/// without a renderer, this is the part that needs one.
+#[cfg(feature = "render_materials")]
+mod material {
+    use super::{ColorPlaneValue, FeathersColorPlane};
+    use bevy_asset::{Asset, Assets};
+    use bevy_ecs::{
+        entity::Entity,
+        hierarchy::Children,
+        query::{Changed, Or},
+        system::{Commands, Query, ResMut},
+    };
+    use bevy_reflect::TypePath;
+    use bevy_render::render_resource::AsBindGroup;
+    use bevy_shader::{ShaderDefVal, ShaderRef};
+    use bevy_ui_render::{prelude::UiMaterial, ui_material::MaterialNode};
+
+    #[repr(C)]
+    #[derive(Eq, PartialEq, Hash, Copy, Clone)]
+    pub(super) struct ColorPlaneMaterialKey {
+        plane: FeathersColorPlane,
+    }
+
+    #[derive(AsBindGroup, Asset, TypePath, Default, Debug, Clone)]
+    #[bind_group_data(ColorPlaneMaterialKey)]
+    pub(super) struct ColorPlaneMaterial {
+        plane: FeathersColorPlane,
+
+        #[uniform(0)]
+        fixed_channel: f32,
+
+        #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
+        #[uniform(0)]
+        _webgl2_padding_12b: bevy_math::Vec3,
+    }
+
+    impl From<&ColorPlaneMaterial> for ColorPlaneMaterialKey {
+        fn from(material: &ColorPlaneMaterial) -> Self {
+            Self {
+                plane: material.plane,
+            }
+        }
+    }
+
+    impl UiMaterial for ColorPlaneMaterial {
+        fn fragment_shader() -> ShaderRef {
+            "embedded://bevy_feathers/assets/shaders/color_plane.wesl".into()
+        }
+
+        fn specialize(
+            descriptor: &mut bevy_render::render_resource::RenderPipelineDescriptor,
+            key: bevy_ui_render::prelude::UiMaterialKey<Self>,
+        ) {
+            let plane_def = match key.bind_group_data.plane {
+                FeathersColorPlane::RedGreen => "PLANE_RG",
+                FeathersColorPlane::RedBlue => "PLANE_RB",
+                FeathersColorPlane::GreenBlue => "PLANE_GB",
+                FeathersColorPlane::HueSaturation => "PLANE_HS",
+                FeathersColorPlane::HueLightness => "PLANE_HL",
+                FeathersColorPlane::OkhslHueSaturation => "PLANE_OKHS",
+                FeathersColorPlane::OkhslHueLightness => "PLANE_OKHL",
+            };
+            descriptor.fragment.as_mut().unwrap().shader_defs =
+                vec![ShaderDefVal::Bool(plane_def.into(), true)];
+        }
+    }
+
+    /// Keeps the `MaterialNode` on the inner rectangle in sync with the plane and fixed channel.
+    pub(super) fn update_plane_material(
+        q_color_plane: Query<
+            (Entity, &FeathersColorPlane, &ColorPlaneValue),
+            Or<(Changed<FeathersColorPlane>, Changed<ColorPlaneValue>)>,
+        >,
+        q_children: Query<&Children>,
+        q_material_node: Query<&MaterialNode<ColorPlaneMaterial>>,
+        mut r_materials: ResMut<Assets<ColorPlaneMaterial>>,
+        mut commands: Commands,
+    ) {
+        for (plane_ent, plane, plane_value) in q_color_plane.iter() {
+            // Find the inner entity
+            let Ok(children) = q_children.get(plane_ent) else {
+                continue;
+            };
+            let Some(inner_ent) = children.first() else {
+                continue;
+            };
+
+            if let Ok(material_node) = q_material_node.get(*inner_ent) {
+                // Node component exists, update it
+                if let Some(mut material) = r_materials.get_mut(material_node.id()) {
+                    // Update properties
+                    material.plane = *plane;
+                    material.fixed_channel = plane_value.0.z;
+                }
+            } else {
+                // Insert new node component
+                let material = r_materials.add(ColorPlaneMaterial {
+                    plane: *plane,
+                    fixed_channel: plane_value.0.z,
+                    #[cfg(all(
+                        feature = "webgl",
+                        target_arch = "wasm32",
+                        not(feature = "webgpu")
+                    ))]
+                    _webgl2_padding_12b: Default::default(),
+                });
+                commands.entity(*inner_ent).insert(MaterialNode(material));
+            }
+        }
+    }
+}
+
 /// Plugin which registers the observers for updating the swatch color.
 pub struct ColorPlanePlugin;
 
 impl Plugin for ColorPlanePlugin {
     fn build(&self, app: &mut bevy_app::App) {
-        app.add_plugins(UiMaterialPlugin::<ColorPlaneMaterial>::default());
-        // `update_plane_color` modifies a node's `left` and `top`
-        app.add_systems(PostUpdate, update_plane_color.before(UiSystems::Layout));
+        // `update_plane_thumb` modifies a node's `left` and `top`
+        app.add_systems(PostUpdate, update_plane_thumb.before(UiSystems::Layout));
         app.add_observer(on_pointer_press)
             .add_observer(on_drag_start)
             .add_observer(on_drag)
             .add_observer(on_drag_end)
             .add_observer(on_drag_cancel);
+
+        #[cfg(feature = "render_materials")]
+        {
+            app.add_plugins(bevy_ui_render::UiMaterialPlugin::<
+                material::ColorPlaneMaterial,
+            >::default());
+            app.add_systems(PostUpdate, material::update_plane_material);
+        }
     }
 }

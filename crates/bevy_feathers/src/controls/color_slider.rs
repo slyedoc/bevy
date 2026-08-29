@@ -1,5 +1,4 @@
 use bevy_app::{Plugin, PreUpdate};
-use bevy_asset::Handle;
 use bevy_color::{Alpha, Color, Hsla, Okhsla};
 use bevy_ecs::{
     bundle::Bundle,
@@ -23,13 +22,12 @@ use bevy_ui::{
     GridPlacement, InterpolationColorSpace, LinearGradient, Node, Outline, PositionType, UiRect,
     UiSystems, UiTransform, Val2,
 };
-use bevy_ui_render::ui_material::MaterialNode;
 use bevy_ui_widgets::{
     Slider, SliderOrientation, SliderRange, SliderThumb, SliderValue, TrackClick,
 };
 
 use crate::{
-    alpha_pattern::{AlphaPattern, AlphaPatternMaterial},
+    alpha_pattern::{alpha_pattern, alpha_pattern_bundle},
     controls::{FeathersSlider, FeathersTextInput, ToggleSwitchSlide},
     focus::FocusIndicator,
     palette,
@@ -260,8 +258,7 @@ impl FeathersColorSlider {
                         border_radius: {RoundedCorners::All.to_border_radius(TRACK_RADIUS)},
                     }
                     ColorSliderTrack
-                    AlphaPattern
-                    MaterialNode::<AlphaPatternMaterial>
+                    alpha_pattern()
                 ),
                 // gradient
                 (
@@ -380,8 +377,7 @@ pub fn color_slider_bundle<B: Bundle>(
                     ..Default::default()
                 },
                 ColorSliderTrack,
-                AlphaPattern,
-                MaterialNode::<AlphaPatternMaterial>(Handle::default()),
+                alpha_pattern_bundle(),
             ),
             // gradient
             (

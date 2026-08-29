@@ -43,7 +43,7 @@ pub use bevy_diagnostic as diagnostic;
 pub use bevy_ecs as ecs;
 #[cfg(feature = "bevy_extract")]
 pub use bevy_extract as extract;
-#[cfg(feature = "bevy_feathers")]
+#[cfg(feature = "bevy_feathers_core")]
 pub use bevy_feathers as feathers;
 #[cfg(feature = "bevy_gilrs")]
 pub use bevy_gilrs as gilrs;

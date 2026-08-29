@@ -418,7 +418,10 @@ bevy_ui_widgets = [
 bevy_settings = ["bevy_internal/bevy_settings"]
 
 # Feathers widget collection.
-bevy_feathers = ["bevy_internal/bevy_feathers", "bevy_ui_widgets"]
+bevy_feathers = ["bevy_feathers_core", "bevy_internal/bevy_feathers"]
+
+# Feathers widget collection, minus the parts that require `bevy_render`: for projects that render Bevy UI with their own backend
+bevy_feathers_core = ["bevy_internal/bevy_feathers_core", "bevy_ui_widgets"]
 
 # Enable passthrough loading for SPIR-V shaders (Only supported on Vulkan, shader capabilities and extensions must agree with the platform implementation)
 spirv_shader_passthrough = ["bevy_internal/spirv_shader_passthrough"]
