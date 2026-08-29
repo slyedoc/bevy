@@ -281,6 +281,8 @@ bevy_feathers = ["bevy_feathers_core", "bevy_feathers/render_materials"]
 # dependency graph. For projects that drive Bevy UI with a custom renderer.
 # Feathers ships its built-in icons as PNGs, so enable the PNG feature.
 bevy_feathers_core = ["dep:bevy_feathers", "png"]
+# Reflection-driven property inspector on Feathers; render-free like bevy_feathers_core.
+bevy_feathers_inspector = ["dep:bevy_feathers_inspector", "bevy_feathers_core"]
 bevy_solari = ["dep:bevy_solari", "bevy_pbr"]
 bevy_gizmos = ["dep:bevy_gizmos", "bevy_camera", "bevy_light?/bevy_gizmos"]
 bevy_gizmos_render = ["dep:bevy_gizmos_render", "bevy_gizmos"]
@@ -557,6 +559,7 @@ bevy_gizmos = { path = "../bevy_gizmos", optional = true, version = "0.20.0-dev"
 bevy_gizmos_render = { path = "../bevy_gizmos_render", optional = true, version = "0.20.0-dev", default-features = false }
 bevy_gltf = { path = "../bevy_gltf", optional = true, version = "0.20.0-dev" }
 bevy_feathers = { path = "../bevy_feathers", optional = true, version = "0.20.0-dev", default-features = false }
+bevy_feathers_inspector = { path = "../bevy_feathers_inspector", optional = true, version = "0.20.0-dev" }
 bevy_image = { path = "../bevy_image", optional = true, version = "0.20.0-dev" }
 bevy_shader = { path = "../bevy_shader", optional = true, version = "0.20.0-dev" }
 bevy_material = { path = "../bevy_material", optional = true, version = "0.20.0-dev" }
