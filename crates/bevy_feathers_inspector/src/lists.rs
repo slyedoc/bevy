@@ -160,7 +160,7 @@ fn apply_list_op(
                 item_type_id
                     .and_then(|id| registry.get(id))
                     .and_then(|reg| reg.data::<ReflectDefault>())
-                    .map(bevy_reflect::std_traits::ReflectDefault::default)
+                    .map(ReflectDefault::default)
             };
             let Some(default) = default else {
                 return;
