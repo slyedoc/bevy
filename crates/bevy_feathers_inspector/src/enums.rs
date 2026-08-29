@@ -59,12 +59,7 @@ pub fn build_enum(
     let variant_names: Vec<String> = value
         .get_represented_type_info()
         .and_then(|i| i.as_enum().ok())
-        .map(|ei| {
-            ei.variant_names()
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect()
-        })
+        .map(|ei| ei.variant_names().iter().map(ToString::to_string).collect())
         .unwrap_or_default();
     let current = enum_ref.variant_name().to_string();
 
@@ -120,7 +115,7 @@ pub fn build_enum(
                 None => format!("{path}.{i}"),
             };
             let label_text = field_name
-                .map(std::string::ToString::to_string)
+                .map(ToString::to_string)
                 .unwrap_or_else(|| i.to_string());
             children.push(field_entry(
                 cx,
