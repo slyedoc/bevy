@@ -1,6 +1,7 @@
 use core::f32::consts::TAU;
 
 use bevy_app::{Plugin, PostUpdate};
+#[cfg(feature = "render_materials")]
 use bevy_asset::{Asset, Assets};
 use bevy_color::{Hsla, Hsva, Hwba};
 use bevy_ecs::{
@@ -22,15 +23,20 @@ use bevy_picking::{
     hover::PointerCaptureMap,
     Pickable,
 };
-use bevy_reflect::{prelude::ReflectDefault, Reflect, TypePath};
+use bevy_reflect::{prelude::ReflectDefault, Reflect};
+#[cfg(feature = "render_materials")]
+use bevy_reflect::TypePath;
+#[cfg(feature = "render_materials")]
 use bevy_render::render_resource::AsBindGroup;
 use bevy_scene::prelude::*;
+#[cfg(feature = "render_materials")]
 use bevy_shader::ShaderRef;
 use bevy_ui::{
     percent, px, AlignSelf, BorderColor, BorderRadius, ComputedNode, ComputedUiRenderTargetInfo,
     Display, InteractionDisabled, Node, Outline, PositionType, UiGlobalTransform, UiRect, UiScale,
     UiSystems, UiTransform, Val2,
 };
+#[cfg(feature = "render_materials")]
 use bevy_ui_render::{prelude::UiMaterial, ui_material::MaterialNode, UiMaterialPlugin};
 use bevy_ui_widgets::ValueChange;
 
@@ -149,6 +155,7 @@ enum ColorWheelSegment {
     Triangle,
 }
 
+#[cfg(feature = "render_materials")]
 #[derive(AsBindGroup, Asset, TypePath, Default, Debug, Clone)]
 struct ColorWheelMaterial {
     #[uniform(0)]
@@ -162,6 +169,7 @@ struct ColorWheelMaterial {
     _webgl2_padding_8b: Vec2,
 }
 
+#[cfg(feature = "render_materials")]
 impl UiMaterial for ColorWheelMaterial {
     fn fragment_shader() -> ShaderRef {
         "embedded://bevy_feathers/assets/shaders/color_wheel.wesl".into()
@@ -244,12 +252,14 @@ fn triangle_corners(hue_angle: f32, triangle_radius: f32) -> (Vec2, Vec2, Vec2) 
 fn update_wheel_color(
     q_color_wheel: Query<(Entity, Ref<FeathersColorWheel>, Ref<ColorWheelValue>)>,
     q_children: Query<&Children>,
-    q_info: Query<Ref<ComputedUiRenderTargetInfo>>,
-    q_material_node: Query<&MaterialNode<ColorWheelMaterial>>,
+    #[cfg(feature = "render_materials")] q_info: Query<Ref<ComputedUiRenderTargetInfo>>,
+    #[cfg(feature = "render_materials")] q_material_node: Query<
+        &MaterialNode<ColorWheelMaterial>,
+    >,
     q_computed_node: Query<Ref<ComputedNode>>,
     mut q_transform: Query<&mut UiTransform>,
-    mut r_materials: ResMut<Assets<ColorWheelMaterial>>,
-    mut commands: Commands,
+    #[cfg(feature = "render_materials")] mut r_materials: ResMut<Assets<ColorWheelMaterial>>,
+    #[cfg(feature = "render_materials")] mut commands: Commands,
 ) {
     for (wheel_ent, wheel, wheel_value) in q_color_wheel.iter() {
         // Find the inner entity
@@ -261,11 +271,14 @@ fn update_wheel_color(
         };
 
         // Scale computed for current frame in UiSystems::Propagate
+        #[cfg(feature = "render_materials")]
         let Ok(inner_info) = q_info.get(*inner_ent) else {
             continue;
         };
+        #[cfg(feature = "render_materials")]
         let scale = inner_info.scale_factor();
 
+        #[cfg(feature = "render_materials")]
         if let Ok(material_node) = q_material_node.get(*inner_ent) {
             // Node component exists, update it
             if let Some(mut material) = r_materials.get_mut(material_node.id())
@@ -618,6 +631,7 @@ pub struct ColorWheelPlugin;
 
 impl Plugin for ColorWheelPlugin {
     fn build(&self, app: &mut bevy_app::App) {
+        #[cfg(feature = "render_materials")]
         app.add_plugins(UiMaterialPlugin::<ColorWheelMaterial>::default());
         // Ensure thumbs stay inside ring/triangle on next frame when scale and/or layout change
         app.add_systems(PostUpdate, update_wheel_color.in_set(UiSystems::Content));

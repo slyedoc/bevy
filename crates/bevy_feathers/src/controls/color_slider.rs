@@ -20,13 +20,12 @@ use bevy_ui::{
     Gradient, GridPlacement, InterpolationColorSpace, LinearGradient, Node, Outline, PositionType,
     UiRect, UiSystems, UiTransform, Val2,
 };
-use bevy_ui_render::ui_material::MaterialNode;
 use bevy_ui_widgets::{
     Slider, SliderOrientation, SliderRange, SliderThumb, SliderValue, TrackClick,
 };
 
 use crate::{
-    alpha_pattern::{AlphaPattern, AlphaPatternMaterial},
+    alpha_pattern::alpha_pattern,
     controls::{FeathersSlider, FeathersTextInput, ToggleSwitchSlide},
     focus::FocusIndicator,
     palette,
@@ -255,8 +254,7 @@ impl FeathersColorSlider {
                     border_radius: {RoundedCorners::All.to_border_radius(TRACK_RADIUS)},
                 }
                 ColorSliderTrack
-                AlphaPattern
-                MaterialNode::<AlphaPatternMaterial>
+                @alpha_pattern()
                 --
                 // gradient
                 Node {

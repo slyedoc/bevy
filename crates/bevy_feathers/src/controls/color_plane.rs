@@ -1,4 +1,5 @@
 use bevy_app::{Plugin, PostUpdate};
+#[cfg(feature = "render_materials")]
 use bevy_asset::{Asset, Assets};
 use bevy_ecs::{
     change_detection::DetectChangesMut,
@@ -6,7 +7,7 @@ use bevy_ecs::{
     entity::Entity,
     hierarchy::{ChildOf, Children},
     observer::On,
-    query::{Changed, Has, Or, With},
+    query::{Has, With},
     reflect::ReflectComponent,
     schedule::IntoScheduleConfigs,
     system::{Commands, Query, Res, ResMut},
@@ -18,15 +19,22 @@ use bevy_picking::{
     hover::PointerCaptureMap,
     Pickable,
 };
-use bevy_reflect::{prelude::ReflectDefault, Reflect, TypePath};
+use bevy_reflect::{prelude::ReflectDefault, Reflect};
+#[cfg(feature = "render_materials")]
+use bevy_ecs::query::{Changed, Or};
+#[cfg(feature = "render_materials")]
+use bevy_reflect::TypePath;
+#[cfg(feature = "render_materials")]
 use bevy_render::render_resource::AsBindGroup;
 use bevy_scene::prelude::*;
+#[cfg(feature = "render_materials")]
 use bevy_shader::{ShaderDefVal, ShaderRef};
 use bevy_ui::{
     percent, px, AlignSelf, BorderColor, BorderRadius, ComputedNode, ComputedUiRenderTargetInfo,
     Display, InteractionDisabled, Node, Outline, PositionType, UiGlobalTransform, UiRect, UiScale,
     UiSystems, UiTransform, Val2,
 };
+#[cfg(feature = "render_materials")]
 use bevy_ui_render::{prelude::UiMaterial, ui_material::MaterialNode, UiMaterialPlugin};
 use bevy_ui_widgets::ValueChange;
 
@@ -78,10 +86,15 @@ pub enum FeathersColorPlane {
 #[reflect(Component, Clone, Default)]
 pub struct ColorPlaneValue(pub Vec3);
 
-/// Marker identifying the inner element of the color plane.
+/// Marker identifying the inner element of the color plane: the rectangle the gradient fills.
+///
+/// With the `render_materials` feature the gradient is a `UiMaterial` on this entity. Without it
+/// the rectangle stays transparent, and a custom render backend paints it from this entity's
+/// `ComputedNode` and the parent's [`FeathersColorPlane`] and [`ColorPlaneValue`]
+/// (whose `z` is the fixed channel).
 #[derive(Component, Default, Clone, Reflect)]
 #[reflect(Component, Clone, Default)]
-struct ColorPlaneInner;
+pub struct ColorPlaneInner;
 
 /// Marker identifying the thumb element of the color plane.
 #[derive(Component, Default, Clone, Reflect)]
@@ -93,12 +106,14 @@ struct ColorPlaneThumb;
 #[reflect(Component)]
 struct ColorPlaneDragState(bool);
 
+#[cfg(feature = "render_materials")]
 #[repr(C)]
 #[derive(Eq, PartialEq, Hash, Copy, Clone)]
 struct ColorPlaneMaterialKey {
     plane: FeathersColorPlane,
 }
 
+#[cfg(feature = "render_materials")]
 #[derive(AsBindGroup, Asset, TypePath, Default, Debug, Clone)]
 #[bind_group_data(ColorPlaneMaterialKey)]
 struct ColorPlaneMaterial {
@@ -112,6 +127,7 @@ struct ColorPlaneMaterial {
     _webgl2_padding_12b: Vec3,
 }
 
+#[cfg(feature = "render_materials")]
 impl From<&ColorPlaneMaterial> for ColorPlaneMaterialKey {
     fn from(material: &ColorPlaneMaterial) -> Self {
         Self {
@@ -120,6 +136,7 @@ impl From<&ColorPlaneMaterial> for ColorPlaneMaterialKey {
     }
 }
 
+#[cfg(feature = "render_materials")]
 impl UiMaterial for ColorPlaneMaterial {
     fn fragment_shader() -> ShaderRef {
         "embedded://bevy_feathers/assets/shaders/color_plane.wesl".into()
@@ -187,6 +204,7 @@ impl FeathersColorPlane {
     }
 }
 
+#[cfg(feature = "render_materials")]
 fn update_plane_color(
     q_color_plane: Query<
         (Entity, &FeathersColorPlane, &ColorPlaneValue),
@@ -445,10 +463,12 @@ pub struct ColorPlanePlugin;
 
 impl Plugin for ColorPlanePlugin {
     fn build(&self, app: &mut bevy_app::App) {
-        app.add_plugins(UiMaterialPlugin::<ColorPlaneMaterial>::default());
+        #[cfg(feature = "render_materials")]
+        app.add_plugins(UiMaterialPlugin::<ColorPlaneMaterial>::default())
+            .add_systems(PostUpdate, update_plane_color.in_set(UiSystems::Content));
         app.add_systems(
             PostUpdate,
-            (update_plane_color, update_plane_thumb_position).in_set(UiSystems::Content),
+            update_plane_thumb_position.in_set(UiSystems::Content),
         );
         app.add_observer(on_pointer_press)
             .add_observer(on_drag_start)

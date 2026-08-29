@@ -10,10 +10,9 @@ use bevy_ecs::{
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_scene::prelude::*;
 use bevy_ui::{percent, px, BackgroundColor, Node, PositionType, ZIndex};
-use bevy_ui_render::ui_material::MaterialNode;
 
 use crate::{
-    alpha_pattern::{AlphaPattern, AlphaPatternMaterial},
+    alpha_pattern::alpha_pattern,
     constants::size,
     palette,
     rounded_corners::RoundedCorners,
@@ -88,8 +87,7 @@ impl FeathersColorSwatch {
             }
             FeathersColorSwatch
             ColorSwatchValue
-            AlphaPattern
-            MaterialNode::<AlphaPatternMaterial>
+            @alpha_pattern()
             Children [
                 Node {
                     position_type: PositionType::Absolute,

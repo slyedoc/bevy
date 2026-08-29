@@ -46,6 +46,7 @@ pub use toggle_switch::*;
 pub use tree_view::*;
 pub use virtual_keyboard::*;
 
+#[cfg(feature = "render_materials")]
 use crate::alpha_pattern::AlphaPatternPlugin;
 use bevy_app::{PluginGroup, PluginGroupBuilder};
 
@@ -54,8 +55,7 @@ pub struct ControlsPlugin;
 
 impl PluginGroup for ControlsPlugin {
     fn build(self) -> PluginGroupBuilder {
-        PluginGroupBuilder::start::<Self>()
-            .add(AlphaPatternPlugin)
+        let group = PluginGroupBuilder::start::<Self>()
             .add(ButtonPlugin)
             .add(CheckboxPlugin)
             .add(ColorInputPlugin)
@@ -75,6 +75,9 @@ impl PluginGroup for ControlsPlugin {
             .add(SplitPanePlugin)
             .add(TextInputPlugin)
             .add(ToggleSwitchPlugin)
-            .add(TreeViewPlugin)
+            .add(TreeViewPlugin);
+        #[cfg(feature = "render_materials")]
+        let group = group.add(AlphaPatternPlugin);
+        group
     }
 }

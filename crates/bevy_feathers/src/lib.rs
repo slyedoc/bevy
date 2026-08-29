@@ -18,6 +18,20 @@
 //! This is important when writing your custom widgets, and understanding the behavior of existing widgets.
 //!
 //! For more guidance on this, see the documentation for [`EntityEvent`](bevy_ecs::event::EntityEvent).
+//!
+//! ## Using feathers without `bevy_render`
+//!
+//! Almost all of feathers is renderer-agnostic: it is themes, layout, cursors and observers on top
+//! of `bevy_ui` and `bevy_ui_widgets`. Only the fills that draw with a `UiMaterial` need
+//! `bevy_render`: the checkerboard alpha pattern behind color swatches and color sliders, and the
+//! gradients inside the `color_plane` and `color_wheel` color-picker controls.
+//!
+//! Those live behind the `render_materials` crate feature, which is on by default. Turn it off
+//! (`bevy` feature `bevy_feathers_core` instead of `bevy_feathers`) and `bevy_render`,
+//! `bevy_shader` and `bevy_ui_render` leave the dependency graph entirely. Every control is still
+//! compiled, spawnable and interactive; what is lost is exactly those fills. Their markers
+//! ([`AlphaPattern`], [`ColorPlaneInner`](controls::ColorPlaneInner)) are public, so a project
+//! driving `bevy_ui` with its own renderer can paint those surfaces itself.
 
 extern crate alloc;
 
@@ -30,15 +44,18 @@ use bevy_input_focus::tab_navigation::TabNavigationPlugin;
 use bevy_picking::cursor::{CursorIconPlugin, DefaultCursor, EntityCursor};
 use bevy_text::{TextColor, TextFont};
 use bevy_ui::{AccessibilityUiSystems, UiSystems};
+#[cfg(feature = "render_materials")]
 use bevy_ui_render::{ImageNodeAssetChangedSystems, UiMaterialPlugin};
 
+#[cfg(feature = "render_materials")]
+use crate::alpha_pattern::{AlphaPatternMaterial, AlphaPatternResource};
 use crate::{
-    alpha_pattern::{AlphaPatternMaterial, AlphaPatternResource},
     controls::ControlsPlugin,
     theme::{ThemeContext, ThemedText, UiTheme},
 };
 
 mod alpha_pattern;
+pub use alpha_pattern::AlphaPattern;
 pub mod constants;
 pub mod containers;
 pub mod controls;
@@ -72,9 +89,12 @@ impl Plugin for FeathersCorePlugin {
         embedded_asset!(app, "assets/icons/x.png");
 
         // Embedded shader
-        embedded_asset!(app, "assets/shaders/alpha_pattern.wesl");
-        embedded_asset!(app, "assets/shaders/color_plane.wesl");
-        embedded_asset!(app, "assets/shaders/color_wheel.wesl");
+        #[cfg(feature = "render_materials")]
+        {
+            embedded_asset!(app, "assets/shaders/alpha_pattern.wesl");
+            embedded_asset!(app, "assets/shaders/color_plane.wesl");
+            embedded_asset!(app, "assets/shaders/color_wheel.wesl");
+        }
 
         app.add_plugins((
             ControlsPlugin,
@@ -82,9 +102,11 @@ impl Plugin for FeathersCorePlugin {
             HierarchyPropagatePlugin::<TextColor, With<ThemedText>>::new(PostUpdate),
             HierarchyPropagatePlugin::<TextFont, With<ThemedText>>::new(PostUpdate),
             HierarchyPropagatePlugin::<ThemeContext>::new(PostUpdate),
-            UiMaterialPlugin::<AlphaPatternMaterial>::default(),
             focus::FocusOutlinesPlugin,
         ));
+
+        #[cfg(feature = "render_materials")]
+        app.add_plugins(UiMaterialPlugin::<AlphaPatternMaterial>::default());
 
         // This needs to run in UiSystems::Propagate so the fonts are up-to-date for `measure_text_system`
         // and `detect_text_needs_rerender` in UiSystems::Content
@@ -101,20 +123,23 @@ impl Plugin for FeathersCorePlugin {
             bevy_window::SystemCursorIcon::Default,
         )));
 
+        let update_themed_icons = display::update_themed_icons
+            .after(PropagateSet::<TextColor>::default())
+            // These systems merely update the `AccessibilityNode` and do not depend
+            // on any changes `update_themed_icons` does to an image node.
+            .ambiguous_with(AccessibilityUiSystems)
+            // `update_themed_icons` does not affect the size of content.
+            .ambiguous_with(UiSystems::Content);
+        // These systems deal with the underlying asset of the ImageNode,
+        // which this system does not change.
+        #[cfg(feature = "render_materials")]
+        let update_themed_icons = update_themed_icons.ambiguous_with(ImageNodeAssetChangedSystems);
+
         app.add_systems(
             PostUpdate,
             (
                 theme::update_theme.in_set(UiSystems::Prepare),
-                display::update_themed_icons
-                    .after(PropagateSet::<TextColor>::default())
-                    // These systems deal with the underlying asset of the ImageNode,
-                    // which this system does not change.
-                    .ambiguous_with(ImageNodeAssetChangedSystems)
-                    // These systems merely update the `AccessibilityNode` and do not depend
-                    // on any changes `update_themed_icons` does to an image node.
-                    .ambiguous_with(AccessibilityUiSystems)
-                    // `update_themed_icons` does not affect the size of content.
-                    .ambiguous_with(UiSystems::Content),
+                update_themed_icons,
             )
                 .chain(),
         )
@@ -124,6 +149,7 @@ impl Plugin for FeathersCorePlugin {
         .add_observer(theme::on_changed_text_color)
         .add_observer(font_styles::on_changed_font);
 
+        #[cfg(feature = "render_materials")]
         app.init_resource::<AlphaPatternResource>();
     }
 }
@@ -136,5 +162,68 @@ impl PluginGroup for FeathersPlugins {
         PluginGroupBuilder::start::<Self>()
             .add(TabNavigationPlugin)
             .add(FeathersCorePlugin)
+    }
+}
+
+// Feathers without its render half is a configuration nothing else in the workspace exercises,
+// so guard it with a smoke test: the whole plugin group has to build and tick with no
+// `bevy_render` in the process at all.
+#[cfg(all(test, not(feature = "render_materials")))]
+mod no_render_tests {
+    use super::*;
+    use bevy_asset::AssetApp;
+
+    /// `FeathersPlugins` builds and runs a frame with no renderer behind it, and a `color_plane`,
+    /// a control whose fill is a `UiMaterial`, spawns and runs with no material behind it.
+    #[test]
+    fn feathers_plugins_run_without_bevy_render() {
+        let mut app = bevy_app::App::new();
+        app.add_plugins((
+            bevy_app::TaskPoolPlugin::default(),
+            bevy_time::TimePlugin,
+            bevy_asset::AssetPlugin::default(),
+            bevy_window::WindowPlugin::default(),
+            bevy_input::InputPlugin,
+            bevy_picking::PickingPlugin,
+            bevy_picking::InteractionPlugin,
+            bevy_scene::ScenePlugin,
+            bevy_text::TextPlugin,
+            bevy_ui::UiPlugin,
+            bevy_input_focus::InputFocusPlugin,
+            bevy_input_focus::InputDispatchPlugin,
+            FeathersPlugins,
+        ));
+        // Normally initialized by `RenderPlugin` / `ImagePlugin`, which are exactly what this
+        // configuration does without.
+        app.init_asset::<bevy_image::Image>();
+        app.init_asset::<bevy_image::TextureAtlasLayout>();
+
+        app.finish();
+        app.cleanup();
+
+        // The control whose fill is a shader. Spawning it through its own scene template is what
+        // pins the split: the widget half must not reach for `MaterialNode`.
+        use crate::controls::{ColorPlaneInner, ColorPlaneValue, FeathersColorPlane};
+        use bevy_ecs::hierarchy::Children;
+        use bevy_math::Vec3;
+        use bevy_scene::{bsn, WorldSceneExt};
+
+        let plane = app
+            .world_mut()
+            .spawn_scene(bsn! { @FeathersColorPlane::RedBlue })
+            .expect("color_plane spawns without a renderer")
+            .id();
+        app.world_mut()
+            .entity_mut(plane)
+            .insert(ColorPlaneValue(Vec3::new(0.25, 0.75, 0.5)));
+
+        app.update();
+
+        // Inner rectangle present and plain; the thumb is there for the layout-driven positioning
+        // system to move once a camera gives the plane a size.
+        let inner = app.world().get::<Children>(plane).unwrap()[0];
+        assert!(app.world().get::<ColorPlaneInner>(inner).is_some());
+        let thumb = app.world().get::<Children>(inner).unwrap()[0];
+        assert!(app.world().get::<bevy_ui::UiTransform>(thumb).is_some());
     }
 }
