@@ -188,12 +188,15 @@ impl Plugin for DefaultInspectorWidgetsPlugin {
         register!(u64);
         register!(usize);
         register!(bool);
+        register!(bevy_color::Color);
 
         // Every card the inspector builds reads its collapsed state from here.
         app.init_resource::<crate::collapse::InspectorCollapsed>();
 
         // Keep open widgets in sync when their source values change elsewhere.
         app.add_systems(Update, crate::sync::sync_inspector_widgets);
+        // Colour pickers fan a changed colour out to their sliders and swatch.
+        app.add_systems(Update, crate::color::refresh_color_pickers);
     }
 }
 

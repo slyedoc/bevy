@@ -26,6 +26,7 @@ extern crate alloc;
 pub mod attributes;
 pub mod binding;
 pub mod collapse;
+pub mod color;
 pub mod entry;
 pub mod enums;
 pub mod lists;
