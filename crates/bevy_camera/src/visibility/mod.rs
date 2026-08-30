@@ -490,9 +490,16 @@ pub enum VisibilitySystems {
     MarkNewlyHiddenEntitiesInvisible,
 }
 
-pub struct VisibilityPlugin;
+/// The propagation half of visibility: [`Visibility`] → [`InheritedVisibility`] down the
+/// hierarchy, the `Mesh2d`/`Mesh3d` required components, and the [`VisibilityClass`] hooks.
+///
+/// This is everything UI, hierarchy hiding, and any renderer that does its own culling need.
+/// [`VisibilityPlugin`] adds it and then layers the per-view CPU/GPU culling
+/// ([`ViewVisibility`], [`VisibleEntities`], bounds) on top; a renderer that culls elsewhere (a
+/// ray tracer, where the acceleration structure is the culling structure) adds only this one.
+pub struct VisibilityPropagatePlugin;
 
-impl Plugin for VisibilityPlugin {
+impl Plugin for VisibilityPropagatePlugin {
     fn build(&self, app: &mut bevy_app::App) {
         use VisibilitySystems::*;
 
@@ -501,6 +508,30 @@ impl Plugin for VisibilityPlugin {
             .register_required_components::<Mesh3d, VisibilityClass>()
             .register_required_components::<Mesh2d, Visibility>()
             .register_required_components::<Mesh2d, VisibilityClass>()
+            .configure_sets(
+                PostUpdate,
+                VisibilityPropagate.after(TransformSystems::Propagate),
+            )
+            .add_systems(
+                PostUpdate,
+                visibility_propagate_system.in_set(VisibilityPropagate),
+            );
+        app.world_mut()
+            .register_component_hooks::<Mesh3d>()
+            .on_add(add_visibility_class::<Mesh3d>);
+        app.world_mut()
+            .register_component_hooks::<Mesh2d>()
+            .on_add(add_visibility_class::<Mesh2d>);
+    }
+}
+
+pub struct VisibilityPlugin;
+
+impl Plugin for VisibilityPlugin {
+    fn build(&self, app: &mut bevy_app::App) {
+        use VisibilitySystems::*;
+
+        app.add_plugins(VisibilityPropagatePlugin)
             .configure_sets(
                 PostUpdate,
                 (UpdateFrusta, VisibilityPropagate)
@@ -526,19 +557,12 @@ impl Plugin for VisibilityPlugin {
                     (calculate_bounds, update_skinned_mesh_bounds)
                         .chain()
                         .in_set(CalculateBounds),
-                    (visibility_propagate_system, reset_view_visibility)
-                        .in_set(VisibilityPropagate),
+                    reset_view_visibility.in_set(VisibilityPropagate),
                     (check_visibility_cpu_culling, check_visibility_gpu_culling)
                         .in_set(CheckVisibility),
                     mark_newly_hidden_entities_invisible.in_set(MarkNewlyHiddenEntitiesInvisible),
                 ),
             );
-        app.world_mut()
-            .register_component_hooks::<Mesh3d>()
-            .on_add(add_visibility_class::<Mesh3d>);
-        app.world_mut()
-            .register_component_hooks::<Mesh2d>()
-            .on_add(add_visibility_class::<Mesh2d>);
     }
 }
 
