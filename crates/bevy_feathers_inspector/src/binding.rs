@@ -9,6 +9,7 @@
 use core::any::TypeId;
 
 use bevy_ecs::prelude::*;
+use bevy_asset::{ReflectAsset, UntypedAssetId};
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_reflect::{GetPath, ParsedPath, PartialReflect};
 use bevy_ui_widgets::ValueChange;
@@ -26,15 +27,25 @@ pub(crate) fn read_field<R>(
 ) -> Option<R> {
     let registry = world.resource::<AppTypeRegistry>().clone();
     let registry = registry.read();
+    // Assets do not live on an entity, so they resolve through `ReflectAsset` instead.
+    if let InspectorRoot::Asset { asset_id, type_id } = root {
+        let reflect_asset = registry.get(*type_id)?.data::<ReflectAsset>()?;
+        let reflected = reflect_asset.get(world, *asset_id)?;
+        let target = reflected.reflect_path(path).ok()?;
+        return Some(f(target));
+    }
     let entity = match root {
         InspectorRoot::Component { entity, .. } => *entity,
         InspectorRoot::Resource { type_id } => world
             .components()
             .get_id(*type_id)
             .and_then(|id| world.resource_entities().get(id))?,
+        InspectorRoot::Asset { .. } => unreachable!("handled above"),
     };
     let type_id = match root {
-        InspectorRoot::Component { type_id, .. } | InspectorRoot::Resource { type_id } => *type_id,
+        InspectorRoot::Component { type_id, .. }
+        | InspectorRoot::Resource { type_id }
+        | InspectorRoot::Asset { type_id, .. } => *type_id,
     };
     let reflect_component = registry.get(type_id)?.data::<ReflectComponent>()?;
     let reflected = reflect_component.reflect(world.get_entity(entity).ok()?)?;
@@ -87,6 +98,16 @@ pub enum InspectorRoot {
     /// A resource.
     Resource {
         /// The resource's registered type.
+        type_id: TypeId,
+    },
+    /// A loaded asset, addressed by id so the binding outlives any particular handle.
+    ///
+    /// Reaching one needs [`ReflectAsset`], which a type carries only if it was registered with
+    /// `register_asset_reflect` rather than a plain `init_asset`.
+    Asset {
+        /// Which asset, within its collection.
+        asset_id: UntypedAssetId,
+        /// The asset's registered type.
         type_id: TypeId,
     },
 }
@@ -205,6 +226,22 @@ pub(crate) fn with_field_reflect_mut(
                 return;
             };
             let Some(mut reflected) = reflect_component.reflect_mut(entity_mut) else {
+                return;
+            };
+            if let Ok(target) = reflected.reflect_path_mut(path) {
+                f(target);
+            }
+        }
+        InspectorRoot::Asset { asset_id, type_id } => {
+            // `ReflectAsset::get_mut` borrows the world, so the registration is cloned out
+            // first — the same dance the component branch does with the registry guard.
+            let Some(reflect_asset) = registry.get(*type_id).and_then(|r| r.data::<ReflectAsset>())
+            else {
+                return;
+            };
+            let reflect_asset = reflect_asset.clone();
+            drop(registry);
+            let Some(reflected) = reflect_asset.get_mut(world, *asset_id) else {
                 return;
             };
             if let Ok(target) = reflected.reflect_path_mut(path) {

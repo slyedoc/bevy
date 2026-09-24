@@ -6,6 +6,7 @@
 
 use core::any::TypeId;
 
+use bevy_asset::{ReflectAsset, UntypedAssetId};
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::prelude::*;
@@ -30,6 +31,8 @@ pub enum InspectorPanel {
     Component(Entity, TypeId),
     /// Shows a single resource.
     Resource(TypeId),
+    /// Shows a single loaded asset.
+    Asset(UntypedAssetId, TypeId),
 }
 
 /// Enumerate `target`'s reflectable components and (re)build an editing section per component as
@@ -153,6 +156,54 @@ pub fn build_resource_inspector(world: &mut World, type_id: TypeId, panel: Entit
     }
 }
 
+/// Enumerate one loaded asset's fields and (re)build an editing section under `panel`.
+///
+/// The asset type must have been registered with `register_asset_reflect`; a plain `init_asset`
+/// leaves no [`ReflectAsset`] to reach it through and this is a no-op.
+pub fn build_asset_inspector(
+    world: &mut World,
+    asset_id: UntypedAssetId,
+    type_id: TypeId,
+    panel: Entity,
+) {
+    clear_children(world, panel);
+    if let Ok(mut panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.insert(InspectorPanel::Asset(asset_id, type_id));
+    }
+
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+
+    let Some(section) = asset_section(world, &registry, asset_id, type_id) else {
+        return;
+    };
+    drop(registry);
+
+    if let Ok(panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.queue_spawn_related_scenes::<Children>(vec![section]);
+    }
+}
+
+/// Build a titled section for a loaded asset, or `None` if it isn't reflectable / loaded.
+pub(crate) fn asset_section(
+    world: &World,
+    registry: &bevy_reflect::TypeRegistry,
+    asset_id: UntypedAssetId,
+    type_id: TypeId,
+) -> Option<Box<dyn Scene>> {
+    let registration = registry.get(type_id)?;
+    let reflect_asset = registration.data::<ReflectAsset>()?;
+    let reflected = reflect_asset.get(world, asset_id)?;
+    let name = registration.type_info().ty().short_path();
+    Some(section_for(
+        world,
+        registry,
+        InspectorRoot::Asset { asset_id, type_id },
+        name,
+        reflected,
+    ))
+}
+
 /// Build a titled section for a resource, or `None` if it isn't reflectable / present.
 pub(crate) fn resource_section(
     world: &World,
@@ -209,6 +260,9 @@ pub fn rebuild_panel(world: &mut World, panel: Entity) {
             build_component_inspector(world, target, type_id, panel);
         }
         InspectorPanel::Resource(type_id) => build_resource_inspector(world, type_id, panel),
+        InspectorPanel::Asset(asset_id, type_id) => {
+            build_asset_inspector(world, asset_id, type_id, panel);
+        }
     }
 }
 
@@ -287,5 +341,22 @@ impl Command for BuildResourceInspector {
     type Out = ();
     fn apply(self, world: &mut World) {
         build_resource_inspector(world, self.type_id, self.panel);
+    }
+}
+
+/// Command form of [`build_asset_inspector`].
+pub struct BuildAssetInspector {
+    /// Which asset, within its collection.
+    pub asset_id: UntypedAssetId,
+    /// The asset type to inspect.
+    pub type_id: TypeId,
+    /// The panel entity the section is spawned under.
+    pub panel: Entity,
+}
+
+impl Command for BuildAssetInspector {
+    type Out = ();
+    fn apply(self, world: &mut World) {
+        build_asset_inspector(world, self.asset_id, self.type_id, self.panel);
     }
 }
