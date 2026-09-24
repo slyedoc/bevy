@@ -37,13 +37,15 @@ pub mod world_inspector;
 
 pub use attributes::{FieldCtx, Hidden, ReadOnly};
 pub use binding::{
-    inspector_writeback_bool, inspector_writeback_slider, InspectorBinding, InspectorRoot,
+    inspector_writeback_bool, inspector_writeback_slider, CustomRead, CustomWrite,
+    InspectorBinding, InspectorRoot,
 };
 pub use collapse::InspectorCollapsed;
 pub use entry::{
-    build_asset_inspector, build_component_inspector, build_entity_inspector,
-    build_resource_inspector, find_ancestor_panel, rebuild_panel, BuildAssetInspector,
-    BuildComponentInspector, BuildEntityInspector, BuildResourceInspector, InspectorPanel,
+    build_asset_inspector, build_component_inspector, build_custom_inspector,
+    build_entity_inspector, build_resource_inspector, find_ancestor_panel, rebuild_panel,
+    BuildAssetInspector, BuildComponentInspector, BuildCustomInspector, BuildEntityInspector,
+    BuildResourceInspector, InspectorPanel,
 };
 pub use recurse::{build_value, BuildCx};
 pub use widget::{

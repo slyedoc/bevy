@@ -11,7 +11,7 @@ use core::any::TypeId;
 use bevy_ecs::prelude::*;
 use bevy_asset::{ReflectAsset, UntypedAssetId};
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
-use bevy_reflect::{GetPath, ParsedPath, PartialReflect};
+use bevy_reflect::{GetPath, ParsedPath, PartialReflect, Reflect};
 use bevy_ui_widgets::ValueChange;
 
 use crate::widget::SliderScalar;
@@ -25,6 +25,21 @@ pub(crate) fn read_field<R>(
     path: &ParsedPath,
     f: impl FnOnce(&dyn PartialReflect) -> R,
 ) -> Option<R> {
+    // Resolved entirely by the app; nothing here knows what it reached.
+    if let InspectorRoot::Custom { read, .. } = root {
+        // `f` is `FnOnce` but the resolver takes `FnMut`, so it moves out on first call.
+        let mut f = Some(f);
+        let mut out = None;
+        let mut visit = |value: &dyn Reflect| {
+            let Ok(target) = value.reflect_path(path) else {
+                return;
+            };
+            let Some(f) = f.take() else { return };
+            out = Some(f(target));
+        };
+        read(world, &mut visit);
+        return out;
+    }
     let registry = world.resource::<AppTypeRegistry>().clone();
     let registry = registry.read();
     // Assets do not live on an entity, so they resolve through `ReflectAsset` instead.
@@ -40,12 +55,15 @@ pub(crate) fn read_field<R>(
             .components()
             .get_id(*type_id)
             .and_then(|id| world.resource_entities().get(id))?,
-        InspectorRoot::Asset { .. } => unreachable!("handled above"),
+        InspectorRoot::Asset { .. } | InspectorRoot::Custom { .. } => {
+            unreachable!("handled above")
+        }
     };
     let type_id = match root {
         InspectorRoot::Component { type_id, .. }
         | InspectorRoot::Resource { type_id }
         | InspectorRoot::Asset { type_id, .. } => *type_id,
+        InspectorRoot::Custom { .. } => unreachable!("handled above"),
     };
     let reflect_component = registry.get(type_id)?.data::<ReflectComponent>()?;
     let reflected = reflect_component.reflect(world.get_entity(entity).ok()?)?;
@@ -85,6 +103,16 @@ pub(crate) fn reflect_to_bool(value: &dyn PartialReflect) -> Option<bool> {
     value.try_as_reflect()?.downcast_ref::<bool>().copied()
 }
 
+/// Hands `f` an immutable reference to a value reached from the world however the app likes.
+///
+/// A plain `fn` rather than a boxed closure so an [`InspectorRoot`] stays `Clone + Eq + Hash`;
+/// anything the resolver needs to know (which item is selected, say) it reads from the world.
+pub type CustomRead = fn(&World, &mut dyn FnMut(&dyn Reflect));
+
+/// The mutable counterpart of [`CustomRead`]. Reach the value through whatever marks its owner
+/// changed — `ResMut`, `Assets::get_mut` — or edits will not be seen.
+pub type CustomWrite = fn(&mut World, &mut dyn FnMut(&mut dyn Reflect));
+
 /// Identifies the reflected value that an inspector widget edits.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum InspectorRoot {
@@ -109,6 +137,19 @@ pub enum InspectorRoot {
         asset_id: UntypedAssetId,
         /// The asset's registered type.
         type_id: TypeId,
+    },
+    /// Anything else, reached by a pair of resolver functions.
+    ///
+    /// The escape hatch for data the other three roots cannot address: a value behind a
+    /// `#[reflect(ignore)]` field, an element of a collection keyed by something a
+    /// [`ParsedPath`] cannot spell, or a `dyn` trait object whose concrete type is only known
+    /// at runtime. The path is still applied to whatever the resolver yields, so nesting,
+    /// enums and lists all work below it as usual.
+    Custom {
+        /// Resolves the value for reading (drawing the UI, and the external-sync refresh).
+        read: CustomRead,
+        /// Resolves it for writing. Must go through something that marks the owner changed.
+        write: CustomWrite,
     },
 }
 
@@ -185,6 +226,20 @@ pub(crate) fn with_field_reflect_mut(
     path: &ParsedPath,
     f: impl FnOnce(&mut dyn PartialReflect),
 ) {
+    // Resolved by the app, and it needs `&mut World`, so take it before the registry guard.
+    if let InspectorRoot::Custom { write, .. } = root {
+        // Same `FnOnce` into `FnMut` hand-off as the read side.
+        let mut f = Some(f);
+        let mut visit = |value: &mut dyn Reflect| {
+            let Ok(target) = value.reflect_path_mut(path) else {
+                return;
+            };
+            let Some(f) = f.take() else { return };
+            f(target);
+        };
+        write(world, &mut visit);
+        return;
+    }
     // Clone the `Arc` so the read guard does not borrow `world`, leaving it free for `entity_mut`.
     let registry = world.resource::<AppTypeRegistry>().clone();
     let registry = registry.read();
@@ -248,5 +303,90 @@ pub(crate) fn with_field_reflect_mut(
                 f(target);
             }
         }
+        InspectorRoot::Custom { .. } => unreachable!("handled above"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::resource::Resource;
+    use bevy_reflect::Reflect;
+
+    #[derive(Reflect, Default, PartialEq, Debug)]
+    struct Inner {
+        gain: f32,
+        on: bool,
+    }
+
+    /// The shape `InspectorRoot::Custom` exists for: the value is behind a field no reflection
+    /// path can traverse, so only hand-written resolvers can reach it.
+    #[derive(Resource, Reflect, Default)]
+    #[reflect(Resource)]
+    struct Owner {
+        #[reflect(ignore)]
+        hidden: Inner,
+    }
+
+    fn read(world: &World, visit: &mut dyn FnMut(&dyn Reflect)) {
+        if let Some(owner) = world.get_resource::<Owner>() {
+            visit(&owner.hidden);
+        }
+    }
+
+    fn write(world: &mut World, visit: &mut dyn FnMut(&mut dyn Reflect)) {
+        if let Some(mut owner) = world.get_resource_mut::<Owner>() {
+            visit(&mut owner.hidden);
+        }
+    }
+
+    fn root() -> InspectorRoot {
+        InspectorRoot::Custom { read, write }
+    }
+
+    #[test]
+    fn a_custom_root_reads_and_writes_through_a_path() {
+        let mut world = World::new();
+        world.insert_resource(AppTypeRegistry::default());
+        world.insert_resource(Owner {
+            hidden: Inner {
+                gain: 0.5,
+                on: false,
+            },
+        });
+
+        let path = ParsedPath::parse("gain").unwrap();
+        let before = read_field(&world, &root(), &path, |value| reflect_to_f32(value));
+        assert_eq!(before, Some(Some(0.5)));
+
+        with_field_reflect_mut(&mut world, &root(), &path, |target| {
+            let _ = target.try_apply(2.5f32.as_partial_reflect());
+        });
+        assert_eq!(world.resource::<Owner>().hidden.gain, 2.5);
+    }
+
+    #[test]
+    fn a_custom_root_that_resolves_to_nothing_is_not_an_error() {
+        // No `Owner` in the world: the resolver never calls back, and both sides no-op rather
+        // than unwrapping something absent.
+        let mut world = World::new();
+        world.insert_resource(AppTypeRegistry::default());
+        let path = ParsedPath::parse("gain").unwrap();
+        assert!(read_field(&world, &root(), &path, |_| ()).is_none());
+        with_field_reflect_mut(&mut world, &root(), &path, |_| {
+            panic!("must not be called when the value cannot be reached");
+        });
+    }
+
+    #[test]
+    fn a_bad_path_does_not_reach_the_writer() {
+        let mut world = World::new();
+        world.insert_resource(AppTypeRegistry::default());
+        world.insert_resource(Owner::default());
+        let path = ParsedPath::parse("nope").unwrap();
+        assert!(read_field(&world, &root(), &path, |_| ()).is_none());
+        with_field_reflect_mut(&mut world, &root(), &path, |_| {
+            panic!("a path that does not resolve must not yield a target");
+        });
     }
 }
