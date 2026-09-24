@@ -17,7 +17,7 @@ use bevy_scene::prelude::*;
 use bevy_scene::Scene;
 
 use crate::attributes::FieldCtx;
-use crate::binding::InspectorRoot;
+use crate::binding::{CustomRead, CustomWrite, InspectorRoot};
 use crate::collapse::InspectorCollapsed;
 use crate::recurse::{build_value, group_card, BuildCx};
 
@@ -33,6 +33,8 @@ pub enum InspectorPanel {
     Resource(TypeId),
     /// Shows a single loaded asset.
     Asset(UntypedAssetId, TypeId),
+    /// Shows whatever a pair of resolver functions reaches.
+    Custom(CustomRead, CustomWrite),
 }
 
 /// Enumerate `target`'s reflectable components and (re)build an editing section per component as
@@ -204,6 +206,48 @@ pub(crate) fn asset_section(
     ))
 }
 
+/// (Re)build an inspector over a value reached by resolver functions, as the sole child of
+/// `panel`.
+///
+/// The escape hatch for data no [`InspectorRoot::Component`] / `Resource` / `Asset` can address:
+/// a value behind a `#[reflect(ignore)]` field, an element keyed by something a reflection path
+/// cannot spell, or a `dyn` trait object whose concrete type is only known at runtime. The
+/// section is titled after the type the resolver actually yields, so it follows the selection
+/// without the caller having to name it.
+pub fn build_custom_inspector(
+    world: &mut World,
+    read: CustomRead,
+    write: CustomWrite,
+    panel: Entity,
+) {
+    clear_children(world, panel);
+    if let Ok(mut panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.insert(InspectorPanel::Custom(read, write));
+    }
+
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+
+    let mut section = None;
+    read(world, &mut |reflected: &dyn Reflect| {
+        section = Some(section_for(
+            world,
+            &registry,
+            InspectorRoot::Custom { read, write },
+            reflected.reflect_short_type_path(),
+            reflected,
+        ));
+    });
+    drop(registry);
+
+    let Some(section) = section else {
+        return;
+    };
+    if let Ok(panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.queue_spawn_related_scenes::<Children>(vec![section]);
+    }
+}
+
 /// Build a titled section for a resource, or `None` if it isn't reflectable / present.
 pub(crate) fn resource_section(
     world: &World,
@@ -263,6 +307,7 @@ pub fn rebuild_panel(world: &mut World, panel: Entity) {
         InspectorPanel::Asset(asset_id, type_id) => {
             build_asset_inspector(world, asset_id, type_id, panel);
         }
+        InspectorPanel::Custom(read, write) => build_custom_inspector(world, read, write, panel),
     }
 }
 
@@ -341,6 +386,23 @@ impl Command for BuildResourceInspector {
     type Out = ();
     fn apply(self, world: &mut World) {
         build_resource_inspector(world, self.type_id, self.panel);
+    }
+}
+
+/// Command form of [`build_custom_inspector`].
+pub struct BuildCustomInspector {
+    /// Resolves the value for reading.
+    pub read: CustomRead,
+    /// Resolves it for writing.
+    pub write: CustomWrite,
+    /// The panel entity the section is spawned under.
+    pub panel: Entity,
+}
+
+impl Command for BuildCustomInspector {
+    type Out = ();
+    fn apply(self, world: &mut World) {
+        build_custom_inspector(world, self.read, self.write, self.panel);
     }
 }
 

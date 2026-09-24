@@ -17,7 +17,7 @@ use bevy_ui_widgets::{checkbox_self_update, slider_self_update, SliderPrecision,
 
 use crate::attributes::FieldCtx;
 use crate::binding::{inspector_writeback_bool, inspector_writeback_slider, InspectorBinding};
-use bevy_asset::AssetPath;
+use bevy_asset::{Asset, AssetPath, Handle};
 
 use crate::recurse::{parse_path, BuildCx};
 
@@ -202,6 +202,37 @@ impl CreateTypeData<AssetPath<'static>> for ReflectInspectorWidget {
     fn create_type_data(_: ()) -> Self {
         Self {
             build: build_display,
+        }
+    }
+}
+
+/// An asset handle as its path.
+///
+/// Without this a `Handle<A>` field recurses as the enum it is, giving a `Strong` / `Uuid`
+/// variant picker over an `Arc` — noise at best, and picking a variant would drop the asset.
+fn build_handle<A: Asset>(
+    _cx: &BuildCx,
+    _path: &str,
+    value: &dyn PartialReflect,
+    _field: &FieldCtx,
+) -> Box<dyn Scene> {
+    let text = value
+        .try_as_reflect()
+        .and_then(<dyn bevy_reflect::Reflect>::downcast_ref::<Handle<A>>)
+        .map(|handle| match handle.path() {
+            Some(path) => path.to_string(),
+            None => "<no path>".to_string(),
+        })
+        .unwrap_or_default();
+    Box::new(bevy_feathers::display::label_dim(text))
+}
+
+/// Opt in per asset type: `app.register_type_data::<Handle<MyAsset>, ReflectInspectorWidget>()`.
+/// Not registered for you, because the inspector has no list of an app's asset types.
+impl<A: Asset> CreateTypeData<Handle<A>> for ReflectInspectorWidget {
+    fn create_type_data(_: ()) -> Self {
+        Self {
+            build: build_handle::<A>,
         }
     }
 }
