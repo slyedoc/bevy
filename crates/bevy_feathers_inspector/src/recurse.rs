@@ -288,8 +288,25 @@ pub fn value_to_string(value: &dyn PartialReflect) -> String {
             return v.clone();
         }
     }
-    value
-        .get_represented_type_info()
-        .map(|info| info.type_path().to_string())
-        .unwrap_or_else(|| "<opaque>".to_string())
+    // Containers summarise; the TYPE PATH of a `HashMap<K, V>` is a wall of generics that
+    // tells the reader nothing about the value in front of them.
+    match value.reflect_ref() {
+        ReflectRef::Map(map) => return format!("{{{} entries}}", map.len()),
+        ReflectRef::Set(set) => return format!("{{{} items}}", set.len()),
+        ReflectRef::List(list) => return format!("[{} items]", list.len()),
+        ReflectRef::Array(array) => return format!("[{} items]", array.len()),
+        _ => {}
+    }
+    // Anything else: whatever `Debug` offers, kept to one line.
+    let text = format!("{value:?}");
+    if text.is_empty() {
+        return value
+            .get_represented_type_info()
+            .map(|info| info.type_path().to_string())
+            .unwrap_or_else(|| "<opaque>".to_string());
+    }
+    match text.char_indices().nth(96) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text,
+    }
 }
