@@ -41,9 +41,9 @@ pub use binding::{
 };
 pub use collapse::InspectorCollapsed;
 pub use entry::{
-    build_component_inspector, build_entity_inspector, build_resource_inspector,
-    find_ancestor_panel, rebuild_panel, BuildComponentInspector, BuildEntityInspector,
-    BuildResourceInspector, InspectorPanel,
+    build_asset_inspector, build_component_inspector, build_entity_inspector,
+    build_resource_inspector, find_ancestor_panel, rebuild_panel, BuildAssetInspector,
+    BuildComponentInspector, BuildEntityInspector, BuildResourceInspector, InspectorPanel,
 };
 pub use recurse::{build_value, BuildCx};
 pub use widget::{
