@@ -17,6 +17,8 @@ use bevy_ui_widgets::{checkbox_self_update, slider_self_update, SliderPrecision,
 
 use crate::attributes::FieldCtx;
 use crate::binding::{inspector_writeback_bool, inspector_writeback_slider, InspectorBinding};
+use bevy_asset::AssetPath;
+
 use crate::recurse::{parse_path, BuildCx};
 
 /// Function that builds a bound widget [`Scene`] for a reflected value.
@@ -169,6 +171,41 @@ impl CreateTypeData<bool> for ReflectInspectorWidget {
     }
 }
 
+/// Read-only display for a leaf with no meaningful editor: render the value instead of the
+/// type name the recursion falls back to. An asset path, a handle or a hash map is something
+/// you want to SEE while editing its neighbours, not something you type into.
+fn build_display(
+    _cx: &BuildCx,
+    _path: &str,
+    value: &dyn PartialReflect,
+    _field: &FieldCtx,
+) -> Box<dyn Scene> {
+    Box::new(bevy_feathers::display::label_dim(display_value(value)))
+}
+
+/// Best-effort short rendering of an opaque reflected value.
+fn display_value(value: &dyn PartialReflect) -> String {
+    if let Some(reflect) = value.try_as_reflect() {
+        if let Some(path) = reflect.downcast_ref::<AssetPath<'static>>() {
+            return path.to_string();
+        }
+    }
+    // `Debug` is what an opaque type can always offer; keep it to one line.
+    let text = format!("{value:?}");
+    match text.char_indices().nth(96) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text,
+    }
+}
+
+impl CreateTypeData<AssetPath<'static>> for ReflectInspectorWidget {
+    fn create_type_data(_: ()) -> Self {
+        Self {
+            build: build_display,
+        }
+    }
+}
+
 /// Registers the built-in leaf widgets with the [`TypeRegistry`].
 pub struct DefaultInspectorWidgetsPlugin;
 
@@ -189,6 +226,8 @@ impl Plugin for DefaultInspectorWidgetsPlugin {
         register!(usize);
         register!(bool);
         register!(bevy_color::Color);
+        // Leaves that display rather than edit.
+        register!(AssetPath<'static>);
 
         // Every card the inspector builds reads its collapsed state from here.
         app.init_resource::<crate::collapse::InspectorCollapsed>();
