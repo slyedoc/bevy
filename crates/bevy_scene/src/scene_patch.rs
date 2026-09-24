@@ -9,10 +9,11 @@ use bevy_ecs::{
     bundle::BundleScratch,
     component::Component,
     entity::Entity,
+    reflect::ReflectComponent,
     template::FromTemplate,
     world::{EntityWorldMut, World},
 };
-use bevy_reflect::TypePath;
+use bevy_reflect::{std_traits::ReflectDefault, Reflect, TypePath};
 use thiserror::Error;
 
 /// An [`Asset`] that holds a [`Scene`], tracks its dependencies, and holds the [`ResolvedSceneRoot`] (after the [`Scene`] has been loaded and resolved).
@@ -106,7 +107,20 @@ pub enum SpawnSceneError {
 }
 
 /// A component that, when added, will queue applying the given [`ScenePatch`] after the scene and its dependencies have been loaded and resolved.
-#[derive(Component, FromTemplate, Deref, DerefMut)]
+///
+/// Reflected and registered so a `.bsn` can reference ANOTHER `.bsn` by path:
+///
+/// ```text
+/// bevy_scene::scene_patch::ScenePatchInstance("trees/oak.bsn")
+/// ```
+///
+/// which is what makes a scene composable out of separately baked assets instead
+/// of every consumer having to spawn the child scene from Rust. Handle resolution
+/// is the same path `Mesh3d("x.cluster_mesh")` already takes.
+#[derive(
+    Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq,
+)]
+#[reflect(Component, Default, Clone, PartialEq)]
 pub struct ScenePatchInstance(pub Handle<ScenePatch>);
 
 /// An [`Asset`] that holds a [`SceneList`], tracks its dependencies, and holds a [`ResolvedSceneListRoot`] (after the [`SceneList`] has been loaded and resolved)

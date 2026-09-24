@@ -1069,6 +1069,11 @@ impl Plugin for ScenePlugin {
             .init_resource::<WaitingScenes>()
             .init_asset::<ScenePatch>()
             .init_asset::<SceneListPatch>()
+            // Registered so a .bsn can name it and reference another .bsn.
+            // The loader turns a string literal in a `Handle<T>` field into a
+            // `HandleTemplate<T>`, so that instantiation has to be in the
+            // registry too -- same mechanism `Mesh3d("x.cluster_mesh")` uses.
+            .register_type::<ScenePatchInstance>()
             .init_asset_loader::<DynamicBsnLoader>()
             .add_systems(
                 SpawnScene,
@@ -1078,6 +1083,26 @@ impl Plugin for ScenePlugin {
                     .after(SceneSpawnerSystems::WorldInstanceSpawn),
             )
             .add_observer(on_add_scene_patch_instance);
+
+        // Let a `.bsn` reference another `.bsn` by path:
+        //
+        //     bevy_scene::scene_patch::ScenePatchInstance("trees/oak.bsn")
+        //
+        // The loader turns a string literal in a `Handle<T>` field into a
+        // `HandleTemplate<T>` through a registered `String` conversion, so that
+        // instantiation and its conversion both have to be in the registry.
+        // `register_asset_reflect::<ScenePatch>()` would do this, but it demands
+        // `ScenePatch: Reflect + FromReflect` and ScenePatch holds a
+        // `Box<dyn Scene>`. Only the conversion is actually needed here.
+        let registry = app.world().resource::<AppTypeRegistry>().clone();
+        {
+            let mut registry = registry.write();
+            registry.register::<bevy_asset::HandleTemplate<ScenePatch>>();
+            registry
+                .register_type_conversion::<String, bevy_asset::HandleTemplate<ScenePatch>, _>(
+                    |s| Ok(s.into()),
+                );
+        }
     }
 }
 
