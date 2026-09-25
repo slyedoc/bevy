@@ -25,7 +25,9 @@ bevy_render = ["dep:bevy_render"]
 bevy_app = { path = "../bevy_app", version = "0.20.0-dev" }
 bevy_color = { path = "../bevy_color", version = "0.20.0-dev" }
 bevy_derive = { path = "../bevy_derive", version = "0.20.0-dev" }
-bevy_dev_tools = { path = "../bevy_dev_tools", version = "0.20.0-dev", features = [
+# `default-features = false`: only `schedule_data` is wanted here, and the default
+# `render` feature would make bevy_render a dependency of every bevy_remote consumer.
+bevy_dev_tools = { path = "../bevy_dev_tools", version = "0.20.0-dev", default-features = false, features = [
   "schedule_data",
 ] }
 bevy_ecs = { path = "../bevy_ecs", version = "0.20.0-dev", features = [

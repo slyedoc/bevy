@@ -13,13 +13,24 @@ extern crate alloc;
 #[cfg(feature = "bevy_ci_testing")]
 pub mod ci_testing;
 
+// The drawing half. Behind `render` (on by default) so a consumer that only wants, say,
+// `schedule_data` is not made to depend on bevy_render and the whole wgpu stack.
+#[cfg(feature = "render")]
 pub mod diagnostics_overlay;
+#[cfg(feature = "render")]
 mod easy_screenshot;
+#[cfg(feature = "render")]
 pub mod fps_overlay;
+#[cfg(feature = "render")]
 pub mod frame_time_graph;
 
+// Not drawing, but `inspection::label_resolution` names component types from
+// bevy_core_pipeline, bevy_pbr, bevy_sprite, bevy_text and bevy_ui to label entities,
+// and picking_debug draws its readout with bevy_ui -- so both need the same crates.
+#[cfg(feature = "render")]
 pub mod inspection;
 
+#[cfg(feature = "render")]
 pub mod picking_debug;
 
 #[cfg(feature = "schedule_data")]
@@ -27,10 +38,13 @@ pub mod schedule_data;
 
 pub mod states;
 
+#[cfg(feature = "render")]
 pub use easy_screenshot::*;
 
+#[cfg(feature = "render")]
 pub mod render_debug;
 
+#[cfg(feature = "render")]
 pub mod infinite_grid;
 
 pub mod world_asset_helpers;
