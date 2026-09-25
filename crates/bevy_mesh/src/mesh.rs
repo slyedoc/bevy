@@ -2627,12 +2627,16 @@ impl Mesh {
         #[cfg(feature = "morph")]
         let morph_target_names = self.morph_target_names.extract()?;
 
-        // store the aabb extents as they cannot be computed after extraction
+        // store the aabb extents as they cannot be computed after extraction.
+        // Never clobber one that is already there: `compute_aabb` only reads Float32x3, so a
+        // mesh whose positions were already compressed would lose the aabb that
+        // `compressed_mesh` computed for it -- and with it its metadata allocation.
         if let Some(MeshAttributeData { values, .. }) = attributes
             .as_ref_option()?
             .and_then(|attrs| attrs.get(&Self::ATTRIBUTE_POSITION.id))
+            && let Some(aabb) = Self::compute_aabb(values)
         {
-            self.final_aabb = Self::compute_aabb(values);
+            self.final_aabb = Some(aabb);
         }
         Ok(Self {
             attributes,
@@ -3676,5 +3680,24 @@ mod tests {
                 .flatten()
             )
             .all(|(a, b)| approx::relative_eq!(a.to_f32(), b.to_f32())));
+    }
+
+    #[test]
+    fn extraction_keeps_a_compressed_meshs_aabb() {
+        // The fallback mesh bevy_render builds for mesh metadata: compressed positions, so
+        // `compute_aabb` cannot read them back after the fact.
+        let mut mesh = Mesh::new(PrimitiveTopology::PointList, RenderAssetUsages::all())
+            .with_inserted_attribute(
+                Mesh::ATTRIBUTE_POSITION,
+                VertexAttributeValues::Float32x3(vec![[0.0; 3]]),
+            )
+            .with_inserted_indices(Indices::U16(vec![0]))
+            .compressed_mesh(MeshAttributeCompressionFlags::COMPRESS_POSITION, false);
+        assert!(mesh.final_aabb.is_some(), "compression computes the aabb");
+        let extracted = mesh.take_gpu_data().expect("extracts");
+        assert!(
+            extracted.final_aabb.is_some(),
+            "extraction must not drop it: no aabb means no metadata allocation"
+        );
     }
 }
