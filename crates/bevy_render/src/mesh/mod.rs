@@ -99,15 +99,21 @@ pub fn prepare_mesh_metadata_fallback_buffer(
     mesh_allocator: Res<MeshAllocator>,
     metadata_fallback_mesh: Res<MeshMetadataFallbackMesh>,
 ) {
-    let slab_id = mesh_allocator
+    // A mesh that has not been allocated yet is an expected state, not a reason to abort the
+    // frame -- `mesh_metadata_slice` documents the same miss as `None`. Skip and try again.
+    let Some(slab_id) = mesh_allocator
         .key_to_slab
         .get(&MeshAllocationKey::new(
             metadata_fallback_mesh.0.id(),
             ElementClass::Metadata,
         ))
         .cloned()
-        .unwrap();
-    let buffer = mesh_allocator.buffer_for_slab(slab_id).unwrap().clone();
+    else {
+        return;
+    };
+    let Some(buffer) = mesh_allocator.buffer_for_slab(slab_id).cloned() else {
+        return;
+    };
     commands.insert_resource(MeshMetadataFallbackBuffer { slab_id, buffer });
 }
 
