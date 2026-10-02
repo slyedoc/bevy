@@ -26,7 +26,8 @@ bevy_picking = { path = "../bevy_picking", version = "0.20.0-dev", default-featu
 bevy_derive = { path = "../bevy_derive", version = "0.20.0-dev" }
 bevy_platform = { path = "../bevy_platform", version = "0.20.0-dev" }
 bevy_image = { path = "../bevy_image", version = "0.20.0-dev" }
-bevy_render = { path = "../bevy_render", version = "0.20.0-dev" }
+# Only the independent-skybox extension draws; the controllers themselves need no renderer.
+bevy_render = { path = "../bevy_render", version = "0.20.0-dev", optional = true }
 bevy_color = { path = "../bevy_color", version = "0.20.0-dev" }
 
 bevy_asset = { path = "../bevy_asset", version = "0.20.0-dev", optional = true }
@@ -51,6 +52,7 @@ extension_independent_skybox = [
   "pan_orbit_camera",
   "bevy_asset",
   "bevy_core_pipeline",
+  "bevy_render",
 ]
 
 [lints]
