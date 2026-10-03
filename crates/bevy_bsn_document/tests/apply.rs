@@ -8,7 +8,7 @@ use bevy_ecs::world::World;
 use bevy_math::Vec3;
 use bevy_transform::components::Transform;
 
-use bevy_bsn::{apply_dirty_ast_patches, parse_bsn_text, spawn_from_ast, SceneBsnAst};
+use bevy_bsn_document::{apply_dirty_ast_patches, parse_bsn_text, spawn_from_ast, SceneBsnAst};
 
 #[test]
 fn bsn_text_materializes_into_ecs() {

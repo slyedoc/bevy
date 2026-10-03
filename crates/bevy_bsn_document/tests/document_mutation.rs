@@ -6,7 +6,7 @@
 use bevy_ecs::entity::Entity;
 use bevy_ecs::world::World;
 
-use bevy_bsn::{
+use bevy_bsn_document::{
     clone_node_into, clone_subtree_into, get_bsn_field, parse_bsn_text, BsnPatch, BsnValue,
     SceneBsnAst,
 };

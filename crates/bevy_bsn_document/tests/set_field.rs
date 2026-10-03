@@ -7,7 +7,7 @@ use bevy_ecs::prelude::Component;
 use bevy_reflect::prelude::ReflectDefault;
 use bevy_reflect::{Reflect, TypePath, TypeRegistry};
 
-use bevy_bsn::{
+use bevy_bsn_document::{
     component_to_bsn_patch, get_bsn_field, set_bsn_field, BsnPatch, BsnPatches, BsnStructData,
     BsnStructFields, BsnValue, SceneBsnAst,
 };
@@ -106,7 +106,7 @@ fn dotted_write_replaces_scalar_intermediate_with_struct() {
     let tp = Outer::type_path();
     let (mut ast, node) = one_patch_ast(BsnPatch::Struct(BsnStructData {
         type_path: tp.to_string(),
-        fields: BsnStructFields(vec![bevy_bsn::BsnField {
+        fields: BsnStructFields(vec![bevy_bsn_document::BsnField {
             name: "mid".to_string(),
             value: BsnValue::Float(0.0),
         }]),

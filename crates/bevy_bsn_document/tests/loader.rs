@@ -1,6 +1,6 @@
 //! Loader tests: `.bsn` text through to the document [`SceneBsnAst`].
 
-use bevy_bsn::{parse_bsn_text, BsnPatch, BsnValue, SceneBsnAst};
+use bevy_bsn_document::{parse_bsn_text, BsnPatch, BsnValue, SceneBsnAst};
 
 use bevy_ecs::entity::Entity;
 
@@ -147,7 +147,7 @@ fn scene_load_routes_embedded_assets_and_resolves_references() {
     use bevy_reflect::prelude::ReflectDefault;
     use bevy_reflect::Reflect;
 
-    use bevy_bsn::load_bsn_scene;
+    use bevy_bsn_document::load_bsn_scene;
 
     #[derive(Asset, Reflect, Clone, Default)]
     #[reflect(Default)]
@@ -244,7 +244,7 @@ fn scene_load_resolves_both_inline_and_catalog_reference_spellings() {
     use bevy_reflect::prelude::ReflectDefault;
     use bevy_reflect::{Reflect, TypePath};
 
-    use bevy_bsn::load_bsn_scene;
+    use bevy_bsn_document::load_bsn_scene;
 
     #[derive(Asset, Reflect, Clone, Default)]
     #[reflect(Default)]
@@ -322,7 +322,7 @@ fn stable_node_id_lookup_finds_nested_nodes() {
     use bevy_app::App;
     use bevy_ecs::reflect::AppTypeRegistry;
 
-    use bevy_bsn::{apply_dirty_ast_patches, parse_bsn_text, spawn_from_ast, SceneBsnAst};
+    use bevy_bsn_document::{apply_dirty_ast_patches, parse_bsn_text, spawn_from_ast, SceneBsnAst};
 
     let text = r##"
 bevy_ecs::hierarchy::Children [

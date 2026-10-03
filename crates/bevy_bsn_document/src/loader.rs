@@ -33,7 +33,7 @@ impl std::error::Error for BsnLoadError {}
 /// `Children`. Without it that entity is byte-identical to the synthetic
 /// multi-root wrapper and would be unwrapped, dropping a real grouping entity.
 /// The loader strips it before installing the root, so it never reaches apply.
-pub(crate) const SCENE_ROOT_GROUP_MARKER: &str = "bevy_bsn::__SceneRootGroup";
+pub(crate) const SCENE_ROOT_GROUP_MARKER: &str = "bevy_bsn_document::__SceneRootGroup";
 
 /// Parse BSN text into a document [`SceneBsnAst`].
 pub fn parse_bsn_text(text: &str) -> Result<SceneBsnAst, BsnLoadError> {

@@ -2,7 +2,7 @@
 //! document directly, so assertions inspect [`SceneBsnAst`] patches and owned
 //! [`BsnValue`] trees.
 
-use bevy_bsn::{parse_bsn, BsnPatch, BsnValue, SceneBsnAst};
+use bevy_bsn_document::{parse_bsn, BsnPatch, BsnValue, SceneBsnAst};
 use bevy_ecs::entity::Entity;
 
 /// Parse text and return the document plus the top-level patch group's

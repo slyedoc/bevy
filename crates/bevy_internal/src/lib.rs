@@ -28,7 +28,7 @@ pub use bevy_asset as asset;
 #[cfg(feature = "bevy_audio")]
 pub use bevy_audio as audio;
 #[cfg(feature = "bevy_scene")]
-pub use bevy_bsn as bsn;
+pub use bevy_bsn_document as bsn_document;
 #[cfg(feature = "bevy_camera")]
 pub use bevy_camera as camera;
 #[cfg(feature = "bevy_camera_controller")]

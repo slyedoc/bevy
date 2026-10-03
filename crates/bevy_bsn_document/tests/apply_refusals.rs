@@ -14,7 +14,7 @@ use bevy_reflect::prelude::ReflectDefault;
 use bevy_reflect::{Reflect, TypePath};
 use bevy_transform::components::Transform;
 
-use bevy_bsn::{apply_dirty_ast_patches, parse_bsn_text, spawn_from_ast};
+use bevy_bsn_document::{apply_dirty_ast_patches, parse_bsn_text, spawn_from_ast};
 
 static RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 

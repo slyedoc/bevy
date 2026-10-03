@@ -16,7 +16,7 @@ use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_ecs::world::World;
 use bevy_reflect::{Reflect, TypeRegistry};
 
-use bevy_bsn::{apply_component_patch, component_to_bsn_patch, BsnPatch, BsnValue};
+use bevy_bsn_document::{apply_component_patch, component_to_bsn_patch, BsnPatch, BsnValue};
 use smol_str::SmolStr;
 
 /// The shape of `ThemeToken`: a tuple struct whose only field is a `SmolStr`.

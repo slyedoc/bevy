@@ -8,7 +8,7 @@
 use bevy_asset::{uuid_handle, Asset, Handle};
 use bevy_reflect::{Reflect, TypeRegistry};
 
-use bevy_bsn::component_to_bsn_patch;
+use bevy_bsn_document::component_to_bsn_patch;
 
 const HANDLE_UUID: &str = "8e6c3d2a-5b14-4f9e-9a77-c01d54a3b681";
 

@@ -3,7 +3,7 @@
 
 use bevy_ecs::entity::Entity;
 
-use bevy_bsn::{
+use bevy_bsn_document::{
     emit_scene, parse_bsn_text, BsnField, BsnPatch, BsnPatches, BsnStructData, BsnStructFields,
     BsnTupleStructData, BsnValue, SceneBsnAst,
 };
@@ -341,7 +341,7 @@ fn emit_tuple_struct_string_value_roundtrips() {
 fn component_to_bsn_patch_with_assets_resolves_handle_to_path() {
     use bevy_app::{App, TaskPoolPlugin};
     use bevy_asset::{Asset, AssetApp, AssetPlugin, AssetServer, Handle, ReflectHandle};
-    use bevy_bsn::{component_to_bsn_patch_with_assets, BsnAssetContext};
+    use bevy_bsn_document::{component_to_bsn_patch_with_assets, BsnAssetContext};
     use bevy_ecs::reflect::AppTypeRegistry;
     use bevy_reflect::Reflect;
     use std::path::Path;
@@ -409,7 +409,7 @@ fn handle_without_path_emits_catalog_name() {
     use bevy_reflect::Reflect;
     use std::path::Path;
 
-    use bevy_bsn::{component_to_bsn_patch_with_assets, BsnAssetContext};
+    use bevy_bsn_document::{component_to_bsn_patch_with_assets, BsnAssetContext};
 
     #[derive(Asset, Reflect, Default)]
     struct ProbeAsset;
@@ -469,7 +469,7 @@ fn handle_without_path_emits_catalog_name() {
 /// Emit a node carrying `paths` as type patches, read it back, and report the
 /// type paths that survived, sorted so the walk order does not decide.
 fn round_tripped_type_paths(paths: &[&str]) -> Vec<String> {
-    use bevy_bsn::{parse_bsn_text, BsnPatch, SceneBsnAst};
+    use bevy_bsn_document::{parse_bsn_text, BsnPatch, SceneBsnAst};
 
     let mut ast = SceneBsnAst::default();
     let node = ast.create_entity_node(
@@ -527,7 +527,7 @@ fn a_document_without_generics_reads_the_same_as_before() {
 /// cannot pass through raw.
 #[test]
 fn unicode_and_control_characters_round_trip() {
-    use bevy_bsn::{BsnField, BsnPatch, BsnStructData, BsnStructFields, BsnValue, SceneBsnAst};
+    use bevy_bsn_document::{BsnField, BsnPatch, BsnStructData, BsnStructFields, BsnValue, SceneBsnAst};
 
     let tricky = "u\u{00fc}ber \u{1f426}\nline two\ttabbed \"quoted\"";
     let mut ast = SceneBsnAst::default();
@@ -547,7 +547,7 @@ fn unicode_and_control_characters_round_trip() {
     let reparsed = parse_bsn_text(&text).expect("emitted text parses");
     let root = reparsed.roots[0];
     assert_eq!(reparsed.get_name(root), Some("n\u{00e4}me"));
-    let value = bevy_bsn::get_bsn_field(&reparsed, root, "test::Labeled", "text");
+    let value = bevy_bsn_document::get_bsn_field(&reparsed, root, "test::Labeled", "text");
     assert!(
         matches!(&value, Some(BsnValue::String(s)) if s == tricky),
         "string survives the round trip; emitted:\n{text}"
@@ -608,7 +608,7 @@ fn single_grouping_root_with_only_children_survives_roundtrip() {
 /// rather than only that field.
 #[test]
 fn a_generic_enums_variant_emits_without_its_type_arguments() {
-    use bevy_bsn::component_to_bsn_patch;
+    use bevy_bsn_document::component_to_bsn_patch;
     use bevy_ecs::component::Component;
     use bevy_reflect::{Reflect, TypeRegistry};
 

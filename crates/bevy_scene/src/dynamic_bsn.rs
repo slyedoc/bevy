@@ -202,7 +202,7 @@ impl AssetLoader for DynamicBsnLoader {
         reader.read_to_end(&mut buffer).await?;
         let input = str::from_utf8(&buffer)?;
 
-        let document = bevy_bsn::parse_bsn_text(input)
+        let document = bevy_bsn_document::parse_bsn_text(input)
             .map_err(|err| DynamicBsnLoaderError::Parse(err.to_string()))?;
         let (ast, patches_id) = BsnAst::from_document(&document)?;
         let patch = ast.convert_bsn_patches_to_patch(patches_id, &self.type_registry)?;
@@ -961,11 +961,11 @@ impl BsnAst {
         }
     }
 
-    /// Build the loader's AST from a parsed [`bevy_bsn::SceneBsnAst`]: the one `.bsn` grammar
-    /// is `bevy_bsn`'s, and this is the bridge into scene resolution. A document with several
+    /// Build the loader's AST from a parsed [`bevy_bsn_document::SceneBsnAst`]: the one `.bsn` grammar
+    /// is `bevy_bsn_document`'s, and this is the bridge into scene resolution. A document with several
     /// roots becomes one anonymous root holding them as children.
     pub fn from_document(
-        document: &bevy_bsn::SceneBsnAst,
+        document: &bevy_bsn_document::SceneBsnAst,
     ) -> Result<(BsnAst, Entity), DynamicBsnLoaderError> {
         let mut world = World::new();
         world.init_resource::<BsnNameStore>();
@@ -991,12 +991,12 @@ impl BsnAst {
 
     fn translate_patches(
         &mut self,
-        document: &bevy_bsn::SceneBsnAst,
+        document: &bevy_bsn_document::SceneBsnAst,
         patches: Entity,
     ) -> Result<Entity, DynamicBsnLoaderError> {
         let ids = document
             .world
-            .get::<bevy_bsn::BsnPatches>(patches)
+            .get::<bevy_bsn_document::BsnPatches>(patches)
             .ok_or(DynamicBsnLoaderError::NoSuchAstNode)?
             .0
             .clone();
@@ -1004,19 +1004,19 @@ impl BsnAst {
         for id in ids {
             let patch = document
                 .world
-                .get::<bevy_bsn::BsnPatch>(id)
+                .get::<bevy_bsn_document::BsnPatch>(id)
                 .ok_or(DynamicBsnLoaderError::NoSuchAstNode)?;
             let translated = match patch {
-                bevy_bsn::BsnPatch::Name(name) => self.create_name_patch(name.clone()),
-                bevy_bsn::BsnPatch::Base(base) => self.create_patch(BsnPatch::Base(base.clone())),
-                bevy_bsn::BsnPatch::Type(path) => self.create_patch(BsnPatch::Var(BsnVar(
+                bevy_bsn_document::BsnPatch::Name(name) => self.create_name_patch(name.clone()),
+                bevy_bsn_document::BsnPatch::Base(base) => self.create_patch(BsnPatch::Base(base.clone())),
+                bevy_bsn_document::BsnPatch::Type(path) => self.create_patch(BsnPatch::Var(BsnVar(
                     BsnSymbol::from_type_path(path),
                     false,
                 ))),
-                bevy_bsn::BsnPatch::Template(path, None) => {
+                bevy_bsn_document::BsnPatch::Template(path, None) => {
                     self.create_patch(BsnPatch::Var(BsnVar(BsnSymbol::from_type_path(path), true)))
                 }
-                bevy_bsn::BsnPatch::Template(path, Some(fields)) => {
+                bevy_bsn_document::BsnPatch::Template(path, Some(fields)) => {
                     let fields = self.translate_fields(fields);
                     self.create_patch(BsnPatch::Struct(BsnStruct(
                         BsnSymbol::from_type_path(path),
@@ -1024,7 +1024,7 @@ impl BsnAst {
                         true,
                     )))
                 }
-                bevy_bsn::BsnPatch::Struct(data) => {
+                bevy_bsn_document::BsnPatch::Struct(data) => {
                     let fields = self.translate_fields(&data.fields);
                     self.create_patch(BsnPatch::Struct(BsnStruct(
                         BsnSymbol::from_type_path(&data.type_path),
@@ -1032,7 +1032,7 @@ impl BsnAst {
                         false,
                     )))
                 }
-                bevy_bsn::BsnPatch::TupleStruct(data) => {
+                bevy_bsn_document::BsnPatch::TupleStruct(data) => {
                     let values = data
                         .values
                         .iter()
@@ -1044,7 +1044,7 @@ impl BsnAst {
                         false,
                     )))
                 }
-                bevy_bsn::BsnPatch::Children(children) => {
+                bevy_bsn_document::BsnPatch::Children(children) => {
                     let children = children
                         .iter()
                         .map(|&child| self.translate_patches(document, child))
@@ -1060,7 +1060,7 @@ impl BsnAst {
         Ok(self.create_patches(out))
     }
 
-    fn translate_fields(&mut self, fields: &bevy_bsn::BsnStructFields) -> Vec<BsnField> {
+    fn translate_fields(&mut self, fields: &bevy_bsn_document::BsnStructFields) -> Vec<BsnField> {
         fields
             .0
             .iter()
@@ -1068,16 +1068,16 @@ impl BsnAst {
             .collect()
     }
 
-    fn translate_value(&mut self, value: &bevy_bsn::BsnValue) -> Entity {
+    fn translate_value(&mut self, value: &bevy_bsn_document::BsnValue) -> Entity {
         let expr = match value {
-            bevy_bsn::BsnValue::Float(v) => BsnExpr::FloatLit(*v),
-            bevy_bsn::BsnValue::Int(v) => BsnExpr::IntLit(*v),
-            bevy_bsn::BsnValue::Bool(v) => BsnExpr::BoolLit(*v),
-            bevy_bsn::BsnValue::String(v) => BsnExpr::StringLit(v.clone()),
-            bevy_bsn::BsnValue::Type(path) => {
+            bevy_bsn_document::BsnValue::Float(v) => BsnExpr::FloatLit(*v),
+            bevy_bsn_document::BsnValue::Int(v) => BsnExpr::IntLit(*v),
+            bevy_bsn_document::BsnValue::Bool(v) => BsnExpr::BoolLit(*v),
+            bevy_bsn_document::BsnValue::String(v) => BsnExpr::StringLit(v.clone()),
+            bevy_bsn_document::BsnValue::Type(path) => {
                 BsnExpr::Var(BsnVar(BsnSymbol::from_type_path(path), false))
             }
-            bevy_bsn::BsnValue::Struct(data) => {
+            bevy_bsn_document::BsnValue::Struct(data) => {
                 let fields = self.translate_fields(&data.fields);
                 BsnExpr::Struct(BsnStruct(
                     BsnSymbol::from_type_path(&data.type_path),
@@ -1085,7 +1085,7 @@ impl BsnAst {
                     false,
                 ))
             }
-            bevy_bsn::BsnValue::TupleStruct(data) => {
+            bevy_bsn_document::BsnValue::TupleStruct(data) => {
                 let values = data
                     .values
                     .iter()
@@ -1097,10 +1097,10 @@ impl BsnAst {
                     false,
                 ))
             }
-            bevy_bsn::BsnValue::List(items) => {
+            bevy_bsn_document::BsnValue::List(items) => {
                 BsnExpr::List(items.iter().map(|v| self.translate_value(v)).collect())
             }
-            bevy_bsn::BsnValue::Map(entries) => BsnExpr::Map(
+            bevy_bsn_document::BsnValue::Map(entries) => BsnExpr::Map(
                 entries
                     .iter()
                     .map(|(k, v)| (self.translate_value(k), self.translate_value(v)))

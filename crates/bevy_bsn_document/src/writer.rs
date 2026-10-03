@@ -390,7 +390,7 @@ mod tests {
         let mut world = test_world();
         world.spawn((Name::new("Thing"), RuntimeState { frames: 3 }));
 
-        let skipping = BsnWriterConfig::include_all().skip_prefix("bevy_bsn::");
+        let skipping = BsnWriterConfig::include_all().skip_prefix("bevy_bsn_document::");
         let skipped = serialize_to_bsn_with_config(&world, &skipping);
         assert!(
             !skipped.contains("RuntimeState"),
@@ -398,7 +398,7 @@ mod tests {
         );
 
         let config = BsnWriterConfig::include_all()
-            .skip_prefix("bevy_bsn::")
+            .skip_prefix("bevy_bsn_document::")
             .always_save(RuntimeState::type_path());
         let kept = serialize_to_bsn_with_config(&world, &config);
         assert!(

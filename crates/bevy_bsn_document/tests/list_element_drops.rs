@@ -8,7 +8,7 @@
 
 use std::sync::Mutex;
 
-use bevy_bsn::{bsn_value_to_reflect, BsnField, BsnStructData, BsnStructFields, BsnValue};
+use bevy_bsn_document::{bsn_value_to_reflect, BsnField, BsnStructData, BsnStructFields, BsnValue};
 use bevy_reflect::{PartialReflect, Reflect, TypeRegistry};
 
 static RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
