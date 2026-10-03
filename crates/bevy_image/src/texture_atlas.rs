@@ -209,7 +209,15 @@ impl TextureAtlasLayout {
 #[cfg_attr(
     feature = "bevy_reflect",
     derive(Reflect),
-    reflect(Default, Debug, PartialEq, Hash, Clone)
+    reflect(
+        Default,
+        Debug,
+        PartialEq,
+        Hash,
+        Clone,
+        bevy_ecs::reflect::FromTemplate
+    ),
+    template(reflect)
 )]
 pub struct TextureAtlas {
     /// Texture atlas layout handle

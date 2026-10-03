@@ -20,7 +20,8 @@ use crate::controls::FeathersButton;
 #[derive(SceneComponent, FromTemplate)]
 #[scene(VirtualKeyboardProps<T>)]
 #[derive(Reflect)]
-#[reflect(Component)]
+#[reflect(Component, FromTemplate)]
+#[template(reflect)]
 pub struct VirtualKeyboard<T: AsRef<str> + Clone + Send + Sync + 'static>(PhantomData<fn() -> T>);
 
 /// Props used to construct the [`VirtualKeyboard`] scene.

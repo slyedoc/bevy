@@ -12,6 +12,8 @@ use crate::{
 };
 use alloc::vec::Vec;
 use bevy_platform::{collections::hash_map::RawEntryMut, hash::Hashed};
+#[cfg(feature = "bevy_reflect")]
+use bevy_reflect::std_traits::ReflectDefault;
 use bevy_utils::PreHashMap;
 use indexmap::Equivalent;
 use variadics_please::all_tuples;
@@ -113,6 +115,15 @@ impl SceneEntityReferences {
         }
     }
 
+    /// Iterates over every [`Entity`] this map resolved or materialized.
+    ///
+    /// This includes entities spawned by [`Self::get`] for forward references that no scene
+    /// entity ever claimed — scene bookkeeping (e.g. hot reload) must account for those too, or
+    /// they leak on every re-application.
+    pub fn iter(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.0.values().copied()
+    }
+
     /// Set the [`Entity`] associated with a [`SceneEntityReference`]
     pub fn set(&mut self, reference: SceneEntityReference, entity: Entity) {
         let inner = reference.0;
@@ -129,24 +140,74 @@ impl SceneEntityReferences {
     }
 }
 
+/// Identifies the "definition scope" that a [`SceneEntityReference`] belongs to. Two references
+/// with different sources are never equal.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum SceneEntityReferenceSource {
+    /// The reference was produced by a macro (such as `bsn!`) expanded at a source location.
+    CallSite {
+        /// The source file of the macro invocation.
+        file: &'static str,
+        /// The line of the macro invocation.
+        line: usize,
+        /// The column of the macro invocation.
+        column: usize,
+    },
+    /// The reference was produced by a scene *asset* (such as a `.bsn` file).
+    ///
+    /// `path_hash` is a deterministic digest of the asset path
+    /// ([`SceneEntityReference::asset_path_hash`]). The path string itself is intentionally not
+    /// stored, so that [`SceneEntityReference`] stays [`Copy`], allocation-free, and small. Two
+    /// distinct asset paths whose digests collide would alias their `#Name` references; at 64 bits
+    /// this is ~1e-10 for six million distinct scene files, and the digest is never persisted.
+    Asset {
+        /// A deterministic digest of the asset path this reference came from.
+        path_hash: u64,
+    },
+}
+
 /// A unique reference for a named entity in a scene.
 /// Usually used by `bevy_scene` in generated code
 ///
 /// Hashed here should allow implementing compile-time hashing in the future
 ///
 /// The uniqueness of this is ensured by the following factors:
-/// - macro invocation location: filename, line and column
-/// - the `name_id` should uniquely identify a name in the individual macros scope
-/// - runtime, per-scope counter for each runtime call (usually from a static `AtomicU64`)
+/// - the [`SceneEntityReferenceSource`]: either a macro invocation location (filename, line and
+///   column) or a digest of the asset path the scene was loaded from
+/// - the `name_id` should uniquely identify a name in the individual macro's scope (for asset
+///   sources it is the stable node id of the named entity inside the document)
+/// - runtime, per-scope counter for each runtime call (usually from a static `AtomicU64`). Asset
+///   sources always use `0`: an asset document is parsed and resolved once and its resolved scene
+///   is shared, so a per-resolve counter would add no distinctness.
+///
+/// # Invariant
+///
+/// A [`SceneEntityReferences`] map must never be shared across two applications of a scene.
+/// `SceneEntityReference`s produced from a scene *asset* (see
+/// [`SceneEntityReference::from_asset`]) are identical for every spawn of that asset, so a shared
+/// map would alias entities across spawns. `ResolvedSceneRoot::apply` and
+/// `ResolvedSceneListRoot::spawn_with` in `bevy_scene` build a fresh map per call; keep it that
+/// way.
+///
+/// # Limitations
+///
+/// If the *same* cached scene is included by two different entities inside one spawn tree, both
+/// copies carry identical `SceneEntityReference` values, so [`SceneEntityReferences::set`]
+/// (first-writer-wins) maps the second occurrence's `#Name` to the first occurrence's entity. This
+/// is already true for macro-defined cached scenes (a scene patch asset is resolved once and its
+/// resolved scene is shared); the asset variant behaves identically.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(feature = "bevy_reflect", derive(bevy_reflect::Reflect))]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    reflect(opaque, Clone, PartialEq, Hash, Debug)
+)]
 pub struct SceneEntityReference(Hashed<InnerSceneEntityReference>);
 
 /// The inner struct actually storing the unique index
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct InnerSceneEntityReference {
-    file: &'static str,
-    line: usize,
-    column: usize,
+    source: SceneEntityReferenceSource,
     name_id: usize,
     runtime: u64,
 }
@@ -157,10 +218,54 @@ impl SceneEntityReference {
         name_id: usize,
         runtime: u64,
     ) -> Self {
+        Self::from_source(
+            SceneEntityReferenceSource::CallSite { file, line, column },
+            name_id,
+            runtime,
+        )
+    }
+
+    /// Create a [`SceneEntityReference`] for a named entity defined in a scene *asset*.
+    ///
+    /// * `asset_path` — the full path of the asset the scene was loaded from. Callers **must**
+    ///   pass the fully-qualified asset path string (including asset source and label, e.g.
+    ///   `"embedded://ui/menu.bsn#footer"`), so that identically-named files in different asset
+    ///   sources stay distinct.
+    /// * `node_id` — an identifier for the node inside that document that is **stable across
+    ///   re-parses of an unchanged file** (e.g. a node index assigned in document order).
+    ///
+    /// The resulting reference is stable for a given `(asset_path, node_id)` pair, and distinct
+    /// from every macro-produced reference.
+    pub fn from_asset(asset_path: &str, node_id: u32) -> Self {
+        Self::from_asset_hashed(Self::asset_path_hash(asset_path), node_id)
+    }
+
+    /// [`SceneEntityReference::from_asset`] for callers that already computed the digest once
+    /// (e.g. once per loaded document rather than once per named entity).
+    pub fn from_asset_hashed(path_hash: u64, node_id: u32) -> Self {
+        Self::from_source(
+            SceneEntityReferenceSource::Asset { path_hash },
+            node_id as usize,
+            0,
+        )
+    }
+
+    /// The digest used by [`SceneEntityReference::from_asset`].
+    ///
+    /// Deterministic within and across processes for a given Bevy build, but an implementation
+    /// detail: never persist it, never compare it across Bevy versions.
+    pub fn asset_path_hash(asset_path: &str) -> u64 {
+        bevy_platform::hash::fixed_hash_one(asset_path)
+    }
+
+    /// The definition scope this reference belongs to.
+    pub fn source(&self) -> SceneEntityReferenceSource {
+        self.0.source
+    }
+
+    fn from_source(source: SceneEntityReferenceSource, name_id: usize, runtime: u64) -> Self {
         Self(Hashed::new(InnerSceneEntityReference {
-            file,
-            line,
-            column,
+            source,
             name_id,
             runtime,
         }))
@@ -169,10 +274,18 @@ impl SceneEntityReference {
 
 impl core::fmt::Display for SceneEntityReference {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_fmt(format_args!(
-            "global={}:{}:{} name_id={} runtime={:?}",
-            self.file, self.line, self.column, self.name_id, self.runtime
-        ))
+        match self.source {
+            SceneEntityReferenceSource::CallSite { file, line, column } => {
+                f.write_fmt(format_args!(
+                    "global={file}:{line}:{column} name_id={} runtime={:?}",
+                    self.name_id, self.runtime
+                ))
+            }
+            SceneEntityReferenceSource::Asset { path_hash } => f.write_fmt(format_args!(
+                "asset=#{path_hash:016x} node_id={}",
+                self.name_id
+            )),
+        }
     }
 }
 
@@ -345,6 +458,42 @@ impl Equivalent<Hashed<InnerSceneEntityReference>> for SceneEntityReference {
 ///     image: Option<Handle<Image>>
 /// }
 /// ```
+/// ## Making the generated template reflectable
+///
+/// By default the generated template type derives nothing, so it is not
+/// [`Reflect`](bevy_reflect::Reflect). Reflection-driven scene formats (e.g. dynamically loaded
+/// `.bsn` assets) need to *construct and patch* the template from data alone, which requires it
+/// to be reflectable. Opt in with the container-level `#[template(reflect)]` attribute:
+///
+/// ```
+/// # use bevy_ecs::prelude::*;
+/// # use bevy_reflect::prelude::*;
+/// #[derive(Component, FromTemplate, Reflect)]
+/// #[reflect(Component, FromTemplate)]
+/// #[template(reflect)]
+/// struct Score {
+///     points: u32,
+/// }
+/// ```
+///
+/// This makes the generated `ScoreTemplate` derive
+/// [`Reflect`](bevy_reflect::Reflect) and register
+/// [`ReflectDefault`] and
+/// [`ReflectTemplate`](crate::reflect::ReflectTemplate) type data (plus the
+/// `ReflectFromReflect` the `Reflect` derive always adds).
+///
+/// Two requirements come with it:
+///
+/// * the deriving type itself must be [`Reflect`](bevy_reflect::Reflect), because
+///   [`ReflectTemplate`](crate::reflect::ReflectTemplate) is only registerable for templates
+///   whose [`Template::Output`] is reflectable;
+/// * **every** field's template type must itself be [`Reflect`](bevy_reflect::Reflect) — for a
+///   field whose template comes from another `#[derive(FromTemplate)]` type, that means the
+///   other type needs `#[template(reflect)]` too.
+///
+/// Pair it with `#[reflect(FromTemplate)]` on the component so that consumers can find the
+/// template type from the component type; see
+/// [`ReflectFromTemplate`](crate::reflect::ReflectFromTemplate).
 pub trait FromTemplate: Sized {
     /// The [`Template`] for this type.
     type Template: Template<Output = Self>;
@@ -419,6 +568,11 @@ pub trait SpecializeFromTemplate: Sized {}
 ///
 /// This is only valid during scene spawning and should **never** be used as a [`Component`](bevy_ecs::prelude::Component) field.
 #[derive(Copy, Clone, Default, Debug)]
+#[cfg_attr(feature = "bevy_reflect", derive(bevy_reflect::Reflect))]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    reflect(Default, Clone, Debug, crate::reflect::Template)
+)]
 pub enum EntityTemplate {
     /// A reference to a specific [`Entity`]
     Entity(Entity),
@@ -438,6 +592,12 @@ impl EntityTemplate {
         runtime: u64,
     ) -> Self {
         Self::SceneEntityReference(SceneEntityReference::new(invocation, name_id, runtime))
+    }
+
+    /// Create an [`EntityTemplate::SceneEntityReference`] pointing at a named entity defined in a
+    /// scene asset. See [`SceneEntityReference::from_asset`].
+    pub fn from_asset_reference(asset_path: &str, node_id: u32) -> Self {
+        Self::SceneEntityReference(SceneEntityReference::from_asset(asset_path, node_id))
     }
 }
 
@@ -519,6 +679,7 @@ impl<T: FromTemplate> BuiltInTemplate for Vec<T> {
 
 /// A [`Template`] for [`Option`].
 #[derive(Default)]
+#[cfg_attr(feature = "bevy_reflect", derive(bevy_reflect::Reflect))]
 pub enum OptionTemplate<T> {
     /// Template of [`Option::Some`].
     Some(T),
@@ -561,6 +722,7 @@ impl<T: Template> Template for OptionTemplate<T> {
 }
 
 /// A [`Template`] for [`Vec`].
+#[cfg_attr(feature = "bevy_reflect", derive(bevy_reflect::Reflect))]
 pub struct VecTemplate<T>(pub Vec<T>);
 
 impl<T> Default for VecTemplate<T> {
@@ -589,6 +751,240 @@ impl<T: Template> Template for VecTemplate<T> {
 mod tests {
     use crate::prelude::*;
     use alloc::string::{String, ToString};
+
+    #[cfg(feature = "bevy_reflect")]
+    mod reflect {
+        use crate::{
+            entity::Entity,
+            prelude::*,
+            reflect::{try_from_reflect_with_fallback, ReflectTemplate},
+            template::{EntityTemplate, OptionTemplate, SceneEntityReference, VecTemplate},
+        };
+        use bevy_reflect::{
+            std_traits::ReflectDefault, structs::DynamicStruct, PartialReflect, Reflect,
+            ReflectFromReflect, ReflectRef, TypeRegistry,
+        };
+        use core::any::TypeId;
+
+        #[derive(FromTemplate, Reflect, PartialEq, Debug)]
+        #[template(reflect)]
+        struct Foo {
+            count: usize,
+            other: usize,
+        }
+
+        /// A `#[derive(FromTemplate)]` without `#[template(reflect)]` still compiles, and its
+        /// template simply is not `Reflect`.
+        #[derive(FromTemplate)]
+        struct NotReflected {
+            #[expect(dead_code, reason = "only used to prove the derive still compiles")]
+            count: usize,
+        }
+
+        #[test]
+        fn template_reflect_attribute_generates_reflect_template() {
+            let mut registry = TypeRegistry::empty();
+            registry.register::<FooTemplate>();
+
+            let data = registry
+                .get_type_data::<ReflectTemplate>(TypeId::of::<FooTemplate>())
+                .unwrap();
+            assert_eq!(data.output_type_id, TypeId::of::<Foo>());
+        }
+
+        #[test]
+        fn generated_template_has_from_reflect() {
+            let mut registry = TypeRegistry::empty();
+            registry.register::<FooTemplate>();
+
+            assert!(registry
+                .get_type_data::<ReflectFromReflect>(TypeId::of::<FooTemplate>())
+                .is_some());
+            assert!(registry
+                .get_type_data::<ReflectDefault>(TypeId::of::<FooTemplate>())
+                .is_some());
+        }
+
+        #[test]
+        fn generated_template_round_trips_through_from_reflect() {
+            let mut registry = TypeRegistry::empty();
+            registry.register::<FooTemplate>();
+
+            let mut patch = DynamicStruct::default();
+            patch.insert("count", 3usize);
+
+            let template =
+                try_from_reflect_with_fallback::<FooTemplate>(&patch, &registry).unwrap();
+            assert_eq!(template.count, 3);
+            assert_eq!(template.other, 0);
+        }
+
+        #[test]
+        fn template_reflect_attribute_is_opt_in() {
+            // Compile-level assertion: `NotReflectedTemplate` exists and is usable without being
+            // `Reflect`.
+            let template = NotReflectedTemplate { count: 7 };
+            assert_eq!(template.count, 7);
+        }
+
+        #[test]
+        fn entity_template_is_reflect() {
+            let mut registry = TypeRegistry::empty();
+            registry.register::<EntityTemplate>();
+
+            assert!(registry
+                .get_type_data::<ReflectDefault>(TypeId::of::<EntityTemplate>())
+                .is_some());
+            let data = registry
+                .get_type_data::<ReflectTemplate>(TypeId::of::<EntityTemplate>())
+                .unwrap();
+            assert_eq!(data.output_type_id, TypeId::of::<Entity>());
+        }
+
+        #[test]
+        fn scene_entity_reference_is_opaque() {
+            let reference = SceneEntityReference::new(("file.rs", 1, 2), 3, 4);
+            assert!(matches!(reference.reflect_ref(), ReflectRef::Opaque(_)));
+            let cloned = reference.reflect_clone().unwrap();
+            assert_eq!(
+                *cloned.downcast::<SceneEntityReference>().unwrap(),
+                reference
+            );
+        }
+
+        #[test]
+        fn option_and_vec_templates_are_reflect() {
+            let mut registry = TypeRegistry::empty();
+            registry.register::<OptionTemplate<u32>>();
+            registry.register::<VecTemplate<u32>>();
+
+            assert!(registry.get(TypeId::of::<OptionTemplate<u32>>()).is_some());
+            assert!(registry.get(TypeId::of::<VecTemplate<u32>>()).is_some());
+            assert!(OptionTemplate::<u32>::None
+                .get_represented_type_info()
+                .is_some());
+            assert!(VecTemplate::<u32>::default()
+                .get_represented_type_info()
+                .is_some());
+        }
+    }
+
+    /// Tests for [`SceneEntityReference`]'s definition-scope identity.
+    mod scene_entity_reference {
+        use crate::{
+            template::{
+                EntityTemplate, SceneEntityReference, SceneEntityReferenceSource,
+                SceneEntityReferences, Template,
+            },
+            world::World,
+        };
+        use alloc::format;
+
+        // 15 — C4
+        #[test]
+        fn asset_scene_entity_reference_is_stable() {
+            let a = SceneEntityReference::from_asset("a.bsn", 3);
+            let b = SceneEntityReference::from_asset("a.bsn", 3);
+            assert_eq!(a, b);
+            assert_eq!(a.hash(), b.hash());
+            assert_eq!(
+                a.source(),
+                SceneEntityReferenceSource::Asset {
+                    path_hash: SceneEntityReference::asset_path_hash("a.bsn")
+                }
+            );
+        }
+
+        // 16 — C4
+        #[test]
+        fn asset_scene_entity_references_differ_by_path_and_node() {
+            assert_ne!(
+                SceneEntityReference::from_asset("a.bsn", 3),
+                SceneEntityReference::from_asset("b.bsn", 3)
+            );
+            assert_ne!(
+                SceneEntityReference::from_asset("a.bsn", 3),
+                SceneEntityReference::from_asset("a.bsn", 4)
+            );
+        }
+
+        // 17 — C4
+        #[test]
+        fn asset_and_call_site_references_never_collide() {
+            assert_ne!(
+                SceneEntityReference::from_asset("x", 0),
+                SceneEntityReference::new(("x", 0, 0), 0, 0)
+            );
+        }
+
+        // 18 — C4
+        #[test]
+        fn scene_entity_references_map_resolves_asset_references() {
+            let mut world = World::new();
+            let mut references = SceneEntityReferences::default();
+
+            let first = references.get(SceneEntityReference::from_asset("a.bsn", 1), &mut world);
+            let first_again =
+                references.get(SceneEntityReference::from_asset("a.bsn", 1), &mut world);
+            let second = references.get(SceneEntityReference::from_asset("a.bsn", 2), &mut world);
+
+            assert_eq!(first, first_again);
+            assert_ne!(first, second);
+            assert!(world.get_entity(first).is_ok());
+            assert!(world.get_entity(second).is_ok());
+        }
+
+        // 19 — C4 invariant: a reference map must never be shared across applies.
+        #[test]
+        fn fresh_reference_map_yields_fresh_entities() {
+            let mut world = World::new();
+            let reference = SceneEntityReference::from_asset("a.bsn", 1);
+
+            let first = SceneEntityReferences::default().get(reference, &mut world);
+            let second = SceneEntityReferences::default().get(reference, &mut world);
+
+            assert_ne!(first, second);
+        }
+
+        // 20 — C4
+        #[test]
+        fn entity_template_from_asset_reference() {
+            let template = EntityTemplate::from_asset_reference("a.bsn", 1);
+            let expected = SceneEntityReference::from_asset("a.bsn", 1);
+
+            let EntityTemplate::SceneEntityReference(reference) = template else {
+                panic!("expected a SceneEntityReference variant, got {template:?}");
+            };
+            assert_eq!(reference, expected);
+
+            let EntityTemplate::SceneEntityReference(cloned) =
+                Template::clone_template(&EntityTemplate::from_asset_reference("a.bsn", 1))
+            else {
+                panic!("expected clone_template to preserve the variant");
+            };
+            assert_eq!(cloned, expected);
+        }
+
+        // 21 — C4 regression: call-site references are unchanged.
+        #[test]
+        fn call_site_scene_entity_reference_unchanged() {
+            let reference = SceneEntityReference::new(("f.rs", 1, 2), 3, 4);
+            assert_eq!(reference, SceneEntityReference::new(("f.rs", 1, 2), 3, 4));
+            assert_ne!(reference, SceneEntityReference::new(("f.rs", 1, 2), 3, 5));
+            assert_eq!(
+                reference.source(),
+                SceneEntityReferenceSource::CallSite {
+                    file: "f.rs",
+                    line: 1,
+                    column: 2
+                }
+            );
+            assert!(format!("{reference}").starts_with("global=f.rs:1:2"));
+            assert!(
+                format!("{}", SceneEntityReference::from_asset("a.bsn", 1)).starts_with("asset=#")
+            );
+        }
+    }
 
     #[test]
     fn option_template() {

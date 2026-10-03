@@ -112,7 +112,8 @@ impl LightProbe {
 ///
 /// [split-sum]: https://learnopengl.com/PBR/IBL/Specular-IBL
 #[derive(Clone, Component, Reflect, FromTemplate)]
-#[reflect(Component, Default, Clone)]
+#[reflect(Component, Default, Clone, FromTemplate)]
+#[template(reflect)]
 pub struct EnvironmentMapLight {
     /// The blurry image that represents diffuse radiance surrounding a region.
     pub diffuse_map: Handle<Image>,
@@ -240,7 +241,8 @@ impl Default for EnvironmentMapLight {
 ///
 /// See also <https://en.wikipedia.org/wiki/Skybox_(video_games)>.
 #[derive(Component, Clone, Reflect, FromTemplate)]
-#[reflect(Component, Default, Clone)]
+#[reflect(Component, Default, Clone, FromTemplate)]
+#[template(reflect)]
 pub struct Skybox {
     /// The cubemap to use.
     ///
@@ -274,7 +276,8 @@ impl Default for Skybox {
 ///
 /// See `bevy_pbr::light_probe::generate` for detailed information.
 #[derive(Clone, Component, Reflect, FromTemplate)]
-#[reflect(Component, Default, Clone)]
+#[reflect(Component, Default, Clone, FromTemplate)]
+#[template(reflect)]
 pub struct GeneratedEnvironmentMapLight {
     /// Source cubemap to be filtered on the GPU, size must be a power of two.
     pub environment_map: Handle<Image>,
@@ -348,8 +351,9 @@ impl Default for AtmosphereEnvironmentMapLight {
 /// This component requires the [`LightProbe`] component, and is typically used with
 /// [`bevy_transform::components::Transform`] to place the volume appropriately.
 #[derive(Clone, Reflect, Component, Debug, FromTemplate)]
-#[reflect(Component, Default, Debug, Clone)]
+#[reflect(Component, Default, Debug, Clone, FromTemplate)]
 #[require(LightProbe)]
+#[template(reflect)]
 pub struct IrradianceVolume {
     /// The 3D texture that represents the ambient cubes, encoded in the format
     /// described in `bevy_pbr::light_probe::irradiance_volume`.

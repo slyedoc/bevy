@@ -1,0 +1,31 @@
+[package]
+name = "bevy_bsn"
+version = "0.20.0-dev"
+edition = "2024"
+description = "Parser, AST and printer for BSN (Bevy Scene Notation) scene description files"
+homepage = "https://bevy.org"
+repository = "https://github.com/bevyengine/bevy"
+license = "MIT OR Apache-2.0"
+keywords = ["bevy", "bsn", "scene", "parser", "no_std"]
+categories = ["parser-implementations", "game-development", "no-std"]
+rust-version = "1.85.0"
+
+[features]
+default = ["std"]
+## Allows access to the `std` crate. Disabling this keeps the crate `no_std` (the `alloc`
+## crate is always required — the AST owns `String`s and `Vec`s).
+std = ["thiserror/std"]
+
+[dependencies]
+thiserror = { version = "2", default-features = false }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args = [
+  "-Zunstable-options",
+  "--generate-link-to-definition",
+  "--generate-macro-expansion",
+]
+all-features = true

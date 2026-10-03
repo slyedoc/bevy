@@ -158,8 +158,9 @@ impl PointLight {
 /// A texture mask is applied to the light source to modulate its intensity,  
 /// simulating patterns like window shadows, gobo/cookie effects, or soft falloffs.
 #[derive(Clone, Component, Debug, Reflect, FromTemplate)]
-#[reflect(Component, Debug)]
+#[reflect(Component, Debug, FromTemplate)]
 #[require(PointLight)]
+#[template(reflect)]
 pub struct PointLightTexture {
     /// The texture image. Only the R channel is read.
     pub image: Handle<Image>,

@@ -10,7 +10,7 @@ use bevy_ecs::{
     lifecycle::RemovedComponents,
     observer::On,
     query::{Added, Changed, Has, Or, With},
-    reflect::{ReflectComponent, ReflectEvent},
+    reflect::{ReflectComponent, ReflectEvent, ReflectFromTemplate},
     schedule::IntoScheduleConfigs,
     system::{Commands, ParamSet, Query, Res, ResMut},
     template::FromTemplate,
@@ -58,7 +58,8 @@ pub struct TreeView {
 /// The selected [`TreeItem`] within a [`TreeView`]. The referenced entity must be an enabled row
 /// of that tree; missing, stale, disabled, and unrelated entities count as no selection.
 #[derive(Component, FromTemplate, Debug, Default, PartialEq, Eq, Reflect)]
-#[reflect(Component, Default, PartialEq)]
+#[reflect(Component, Default, PartialEq, FromTemplate)]
+#[template(reflect)]
 pub struct SelectedTreeItem(#[template(built_in)] pub Option<Entity>);
 
 /// A headless tree row. Rows are focusable through a roving [`TabIndex`], and derive [`Selected`]

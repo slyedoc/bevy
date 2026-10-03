@@ -5,7 +5,11 @@ pub use bevy_gizmos_macros::GizmoConfigGroup;
 
 use {crate::GizmoAsset, bevy_asset::Handle, bevy_ecs::component::Component};
 
-use bevy_ecs::{reflect::ReflectResource, resource::Resource, template::FromTemplate};
+use bevy_ecs::{
+    reflect::{ReflectComponent, ReflectFromTemplate, ReflectResource},
+    resource::Resource,
+    template::FromTemplate,
+};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect, TypePath};
 use bevy_utils::TypeIdHashMap;
 use core::{
@@ -283,7 +287,9 @@ impl Default for GizmoLineConfig {
 }
 
 /// Configuration for gizmo meshes.
-#[derive(Component, FromTemplate)]
+#[derive(Component, FromTemplate, Reflect)]
+#[reflect(Component, FromTemplate)]
+#[template(reflect)]
 pub struct GizmoMeshConfig {
     /// Apply perspective to gizmo lines.
     ///

@@ -8,7 +8,7 @@ use bevy_ecs::{
     entity::Entity,
     lifecycle::HookContext,
     query::Changed,
-    reflect::{ReflectComponent, ReflectResource},
+    reflect::{ReflectComponent, ReflectFromTemplate, ReflectResource},
     resource::Resource,
     system::{Query, ResMut},
     template::FromTemplate,
@@ -51,8 +51,9 @@ pub struct TilemapChunkMeshCache(HashMap<UVec2, Handle<Mesh>>);
 /// A component representing a chunk of a tilemap.
 /// Each chunk is a rectangular section of tiles that is rendered as a single mesh.
 #[derive(Component, Clone, Debug, Default, Reflect, FromTemplate)]
-#[reflect(Component, Clone, Debug, Default)]
+#[reflect(Component, Clone, Debug, Default, FromTemplate)]
 #[component(immutable, on_insert = on_insert_tilemap_chunk)]
+#[template(reflect)]
 pub struct TilemapChunk {
     /// The size of the chunk in tiles.
     pub chunk_size: UVec2,

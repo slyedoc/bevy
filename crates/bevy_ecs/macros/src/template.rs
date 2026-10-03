@@ -9,6 +9,7 @@ use syn::{
 const TEMPLATE_DEFAULT_ATTRIBUTE: &str = "default";
 const TEMPLATE_ATTRIBUTE: &str = "template";
 const BUILT_IN_ATTRIBUTE: &str = "built_in";
+const TEMPLATE_REFLECT_ATTRIBUTE: &str = "reflect";
 
 pub(crate) fn derive_from_template(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
@@ -20,6 +21,30 @@ pub(crate) fn derive_from_template(input: TokenStream) -> TokenStream {
     let template_ident = format_ident!("{type_ident}Template");
 
     let type_visibility = &ast.vis;
+
+    let derive_reflect = match parse_container_attributes(&ast) {
+        Ok(derive_reflect) => derive_reflect,
+        Err(err) => return err.into_compile_error().into(),
+    };
+
+    // When `#[template(reflect)]` is present, the generated template type derives `Reflect` and
+    // registers `ReflectDefault` + `ReflectTemplate`, which is what reflection-driven scene
+    // formats (e.g. dynamically loaded `.bsn` assets) need in order to build the template from
+    // data alone. Note that `from_reflect = false` is deliberately never emitted: the generated
+    // template must keep its auto-derived `FromReflect` (and therefore its `ReflectFromReflect`
+    // registration).
+    let template_reflect_attributes = if derive_reflect {
+        let bevy_reflect = BevyManifest::shared(|manifest| manifest.get_path("bevy_reflect"));
+        quote! {
+            #[derive(#bevy_reflect::Reflect)]
+            #[reflect(
+                #bevy_reflect::std_traits::ReflectDefault,
+                #bevy_ecs::reflect::Template
+            )]
+        }
+    } else {
+        quote! {}
+    };
 
     let template = match &ast.data {
         Data::Struct(data_struct) => {
@@ -38,6 +63,7 @@ pub(crate) fn derive_from_template(input: TokenStream) -> TokenStream {
                 Fields::Named(_) => {
                     quote! {
                         #[allow(missing_docs)]
+                        #template_reflect_attributes
                         #type_visibility struct #template_ident #impl_generics #where_clause {
                             #(#template_fields,)*
                         }
@@ -69,6 +95,7 @@ pub(crate) fn derive_from_template(input: TokenStream) -> TokenStream {
                 Fields::Unnamed(_) => {
                     quote! {
                         #[allow(missing_docs)]
+                        #template_reflect_attributes
                         #type_visibility struct #template_ident #impl_generics (
                             #(#template_fields,)*
                         )  #where_clause;
@@ -100,6 +127,7 @@ pub(crate) fn derive_from_template(input: TokenStream) -> TokenStream {
                 Fields::Unit => {
                     quote! {
                         #[allow(missing_docs)]
+                        #template_reflect_attributes
                         #type_visibility struct #template_ident;
 
                         impl #impl_generics #bevy_ecs::template::Template for #template_ident #type_generics #where_clause {
@@ -246,6 +274,7 @@ pub(crate) fn derive_from_template(input: TokenStream) -> TokenStream {
 
             quote! {
                 #[allow(missing_docs)]
+                #template_reflect_attributes
                 #type_visibility enum #template_ident #type_generics #where_clause {
                     #(#variant_definitions,)*
                 }
@@ -293,6 +322,32 @@ pub(crate) fn derive_from_template(input: TokenStream) -> TokenStream {
 
         #template
     })
+}
+
+/// Parses container-level `#[template(...)]` attributes.
+///
+/// The only currently supported content is the bare ident `reflect`, which opts the generated
+/// template type into `#[derive(Reflect)]` + `#[reflect(Default, Template)]`.
+fn parse_container_attributes(ast: &DeriveInput) -> Result<bool> {
+    let mut derive_reflect = false;
+    for attr in &ast.attrs {
+        if !attr.path().is_ident(TEMPLATE_ATTRIBUTE) {
+            continue;
+        }
+        attr.parse_args_with(|stream: ParseStream| {
+            let ident = stream.parse::<Ident>()?;
+            if ident == TEMPLATE_REFLECT_ATTRIBUTE {
+                derive_reflect = true;
+                Ok(())
+            } else {
+                Err(syn::Error::new(
+                    ident.span(),
+                    "Expected `reflect`, the only supported container-level `template` attribute",
+                ))
+            }
+        })?;
+    }
+    Ok(derive_reflect)
 }
 
 struct StructImpl {

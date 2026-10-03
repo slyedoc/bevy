@@ -246,7 +246,8 @@ pub struct DefaultSpatialScale(pub SpatialScale);
 /// Playback can be configured using the [`PlaybackSettings`] component. Note that changes to the
 /// [`PlaybackSettings`] component will *not* affect already-playing audio.
 #[derive(Component, Reflect, FromTemplate)]
-#[reflect(Component, Clone)]
+#[reflect(Component, Clone, FromTemplate)]
+#[template(reflect)]
 #[require(PlaybackSettings)]
 pub struct AudioPlayer<Source = AudioSource>(pub Handle<Source>)
 where
@@ -269,5 +270,36 @@ impl AudioPlayer<AudioSource> {
     /// tuple struct syntax.
     pub fn new(source: Handle<AudioSource>) -> Self {
         Self(source)
+    }
+}
+
+#[cfg(test)]
+mod template_reflect_tests {
+    use super::*;
+    use bevy_ecs::reflect::{ReflectFromTemplate, ReflectTemplate};
+    use bevy_reflect::{std_traits::ReflectDefault, TypeRegistry};
+    use core::any::TypeId;
+
+    /// Walks the exact lookup chain a reflection-driven scene format performs: component type →
+    /// [`ReflectFromTemplate`] → template registration → [`ReflectTemplate`] + `ReflectDefault`.
+    fn assert_template_chain<C: bevy_reflect::GetTypeRegistration + 'static>(
+        registry: &TypeRegistry,
+    ) {
+        let from_template = registry
+            .get_type_data::<ReflectFromTemplate>(TypeId::of::<C>())
+            .expect("component should carry `ReflectFromTemplate`");
+        let template = registry
+            .get(from_template.template_type_id)
+            .unwrap_or_else(|| panic!("`{}` is not registered", from_template.template_type_path));
+        assert!(template.data::<ReflectTemplate>().is_some());
+        assert!(template.data::<ReflectDefault>().is_some());
+    }
+
+    #[test]
+    fn template_type_registered_for_seed_set() {
+        let mut registry = TypeRegistry::empty();
+        registry.register::<AudioPlayer<AudioSource>>();
+        registry.register::<AudioPlayerTemplate<AudioSource>>();
+        assert_template_chain::<AudioPlayer<AudioSource>>(&registry);
     }
 }

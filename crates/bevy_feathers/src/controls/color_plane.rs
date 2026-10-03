@@ -8,9 +8,10 @@ use bevy_ecs::{
     hierarchy::{ChildOf, Children},
     observer::On,
     query::{Has, With},
-    reflect::ReflectComponent,
+    reflect::{ReflectComponent, ReflectFromTemplate},
     schedule::IntoScheduleConfigs,
     system::{Commands, Query, Res, ResMut},
+    template::FromTemplate,
 };
 use bevy_math::{Vec2, Vec3};
 use bevy_picking::{
@@ -58,9 +59,12 @@ const COLOR_PLANE_THUMB_SIZE: f32 = 10.0;
 ///
 /// **Note:** For information on how widget state is managed
 /// and how to respond to state changes, see the [`bevy_ui_widgets` documentation](bevy_ui_widgets).
-#[derive(SceneComponent, Debug, Reflect, Copy, PartialEq, Eq, Hash, Default, Clone)]
-#[reflect(Component)]
+#[derive(
+    SceneComponent, FromTemplate, Debug, Reflect, Copy, PartialEq, Eq, Hash, Default, Clone,
+)]
+#[reflect(Component, FromTemplate)]
 #[require(ColorPlaneDragState)]
+#[template(reflect)]
 pub enum FeathersColorPlane {
     /// Show red on the horizontal axis and green on the vertical.
     RedGreen,

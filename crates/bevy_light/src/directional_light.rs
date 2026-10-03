@@ -171,8 +171,9 @@ impl DirectionalLight {
 /// A texture mask is applied to the light source to modulate its intensity,  
 /// simulating patterns like window shadows, gobo/cookie effects, or soft falloffs.
 #[derive(Clone, Component, Debug, Reflect, FromTemplate)]
-#[reflect(Component, Debug)]
+#[reflect(Component, Debug, FromTemplate)]
 #[require(DirectionalLight)]
+#[template(reflect)]
 pub struct DirectionalLightTexture {
     /// The texture image. Only the R channel is read.
     pub image: Handle<Image>,

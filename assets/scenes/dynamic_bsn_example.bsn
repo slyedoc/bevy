@@ -1,0 +1,61 @@
+// The root scene of the `dynamic_bsn` example.
+//
+// Loaded with `asset_server.load::<ScenePatch>("scenes/dynamic_bsn_example.bsn")` and spawned by
+// putting the resulting handle in a `ScenePatchInstance`.
+//
+// Run the example with `--features file_watcher` and edit any value below while it is running:
+// the change is picked up and the spawned scene is rebuilt in place.
+//
+// `#Root` names this entity. A `#Name` becomes a `Name` component, which is how Rust code (and
+// this example's CI verification system) finds a particular entity inside a spawned scene.
+#Root
+Node {
+    width: Val::Percent(100.0),
+    height: Val::Percent(100.0),
+    flex_direction: FlexDirection::Column,
+    align_items: AlignItems::Center,
+    justify_content: JustifyContent::Center,
+    row_gap: Val::Px(16.0),
+}
+Children [
+    (
+        #Logo
+        // A string in a `Handle` field becomes an asset dependency: this scene is not spawned
+        // until the image has loaded too.
+        ImageNode { image: "branding/bevy_logo_dark.png" }
+        Node { width: Val::Px(320.0) }
+    ),
+    (
+        #Title
+        Text("Loaded from dynamic_bsn_example.bsn")
+        // Enum values are written variant-first, exactly as in Rust.
+        TextFont { font_size: FontSize::Px(28.0) }
+        TextColor(Color::Srgba(Srgba {
+            red: 0.95,
+            green: 0.95,
+            blue: 0.95,
+            alpha: 1.0,
+        }))
+    ),
+    (
+        // One `.bsn` file inheriting another, with the same `:"path"` syntax the `bsn!` macro
+        // uses. The include has to come first, before `#Confirm`.
+        :"scenes/dynamic_bsn_button.bsn"
+        #Confirm
+        Node {
+            // Patching an enum field is match-or-reset: naming a *different* variant replaces the
+            // whole value, so the base's `Val::Px(180.0)` payload is discarded rather than merged
+            // into. `height` is not mentioned at all, so it keeps the base's `Val::Px(56.0)`.
+            width: Val::Percent(30.0),
+        }
+        BackgroundColor(Color::Srgba(Srgba {
+            red: 0.1,
+            green: 0.3,
+            blue: 0.55,
+            alpha: 1.0,
+        }))
+        Children [
+            (#Label Text("Confirm"))
+        ]
+    ),
+]

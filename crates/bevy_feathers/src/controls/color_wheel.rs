@@ -11,7 +11,7 @@ use bevy_ecs::{
     hierarchy::{ChildOf, Children},
     observer::On,
     query::{Has, With},
-    reflect::ReflectComponent,
+    reflect::{ReflectComponent, ReflectFromTemplate},
     schedule::IntoScheduleConfigs,
     system::{Commands, Query, Res, ResMut},
     template::FromTemplate,
@@ -65,7 +65,8 @@ const THUMB_SIZE: f32 = 10.0;
 #[derive(
     SceneComponent, FromTemplate, Debug, Reflect, Copy, PartialEq, Eq, Hash, Default, Clone,
 )]
-#[reflect(Component)]
+#[reflect(Component, FromTemplate)]
+#[template(reflect)]
 #[require(ColorWheelDragState)]
 pub struct FeathersColorWheel;
 

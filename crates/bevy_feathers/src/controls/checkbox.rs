@@ -6,7 +6,7 @@ use bevy_ecs::{
     hierarchy::Children,
     lifecycle::RemovedComponents,
     query::{Added, Changed, Has, Or, With},
-    reflect::ReflectComponent,
+    reflect::{ReflectComponent, ReflectFromTemplate},
     schedule::IntoScheduleConfigs,
     system::{Commands, Query},
     template::FromTemplate,
@@ -44,7 +44,8 @@ use crate::{
 #[derive(SceneComponent, FromTemplate)]
 #[scene(FeathersCheckboxProps)]
 #[derive(Reflect)]
-#[reflect(Component)]
+#[reflect(Component, FromTemplate)]
+#[template(reflect)]
 pub struct FeathersCheckbox;
 
 /// Props used to construct a [`FeathersCheckbox`] scene.

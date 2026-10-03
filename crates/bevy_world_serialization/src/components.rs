@@ -1,6 +1,9 @@
 use bevy_asset::{AsAssetId, AssetId, Handle};
 use bevy_derive::{Deref, DerefMut};
-use bevy_ecs::{component::Component, prelude::ReflectComponent, template::FromTemplate};
+use bevy_ecs::{
+    component::Component, prelude::ReflectComponent, reflect::ReflectFromTemplate,
+    template::FromTemplate,
+};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_transform::components::Transform;
 use derive_more::derive::From;
@@ -17,9 +20,10 @@ use crate::{DynamicWorld, WorldAsset};
 #[derive(
     Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From,
 )]
-#[reflect(Component, Default, Debug, PartialEq, Clone)]
+#[reflect(Component, Default, Debug, PartialEq, Clone, FromTemplate)]
 #[require(Transform)]
 #[require(Visibility)]
+#[template(reflect)]
 pub struct WorldAssetRoot(pub Handle<WorldAsset>);
 
 impl AsAssetId for WorldAssetRoot {
@@ -35,9 +39,10 @@ impl AsAssetId for WorldAssetRoot {
 #[derive(
     Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From,
 )]
-#[reflect(Component, Default, Debug, PartialEq, Clone)]
+#[reflect(Component, Default, Debug, PartialEq, Clone, FromTemplate)]
 #[require(Transform)]
 #[require(Visibility)]
+#[template(reflect)]
 pub struct DynamicWorldRoot(pub Handle<DynamicWorld>);
 
 impl AsAssetId for DynamicWorldRoot {

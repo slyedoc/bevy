@@ -1,0 +1,28 @@
+// A reusable button, meant to be included and then completed by whoever uses it.
+//
+// Included from Rust with `bsn! { :"scenes/dynamic_bsn_button.bsn" }`, and from another `.bsn`
+// file with `:"scenes/dynamic_bsn_button.bsn"`. Include paths are relative to the asset root,
+// never to the file that names them, and the include must be the first thing in an entity —
+// before its `#Name`, its components and its relations.
+//
+// Type paths may be written in full (`bevy_ui::ui_node::Node`) or, when the short name is
+// unambiguous in the type registry, short (`Node`). This file uses the short form.
+//
+// Note the deliberate absence of a `Children` block: children coming from a base and children
+// coming from the file that includes it are *appended*, not merged pairwise, so a label written
+// here would end up next to the includer's label rather than being replaced by it. A base that
+// expects to be completed leaves the slot empty.
+Node {
+    width: Val::Px(180.0),
+    height: Val::Px(56.0),
+    justify_content: JustifyContent::Center,
+    align_items: AlignItems::Center,
+}
+// `.bsn` has no access to Rust items, so there are no constants (`Color::WHITE`) and no
+// constructor calls (`Color::srgb(...)`): colors are written out as struct literals.
+BackgroundColor(Color::Srgba(Srgba {
+    red: 0.15,
+    green: 0.15,
+    blue: 0.15,
+    alpha: 1.0,
+}))

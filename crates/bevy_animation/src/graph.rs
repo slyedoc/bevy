@@ -14,7 +14,7 @@ use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     component::Component,
     message::MessageReader,
-    reflect::ReflectComponent,
+    reflect::{ReflectComponent, ReflectFromTemplate},
     resource::Resource,
     system::{Local, Res, ResMut},
     template::FromTemplate,
@@ -135,7 +135,8 @@ pub struct AnimationGraph {
 #[derive(
     Component, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From, FromTemplate,
 )]
-#[reflect(Component, Default, Clone)]
+#[reflect(Component, Default, Clone, FromTemplate)]
+#[template(reflect)]
 pub struct AnimationGraphHandle(pub Handle<AnimationGraph>);
 
 impl From<AnimationGraphHandle> for AssetId<AnimationGraph> {

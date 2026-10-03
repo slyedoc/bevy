@@ -15,6 +15,7 @@ use bevy_reflect::{std_traits::ReflectDefault, Reflect};
     derive(Reflect),
     reflect(Debug, Default, Hash, PartialEq, Clone)
 )]
+#[cfg_attr(feature = "bevy_reflect", template(reflect))]
 pub struct CustomCursorImage {
     /// Handle to the image to use as the cursor. The image must be in 8 bit int
     /// or 32 bit float rgba. PNG images work well for this.
@@ -71,6 +72,7 @@ pub struct CustomCursorUrl {
     derive(Reflect),
     reflect(Clone, PartialEq, Hash)
 )]
+#[cfg_attr(feature = "bevy_reflect", template(reflect))]
 pub enum CustomCursor {
     #[default]
     /// Use an image as the cursor.

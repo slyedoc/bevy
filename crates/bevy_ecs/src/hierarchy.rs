@@ -147,7 +147,10 @@ impl FromWorld for ChildOf {
 #[derive(Component, Default, Debug, PartialEq, Eq)]
 #[relationship_target(relationship = ChildOf, linked_spawn)]
 #[cfg_attr(feature = "bevy_reflect", derive(bevy_reflect::Reflect))]
-#[cfg_attr(feature = "bevy_reflect", reflect(Component, FromWorld, Default))]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    reflect(Component, FromWorld, Default, crate::reflect::RelationshipTarget)
+)]
 #[doc(alias = "IsParent")]
 pub struct Children(Vec<Entity>);
 

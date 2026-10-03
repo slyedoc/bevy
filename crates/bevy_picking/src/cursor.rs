@@ -7,7 +7,7 @@ use bevy_ecs::{
     entity::Entity,
     hierarchy::ChildOf,
     query::{With, Without},
-    reflect::{ReflectComponent, ReflectResource},
+    reflect::{ReflectComponent, ReflectFromTemplate, ReflectResource},
     resource::Resource,
     schedule::IntoScheduleConfigs,
     system::{Commands, Query, Res},
@@ -30,7 +30,8 @@ pub struct DefaultCursor(pub EntityCursor);
 /// This is effectively the same type as [`CustomCursor`] but with different methods, and used
 /// in different places.
 #[derive(Component, Debug, Clone, Reflect, PartialEq, Eq, FromTemplate)]
-#[reflect(Component, Debug, Default, PartialEq, Clone)]
+#[reflect(Component, Debug, Default, PartialEq, Clone, FromTemplate)]
+#[template(reflect)]
 pub enum EntityCursor {
     #[cfg(feature = "custom_cursor")]
     /// Custom cursor image.

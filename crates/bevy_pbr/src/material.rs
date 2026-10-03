@@ -446,6 +446,9 @@ where
     fn build(&self, app: &mut App) {
         app.init_asset::<M>()
             .register_type::<MeshMaterial3d<M>>()
+            // Generic types are never auto-registered for reflection, so the generated template
+            // needs an explicit registration for reflection-driven scene formats to find it.
+            .register_type::<MeshMaterial3dTemplate<M>>()
             .init_resource::<EntitiesNeedingSpecialization<M>>()
             .add_plugins((ErasedRenderAssetPlugin::<MeshMaterial3d<M>>::default(),))
             .add_systems(

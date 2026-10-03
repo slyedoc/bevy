@@ -11,6 +11,7 @@ use bevy_ecs::{
     system::IntoObserverSystem,
     template::{FnTemplate, FromTemplate, SceneEntityReference, Template, TemplateContext},
 };
+use bevy_reflect::{ApplyError, TypeRegistry};
 use core::{any::TypeId, marker::PhantomData};
 use thiserror::Error;
 use variadics_please::all_tuples;
@@ -165,17 +166,25 @@ pub enum ResolveSceneError {
     /// Caused when a [`Scene`]/[`SceneList`] is not present on the scene asset.
     #[error("The Scene/SceneList is not present on the scene asset. This is likely because the scene has already been resolved, which consumed the source scene")]
     MissingScene,
-    /// Caused when a [`Scene`] describes a relationship that the resolver does not support
-    /// (currently only [`ChildOf`](bevy_ecs::hierarchy::ChildOf) relationships are supported by the BSN asset loader).
-    #[error("Unsupported relationship in scene")]
-    UnsupportedRelationship,
-    /// Caused when a [`Scene`] references a type that is not present in the [`AppTypeRegistry`](bevy_ecs::reflect::AppTypeRegistry)
-    /// or does not implement the reflection traits required to resolve it.
-    #[error("Type is not reflectable / registered")]
-    TypeNotReflectable,
-    /// Caused when a [`Scene`] references a type that does not register [`ReflectDefault`](bevy_reflect::std_traits::ReflectDefault).
-    #[error("Type does not register `ReflectDefault`")]
-    TypeDoesntReflectDefault,
+    /// Caused when reflectively applying patched fields onto a template value fails.
+    #[error("Failed to apply a scene patch to `{type_path}`: {error}")]
+    ApplyFailed {
+        /// The template type path being patched.
+        type_path: String,
+        /// The underlying reflection error.
+        #[source]
+        error: ApplyError,
+    },
+    /// Caused when a runtime-defined patch targets a template that already exists in the
+    /// [`ResolvedScene`] but cannot be viewed reflectively (see
+    /// [`erased_template_as_partial_reflect_mut`]).
+    ///
+    /// [`erased_template_as_partial_reflect_mut`]: crate::erased_template_as_partial_reflect_mut
+    #[error("The template `{type_path}` already present in this scene cannot be patched reflectively. Its template type must derive `Reflect` and be registered.")]
+    UnpatchableTemplate {
+        /// The template type path that could not be patched.
+        type_path: String,
+    },
 }
 
 /// Context used by [`Scene`] implementations during [`Scene::resolve`].
@@ -186,6 +195,28 @@ pub struct ResolveContext<'a> {
     pub patches: &'a Assets<ScenePatch>,
     /// The currently cached [`ScenePatch`], if there is one.
     pub cached: Option<&'a ScenePatch>,
+    /// The app's [`TypeRegistry`], if one was available where this scene's resolution was started.
+    ///
+    /// This is `Some` for every resolve driven by a [`World`] that has an [`AppTypeRegistry`]
+    /// resource — which is all of Bevy's own entry points ([`World::spawn_scene`],
+    /// [`World::spawn_scene_list`], [`EntityWorldMut::apply_scene`], and the
+    /// [`resolve_scene_patches`] system). It is `None` only when a caller drives
+    /// [`ResolvedSceneRoot::resolve`] by hand without a registry.
+    ///
+    /// Reflection-driven [`Scene`] implementations require it; statically-typed ones ignore it.
+    ///
+    /// A read lock on the app's registry is held for the whole of [`Scene::resolve`]. A [`Scene`]
+    /// implementation must therefore never take a **write** lock on the same registry during
+    /// resolution — that would deadlock.
+    ///
+    /// [`AppTypeRegistry`]: bevy_ecs::reflect::AppTypeRegistry
+    /// [`World`]: bevy_ecs::world::World
+    /// [`World::spawn_scene`]: crate::WorldSceneExt::spawn_scene
+    /// [`World::spawn_scene_list`]: crate::WorldSceneExt::spawn_scene_list
+    /// [`EntityWorldMut::apply_scene`]: crate::EntityWorldMutSceneExt::apply_scene
+    /// [`resolve_scene_patches`]: crate::resolve_scene_patches
+    /// [`ResolvedSceneRoot::resolve`]: crate::ResolvedSceneRoot::resolve
+    pub type_registry: Option<&'a TypeRegistry>,
 }
 
 macro_rules! scene_impl {

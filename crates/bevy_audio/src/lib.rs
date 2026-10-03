@@ -101,6 +101,14 @@ impl Plugin for AudioPlugin {
         }
 
         app.add_audio_source::<Pitch>();
+
+        // Generic types are never auto-registered for reflection, so the player components for
+        // the built-in source types and their generated templates need explicit registrations
+        // for reflection-driven scene formats to find them.
+        app.register_type::<AudioPlayer<AudioSource>>()
+            .register_type::<AudioPlayerTemplate<AudioSource>>()
+            .register_type::<AudioPlayer<Pitch>>()
+            .register_type::<AudioPlayerTemplate<Pitch>>();
     }
 }
 

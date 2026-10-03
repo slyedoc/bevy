@@ -13,7 +13,8 @@ use taffy::{MaybeMath, ResolveOrZero};
 
 /// A UI Node that renders an image.
 #[derive(Component, Clone, Debug, Reflect, FromTemplate)]
-#[reflect(Component, Default, Debug, Clone)]
+#[reflect(Component, Default, Debug, Clone, FromTemplate)]
+#[template(reflect)]
 #[require(Node, ImageNodeSize)]
 pub struct ImageNode {
     /// The tint color used to draw the image.
@@ -416,5 +417,36 @@ pub fn update_image_content_size_system(
                 }));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod template_reflect_tests {
+    use super::*;
+    use bevy_ecs::reflect::{ReflectFromTemplate, ReflectTemplate};
+    use bevy_reflect::{std_traits::ReflectDefault, TypeRegistry};
+    use core::any::TypeId;
+
+    /// Walks the exact lookup chain a reflection-driven scene format performs: component type →
+    /// [`ReflectFromTemplate`] → template registration → [`ReflectTemplate`] + `ReflectDefault`.
+    fn assert_template_chain<C: bevy_reflect::GetTypeRegistration + 'static>(
+        registry: &TypeRegistry,
+    ) {
+        let from_template = registry
+            .get_type_data::<ReflectFromTemplate>(TypeId::of::<C>())
+            .expect("component should carry `ReflectFromTemplate`");
+        let template = registry
+            .get(from_template.template_type_id)
+            .unwrap_or_else(|| panic!("`{}` is not registered", from_template.template_type_path));
+        assert!(template.data::<ReflectTemplate>().is_some());
+        assert!(template.data::<ReflectDefault>().is_some());
+    }
+
+    #[test]
+    fn template_type_registered_for_seed_set() {
+        let mut registry = TypeRegistry::empty();
+        registry.register::<ImageNode>();
+        registry.register::<ImageNodeTemplate>();
+        assert_template_chain::<ImageNode>(&registry);
     }
 }

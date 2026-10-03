@@ -2,8 +2,12 @@ use crate::mesh::Mesh;
 use bevy_asset::{AsAssetId, AssetEvent, AssetId, Handle};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
-    change_detection::DetectChangesMut, component::Component, message::MessageReader,
-    reflect::ReflectComponent, system::Query, template::FromTemplate,
+    change_detection::DetectChangesMut,
+    component::Component,
+    message::MessageReader,
+    reflect::{ReflectComponent, ReflectFromTemplate},
+    system::Query,
+    template::FromTemplate,
 };
 use bevy_platform::{collections::HashSet, hash::FixedHasher};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
@@ -41,7 +45,8 @@ use derive_more::derive::From;
 #[derive(
     Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From,
 )]
-#[reflect(Component, Default, Clone, PartialEq)]
+#[reflect(Component, Default, Clone, PartialEq, FromTemplate)]
+#[template(reflect)]
 #[require(Transform)]
 pub struct Mesh2d(pub Handle<Mesh>);
 
@@ -98,7 +103,8 @@ impl AsAssetId for Mesh2d {
 #[derive(
     Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From,
 )]
-#[reflect(Component, Default, Clone, PartialEq)]
+#[reflect(Component, Default, Clone, PartialEq, FromTemplate)]
+#[template(reflect)]
 #[require(Transform)]
 pub struct Mesh3d(pub Handle<Mesh>);
 
@@ -290,5 +296,39 @@ impl MeshTag {
     #[cfg(not(debug_assertions))]
     pub fn type_id_is(&self, _: TypeId) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod template_reflect_tests {
+    use super::*;
+    use bevy_ecs::reflect::{ReflectFromTemplate, ReflectTemplate};
+    use bevy_reflect::{std_traits::ReflectDefault, TypeRegistry};
+    use core::any::TypeId;
+
+    /// Walks the exact lookup chain a reflection-driven scene format performs: component type →
+    /// [`ReflectFromTemplate`] → template registration → [`ReflectTemplate`] + `ReflectDefault`.
+    fn assert_template_chain<C: bevy_reflect::GetTypeRegistration + 'static>(
+        registry: &TypeRegistry,
+    ) {
+        let from_template = registry
+            .get_type_data::<ReflectFromTemplate>(TypeId::of::<C>())
+            .expect("component should carry `ReflectFromTemplate`");
+        let template = registry
+            .get(from_template.template_type_id)
+            .unwrap_or_else(|| panic!("`{}` is not registered", from_template.template_type_path));
+        assert!(template.data::<ReflectTemplate>().is_some());
+        assert!(template.data::<ReflectDefault>().is_some());
+    }
+
+    #[test]
+    fn template_type_registered_for_seed_set() {
+        let mut registry = TypeRegistry::empty();
+        registry.register::<Mesh2d>();
+        registry.register::<Mesh2dTemplate>();
+        registry.register::<Mesh3d>();
+        registry.register::<Mesh3dTemplate>();
+        assert_template_chain::<Mesh2d>(&registry);
+        assert_template_chain::<Mesh3d>(&registry);
     }
 }

@@ -72,6 +72,10 @@ pub use crate::render::prelude::*;
 pub use crate::scene::prelude::*;
 
 #[doc(hidden)]
+#[cfg(feature = "bsn_asset")]
+pub use crate::bsn_asset::{BsnAssetPlugin, DynamicBsnLoader};
+
+#[doc(hidden)]
 #[cfg(feature = "bevy_world_serialization")]
 pub use crate::world_serialization::prelude::*;
 

@@ -1,8 +1,8 @@
 use crate::{Mesh, MeshVertexAttribute, VertexAttributeValues, VertexFormat};
 use bevy_asset::{AsAssetId, Asset, AssetId, Handle};
 use bevy_ecs::{
-    component::Component, entity::Entity, prelude::ReflectComponent, system::Query,
-    template::FromTemplate,
+    component::Component, entity::Entity, prelude::ReflectComponent, reflect::ReflectFromTemplate,
+    system::Query, template::FromTemplate,
 };
 use bevy_math::{Affine3A, Mat4, Vec3, Vec3A};
 use bevy_reflect::prelude::*;
@@ -12,7 +12,8 @@ use core::ops::Deref;
 use thiserror::Error;
 
 #[derive(Component, Debug, Default, Clone, Reflect, FromTemplate)]
-#[reflect(Component, Default, Debug, Clone)]
+#[reflect(Component, Default, Debug, Clone, FromTemplate)]
+#[template(reflect)]
 pub struct SkinnedMesh {
     pub inverse_bindposes: Handle<SkinnedMeshInverseBindposes>,
     #[entities]

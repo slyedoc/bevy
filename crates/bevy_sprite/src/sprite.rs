@@ -2,7 +2,11 @@ use bevy_asset::{AsAssetId, AssetId, Assets, Handle};
 use bevy_camera::visibility::{Visibility, VisibilityClass};
 use bevy_color::Color;
 use bevy_derive::{Deref, DerefMut};
-use bevy_ecs::{component::Component, reflect::ReflectComponent, template::FromTemplate};
+use bevy_ecs::{
+    component::Component,
+    reflect::{ReflectComponent, ReflectFromTemplate},
+    template::FromTemplate,
+};
 use bevy_image::{Image, TextureAtlas, TextureAtlasLayout};
 use bevy_math::{Rect, UVec2, Vec2};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
@@ -13,7 +17,8 @@ use crate::TextureSlicer;
 /// Describes a sprite to be rendered to a 2D camera
 #[derive(Component, Debug, Default, Clone, Reflect, PartialEq, FromTemplate)]
 #[require(Transform, Visibility, VisibilityClass, Anchor)]
-#[reflect(Component, Default, Debug, Clone)]
+#[reflect(Component, Default, Debug, Clone, FromTemplate)]
+#[template(reflect)]
 pub struct Sprite {
     /// The image used to render the sprite
     pub image: Handle<Image>,
@@ -630,5 +635,36 @@ mod tests {
         );
         // The pixel is outside the texture atlas, but is still a valid pixel in the image.
         assert_eq!(compute(Vec2::new(0.0, 35.0)), Err(Vec2::new(0.0, -35.0)));
+    }
+}
+
+#[cfg(test)]
+mod template_reflect_tests {
+    use super::*;
+    use bevy_ecs::reflect::{ReflectFromTemplate, ReflectTemplate};
+    use bevy_reflect::{std_traits::ReflectDefault, TypeRegistry};
+    use core::any::TypeId;
+
+    /// Walks the exact lookup chain a reflection-driven scene format performs: component type →
+    /// [`ReflectFromTemplate`] → template registration → [`ReflectTemplate`] + `ReflectDefault`.
+    fn assert_template_chain<C: bevy_reflect::GetTypeRegistration + 'static>(
+        registry: &TypeRegistry,
+    ) {
+        let from_template = registry
+            .get_type_data::<ReflectFromTemplate>(TypeId::of::<C>())
+            .expect("component should carry `ReflectFromTemplate`");
+        let template = registry
+            .get(from_template.template_type_id)
+            .unwrap_or_else(|| panic!("`{}` is not registered", from_template.template_type_path));
+        assert!(template.data::<ReflectTemplate>().is_some());
+        assert!(template.data::<ReflectDefault>().is_some());
+    }
+
+    #[test]
+    fn template_type_registered_for_seed_set() {
+        let mut registry = TypeRegistry::empty();
+        registry.register::<Sprite>();
+        registry.register::<SpriteTemplate>();
+        assert_template_chain::<Sprite>(&registry);
     }
 }

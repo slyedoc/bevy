@@ -281,6 +281,7 @@ impl From<Justify> for parley::Alignment {
 /// You can check which font family is used for a given [`FontSource`]
 /// by calling [`FontCx::get_family`](crate::FontCx::get_family).
 #[derive(Clone, Debug, Reflect, PartialEq, FromTemplate, Default)]
+#[template(reflect)]
 pub enum FontSource {
     /// Use a specific font face referenced by a [`Font`] asset handle.
     ///
@@ -698,7 +699,8 @@ impl From<GenericFontFamily> for parley::GenericFamily {
 /// `TextFont` determines the style of a text span within a [`ComputedTextBlock`], specifically
 /// the font face, the font size, the line height, and the antialiasing method.
 #[derive(Component, Clone, Debug, Reflect, PartialEq, FromTemplate)]
-#[reflect(Component, Default, Debug, Clone)]
+#[reflect(Component, Default, Debug, Clone, FromTemplate)]
+#[template(reflect)]
 pub struct TextFont {
     /// Specifies the font face used for this text section.
     ///
@@ -1778,5 +1780,36 @@ mod tests {
                 Cow::Borrowed("Dummy Font")
             )))
         );
+    }
+}
+
+#[cfg(test)]
+mod template_reflect_tests {
+    use super::*;
+    use bevy_ecs::reflect::{ReflectFromTemplate, ReflectTemplate};
+    use bevy_reflect::{std_traits::ReflectDefault, TypeRegistry};
+    use core::any::TypeId;
+
+    /// Walks the exact lookup chain a reflection-driven scene format performs: component type →
+    /// [`ReflectFromTemplate`] → template registration → [`ReflectTemplate`] + `ReflectDefault`.
+    fn assert_template_chain<C: bevy_reflect::GetTypeRegistration + 'static>(
+        registry: &TypeRegistry,
+    ) {
+        let from_template = registry
+            .get_type_data::<ReflectFromTemplate>(TypeId::of::<C>())
+            .expect("component should carry `ReflectFromTemplate`");
+        let template = registry
+            .get(from_template.template_type_id)
+            .unwrap_or_else(|| panic!("`{}` is not registered", from_template.template_type_path));
+        assert!(template.data::<ReflectTemplate>().is_some());
+        assert!(template.data::<ReflectDefault>().is_some());
+    }
+
+    #[test]
+    fn template_type_registered_for_seed_set() {
+        let mut registry = TypeRegistry::empty();
+        registry.register::<TextFont>();
+        registry.register::<TextFontTemplate>();
+        assert_template_chain::<TextFont>(&registry);
     }
 }

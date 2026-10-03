@@ -7,7 +7,10 @@ use super::{
 use bevy_asset::Handle;
 use bevy_derive::Deref;
 use bevy_ecs::{
-    component::Component, entity::Entity, reflect::ReflectComponent, template::FromTemplate,
+    component::Component,
+    entity::Entity,
+    reflect::{ReflectComponent, ReflectFromTemplate},
+    template::FromTemplate,
 };
 use bevy_image::Image;
 use bevy_math::{ops, Dir3, FloatOrd, Mat4, Rect, URect, UVec2, Vec2, Vec3, Vec3A};
@@ -889,7 +892,8 @@ impl Default for CameraOutputMode {
 /// The "target" that a [`Camera`] will render to. For example, this could be a `Window`
 /// swapchain or an [`Image`].
 #[derive(Component, FromTemplate, Debug, Clone, Reflect, From)]
-#[reflect(Clone, Component)]
+#[reflect(Clone, Component, FromTemplate)]
+#[template(reflect)]
 pub enum RenderTarget {
     /// Window to which the camera's view is rendered.
     #[default]
@@ -978,12 +982,14 @@ pub enum NormalizedRenderTarget {
     Reflect,
     FromTemplate,
 )]
-#[reflect(Component, Default, Debug, PartialEq, Hash, Clone)]
+#[reflect(Component, Default, Debug, PartialEq, Hash, Clone, FromTemplate)]
+#[template(reflect)]
 pub struct ManualTextureViewHandle(pub u32);
 
 /// A render target that renders to an [`Image`].
 #[derive(FromTemplate, Debug, Clone, Reflect)]
-#[reflect(Clone, PartialEq, Hash)]
+#[reflect(Clone, PartialEq, Hash, FromTemplate)]
+#[template(reflect)]
 pub struct ImageRenderTarget {
     /// The image to render to.
     pub handle: Handle<Image>,

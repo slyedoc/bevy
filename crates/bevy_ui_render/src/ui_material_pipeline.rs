@@ -1,5 +1,5 @@
 use crate::clipping::clip_polygon;
-use crate::ui_material::{MaterialNode, UiMaterial, UiMaterialKey};
+use crate::ui_material::{MaterialNode, MaterialNodeTemplate, UiMaterial, UiMaterialKey};
 use crate::*;
 use bevy_asset::*;
 use bevy_ecs::{
@@ -53,6 +53,9 @@ where
 
         app.init_asset::<M>()
             .register_type::<MaterialNode<M>>()
+            // Generic types are never auto-registered for reflection, so the generated template
+            // needs an explicit registration for reflection-driven scene formats to find it.
+            .register_type::<MaterialNodeTemplate<M>>()
             .add_plugins(RenderAssetPlugin::<
                 PreparedUiMaterial<M>,
                 (GpuImage, GpuShaderBuffer),

@@ -168,7 +168,7 @@ audio = ["bevy_audio", "vorbis"]
 audio-all-formats = ["bevy_audio", "aac", "flac", "mp3", "mp4", "vorbis", "wav"]
 
 # COLLECTION: Features used to compose Bevy scenes.
-scene = ["bevy_world_serialization", "bevy_scene"]
+scene = ["bevy_world_serialization", "bevy_scene", "bsn_asset"]
 
 # COLLECTION: Enables picking with all backends.
 picking = ["bevy_picking", "mesh_picking", "sprite_picking", "ui_picking"]
@@ -334,6 +334,9 @@ bevy_world_serialization = ["bevy_internal/bevy_world_serialization"]
 
 # Provides scene functionality
 bevy_scene = ["bevy_internal/bevy_scene"]
+
+# Provides the `.bsn` scene asset format and its asset loader
+bsn_asset = ["bevy_internal/bsn_asset"]
 
 # Provides raytraced lighting (experimental)
 bevy_solari = ["bevy_internal/bevy_solari"]
@@ -822,6 +825,13 @@ getrandom = { version = "0.4", default-features = false, features = [
 ] }
 wasm-bindgen = { version = "0.2" }
 web-sys = { version = "0.3", features = ["Window"] }
+
+# Integration tests in `tests/` are picked up automatically; this one only needs a manual target
+# because it requires an optional feature.
+[[test]]
+name = "dynamic_bsn_real"
+path = "tests/dynamic_bsn_real.rs"
+required-features = ["bsn_asset"]
 
 [[example]]
 name = "context_menu"
@@ -3219,12 +3229,13 @@ wasm = true
 name = "dynamic_bsn"
 path = "examples/scene/dynamic_bsn.rs"
 doc-scrape-examples = true
+required-features = ["bsn_asset"]
 
 [package.metadata.example.dynamic_bsn]
 name = "Dynamic BSN"
-description = "Demonstrates how to load and spawn BSN assets at runtime"
+description = "Demonstrates loading scenes from `.bsn` asset files"
 category = "Scene"
-wasm = false
+wasm = true
 
 # Shaders
 [[package.metadata.example_category]]

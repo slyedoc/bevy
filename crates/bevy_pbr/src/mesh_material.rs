@@ -1,7 +1,11 @@
 use crate::Material;
 use bevy_asset::{AsAssetId, AssetId, Handle};
 use bevy_derive::{Deref, DerefMut};
-use bevy_ecs::{component::Component, reflect::ReflectComponent, template::FromTemplate};
+use bevy_ecs::{
+    component::Component,
+    reflect::{ReflectComponent, ReflectFromTemplate},
+    template::FromTemplate,
+};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use derive_more::derive::From;
 
@@ -37,7 +41,8 @@ use derive_more::derive::From;
 /// }
 /// ```
 #[derive(Component, FromTemplate, Clone, Debug, Deref, DerefMut, Reflect, From)]
-#[reflect(Component, Default, Clone, PartialEq)]
+#[reflect(Component, Default, Clone, PartialEq, FromTemplate)]
+#[template(reflect)]
 pub struct MeshMaterial3d<M: Material>(pub Handle<M>);
 
 impl<M: Material> Default for MeshMaterial3d<M> {
@@ -71,5 +76,36 @@ impl<M: Material> AsAssetId for MeshMaterial3d<M> {
 
     fn as_asset_id(&self) -> AssetId<Self::Asset> {
         self.id()
+    }
+}
+
+#[cfg(test)]
+mod template_reflect_tests {
+    use super::*;
+    use bevy_ecs::reflect::{ReflectFromTemplate, ReflectTemplate};
+    use bevy_reflect::{std_traits::ReflectDefault, TypeRegistry};
+    use core::any::TypeId;
+
+    /// Walks the exact lookup chain a reflection-driven scene format performs: component type →
+    /// [`ReflectFromTemplate`] → template registration → [`ReflectTemplate`] + `ReflectDefault`.
+    fn assert_template_chain<C: bevy_reflect::GetTypeRegistration + 'static>(
+        registry: &TypeRegistry,
+    ) {
+        let from_template = registry
+            .get_type_data::<ReflectFromTemplate>(TypeId::of::<C>())
+            .expect("component should carry `ReflectFromTemplate`");
+        let template = registry
+            .get(from_template.template_type_id)
+            .unwrap_or_else(|| panic!("`{}` is not registered", from_template.template_type_path));
+        assert!(template.data::<ReflectTemplate>().is_some());
+        assert!(template.data::<ReflectDefault>().is_some());
+    }
+
+    #[test]
+    fn template_type_registered_for_seed_set() {
+        let mut registry = TypeRegistry::empty();
+        registry.register::<MeshMaterial3d<crate::StandardMaterial>>();
+        registry.register::<MeshMaterial3dTemplate<crate::StandardMaterial>>();
+        assert_template_chain::<MeshMaterial3d<crate::StandardMaterial>>(&registry);
     }
 }

@@ -53,15 +53,24 @@
 //!
 //! Those functions will increase the size of the final app binary.
 //!
+//! [`ReflectComponentFns::push_to_bundle_writer`] is written with this in mind: its per-type
+//! body is a named generic function (so it is emitted once per component type and never inlined
+//! into callers), and the reflection fallback ladder it uses lives behind the erased,
+//! `#[inline(never)]` helper shared by [`try_from_reflect_with_fallback`].
+//!
+//! [`try_from_reflect_with_fallback`]: super::try_from_reflect_with_fallback
+//!
 //! [^1]: `crates/bevy_reflect/bevy_reflect_derive/src/registration.rs`
 //!
 //! [`get_type_registration`]: bevy_reflect::GetTypeRegistration::get_type_registration
 
-use super::from_reflect_with_fallback;
+use super::{from_reflect_with_fallback, try_from_reflect_with_fallback};
 use crate::{
+    bundle::BundleWriter,
     change_detection::Mut,
-    component::{ComponentId, ComponentMutability},
+    component::{ComponentId, ComponentMutability, ComponentsRegistrator},
     entity::{Entity, EntityMapper},
+    error::BevyError,
     prelude::Component,
     relationship::RelationshipHookMode,
     world::{
@@ -135,6 +144,65 @@ pub struct ReflectComponentFns {
     pub copy: fn(&World, &mut World, Entity, Entity, &TypeRegistry),
     /// Function pointer implementing [`ReflectComponent::register_component()`].
     pub register_component: fn(&mut World) -> ComponentId,
+    /// Function pointer implementing [`ReflectComponent::push_to_bundle_writer()`].
+    ///
+    /// Builds a concrete component value from the given value and pushes it into the given
+    /// [`BundleWriter`], registering the component in the given [`ComponentsRegistrator`] if
+    /// needed. The value is first downcast to the concrete component type (the fast path: values
+    /// produced by [`ReflectTemplate::build_template`] are always concrete); if that fails, it is
+    /// rebuilt with [`try_from_reflect_with_fallback`].
+    ///
+    /// This exists so that reflection-driven scene spawning can insert an arbitrary number of
+    /// dynamically-typed components with a **single** archetype move, instead of one
+    /// [`EntityWorldMut::insert`] per component.
+    ///
+    /// Unlike [`ReflectComponentFns::apply`] and [`ReflectComponentFns::reflect_mut`], this is an
+    /// *insertion*, which is legal for immutable components: it has no mutability guard and never
+    /// panics for `Component<Mutability = Immutable>`.
+    ///
+    /// If this returns `Err`, nothing was pushed for *this* component, but any previously-pushed
+    /// components are still in the scratch space. As always, the caller must follow up with
+    /// either [`BundleWriter::write`] or
+    /// [`BundleScratch::manual_drop`](crate::bundle::BundleScratch::manual_drop) to avoid leaking.
+    ///
+    /// # Safety
+    ///
+    /// The [`ComponentsRegistrator`] must come from the same [`World`] as every other
+    /// [`BundleWriter::push_component`] / [`BundleWriter::push_component_by_id`] call on this
+    /// `BundleWriter`, and as the following [`BundleWriter::write`].
+    ///
+    /// [`ReflectTemplate::build_template`]: crate::reflect::ReflectTemplate::build_template
+    /// [`try_from_reflect_with_fallback`]: super::try_from_reflect_with_fallback
+    pub push_to_bundle_writer: unsafe fn(
+        Box<dyn PartialReflect>,
+        &TypeRegistry,
+        &mut ComponentsRegistrator,
+        &mut BundleWriter,
+    ) -> Result<(), BevyError>,
+}
+
+/// Backing implementation of [`ReflectComponentFns::push_to_bundle_writer`] for a concrete `C`.
+///
+/// This is a named generic function rather than a closure so that it is emitted exactly once per
+/// component type and never inlined into a caller (see the module docs on code generation).
+///
+/// # Safety
+///
+/// See [`ReflectComponentFns::push_to_bundle_writer`].
+unsafe fn push_to_bundle_writer<C: Component + Reflect>(
+    value: Box<dyn PartialReflect>,
+    registry: &TypeRegistry,
+    components: &mut ComponentsRegistrator,
+    bundle_writer: &mut BundleWriter,
+) -> Result<(), BevyError> {
+    let component: C = match value.try_take::<C>() {
+        Ok(component) => component,
+        Err(value) => try_from_reflect_with_fallback::<C>(value.as_ref(), registry)?,
+    };
+    // SAFETY: the caller guarantees `components` and `bundle_writer` belong to the same `World`
+    // as every other push on this writer and as the following `write`.
+    unsafe { bundle_writer.push_component(components, component) };
+    Ok(())
 }
 
 impl ReflectComponentFns {
@@ -263,6 +331,30 @@ impl ReflectComponent {
     /// Register the type of this [`Component`] in [`World`], returning its [`ComponentId`].
     pub fn register_component(&self, world: &mut World) -> ComponentId {
         (self.0.register_component)(world)
+    }
+
+    /// Builds a concrete value of this [`Component`] type from `value` and pushes it into
+    /// `bundle_writer`.
+    ///
+    /// See [`ReflectComponentFns::push_to_bundle_writer`] for the full contract, including the
+    /// fact that this works for immutable components and that a failure leaves previously-pushed
+    /// components in the writer's scratch space (which must still be drained via
+    /// [`BundleWriter::write`] or
+    /// [`BundleScratch::manual_drop`](crate::bundle::BundleScratch::manual_drop)).
+    ///
+    /// # Safety
+    ///
+    /// `components` must come from the same [`World`] as every other push on `bundle_writer`
+    /// and as the following [`BundleWriter::write`].
+    pub unsafe fn push_to_bundle_writer(
+        &self,
+        value: Box<dyn PartialReflect>,
+        registry: &TypeRegistry,
+        components: &mut ComponentsRegistrator,
+        bundle_writer: &mut BundleWriter,
+    ) -> Result<(), BevyError> {
+        // SAFETY: safety requirements deferred to the caller
+        unsafe { (self.0.push_to_bundle_writer)(value, registry, components, bundle_writer) }
     }
 
     /// Create a custom implementation of [`ReflectComponent`].
@@ -402,10 +494,295 @@ impl<C: Component + Reflect + TypePath> CreateTypeData<C> for ReflectComponent {
             register_component: |world: &mut World| -> ComponentId {
                 world.register_component::<C>()
             },
+            push_to_bundle_writer: push_to_bundle_writer::<C>,
             map_entities: |reflect: &mut dyn Reflect, mut mapper: &mut dyn EntityMapper| {
                 let component = reflect.downcast_mut::<C>().unwrap();
                 Component::map_entities(component, &mut mapper);
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{bundle::BundleScratch, lifecycle::HookContext, world::DeferredWorld};
+    use bevy_reflect::{std_traits::ReflectDefault, structs::DynamicStruct, TypeRegistry};
+
+    /// Neither `Default` nor `FromReflect` type data: only the concrete fast path can build it.
+    #[derive(Component, Reflect, PartialEq, Debug)]
+    #[reflect(Component, from_reflect = false)]
+    struct NoConstructor {
+        value: u32,
+    }
+
+    #[derive(Component, Reflect, PartialEq, Debug)]
+    #[reflect(Component)]
+    struct FromReflectable {
+        value: u32,
+    }
+
+    #[derive(Component, Reflect, Default, PartialEq, Debug)]
+    #[reflect(Component, Default, from_reflect = false)]
+    struct DefaultOnly {
+        value: u32,
+        other: u32,
+    }
+
+    #[derive(Component, Reflect, PartialEq, Debug)]
+    #[component(immutable)]
+    #[reflect(Component)]
+    struct Immutable {
+        value: u32,
+    }
+
+    #[derive(Component, Reflect, Default, PartialEq, Debug)]
+    #[reflect(Component, Default)]
+    #[component(on_insert = assert_second_is_present)]
+    struct First;
+
+    #[derive(Component, Reflect, Default, PartialEq, Debug)]
+    #[reflect(Component, Default)]
+    struct Second;
+
+    fn assert_second_is_present(world: DeferredWorld, context: HookContext) {
+        assert!(
+            world.entity(context.entity).contains::<Second>(),
+            "`Second` should already be present: both components must arrive in a single \
+             archetype move"
+        );
+    }
+
+    fn registry() -> TypeRegistry {
+        let mut registry = TypeRegistry::empty();
+        registry.register::<NoConstructor>();
+        registry.register::<FromReflectable>();
+        registry.register::<DefaultOnly>();
+        registry.register::<Immutable>();
+        registry.register::<First>();
+        registry.register::<Second>();
+        registry
+    }
+
+    fn reflect_component<C: 'static>(registry: &TypeRegistry) -> ReflectComponent {
+        registry
+            .get_type_data::<ReflectComponent>(core::any::TypeId::of::<C>())
+            .unwrap()
+            .clone()
+    }
+
+    fn dynamic(fields: &[(&str, u32)]) -> DynamicStruct {
+        let mut value = DynamicStruct::default();
+        for (name, field) in fields {
+            value.insert(*name, *field);
+        }
+        value
+    }
+
+    #[test]
+    fn push_to_bundle_writer_takes_concrete_value() {
+        let registry = registry();
+        let reflect_component = reflect_component::<NoConstructor>(&registry);
+
+        let mut world = World::new();
+        let mut bundle_scratch = BundleScratch::default();
+        let mut bundle_writer = bundle_scratch.writer();
+        // SAFETY: a single World is used for every writer operation
+        let entity = unsafe {
+            let mut components = world.components_registrator();
+            reflect_component
+                .push_to_bundle_writer(
+                    Box::new(NoConstructor { value: 3 }),
+                    &registry,
+                    &mut components,
+                    &mut bundle_writer,
+                )
+                .unwrap();
+            let mut entity = world.spawn_empty();
+            bundle_writer.write(&mut entity);
+            entity.id()
+        };
+
+        assert_eq!(
+            world.entity(entity).get::<NoConstructor>().unwrap(),
+            &NoConstructor { value: 3 }
+        );
+    }
+
+    #[test]
+    fn push_to_bundle_writer_uses_from_reflect() {
+        let registry = registry();
+        let reflect_component = reflect_component::<FromReflectable>(&registry);
+
+        let mut world = World::new();
+        let mut bundle_scratch = BundleScratch::default();
+        let mut bundle_writer = bundle_scratch.writer();
+        // SAFETY: a single World is used for every writer operation
+        let entity = unsafe {
+            let mut components = world.components_registrator();
+            reflect_component
+                .push_to_bundle_writer(
+                    Box::new(dynamic(&[("value", 3)])),
+                    &registry,
+                    &mut components,
+                    &mut bundle_writer,
+                )
+                .unwrap();
+            let mut entity = world.spawn_empty();
+            bundle_writer.write(&mut entity);
+            entity.id()
+        };
+
+        assert_eq!(
+            world.entity(entity).get::<FromReflectable>().unwrap(),
+            &FromReflectable { value: 3 }
+        );
+    }
+
+    #[test]
+    fn push_to_bundle_writer_uses_default_fallback() {
+        let registry = registry();
+        let reflect_component = reflect_component::<DefaultOnly>(&registry);
+
+        let mut world = World::new();
+        let mut bundle_scratch = BundleScratch::default();
+        let mut bundle_writer = bundle_scratch.writer();
+        // SAFETY: a single World is used for every writer operation
+        let entity = unsafe {
+            let mut components = world.components_registrator();
+            reflect_component
+                .push_to_bundle_writer(
+                    Box::new(dynamic(&[("value", 3)])),
+                    &registry,
+                    &mut components,
+                    &mut bundle_writer,
+                )
+                .unwrap();
+            let mut entity = world.spawn_empty();
+            bundle_writer.write(&mut entity);
+            entity.id()
+        };
+
+        assert_eq!(
+            world.entity(entity).get::<DefaultOnly>().unwrap(),
+            &DefaultOnly { value: 3, other: 0 }
+        );
+    }
+
+    #[test]
+    fn push_to_bundle_writer_errors_without_constructor() {
+        let registry = registry();
+        let reflect_component = reflect_component::<NoConstructor>(&registry);
+
+        let mut world = World::new();
+        let mut bundle_scratch = BundleScratch::default();
+        let mut bundle_writer = bundle_scratch.writer();
+        // SAFETY: a single World is used for every writer operation
+        unsafe {
+            let mut components = world.components_registrator();
+            let result = reflect_component.push_to_bundle_writer(
+                Box::new(dynamic(&[("value", 3)])),
+                &registry,
+                &mut components,
+                &mut bundle_writer,
+            );
+            assert!(result.is_err());
+            assert!(bundle_writer.is_empty());
+        }
+    }
+
+    #[test]
+    fn push_to_bundle_writer_supports_immutable_components() {
+        let registry = registry();
+        let reflect_component = reflect_component::<Immutable>(&registry);
+
+        let mut world = World::new();
+        let mut bundle_scratch = BundleScratch::default();
+        let mut bundle_writer = bundle_scratch.writer();
+        // SAFETY: a single World is used for every writer operation
+        let entity = unsafe {
+            let mut components = world.components_registrator();
+            reflect_component
+                .push_to_bundle_writer(
+                    Box::new(Immutable { value: 3 }),
+                    &registry,
+                    &mut components,
+                    &mut bundle_writer,
+                )
+                .unwrap();
+            let mut entity = world.spawn_empty();
+            bundle_writer.write(&mut entity);
+            entity.id()
+        };
+
+        assert_eq!(
+            world.entity(entity).get::<Immutable>().unwrap(),
+            &Immutable { value: 3 }
+        );
+    }
+
+    #[test]
+    fn push_to_bundle_writer_single_archetype_move() {
+        let registry = registry();
+        let first = reflect_component::<First>(&registry);
+        let second = reflect_component::<Second>(&registry);
+
+        let mut world = World::new();
+        let mut bundle_scratch = BundleScratch::default();
+        let mut bundle_writer = bundle_scratch.writer();
+        // SAFETY: a single World is used for every writer operation
+        let entity = unsafe {
+            let mut components = world.components_registrator();
+            first
+                .push_to_bundle_writer(
+                    Box::new(First),
+                    &registry,
+                    &mut components,
+                    &mut bundle_writer,
+                )
+                .unwrap();
+            second
+                .push_to_bundle_writer(
+                    Box::new(Second),
+                    &registry,
+                    &mut components,
+                    &mut bundle_writer,
+                )
+                .unwrap();
+            let mut entity = world.spawn_empty();
+            bundle_writer.write(&mut entity);
+            entity.id()
+        };
+
+        assert!(world.entity(entity).contains::<First>());
+        assert!(world.entity(entity).contains::<Second>());
+    }
+
+    #[test]
+    fn push_to_bundle_writer_registers_component() {
+        let registry = registry();
+        let reflect_component = reflect_component::<NoConstructor>(&registry);
+
+        let mut world = World::new();
+        assert!(world.component_id::<NoConstructor>().is_none());
+
+        let mut bundle_scratch = BundleScratch::default();
+        let mut bundle_writer = bundle_scratch.writer();
+        // SAFETY: a single World is used for every writer operation
+        unsafe {
+            let mut components = world.components_registrator();
+            reflect_component
+                .push_to_bundle_writer(
+                    Box::new(NoConstructor { value: 3 }),
+                    &registry,
+                    &mut components,
+                    &mut bundle_writer,
+                )
+                .unwrap();
+            let mut entity = world.spawn_empty();
+            bundle_writer.write(&mut entity);
+        }
+
+        assert!(world.component_id::<NoConstructor>().is_some());
     }
 }

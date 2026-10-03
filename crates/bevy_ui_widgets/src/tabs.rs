@@ -9,7 +9,7 @@ use bevy_ecs::{
     lifecycle::RemovedComponents,
     observer::On,
     query::{Added, Changed, Has, Or, With},
-    reflect::ReflectComponent,
+    reflect::{ReflectComponent, ReflectFromTemplate},
     schedule::IntoScheduleConfigs,
     system::{Commands, Query, Res, ResMut},
     template::FromTemplate,
@@ -73,7 +73,8 @@ impl Default for TabList {
 /// The referenced entity must be an enabled direct child of the list. Missing, stale, disabled,
 /// and unrelated entities are treated as no selection.
 #[derive(Component, FromTemplate, Debug, Default, PartialEq, Eq, Reflect)]
-#[reflect(Component, Default, PartialEq)]
+#[reflect(Component, Default, PartialEq, FromTemplate)]
+#[template(reflect)]
 pub struct SelectedTab(#[template(built_in)] pub Option<Entity>);
 
 /// A headless tab header.

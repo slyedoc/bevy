@@ -3431,7 +3431,8 @@ impl Default for LayoutConfig {
 /// which is either a single camera with the [`IsDefaultUiCamera`] marker component or the highest
 /// order camera targeting the primary window.
 #[derive(Component, FromTemplate, Clone, Debug, Reflect, Eq, PartialEq)]
-#[reflect(Component, Debug, PartialEq, Clone)]
+#[reflect(Component, Debug, PartialEq, Clone, FromTemplate)]
+#[template(reflect)]
 pub struct UiTargetCamera(pub Entity);
 
 impl UiTargetCamera {

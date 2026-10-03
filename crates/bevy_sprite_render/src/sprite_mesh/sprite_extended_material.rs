@@ -213,7 +213,8 @@ fn update_changed_material_extensions<M>(
 ///
 /// See the `sprite_material` example for a complete usage example of sprite materials.
 #[derive(Component, Reflect, Deref, DerefMut, PartialEq, Debug, FromTemplate, Clone)]
-#[reflect(Component)]
+#[reflect(Component, FromTemplate)]
+#[template(reflect)]
 #[component(on_add, on_remove)]
 pub struct SpriteMaterial<M>(pub Handle<M>)
 where

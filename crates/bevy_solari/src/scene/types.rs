@@ -1,6 +1,9 @@
 use bevy_asset::Handle;
 use bevy_derive::{Deref, DerefMut};
-use bevy_ecs::{component::Component, prelude::ReflectComponent, template::FromTemplate};
+use bevy_ecs::{
+    component::Component, prelude::ReflectComponent, reflect::ReflectFromTemplate,
+    template::FromTemplate,
+};
 use bevy_mesh::Mesh;
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
@@ -19,6 +22,7 @@ use derive_more::derive::From;
 #[derive(
     Component, FromTemplate, Clone, Debug, Default, Deref, DerefMut, Reflect, PartialEq, Eq, From,
 )]
-#[reflect(Component, Default, Clone, PartialEq)]
+#[reflect(Component, Default, Clone, PartialEq, FromTemplate)]
 #[require(MeshMaterial3d<StandardMaterial>, Transform, SyncToRenderWorld)]
+#[template(reflect)]
 pub struct RaytracingMesh3d(pub Handle<Mesh>);

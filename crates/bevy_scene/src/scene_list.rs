@@ -93,8 +93,16 @@ impl<S: Scene> SceneList for EntityScene<S> {
         context: &mut ResolveContext,
         scenes: &mut Vec<ResolvedScene>,
     ) -> Result<(), ResolveSceneError> {
+        // A cached include (`:"scene.bsn"`) applies only to the entity that declared it. This
+        // child is a fresh entity with a fresh `ResolvedScene`, so it must not resolve against
+        // the parent's cached scene: template accesses would clone the parent base's templates
+        // into a scene whose own `cached` is `None`, which is an invariant violation (and, before
+        // this guard, a panic in `get_or_insert_erased_template`).
+        let parent_cached = context.cached.take();
         let mut resolved_scene = ResolvedScene::default();
-        self.0.resolve(context, &mut resolved_scene)?;
+        let result = self.0.resolve(context, &mut resolved_scene);
+        context.cached = parent_cached;
+        result?;
         scenes.push(resolved_scene);
         Ok(())
     }

@@ -249,7 +249,10 @@ impl ContainerAttributes {
             self.parse_partial_ord(input)
         } else if lookahead.peek(kw::PartialEq) {
             self.parse_partial_eq(input)
-        } else if lookahead.peek(Ident::peek_any) {
+        } else if lookahead.peek(Ident::peek_any) || lookahead.peek(Token![::]) {
+            // The leading-`::` case exists so that generated code can name type data by an
+            // absolute path (e.g. `#[reflect(::bevy::ecs::reflect::Template)]`), which is what
+            // `BevyManifest::get_path` produces for crates depending on the `bevy` umbrella.
             self.parse_type_data(input)
         } else {
             Err(lookahead.error())
@@ -261,6 +264,8 @@ impl ContainerAttributes {
     /// Examples:
     /// - `#[reflect(Default)]`
     /// - `#[reflect(Hash(custom_hash_fn))]`
+    /// - `#[reflect(foo::bar::Baz)]`
+    /// - `#[reflect(::foo::bar::Baz)]`
     fn parse_type_data(&mut self, input: ParseStream) -> syn::Result<()> {
         let type_data = input.parse::<TypeDataRegistration>()?;
 

@@ -50,8 +50,8 @@ use syn::{parse_macro_input, DeriveInput};
 /// | `@MySceneComp { @prop: val }`              | Include a [`SceneComponent`] with a `prop` field, passed to this components scene function                     |
 /// | `@MySceneComp { name: val }`               | Include a [`SceneComponent`] with a normal field, works the same as it does for normal components              |
 /// | `@MySceneComp { @prop: val1, name: val2 }` | Include a [`SceneComponent`] with both a `prop` and a field                                                    |
-/// | `:"scene.bsn"`                             | <div class="warning">Asset format not yet implemented!</div> Include a cached scene asset file                 |
-/// | `:scene()`<br>`:MySceneComp`               | <div class="warning">Caching for scene includes not yet implemented!</div> Include a cached scene function     |
+/// | `:"scene.bsn"`                             | Include a cached scene asset file                                                                             |
+/// | `:scene()`<br>`:@MySceneComp`              | <div class="warning">Caching for scene includes not yet implemented!</div> Include a cached scene function     |
 /// | **Named entity references**                |                                                                                                                |
 /// | `#MyName`                                  | Becomes `Name("MyName")` when used as a `part` of a scene                                                      |
 /// | `CompA(#MyName)`<br>`@scene(#MyName)`      | Referring to the entity which was named `MyName` in this scope, results in an [`EntityTemplate`] being passed  |

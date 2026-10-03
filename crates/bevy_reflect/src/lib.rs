@@ -4121,15 +4121,26 @@ bevy_reflect::tests::Test {
         #[reflect(foo::bar::ReflectBaz)]
         struct ManualPrefix;
 
+        // Absolute paths must work too: generated code names type data by the path
+        // `BevyManifest::get_path` produces, which has a leading `::` for crates depending on
+        // the `bevy` umbrella crate.
+        #[derive(Reflect, Default)]
+        #[reflect(::bevy_reflect::std_traits::Default)]
+        struct LeadingColon;
+
         let mut registry = TypeRegistry::empty();
         registry.register::<AutoPrefix>();
         registry.register::<ManualPrefix>();
+        registry.register::<LeadingColon>();
 
         assert!(registry
             .get_type_data::<foo::bar::ReflectBaz>(TypeId::of::<AutoPrefix>())
             .is_some());
         assert!(registry
             .get_type_data::<foo::bar::ReflectBaz>(TypeId::of::<ManualPrefix>())
+            .is_some());
+        assert!(registry
+            .get_type_data::<ReflectDefault>(TypeId::of::<LeadingColon>())
             .is_some());
     }
 
