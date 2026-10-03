@@ -1,17 +1,17 @@
 //! `.bsn` source text to the editor document.
 //!
 //! Parsing is `bevy_bsn`'s: this module lowers its arena [`BsnDocument`] into a
-//! [`SceneBsnAst`]. The document holds `Children` as its only relation. A list whose
-//! every item is a two-element tuple, `[(key, value), ...]`, is a map; any other tuple
-//! is a list.
+//! [`SceneBsnAst`]. `Children [...]` lowers to the editor hierarchy, any other relation to
+//! [`BsnPatch::Related`]. A list whose every item is a two-element tuple,
+//! `[(key, value), ...]`, is a map; any other tuple is a list.
 
 use bevy_bsn::{BsnDocument, BsnNodeId, BsnNodeKind, BsnPatchPrefix, BsnValueId, Span};
 use bevy_ecs::entity::Entity;
 use thiserror::Error;
 
 use crate::document::{
-    BsnField, BsnPatch, BsnPatches, BsnStructData, BsnStructFields, BsnTupleStructData, BsnValue,
-    SceneBsnAst,
+    BsnField, BsnPatch, BsnPatches, BsnRelated, BsnStructData, BsnStructFields, BsnTupleStructData,
+    BsnValue, SceneBsnAst,
 };
 
 /// An error produced while parsing `.bsn` source text.
@@ -102,20 +102,18 @@ impl Lower<'_> {
                 target_symbol,
                 entities,
             } => {
-                if target_symbol.last_ident() != "Children" {
-                    return Err(self.error(
-                        node.span,
-                        format!(
-                            "`{}`: the document holds `Children` as its only relation",
-                            target_symbol.to_type_path()
-                        ),
-                    ));
-                }
-                let children = entities
+                let related = entities
                     .iter()
                     .map(|&child| self.entity(child))
                     .collect::<Result<_, _>>()?;
-                Ok(BsnPatch::Children(children))
+                if target_symbol.last_ident() == "Children" {
+                    Ok(BsnPatch::Children(related))
+                } else {
+                    Ok(BsnPatch::Related(BsnRelated {
+                        target: target_symbol.to_type_path(),
+                        entities: related,
+                    }))
+                }
             }
             BsnNodeKind::Patch {
                 symbol,
@@ -135,10 +133,9 @@ impl Lower<'_> {
                     (BsnPatchPrefix::Template, bevy_bsn::BsnValue::Struct(_, fields)) => {
                         Ok(BsnPatch::Template(type_path, Some(self.fields(fields)?)))
                     }
-                    (BsnPatchPrefix::Template, _) => Err(self.error(
-                        node.span,
-                        "a `~` template takes no body or a struct body",
-                    )),
+                    (BsnPatchPrefix::Template, _) => {
+                        Err(self.error(node.span, "a `~` template takes no body or a struct body"))
+                    }
                     (_, bevy_bsn::BsnValue::Path(_)) => Ok(BsnPatch::Type(type_path)),
                     (_, bevy_bsn::BsnValue::Struct(_, fields)) => {
                         Ok(BsnPatch::Struct(BsnStructData {

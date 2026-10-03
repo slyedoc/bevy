@@ -8,8 +8,9 @@ use std::any::TypeId;
 
 use bevy_asset::prelude::*;
 use bevy_asset::{AssetServer, ReflectHandle};
+use bevy_ecs::bundle::BundleScratch;
 use bevy_ecs::prelude::*;
-use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
+use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent, ReflectRelationshipTarget};
 use bevy_platform::collections::HashSet;
 use bevy_reflect::prelude::*;
 use bevy_reflect::{
@@ -222,21 +223,21 @@ pub fn spawn_ast_node(
 }
 
 /// [`spawn_ast_node`] counting how deep it has gone, so a document whose
-/// `Children` lists form a cycle stops at [`crate::MAX_AST_DEPTH`] rather
-/// than spawning entities until memory runs out.
+/// relations form a cycle stops at [`crate::MAX_AST_DEPTH`] rather than
+/// spawning entities until memory runs out. Returns the spawned entity.
 fn spawn_ast_node_to_depth(
     world: &mut World,
     ast_entity: Entity,
     parent: Option<Entity>,
     spawned: &mut Vec<Entity>,
     depth: usize,
-) {
+) -> Option<Entity> {
     if depth >= crate::MAX_AST_DEPTH {
         log::warn!(
             "document node {ast_entity} is deeper than {}; it was not spawned",
             crate::MAX_AST_DEPTH
         );
-        return;
+        return None;
     }
     let ecs_entity = world
         .spawn((
@@ -258,24 +259,71 @@ fn spawn_ast_node_to_depth(
 
     spawned.push(ecs_entity);
 
-    // Recurse into children.
-    let children_ast = {
+    // Recurse into children and other relations, in patch order.
+    let relations: Vec<BsnPatch> = {
         let ast = world.resource::<SceneBsnAst>();
         let Some(patches) = ast.get_patches(ast_entity) else {
-            return;
+            return Some(ecs_entity);
         };
-        let mut children = Vec::new();
-        for &pe in &patches.0 {
-            if let Some(BsnPatch::Children(child_list)) = ast.get_patch(pe) {
-                children.extend(child_list.iter().copied());
-            }
-        }
-        children
+        patches
+            .0
+            .iter()
+            .filter_map(|&pe| ast.get_patch(pe))
+            .filter(|patch| patch.related_entities().is_some())
+            .cloned()
+            .collect()
     };
 
-    for child_ast in children_ast {
-        spawn_ast_node_to_depth(world, child_ast, Some(ecs_entity), spawned, depth + 1);
+    for relation in relations {
+        match relation {
+            BsnPatch::Children(children) => {
+                for child_ast in children {
+                    spawn_ast_node_to_depth(world, child_ast, Some(ecs_entity), spawned, depth + 1);
+                }
+            }
+            BsnPatch::Related(related) => {
+                for related_ast in related.entities {
+                    if let Some(entity) =
+                        spawn_ast_node_to_depth(world, related_ast, None, spawned, depth + 1)
+                    {
+                        insert_relationship(world, entity, ecs_entity, &related.target);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
+    Some(ecs_entity)
+}
+
+/// Inserts the relationship of the `RelationshipTarget` named `target` (full or short type
+/// path) on `entity`, pointing at `owner`. Warns and returns `false` when `target` is not
+/// registered with `#[reflect(RelationshipTarget)]`.
+#[expect(
+    unsafe_code,
+    reason = "`ReflectRelationshipTarget` only writes through a `BundleWriter`."
+)]
+pub fn insert_relationship(world: &mut World, entity: Entity, owner: Entity, target: &str) -> bool {
+    let data = {
+        let registry = world.resource::<AppTypeRegistry>().read();
+        registry
+            .get_with_type_path(target)
+            .or_else(|| registry.get_with_short_type_path(target))
+            .and_then(|registration| registration.data::<ReflectRelationshipTarget>())
+            .cloned()
+    };
+    let Some(data) = data else {
+        log::warn!("`{target}` is not a registered `#[reflect(RelationshipTarget)]`; {entity} was left unrelated");
+        return false;
+    };
+    let mut scratch = BundleScratch::default();
+    let mut writer = scratch.writer();
+    // SAFETY: the component is registered in, and written to an entity of, this one world.
+    unsafe {
+        (data.insert_relationship)(&mut writer, &mut world.components_registrator(), owner);
+        writer.write(&mut world.entity_mut(entity));
+    }
+    true
 }
 
 /// Applies AST patches to all dirty entities, then removes the marker. Called
@@ -346,7 +394,7 @@ pub fn apply_ast_to_ecs(world: &mut World, entity: Entity) {
             BsnPatch::TupleStruct(ref data) => {
                 apply_tuple_struct_patch(world, entity, data);
             }
-            // Base, Template, Children handled elsewhere.
+            // Base, Template and relations handled elsewhere.
             _ => {}
         }
     }
@@ -363,7 +411,8 @@ pub fn apply_component_patch(world: &mut World, entity: Entity, patch: &BsnPatch
         BsnPatch::Name(_)
         | BsnPatch::Base(_)
         | BsnPatch::Template(_, _)
-        | BsnPatch::Children(_) => {}
+        | BsnPatch::Children(_)
+        | BsnPatch::Related(_) => {}
     }
 }
 
@@ -2974,5 +3023,67 @@ mod apply_value_tests {
         let holder = world.get::<PropMapHolder>(entity).expect("holder applied");
         assert_eq!(holder.props.get("hp"), Some(&Prop::Number(7.0)));
         assert_eq!(holder.props.get("alive"), Some(&Prop::Flag(true)));
+    }
+
+    #[derive(Component, Reflect)]
+    #[relationship(relationship_target = Items)]
+    #[reflect(Component)]
+    struct ItemOf(Entity);
+
+    #[derive(Component, Reflect)]
+    #[relationship_target(relationship = ItemOf)]
+    #[reflect(Component, RelationshipTarget)]
+    struct Items(Vec<Entity>);
+
+    fn spawn_text(world: &mut World, text: &str) -> Vec<Entity> {
+        world.insert_resource(crate::parse_bsn(text).expect("parses"));
+        let spawned = spawn_from_ast(world);
+        apply_dirty_ast_patches(world);
+        spawned
+    }
+
+    fn named(world: &mut World, name: &str) -> Entity {
+        world
+            .query::<(Entity, &Name)>()
+            .iter(world)
+            .find(|(_, n)| n.as_str() == name)
+            .map(|(e, _)| e)
+            .unwrap_or_else(|| panic!("no entity named {name}"))
+    }
+
+    #[test]
+    fn a_custom_relation_spawns_its_relationship() {
+        let mut world = base_world();
+        world
+            .resource::<AppTypeRegistry>()
+            .write()
+            .register::<Items>();
+        let items = core::any::type_name::<Items>();
+        spawn_text(
+            &mut world,
+            &format!("#Chest\n{items} [\n    #Sword\n    --\n    #Shield\n]\nChildren [ #Lid ]\n"),
+        );
+        let chest = named(&mut world, "Chest");
+        let sword = named(&mut world, "Sword");
+        let shield = named(&mut world, "Shield");
+        let lid = named(&mut world, "Lid");
+        assert_eq!(
+            world.get::<Items>(chest).map(|i| i.0.clone()),
+            Some(vec![sword, shield])
+        );
+        assert!(
+            world.get::<ChildOf>(sword).is_none(),
+            "an item is not a child"
+        );
+        assert_eq!(world.get::<ChildOf>(lid).map(ChildOf::parent), Some(chest));
+    }
+
+    #[test]
+    fn an_unregistered_relation_still_spawns_its_entities_unrelated() {
+        let mut world = base_world();
+        let spawned = spawn_text(&mut world, "#Chest\nmygame::Items [ #Sword ]\n");
+        assert_eq!(spawned.len(), 2, "the sword stays editable");
+        let sword = named(&mut world, "Sword");
+        assert!(world.get::<ChildOf>(sword).is_none());
     }
 }

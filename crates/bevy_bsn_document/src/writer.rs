@@ -25,9 +25,10 @@
 //! - [`BsnWriterConfig`] gains `always_save_paths`, an allow-list that
 //!   overrides every skip rule. The editor needs it to keep e.g. `Visibility`
 //!   while skipping the rest of `bevy_camera::visibility::`.
-//! - `Name`, `ChildOf`, and `Children` are always skipped as component
-//!   patches, independent of config: `Name` emits as a `#name` reference and
-//!   hierarchy emits structurally as `Children [...]`. The PR relied on its
+//! - `Name`, `ChildOf`, `Children` and every other reflected relationship pair
+//!   are always skipped as component patches, independent of config: `Name`
+//!   emits as a `#name` reference and hierarchy emits structurally as
+//!   `Children [...]`; other relations are not written. The PR relied on its
 //!   default config's `bevy_ecs::hierarchy::` prefix for the latter, which
 //!   `include_all()` would have disabled.
 //! - Component enumeration walks the type registry (whose iteration order is
@@ -50,7 +51,7 @@ use bevy_asset::{AssetServer, UntypedAssetId};
 use bevy_ecs::entity::Entity;
 use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::name::Name;
-use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
+use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent, ReflectRelationshipTarget};
 use bevy_ecs::world::World;
 use bevy_platform::collections::HashMap;
 
@@ -228,11 +229,19 @@ pub fn append_world_to_ast(
     let reg = registry.read();
     let asset_server = world.get_resource::<AssetServer>();
     let entity_set: HashSet<Entity> = entities.iter().copied().collect();
-    let structural = [
+    // Relationship components hold entity ids, which mean nothing in a file.
+    let mut structural: HashSet<TypeId> = [
         TypeId::of::<Name>(),
         TypeId::of::<ChildOf>(),
         TypeId::of::<Children>(),
-    ];
+    ]
+    .into();
+    for registration in reg.iter() {
+        if let Some(target) = registration.data::<ReflectRelationshipTarget>() {
+            structural.insert(registration.type_id());
+            structural.insert(target.relationship_type_id);
+        }
+    }
 
     for entity in parent_first_order(world, entities) {
         let entity_ref = world.entity(entity);

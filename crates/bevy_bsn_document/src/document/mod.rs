@@ -41,8 +41,41 @@ pub enum BsnPatch {
     TupleStruct(BsnTupleStructData),
     /// `@type::Path { ... }` template type.
     Template(String, Option<BsnStructFields>),
-    /// `Children [...]` child entity relation.
+    /// `Children [...]` child entity relation, the editor hierarchy.
     Children(Vec<Entity>),
+    /// `Target [...]` for any other `RelationshipTarget`; the document owns the related entities.
+    Related(BsnRelated),
+}
+
+impl BsnPatch {
+    /// The entities this patch nests (`Children` or any other relation), if it is a relation.
+    pub fn related_entities(&self) -> Option<&Vec<Entity>> {
+        match self {
+            BsnPatch::Children(entities) | BsnPatch::Related(BsnRelated { entities, .. }) => {
+                Some(entities)
+            }
+            _ => None,
+        }
+    }
+
+    /// Mutable [`Self::related_entities`].
+    pub fn related_entities_mut(&mut self) -> Option<&mut Vec<Entity>> {
+        match self {
+            BsnPatch::Children(entities) | BsnPatch::Related(BsnRelated { entities, .. }) => {
+                Some(entities)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A non-`Children` relation: `target` names the `RelationshipTarget` type as written.
+#[derive(Debug, Clone)]
+pub struct BsnRelated {
+    /// The relationship target's type path, e.g. `my_game::Followers`.
+    pub target: String,
+    /// The related entities, in source order.
+    pub entities: Vec<Entity>,
 }
 
 /// Fields of a BSN struct patch: `TypePath { field: expr, ... }`.

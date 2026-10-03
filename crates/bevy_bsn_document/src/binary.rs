@@ -11,8 +11,8 @@
 use bevy_ecs::entity::Entity;
 
 use crate::document::{
-    BsnField, BsnPatch, BsnStructData, BsnStructFields, BsnTupleStructData, BsnValue, SceneBsnAst,
-    MAX_AST_DEPTH,
+    BsnField, BsnPatch, BsnRelated, BsnStructData, BsnStructFields, BsnTupleStructData, BsnValue,
+    SceneBsnAst, MAX_AST_DEPTH,
 };
 
 /// The four bytes every binary BSN document starts with.
@@ -31,6 +31,7 @@ const PATCH_STRUCT: u8 = 3;
 const PATCH_TUPLE_STRUCT: u8 = 4;
 const PATCH_TEMPLATE: u8 = 5;
 const PATCH_CHILDREN: u8 = 6;
+const PATCH_RELATED: u8 = 7;
 
 const VALUE_FLOAT: u8 = 0;
 const VALUE_INT: u8 = 1;
@@ -192,6 +193,14 @@ fn write_patch(ast: &SceneBsnAst, patch: &BsnPatch, depth: usize, out: &mut Vec<
             out.push(PATCH_CHILDREN);
             write_len(children.len(), out);
             for &child in children {
+                write_node(ast, child, depth + 1, out);
+            }
+        }
+        BsnPatch::Related(related) => {
+            out.push(PATCH_RELATED);
+            write_str(&related.target, out);
+            write_len(related.entities.len(), out);
+            for &child in &related.entities {
                 write_node(ast, child, depth + 1, out);
             }
         }
@@ -409,6 +418,15 @@ fn read_patch(
                 children.push(read_node(reader, ast, depth + 1)?);
             }
             Ok(BsnPatch::Children(children))
+        }
+        PATCH_RELATED => {
+            let target = reader.string()?;
+            let count = reader.len()?;
+            let mut entities = Vec::new();
+            for _ in 0..count {
+                entities.push(read_node(reader, ast, depth + 1)?);
+            }
+            Ok(BsnPatch::Related(BsnRelated { target, entities }))
         }
         tag => Err(BinaryError::UnknownTag { kind: "patch", tag }),
     }

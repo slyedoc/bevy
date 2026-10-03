@@ -4,8 +4,8 @@
 use bevy_ecs::entity::Entity;
 
 use bevy_bsn_document::{
-    emit_scene, parse_bsn_text, BsnField, BsnPatch, BsnPatches, BsnStructData, BsnStructFields,
-    BsnTupleStructData, BsnValue, SceneBsnAst,
+    emit_scene, parse_bsn_text, BsnField, BsnPatch, BsnPatches, BsnRelated, BsnStructData,
+    BsnStructFields, BsnTupleStructData, BsnValue, SceneBsnAst,
 };
 
 /// Recursively assert that two document ASTs are structurally identical:
@@ -51,7 +51,11 @@ fn assert_patch_eq(a: &SceneBsnAst, patch_a: &BsnPatch, b: &SceneBsnAst, patch_b
                 _ => panic!("Template field presence mismatch"),
             }
         }
-        (BsnPatch::Children(ca), BsnPatch::Children(cb)) => {
+        (BsnPatch::Children(ca), BsnPatch::Children(cb))
+        | (
+            BsnPatch::Related(BsnRelated { entities: ca, .. }),
+            BsnPatch::Related(BsnRelated { entities: cb, .. }),
+        ) => {
             assert_eq!(ca.len(), cb.len(), "Children count");
             for (&child_a, &child_b) in ca.iter().zip(cb.iter()) {
                 assert_patches_eq(a, child_a, b, child_b);
@@ -77,6 +81,7 @@ fn describe_patch(patch: &BsnPatch) -> String {
         BsnPatch::TupleStruct(d) => format!("TupleStruct({})", d.type_path),
         BsnPatch::Template(t, _) => format!("Template({t})"),
         BsnPatch::Children(c) => format!("Children(len={})", c.len()),
+        BsnPatch::Related(r) => format!("Related({}, len={})", r.target, r.entities.len()),
     }
 }
 
@@ -527,7 +532,9 @@ fn a_document_without_generics_reads_the_same_as_before() {
 /// cannot pass through raw.
 #[test]
 fn unicode_and_control_characters_round_trip() {
-    use bevy_bsn_document::{BsnField, BsnPatch, BsnStructData, BsnStructFields, BsnValue, SceneBsnAst};
+    use bevy_bsn_document::{
+        BsnField, BsnPatch, BsnStructData, BsnStructFields, BsnValue, SceneBsnAst,
+    };
 
     let tricky = "u\u{00fc}ber \u{1f426}\nline two\ttabbed \"quoted\"";
     let mut ast = SceneBsnAst::default();

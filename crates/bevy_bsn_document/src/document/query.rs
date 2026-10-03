@@ -132,10 +132,10 @@ impl SceneBsnAst {
                         {
                             found = Some(node);
                         }
-                        Some(BsnPatch::Children(children)) => {
-                            nodes.extend(children.iter().copied());
+                        Some(patch) => {
+                            nodes.extend(patch.related_entities().into_iter().flatten());
                         }
-                        _ => {}
+                        None => {}
                     }
                 }
             }
@@ -203,7 +203,7 @@ impl SceneBsnAst {
         None
     }
 
-    /// Find which AST entity contains `child_ast` in a Children patch.
+    /// Find which AST entity nests `child_ast`, in `Children` or any other relation.
     /// Returns `None` if `child_ast` is a root (or not found).
     pub fn find_ast_parent_of(&self, child_ast: Entity) -> Option<Entity> {
         if self.roots.contains(&child_ast) {
@@ -220,7 +220,10 @@ impl SceneBsnAst {
     fn find_parent_in_subtree(&self, current: Entity, target: Entity) -> Option<Entity> {
         let patches = self.get_patches(current)?;
         for &patch_entity in &patches.0 {
-            if let Some(BsnPatch::Children(children)) = self.get_patch(patch_entity) {
+            if let Some(children) = self
+                .get_patch(patch_entity)
+                .and_then(BsnPatch::related_entities)
+            {
                 if children.contains(&target) {
                     return Some(current);
                 }
@@ -257,15 +260,29 @@ impl SceneBsnAst {
         out
     }
 
-    /// All AST descendants of `root_ast`, excluding `root_ast` itself. Walks the
-    /// [`BsnPatch::Children`] relation recursively via
-    /// [`get_children_ast`](Self::get_children_ast). Returns an empty vector when
-    /// the node has no children.
+    /// Every node `patches_entity` nests: `Children` first-class and every other
+    /// relation, in patch order.
+    pub fn get_related_ast(&self, patches_entity: Entity) -> Vec<Entity> {
+        let Some(patches) = self.get_patches(patches_entity) else {
+            return Vec::new();
+        };
+        patches
+            .0
+            .iter()
+            .filter_map(|&pe| self.get_patch(pe).and_then(BsnPatch::related_entities))
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// All AST descendants of `root_ast`, excluding `root_ast` itself, through
+    /// `Children` and every other relation. Returns an empty vector when the
+    /// node nests nothing.
     pub fn descendants_of(&self, root_ast: Entity) -> Vec<Entity> {
         let mut out = Vec::new();
         let mut stack = vec![root_ast];
         while let Some(current) = stack.pop() {
-            for child in self.get_children_ast(current) {
+            for child in self.get_related_ast(current) {
                 out.push(child);
                 stack.push(child);
             }
@@ -273,7 +290,7 @@ impl SceneBsnAst {
         out
     }
 
-    /// The parent AST node that lists `ast` in its [`BsnPatch::Children`], or
+    /// The AST node that nests `ast` in a relation, or
     /// `None` when `ast` is a root (or is not present in the document). Public
     /// wrapper over the internal parentage walk.
     pub fn ast_parent_of(&self, ast: Entity) -> Option<Entity> {

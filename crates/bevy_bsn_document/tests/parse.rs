@@ -8,7 +8,11 @@ use bevy_ecs::entity::Entity;
 /// Parse text and return the document plus its first root's patch entities.
 fn parse(text: &str) -> (SceneBsnAst, Vec<Entity>) {
     let ast = parse_bsn(text).expect("text should parse");
-    let patches = ast.get_patches(ast.roots[0]).expect("root patch group").0.clone();
+    let patches = ast
+        .get_patches(ast.roots[0])
+        .expect("root patch group")
+        .0
+        .clone();
     (ast, patches)
 }
 

@@ -41,17 +41,17 @@ pub use delta::{apply_deltas, bsn_value_eq, shallow_diff};
 pub use document::{
     bsn_value_as_int, clone_node_into, clone_subtree_into, component_to_bsn_patch,
     component_to_bsn_patch_with_assets, is_enum_variant_of, patch_type_path, type_paths_include,
-    AstNodeRef, BsnAssetContext, BsnField, BsnPatch, BsnPatches, BsnStructData, BsnStructFields,
-    BsnTupleStructData, BsnValue, SceneBsnAst, MAX_AST_DEPTH,
+    AstNodeRef, BsnAssetContext, BsnField, BsnPatch, BsnPatches, BsnRelated, BsnStructData,
+    BsnStructFields, BsnTupleStructData, BsnValue, SceneBsnAst, MAX_AST_DEPTH,
 };
 pub use emitter::{emit_entities, emit_entity, emit_scene};
 pub use loader::{parse_bsn_text, BsnLoadError};
 
 pub use apply::{
     apply_ast_to_ecs, apply_component_patch, apply_dirty_ast_patches, apply_reference_map,
-    bsn_value_to_reflect, get_bsn_field, remove_bsn_field, set_bsn_field, spawn_ast_node,
-    spawn_from_ast, AstDirty, BsnApplyAssets, BsnAssetPaths, BsnProjectAssets, BsnSceneAssets,
-    DocumentOnlyTypes, UnresolvedTypes,
+    bsn_value_to_reflect, get_bsn_field, insert_relationship, remove_bsn_field, set_bsn_field,
+    spawn_ast_node, spawn_from_ast, AstDirty, BsnApplyAssets, BsnAssetPaths, BsnProjectAssets,
+    BsnSceneAssets, DocumentOnlyTypes, UnresolvedTypes,
 };
 
 pub use sync::{

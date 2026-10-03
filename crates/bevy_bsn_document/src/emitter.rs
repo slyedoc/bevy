@@ -53,7 +53,7 @@ fn lower_entity(
     patches_entity: Entity,
     depth: usize,
 ) -> Option<BsnNodeId> {
-    // A `Children` cycle stops here rather than writing text until memory runs out.
+    // A relation cycle stops here rather than writing text until memory runs out.
     if depth >= crate::MAX_AST_DEPTH {
         log::warn!(
             "document node {patches_entity} is deeper than {}; it was not emitted",
@@ -103,13 +103,19 @@ fn lower_entity(
                 };
                 patch_nodes.push(doc.push_patch(BsnPatchPrefix::Template, path(type_path), body));
             }
-            BsnPatch::Children(children) => {
-                let entities = children
-                    .iter()
+            BsnPatch::Children(_) | BsnPatch::Related(_) => {
+                let target = match patch {
+                    BsnPatch::Related(related) => related.target.as_str(),
+                    _ => "bevy_ecs::hierarchy::Children",
+                };
+                let entities = patch
+                    .related_entities()
+                    .into_iter()
+                    .flatten()
                     .filter_map(|&child| lower_entity(ast, doc, child, depth + 1))
                     .collect();
                 relations.push(doc.push_node(BsnNodeKind::Relation {
-                    target_symbol: path("bevy_ecs::hierarchy::Children"),
+                    target_symbol: path(target),
                     entities,
                 }));
             }
@@ -337,5 +343,33 @@ mod tests {
         let second = emit_scene(&ast);
         assert_eq!(first, expected);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_custom_relation_round_trips_through_text_binary_and_clone() {
+        let text = "#Chest\nmygame::Items [\n    #Sword\n]\nbevy_ecs::hierarchy::Children [\n    #Lid\n]\n";
+        let ast = crate::parse_bsn(text).expect("parses");
+        let root = ast.roots[0];
+        let relation = ast
+            .get_patches(root)
+            .unwrap()
+            .0
+            .iter()
+            .find_map(|&pe| match ast.get_patch(pe) {
+                Some(BsnPatch::Related(related)) => Some(related.clone()),
+                _ => None,
+            })
+            .expect("a Related patch");
+        assert_eq!(relation.target, "mygame::Items");
+        assert_eq!(ast.get_children_ast(root).len(), 1, "only Lid is a child");
+        assert_eq!(ast.descendants_of(root).len(), 2, "both are owned");
+
+        let emitted = emit_scene(&ast);
+        assert_eq!(emit_scene(&crate::parse_bsn(&emitted).unwrap()), emitted);
+        assert!(emitted.contains("mygame::Items ["), "{emitted}");
+
+        let decoded = crate::binary::decode(&crate::binary::encode(&ast, None)).unwrap();
+        assert_eq!(emit_scene(&decoded.ast), emitted);
+        assert_eq!(emit_scene(&ast.deep_clone()), emitted);
     }
 }

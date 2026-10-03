@@ -116,8 +116,8 @@ impl SceneBsnAst {
         }
     }
 
-    /// Removes a child from every `Children` patch its parent carries, not just
-    /// the first, or a move out of a parent with two lists duplicates it.
+    /// Removes a child from every relation its parent carries, not just the
+    /// first, or a move out of a parent with two lists duplicates it.
     pub fn remove_child_from_ast(&mut self, parent_ast: Entity, child_ast: Entity) {
         let Some(patches) = self.get_patches(parent_ast) else {
             return;
@@ -126,7 +126,7 @@ impl SceneBsnAst {
 
         for &patch_entity in &patch_ids {
             if let Some(patch) = self.world.get_mut::<BsnPatch>(patch_entity)
-                && let BsnPatch::Children(children) = patch.into_inner()
+                && let Some(children) = patch.into_inner().related_entities_mut()
             {
                 children.retain(|&e| e != child_ast);
             }
@@ -168,24 +168,7 @@ impl SceneBsnAst {
         // recycled for an unrelated AST node.
         self.unlink_ast(node);
 
-        let children: Vec<Entity> = if let Some(patches) = self.get_patches(node) {
-            patches
-                .0
-                .iter()
-                .filter_map(|&pe| {
-                    if let Some(BsnPatch::Children(child_list)) = self.get_patch(pe) {
-                        Some(child_list.clone())
-                    } else {
-                        None
-                    }
-                })
-                .flatten()
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        for child in children {
+        for child in self.get_related_ast(node) {
             self.despawn_recursive_to_depth(child, depth + 1);
         }
 
@@ -269,9 +252,8 @@ impl SceneBsnAst {
         dst
     }
 
-    /// Clone `node`'s component patches into a fresh vector, dropping the
-    /// [`BsnPatch::Children`] relation (callers rebuild the hierarchy
-    /// separately). Name, base, and every component patch pass through.
+    /// Clone `node`'s component patches into a fresh vector, dropping every
+    /// relation (callers rebuild them separately). Name, base, and every component patch pass through.
     /// Returns an empty vector when `node` has no patches.
     pub fn cloned_component_patches(&self, node: Entity) -> Vec<BsnPatch> {
         match self.get_patches(node) {
@@ -279,7 +261,7 @@ impl SceneBsnAst {
                 .0
                 .iter()
                 .filter_map(|&pe| self.get_patch(pe))
-                .filter(|patch| !matches!(patch, BsnPatch::Children(_)))
+                .filter(|patch| patch.related_entities().is_none())
                 .cloned()
                 .collect(),
             None => Vec::new(),
@@ -289,7 +271,7 @@ impl SceneBsnAst {
 
 /// Graft `src_node`'s full subtree into `dst` under `dst_parent` (`None` = new root).
 ///
-/// The walk stops at [`MAX_AST_DEPTH`], so a `src` whose `Children` lists form
+/// The walk stops at [`MAX_AST_DEPTH`], so a `src` whose relations form
 /// a cycle costs a bounded graft and a warning rather than the stack.
 pub fn clone_subtree_into(
     dst: &mut SceneBsnAst,
@@ -307,23 +289,51 @@ fn clone_subtree_to_depth(
     dst_parent: Option<Entity>,
     depth: usize,
 ) -> Entity {
-    let new_node = match dst_parent {
-        Some(parent) => clone_node_into(dst, src, src_node, parent),
-        None => {
-            let patches = src.cloned_component_patches(src_node);
-            let node = dst.create_entity_node(patches);
-            dst.add_to_roots(node);
-            node
-        }
-    };
+    let new_node = clone_unattached(dst, src, src_node, depth);
+    match dst_parent {
+        Some(parent) => dst.add_child_to_ast(parent, new_node),
+        None => dst.add_to_roots(new_node),
+    }
+    new_node
+}
+
+/// Copy `src_node` and everything it nests, one relation patch per source patch in
+/// source order, without attaching the copy anywhere.
+fn clone_unattached(
+    dst: &mut SceneBsnAst,
+    src: &SceneBsnAst,
+    src_node: Entity,
+    depth: usize,
+) -> Entity {
+    let new_node = dst.create_entity_node(src.cloned_component_patches(src_node));
     if depth >= MAX_AST_DEPTH {
         log::warn!(
             "document node {src_node} is deeper than {MAX_AST_DEPTH}; its children were not copied"
         );
         return new_node;
     }
-    for child in src.get_children_ast(src_node) {
-        clone_subtree_to_depth(dst, src, child, Some(new_node), depth + 1);
+    let relations: Vec<BsnPatch> = src
+        .get_patches(src_node)
+        .map(|patches| {
+            patches
+                .0
+                .iter()
+                .filter_map(|&pe| src.get_patch(pe))
+                .filter(|patch| patch.related_entities().is_some())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    for mut relation in relations {
+        if let Some(entities) = relation.related_entities_mut() {
+            for entity in entities.iter_mut() {
+                *entity = clone_unattached(dst, src, *entity, depth + 1);
+            }
+        }
+        let patch = dst.world.spawn(relation).id();
+        if let Some(patches) = dst.get_patches_mut(new_node) {
+            patches.0.push(patch);
+        }
     }
     new_node
 }
@@ -349,8 +359,8 @@ fn link_cloned_subtree(
     src_node: Entity,
     dst_node: Entity,
 ) {
-    let src_children = src.get_children_ast(src_node);
-    let dst_children = dst.get_children_ast(dst_node);
+    let src_children = src.get_related_ast(src_node);
+    let dst_children = dst.get_related_ast(dst_node);
     for (src_child, dst_child) in src_children.into_iter().zip(dst_children) {
         if let Some(ecs) = src.ecs_for_ast(src_child) {
             dst.link(ecs, dst_child);
