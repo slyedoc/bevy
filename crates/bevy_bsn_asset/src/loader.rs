@@ -111,8 +111,14 @@ impl AssetLoader for DynamicBsnLoader {
 
         // (5) Lower the document. `source` here is the asset path string: it gives the document's
         //     `#Name` references a stable identity across reloads of the same file.
-        let scene = DynamicScene::from_document(&document, path.clone(), &self.type_registry)
-            .map_err(|error| DynamicBsnLoaderError::from_build_error(&path, source, error))?;
+        let mut handles = |type_id, asset_path| load_context.load_builder().load_erased(type_id, asset_path);
+        let scene = DynamicScene::from_document_with_handles(
+            &document,
+            path.clone(),
+            &self.type_registry,
+            &mut handles,
+        )
+        .map_err(|error| DynamicBsnLoaderError::from_build_error(&path, source, error))?;
 
         // (6) Register the scene's asset dependencies and build the asset value. Dependencies are
         //     registered exactly once, here, so `ScenePatch::dependencies` stays authoritative.

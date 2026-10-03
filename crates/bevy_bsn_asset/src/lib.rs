@@ -35,7 +35,7 @@ mod scene;
 mod template;
 mod value;
 
-pub use build::DynamicSceneBuildError;
+pub use build::{DynamicSceneBuildError, HandleProvider};
 pub use loader::{report_scene_patch_load_failures, DynamicBsnLoader, DynamicBsnLoaderError};
 pub use scene::DynamicScene;
 pub use template::DynamicComponentTemplate;

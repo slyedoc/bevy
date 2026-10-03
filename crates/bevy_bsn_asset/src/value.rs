@@ -71,7 +71,10 @@ pub(crate) fn build_value(
                         dynamic.set_represented_type(Some(expected.type_info()));
                         Ok(Box::new(dynamic) as Box<dyn PartialReflect>)
                     }
-                    Err(_) => Err(err),
+                    // A plain mismatch says more about the outer type; anything else (a bad
+                    // asset path, a handle that needs the loader) is the real problem.
+                    Err(DynamicSceneBuildError::ValueTypeMismatch { .. }) => Err(err),
+                    Err(inner) => Err(inner),
                 },
                 None => Err(err),
             }
@@ -282,6 +285,20 @@ fn build_string(
     }
     if type_id == TypeId::of::<AssetPath<'static>>() {
         return Ok(Box::new(asset_path(literal, span)?));
+    }
+
+    // A plain `Handle<A>` outside a template, e.g. a texture field of an inline asset value: the
+    // loader makes it now, which also records the dependency.
+    if let Some(reflect_handle) = expected.data::<ReflectHandle>() {
+        let path = asset_path(literal, span)?;
+        let Some(handles) = cx.handles.as_mut() else {
+            return Err(DynamicSceneBuildError::HandleNeedsLoader {
+                type_path: expected.type_info().type_path().to_string(),
+                span,
+            });
+        };
+        let handle = handles(reflect_handle.asset_type_id(), path);
+        return Ok(reflect_handle.typed(handle).into_partial_reflect());
     }
 
     // The destination is a template whose output is a `Handle<A>`. Validate the path *before*
@@ -740,7 +757,7 @@ mod tests {
     }
 
     /// The registration of `T`, which must be in the fixture registry.
-    fn reg<'a, T: 'static>(cx: &BuildCx<'a>) -> &'a TypeRegistration {
+    fn reg<'a, T: 'static>(cx: &BuildCx<'a, '_>) -> &'a TypeRegistration {
         cx.registry
             .get(TypeId::of::<T>())
             .expect("the fixture type should be registered")

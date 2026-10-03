@@ -4,7 +4,7 @@
 use alloc::sync::Arc;
 use core::any::TypeId;
 
-use bevy_asset::AssetPath;
+use bevy_asset::{AssetPath, UntypedHandle};
 use bevy_bsn::{BsnDocument, BsnNodeId, BsnNodeKind, BsnPatchPrefix, BsnPath, BsnValue, Span};
 use bevy_ecs::{
     name::Name,
@@ -206,6 +206,18 @@ pub enum DynamicSceneBuildError {
         /// Where the string was written.
         span: Span,
     },
+    /// A `Handle` outside a template (a texture inside an inline asset, say) needs the loader to
+    /// make it, and this document was built without one.
+    #[error(
+        "`{type_path}` holds a handle outside a template; build the scene with \
+         `DynamicScene::from_document_with_handles` (the `.bsn` loader does)."
+    )]
+    HandleNeedsLoader {
+        /// The handle type.
+        type_path: String,
+        /// Where the asset path was written.
+        span: Span,
+    },
     /// The document describes more than one root entity.
     #[error(
         "a scene asset must contain exactly one root entity, found {count}. Wrap them in a \
@@ -250,6 +262,7 @@ impl DynamicSceneBuildError {
             | Self::SceneComponentUnsupported { span, .. }
             | Self::UnknownEntityName { span, .. }
             | Self::InvalidAssetPath { span, .. }
+            | Self::HandleNeedsLoader { span, .. }
             | Self::MultipleRoots { span, .. }
             | Self::MalformedDocument { span, .. } => *span,
         }
@@ -263,7 +276,11 @@ impl DynamicSceneBuildError {
 }
 
 /// Shared state for one document lowering.
-pub(crate) struct BuildCx<'a> {
+/// Loads an asset by type and path, returning its handle: the loader's
+/// [`LoadContext`](bevy_asset::LoadContext), so the load is a dependency of the scene.
+pub type HandleProvider<'h> = &'h mut dyn FnMut(TypeId, AssetPath<'static>) -> UntypedHandle;
+
+pub(crate) struct BuildCx<'a, 'h> {
     /// The registry, read-locked for the whole build.
     pub(crate) registry: &'a TypeRegistry,
     /// The document being lowered.
@@ -275,11 +292,13 @@ pub(crate) struct BuildCx<'a> {
     pub(crate) names: HashMap<String, u32>,
     /// Asset dependencies discovered so far.
     pub(crate) dependencies: Vec<(TypeId, AssetPath<'static>)>,
+    /// Makes the `Handle` for an asset path outside a template, when the loader provides it.
+    pub(crate) handles: Option<HandleProvider<'h>>,
     /// The current recursion depth.
     depth: u32,
 }
 
-impl<'a> BuildCx<'a> {
+impl<'a, 'h> BuildCx<'a, 'h> {
     /// Creates a build context for `document`, which was parsed from the asset path `source`.
     pub(crate) fn new(registry: &'a TypeRegistry, document: &'a BsnDocument, source: &str) -> Self {
         Self {
@@ -288,6 +307,7 @@ impl<'a> BuildCx<'a> {
             source_path_hash: SceneEntityReference::asset_path_hash(source),
             names: collect_names(document),
             dependencies: Vec::new(),
+            handles: None,
             depth: 0,
         }
     }
@@ -350,10 +370,30 @@ impl DynamicScene {
         source: impl Into<Arc<str>>,
         registry: &AppTypeRegistry,
     ) -> Result<Self, DynamicSceneBuildError> {
-        let source: Arc<str> = source.into();
+        Self::build(document, source.into(), registry, None)
+    }
+
+    /// [`DynamicScene::from_document`], with `handles` making the `Handle`s that sit outside a
+    /// template, such as the textures of an inline asset value.
+    pub fn from_document_with_handles(
+        document: &BsnDocument,
+        source: impl Into<Arc<str>>,
+        registry: &AppTypeRegistry,
+        handles: HandleProvider,
+    ) -> Result<Self, DynamicSceneBuildError> {
+        Self::build(document, source.into(), registry, Some(handles))
+    }
+
+    fn build(
+        document: &BsnDocument,
+        source: Arc<str>,
+        registry: &AppTypeRegistry,
+        handles: Option<HandleProvider>,
+    ) -> Result<Self, DynamicSceneBuildError> {
         let (root, dependencies) = {
             let guard = registry.read();
             let mut cx = BuildCx::new(&guard, document, &source);
+            cx.handles = handles;
 
             let root = match document.roots.split_first() {
                 None => DynamicSceneEntity {

@@ -704,6 +704,9 @@ impl AssetApp for App {
             type_registry.register_type_data::<Handle<A>, ReflectHandle>();
             type_registry.register_type_data::<Handle<A>, ReflectFromTemplate>();
             type_registry.register_type_data::<HandleTemplate<A>, ReflectTemplate>();
+            // An asset value written in place of a handle becomes an inline asset.
+            type_registry
+                .register_type_conversion::<A, HandleTemplate<A>, _>(|a| Ok(HandleTemplate::value(a)));
             type_registry.register_type_conversion::<String, HandleTemplate<A>, _>(|s| {
                 // Validate before converting: `HandleTemplate: From<String>` goes through
                 // `AssetPath::parse`, which panics on malformed paths, and conversion inputs

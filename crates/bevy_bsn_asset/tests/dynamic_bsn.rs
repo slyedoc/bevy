@@ -84,6 +84,20 @@ struct Sprite {
     image: Handle<Image>,
 }
 
+/// An asset written in place of a handle, with a handle of its own.
+#[derive(Asset, Reflect, Clone, Default)]
+#[reflect(Default, Clone)]
+struct Material {
+    value: u32,
+    texture: Option<Handle<Image>>,
+}
+
+/// A component holding a [`Material`] handle.
+#[derive(Component, FromTemplate, Reflect, PartialEq, Debug)]
+#[template(reflect)]
+#[reflect(Component, FromTemplate)]
+struct MaterialRef(Handle<Material>);
+
 /// A component with a nested struct field, for nested partial patches.
 #[derive(Component, Reflect, Clone, Default, PartialEq, Debug)]
 #[reflect(Component, Default)]
@@ -297,6 +311,10 @@ fn test_app(dir: &Dir) -> App {
     app.register_type::<Position>();
     app.register_type::<Sprite>();
     app.register_type::<SpriteTemplate>();
+    app.init_asset::<Material>();
+    app.register_asset_reflect::<Material>();
+    app.register_type::<MaterialRef>();
+    app.register_type::<MaterialRefTemplate>();
     app.register_type::<Name>();
     app.register_type::<Children>();
     app.register_type::<ChildOf>();
@@ -1698,5 +1716,43 @@ fn reinserting_scene_patch_instance_swaps_the_bsn_file() {
         app.world().entities().count_spawned(),
         before + 2,
         "the instance entity and the one child of the new scene"
+    );
+}
+
+#[test]
+fn inline_asset_value_is_added_once_with_its_handles() {
+    let dir = Dir::default();
+    dir.insert_asset_text(Path::new("tex.png"), "");
+    dir.insert_asset_text(
+        Path::new("inline.bsn"),
+        "MaterialRef(Material { value: 7, texture: \"tex.png\" })",
+    );
+    let mut app = test_app(&dir);
+
+    let first = spawn_instance(&mut app, "inline.bsn");
+    let second = spawn_instance(&mut app, "inline.bsn");
+    let world = app.world();
+    let handle = &world.get::<MaterialRef>(first).unwrap().0;
+    assert_eq!(handle, &world.get::<MaterialRef>(second).unwrap().0);
+
+    let materials = world.resource::<Assets<Material>>();
+    assert_eq!(materials.len(), 1, "one inline asset, shared by both spawns");
+    let material = materials.get(handle).unwrap();
+    assert_eq!(material.value, 7);
+    let texture = material.texture.as_ref().unwrap();
+    assert_eq!(texture.path().map(ToString::to_string).as_deref(), Some("tex.png"));
+}
+
+#[test]
+fn handle_outside_a_template_needs_the_loader() {
+    let mut app = test_app(&Dir::default());
+    let document = bevy_bsn::parse("MaterialRef(Material { texture: \"tex.png\" })").unwrap();
+    let registry = app.world_mut().resource::<AppTypeRegistry>().clone();
+    let error = bevy_bsn_asset::DynamicScene::from_document(&document, "x.bsn", &registry)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, bevy_bsn_asset::DynamicSceneBuildError::HandleNeedsLoader { .. }),
+        "{error}"
     );
 }
