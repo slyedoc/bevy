@@ -1078,6 +1078,22 @@ A {
 }
 
 #[test]
+fn one_field_per_line_breaks_structs_but_not_tuple_structs() {
+    let document = parse("A { x: B { y: 1 }, z: Name(\"n\") }\n").unwrap();
+    let mut out = String::new();
+    write_document_with(
+        &document,
+        &mut out,
+        &PrintOptions {
+            one_field_per_line: true,
+            ..PrintOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(out, "A {\n    x: B {\n        y: 1,\n    },\n    z: Name(\"n\"),\n}\n");
+}
+
+#[test]
 fn print_string_escapes() {
     let source = "A { x: \"a\\\"b\\\\c\\n\\t\\0\\u{7}\\u{1F600}\" }\n";
     let document = parse(source).unwrap();

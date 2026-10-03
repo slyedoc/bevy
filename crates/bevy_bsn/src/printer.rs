@@ -55,6 +55,9 @@ pub struct PrintOptions {
     pub trailing_commas: bool,
     /// Emit a blank line between top-level roots. Default `true`.
     pub blank_line_between_roots: bool,
+    /// Put every field of a non-empty struct body on its own line, whatever its width, so an
+    /// edit to one field changes one line. Default `false`.
+    pub one_field_per_line: bool,
 }
 
 impl Default for PrintOptions {
@@ -64,6 +67,7 @@ impl Default for PrintOptions {
             max_inline_width: 100,
             trailing_commas: true,
             blank_line_between_roots: true,
+            one_field_per_line: false,
         }
     }
 }
@@ -329,7 +333,10 @@ impl Printer<'_> {
         };
         let inline = self.inline_value(id, depth);
         let breakable = is_breakable(&node.value);
-        if let Some(text) = &inline {
+        let expand = self.options.one_field_per_line && holds_struct(document, &node.value, depth);
+        if let Some(text) = &inline
+            && !expand
+        {
             let width = last_line_width(out) + text.chars().count();
             if !breakable || width <= self.options.max_inline_width as usize {
                 out.push_str(text);
@@ -458,6 +465,24 @@ impl Printer<'_> {
 }
 
 /// Returns `true` if a value has a body that can be broken across lines.
+/// Whether `value` is, or contains, a struct with fields.
+fn holds_struct(document: &BsnDocument, value: &BsnValue, depth: u32) -> bool {
+    if depth > MAX_WALK_DEPTH {
+        return false;
+    }
+    match value {
+        BsnValue::Struct(_, fields) => !fields.is_empty(),
+        BsnValue::NamedTuple(_, items) | BsnValue::Tuple(items) | BsnValue::List(items) => {
+            items.iter().any(|item| {
+                document
+                    .value(*item)
+                    .is_some_and(|node| holds_struct(document, &node.value, depth + 1))
+            })
+        }
+        _ => false,
+    }
+}
+
 fn is_breakable(value: &BsnValue) -> bool {
     match value {
         BsnValue::Struct(_, fields) => !fields.is_empty(),

@@ -866,18 +866,21 @@ fn non_default_print_options_still_re_parse() {
             max_inline_width: 0,
             trailing_commas: false,
             blank_line_between_roots: false,
+            one_field_per_line: false,
         },
         crate::PrintOptions {
             indent: 1,
             max_inline_width: u16::MAX,
             trailing_commas: false,
             blank_line_between_roots: true,
+            one_field_per_line: true,
         },
         crate::PrintOptions {
             indent: 8,
             max_inline_width: 1,
             trailing_commas: true,
             blank_line_between_roots: false,
+            one_field_per_line: true,
         },
     ];
     let mut rng = Rng(0x7777_1111_2222_3333);
