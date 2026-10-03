@@ -18,7 +18,7 @@ use bevy_scene::Scene;
 use bevy_ui::{px, Display, FlexDirection, FlexWrap, Node};
 use bevy_ui_widgets::Activate;
 
-use bevy_feathers::controls::{ButtonVariant, FeathersButton, FeathersButtonProps};
+use bevy_feathers::controls::{ButtonVariant, FeathersButton};
 use bevy_feathers::display::label;
 
 use crate::attributes::FieldCtx;
@@ -78,19 +78,16 @@ pub fn build_enum(
             };
             let caption: Box<dyn SceneList> =
                 Box::new(vec![Box::new(label(name.clone())) as Box<dyn Scene>]);
-            Box::new((
-                <FeathersButton as SceneComponent>::scene(FeathersButtonProps {
-                    caption,
-                    variant: if is_current {
-                        ButtonVariant::Primary
-                    } else {
-                        ButtonVariant::Normal
-                    },
-                    ..Default::default()
-                }),
-                template_value(button),
-                on(on_enum_variant_click),
-            )) as Box<dyn Scene>
+            let variant = if is_current {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Normal
+            };
+            Box::new(bsn! {
+                @FeathersButton { @caption: {caption}, @variant: {variant} }
+                button
+                on(on_enum_variant_click)
+            }) as Box<dyn Scene>
         })
         .collect();
     children.push(Box::new(bsn! {

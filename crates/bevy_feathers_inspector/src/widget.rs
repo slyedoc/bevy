@@ -6,9 +6,7 @@
 //! boxed feathers [`Scene`] bound to the value.
 
 use bevy_app::{Plugin, PluginGroup, PluginGroupBuilder, Update};
-use bevy_feathers::controls::{
-    FeathersCheckbox, FeathersCheckboxProps, FeathersSlider, FeathersSliderProps,
-};
+use bevy_feathers::controls::{FeathersCheckbox, FeathersSlider};
 use bevy_reflect::{CreateTypeData, PartialReflect};
 use bevy_scene::prelude::*;
 use bevy_scene::Scene;
@@ -83,20 +81,21 @@ fn build_numeric<T: SliderScalar>(
 ) -> Box<dyn Scene> {
     let current = T::to_slider_f32(value).unwrap_or_default();
     let (min, max) = field.range.unwrap_or_else(|| derived_range(current));
-    Box::new((
-        <FeathersSlider as SceneComponent>::scene(FeathersSliderProps { min, max }),
+    let binding = InspectorBinding {
+        root: Some(cx.root.clone()),
+        path: parse_path(path),
+    };
+    Box::new(bsn! {
+        @FeathersSlider { @min: {min}, @max: {max} }
         // The initial value is a component on main, not a prop.
-        template_value(SliderValue(current)),
+        SliderValue({current})
         // `update_slider_pos` requires `SliderPrecision`; without it the bar/text never update.
-        template_value(SliderPrecision(T::PRECISION)),
-        template_value(InspectorBinding {
-            root: Some(cx.root.clone()),
-            path: parse_path(path),
-        }),
+        SliderPrecision({T::PRECISION})
+        binding
         // `slider_self_update` moves the thumb; our observer writes the data back.
-        on(slider_self_update),
-        on(inspector_writeback_slider::<T>),
-    ))
+        on(slider_self_update)
+        on(inspector_writeback_slider::<T>)
+    })
 }
 
 /// When a field has no explicit range, derive one that keeps the value visible mid-track.
@@ -128,20 +127,20 @@ fn build_bool(
     // The `Checked` marker seeds the visual state; `checkbox_self_update` keeps it in sync while
     // our observer writes the data back. A checked/unchecked branch avoids an `Option<Scene>`.
     if current {
-        Box::new((
-            <FeathersCheckbox as SceneComponent>::scene(FeathersCheckboxProps::default()),
-            template_value(Checked),
-            template_value(binding),
-            on(checkbox_self_update),
-            on(inspector_writeback_bool),
-        ))
+        Box::new(bsn! {
+            @FeathersCheckbox
+            Checked
+            binding
+            on(checkbox_self_update)
+            on(inspector_writeback_bool)
+        })
     } else {
-        Box::new((
-            <FeathersCheckbox as SceneComponent>::scene(FeathersCheckboxProps::default()),
-            template_value(binding),
-            on(checkbox_self_update),
-            on(inspector_writeback_bool),
-        ))
+        Box::new(bsn! {
+            @FeathersCheckbox
+            binding
+            on(checkbox_self_update)
+            on(inspector_writeback_bool)
+        })
     }
 }
 

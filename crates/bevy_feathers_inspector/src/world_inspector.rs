@@ -276,18 +276,18 @@ fn build_tree(world: &mut World, root: Entity, entities: &[Entity]) {
 /// A disclosure toggle + label row.
 fn disclosure_row(target: DisclosureTarget, name: String, expanded: bool) -> Box<dyn Scene> {
     let toggle: Box<dyn Scene> = if expanded {
-        Box::new((
-            <FeathersDisclosureToggle as SceneComponent>::scene(()),
-            template_value(Checked),
-            template_value(target),
-            on(on_disclosure),
-        ))
+        Box::new(bsn! {
+            @FeathersDisclosureToggle
+            Checked
+            target
+            on(on_disclosure)
+        })
     } else {
-        Box::new((
-            <FeathersDisclosureToggle as SceneComponent>::scene(()),
-            template_value(target),
-            on(on_disclosure),
-        ))
+        Box::new(bsn! {
+            @FeathersDisclosureToggle
+            target
+            on(on_disclosure)
+        })
     };
     let children: Vec<Box<dyn Scene>> = vec![toggle, Box::new(label(name))];
     Box::new(bsn! {

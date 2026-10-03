@@ -292,6 +292,9 @@ macro_rules! impl_componentwise_vector_space {
                 bevy_math::VectorSpace::lerp(*self, *other, t)
             }
         }
+
+        // Componentwise colors ease like any other vector space (`EasingCurve<Srgba>`).
+        impl bevy_curve::EaseVectorSpace for $ty {}
     };
 }
 

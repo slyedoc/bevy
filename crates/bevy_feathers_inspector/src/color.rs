@@ -15,8 +15,8 @@ use bevy_color::{Color, Hsla, LinearRgba, Srgba};
 use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::prelude::*;
 use bevy_feathers::controls::{
-    ColorChannel, ColorSlider, ColorSwatchValue, FeathersColorSlider, FeathersColorSliderProps,
-    FeathersColorSwatch, FeathersColorSwatchProps, SliderBaseColor,
+    ColorChannel, ColorSlider, ColorSwatchValue, FeathersColorSlider, FeathersColorSwatch,
+    SliderBaseColor,
 };
 use bevy_reflect::{CreateTypeData, PartialReflect};
 use bevy_scene::prelude::*;
@@ -97,17 +97,16 @@ fn build_color(
         path: parse_path(path),
     };
 
-    let swatch: Vec<Box<dyn Scene>> = vec![Box::new((
-        <FeathersColorSwatch as SceneComponent>::scene(FeathersColorSwatchProps::default()),
+    let swatch: Vec<Box<dyn Scene>> = vec![Box::new(bsn! {
+        @FeathersColorSwatch
         // Full-width strip instead of the default square.
-        template_value(Node {
+        Node {
             height: px(18),
             width: percent(100),
-            border_radius: BorderRadius::all(px(5)),
-            ..Default::default()
-        }),
-        template_value(ColorSwatchValue(base)),
-    ))];
+            border_radius: {BorderRadius::all(px(5))},
+        }
+        ColorSwatchValue({base})
+    })];
     let sliders: Vec<Box<dyn Scene>> = [
         (ColorChannel::HslHue, picker.hsl.hue),
         (ColorChannel::HslSaturation, picker.hsl.saturation),
@@ -115,31 +114,26 @@ fn build_color(
     ]
     .into_iter()
     .map(|(channel, value)| {
-        Box::new((
-            <FeathersColorSlider as SceneComponent>::scene(FeathersColorSliderProps {
-                value,
-                channel,
-            }),
-            template_value(SliderBaseColor(base)),
-            on(on_color_slider_change),
-        )) as Box<dyn Scene>
+        Box::new(bsn! {
+            @FeathersColorSlider { @value: {value}, @channel: {channel} }
+            SliderBaseColor({base})
+            on(on_color_slider_change)
+        }) as Box<dyn Scene>
     })
     .collect();
 
-    Box::new((
-        bsn! {
-            Node {
-                display: Display::Flex,
-                flex_direction: FlexDirection::Column,
-                align_self: AlignSelf::Stretch,
-                flex_grow: 1.0,
-                row_gap: px(4),
-            }
-            Children [ {swatch}, {sliders} ]
-        },
-        template_value(picker),
-        template_value(binding),
-    ))
+    Box::new(bsn! {
+        Node {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            align_self: AlignSelf::Stretch,
+            flex_grow: 1.0,
+            row_gap: px(4),
+        }
+        picker
+        binding
+        Children [ {swatch} -- {sliders} ]
+    })
 }
 
 impl CreateTypeData<Color> for ReflectInspectorWidget {

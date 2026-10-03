@@ -70,20 +70,20 @@ pub(crate) fn collapse_toggle(root: &InspectorRoot, path: &str, collapsed: bool)
     // `checkbox_self_update` flips `Checked` (which rotates the chevron); our observer hides the
     // body and records the state. A checked/unchecked branch avoids an `Option<Scene>`.
     if collapsed {
-        Box::new((
-            <FeathersDisclosureToggle as SceneComponent>::scene(()),
-            template_value(toggle),
-            on(checkbox_self_update),
-            on(on_collapse_toggle),
-        ))
+        Box::new(bsn! {
+            @FeathersDisclosureToggle
+            toggle
+            on(checkbox_self_update)
+            on(on_collapse_toggle)
+        })
     } else {
-        Box::new((
-            <FeathersDisclosureToggle as SceneComponent>::scene(()),
-            template_value(Checked),
-            template_value(toggle),
-            on(checkbox_self_update),
-            on(on_collapse_toggle),
-        ))
+        Box::new(bsn! {
+            @FeathersDisclosureToggle
+            Checked
+            toggle
+            on(checkbox_self_update)
+            on(on_collapse_toggle)
+        })
     }
 }
 

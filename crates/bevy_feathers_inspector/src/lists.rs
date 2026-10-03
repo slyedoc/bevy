@@ -16,7 +16,7 @@ use bevy_scene::Scene;
 use bevy_ui::{px, AlignItems, Display, FlexDirection, Node};
 use bevy_ui_widgets::Activate;
 
-use bevy_feathers::controls::{FeathersButton, FeathersButtonProps};
+use bevy_feathers::controls::FeathersButton;
 use bevy_feathers::display::label;
 
 use crate::attributes::FieldCtx;
@@ -98,14 +98,11 @@ fn op_button(
     };
     let caption_list: Box<dyn SceneList> =
         Box::new(vec![Box::new(label(caption.to_string())) as Box<dyn Scene>]);
-    Box::new((
-        <FeathersButton as SceneComponent>::scene(FeathersButtonProps {
-            caption: caption_list,
-            ..Default::default()
-        }),
-        template_value(button),
-        on(on_list_button_click),
-    ))
+    Box::new(bsn! {
+        @FeathersButton { @caption: {caption_list} }
+        button
+        on(on_list_button_click)
+    })
 }
 
 /// Observer: apply the pending list edit and rebuild the owning panel.

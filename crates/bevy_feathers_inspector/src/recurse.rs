@@ -189,11 +189,10 @@ pub fn field_row(name: &str, widget: Box<dyn Scene>) -> impl Scene {
             min_height: px(26),
         }
         Children [
-            (
-                Node { width: px(96), flex_shrink: 0.0 }
-                Children [ {label_cell} ]
-            ),
-            {widget_cell},
+            Node { width: px(96), flex_shrink: 0.0 }
+            Children [ {label_cell} ]
+            --
+            {widget_cell}
         ]
     }
 }
@@ -234,23 +233,20 @@ pub(crate) fn group_card(
     ];
     let content: Vec<Box<dyn Scene>> = vec![body];
     bsn! {
-        group()
+        @group()
         CollapseGroup
         Node { width: percent(100) }
         Children [
-            (
-                group_header()
-                // The chevron and the title read as one unit, so override the header's
-                // space-between default.
-                Node { justify_content: JustifyContent::Start, column_gap: px(6) }
-                Children [ {header} ]
-            ),
-            (
-                group_body()
-                CollapseBody
-                Node { width: percent(100), display: {body_display} }
-                Children [ {content} ]
-            ),
+            @group_header()
+            // The chevron and the title read as one unit, so override the header's
+            // space-between default.
+            Node { justify_content: JustifyContent::Start, column_gap: px(6) }
+            Children [ {header} ]
+            --
+            @group_body()
+            CollapseBody
+            Node { width: percent(100), display: {body_display} }
+            Children [ {content} ]
         ]
     }
 }
