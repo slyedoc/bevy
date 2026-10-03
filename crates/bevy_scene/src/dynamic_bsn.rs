@@ -26,6 +26,7 @@ use bevy_reflect::{
     convert::ReflectConvert,
     enums::{DynamicEnum, DynamicVariant, StructVariantInfo, VariantInfoError},
     list::DynamicList,
+    map::{DynamicMap, Map},
     prelude::ReflectDefault,
     structs::{DynamicStruct, Struct, StructInfo},
     tuple::DynamicTuple,
@@ -35,7 +36,6 @@ use bevy_reflect::{
 };
 use core::{
     any::{Any, TypeId},
-    cell::RefCell,
     fmt::Write,
     mem,
     str::Utf8Error,
@@ -44,9 +44,8 @@ use std::io::Error as IoError;
 use thiserror::Error;
 
 use crate::{
-    dynamic_bsn_grammar::TopLevelPatchesParser, dynamic_bsn_lexer::Lexer, CachedSceneAsset,
-    ErasedTemplate, NameEntityReference, ResolveContext, ResolveSceneError, ResolvedScene,
-    Scene, SceneDependencies, ScenePatch, SceneScope,
+    CachedSceneAsset, ErasedTemplate, NameEntityReference, ResolveContext,
+    ResolveSceneError, ResolvedScene, Scene, SceneDependencies, ScenePatch, SceneScope,
 };
 
 #[derive(Default)]
@@ -95,6 +94,7 @@ pub enum BsnExpr {
     BoolLit(bool),
     IntLit(i128),
     List(Vec<Entity>),
+    Map(Vec<(Entity, Entity)>),
 }
 
 impl BsnSymbol {
@@ -105,6 +105,30 @@ impl BsnSymbol {
     pub fn append(mut self, ident: String) -> BsnSymbol {
         self.0.push(mem::replace(&mut self.1, ident));
         self
+    }
+
+    /// Split a type path at its top-level `::`, leaving generic arguments whole: joining the
+    /// segments back gives the same string.
+    pub fn from_type_path(path: &str) -> BsnSymbol {
+        let mut segments = Vec::new();
+        let (mut depth, mut start) = (0usize, 0usize);
+        let bytes = path.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'<' => depth += 1,
+                b'>' => depth = depth.saturating_sub(1),
+                b':' if depth == 0 && bytes.get(i + 1) == Some(&b':') => {
+                    segments.push(path[start..i].to_string());
+                    i += 2;
+                    start = i;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        BsnSymbol(segments, path[start..].to_string())
     }
 }
 
@@ -178,19 +202,9 @@ impl AssetLoader for DynamicBsnLoader {
         reader.read_to_end(&mut buffer).await?;
         let input = str::from_utf8(&buffer)?;
 
-        let mut world = World::new();
-        world.init_resource::<BsnNameStore>();
-        let ast = RefCell::new(BsnAst(world));
-
-        let lexer = Lexer::new(input);
-        let patches_id = match TopLevelPatchesParser::new().parse(&ast, lexer) {
-            Ok(patches_id) => patches_id,
-            Err(err) => {
-                return Err(DynamicBsnLoaderError::Parse(format!("{:?}", err)));
-            }
-        };
-
-        let ast = ast.into_inner();
+        let document = bevy_bsn::parse_bsn_text(input)
+            .map_err(|err| DynamicBsnLoaderError::Parse(err.to_string()))?;
+        let (ast, patches_id) = BsnAst::from_document(&document)?;
         let patch = ast.convert_bsn_patches_to_patch(patches_id, &self.type_registry)?;
 
         // FIXME: We throw the AST away here. Probably not what we want to do
@@ -349,14 +363,24 @@ impl BsnAst {
                                 if let (Some(name), Some(value)) =
                                     (current.name_at(i), current.field_at(i))
                                 {
-                                    rebuilt.insert_boxed(name.to_owned(), value.to_dynamic().expect("reflect clone during .bsn resolve"));
+                                    rebuilt.insert_boxed(
+                                        name.to_owned(),
+                                        value
+                                            .to_dynamic()
+                                            .expect("reflect clone during .bsn resolve"),
+                                    );
                                 }
                             }
                             for i in 0..dynamic_struct.field_len() {
                                 if let (Some(name), Some(value)) =
                                     (dynamic_struct.name_at(i), dynamic_struct.field_at(i))
                                 {
-                                    rebuilt.insert_boxed(name.to_owned(), value.to_dynamic().expect("reflect clone during .bsn resolve"));
+                                    rebuilt.insert_boxed(
+                                        name.to_owned(),
+                                        value
+                                            .to_dynamic()
+                                            .expect("reflect clone during .bsn resolve"),
+                                    );
                                 }
                             }
                             *reflect = Box::new(rebuilt);
@@ -367,7 +391,11 @@ impl BsnAst {
                         // dynamic target (replaces the variant wholesale).
                         let dynamic_enum = DynamicEnum::new(
                             symbol.1.clone(),
-                            DynamicVariant::Struct(dynamic_struct.to_dynamic_struct().expect("reflect clone during .bsn resolve")),
+                            DynamicVariant::Struct(
+                                dynamic_struct
+                                    .to_dynamic_struct()
+                                    .expect("reflect clone during .bsn resolve"),
+                            ),
                         );
                         let ReflectMut::Enum(reflect_enum) = reflect.reflect_mut() else {
                             error!("Expected an enum: `{}`", struct_type_path);
@@ -435,9 +463,17 @@ impl BsnAst {
                             rebuilt.set_represented_type(current.get_represented_type_info());
                             for i in 0..current.field_len() {
                                 let value = if i < dynamic_tuple_struct.field_len() {
-                                    dynamic_tuple_struct.field(i).unwrap().to_dynamic().expect("reflect clone during .bsn resolve")
+                                    dynamic_tuple_struct
+                                        .field(i)
+                                        .unwrap()
+                                        .to_dynamic()
+                                        .expect("reflect clone during .bsn resolve")
                                 } else {
-                                    current.field(i).unwrap().to_dynamic().expect("reflect clone during .bsn resolve")
+                                    current
+                                        .field(i)
+                                        .unwrap()
+                                        .to_dynamic()
+                                        .expect("reflect clone during .bsn resolve")
                                 };
                                 rebuilt.insert_boxed(value);
                             }
@@ -447,8 +483,13 @@ impl BsnAst {
 
                         // Enum tuple variant: wrap DynamicTupleStruct in DynamicEnum and apply
                         let dynamic_tuple = DynamicTuple::from_iter(
-                            (0..dynamic_tuple_struct.field_len())
-                                .map(|i| dynamic_tuple_struct.field(i).unwrap().to_dynamic().expect("reflect clone during .bsn resolve")),
+                            (0..dynamic_tuple_struct.field_len()).map(|i| {
+                                dynamic_tuple_struct
+                                    .field(i)
+                                    .unwrap()
+                                    .to_dynamic()
+                                    .expect("reflect clone during .bsn resolve")
+                            }),
                         );
                         let dynamic_enum = DynamicEnum::new(
                             symbol.1.clone(),
@@ -574,7 +615,12 @@ impl BsnAst {
                         if let (Some(name), Some(value)) =
                             (default_struct.name_at(i), default_struct.field_at(i))
                         {
-                            dynamic_struct.insert_boxed(name.to_owned(), value.to_dynamic().expect("reflect clone during .bsn resolve"));
+                            dynamic_struct.insert_boxed(
+                                name.to_owned(),
+                                value
+                                    .to_dynamic()
+                                    .expect("reflect clone during .bsn resolve"),
+                            );
                         }
                     }
                     for field in &bsn_struct.1 {
@@ -600,9 +646,7 @@ impl BsnAst {
                     .map_err(|_| DynamicBsnLoaderError::TypeNotStruct)?;
                 let variant_info = enum_info
                     .variant(&bsn_struct.0 .1)
-                    .ok_or_else(|| {
-                        DynamicBsnLoaderError::UnknownType(bsn_struct.0.as_path())
-                    })?
+                    .ok_or_else(|| DynamicBsnLoaderError::UnknownType(bsn_struct.0.as_path()))?
                     .as_struct_variant()?;
 
                 let mut dynamic_struct = DynamicStruct::default();
@@ -677,8 +721,13 @@ impl BsnAst {
                     for i in 0..default_ts.field_len() {
                         match parsed.next() {
                             Some(value) => dynamic_tuple_struct.insert_boxed(value),
-                            None => dynamic_tuple_struct
-                                .insert_boxed(default_ts.field(i).unwrap().to_dynamic().expect("reflect clone during .bsn resolve")),
+                            None => dynamic_tuple_struct.insert_boxed(
+                                default_ts
+                                    .field(i)
+                                    .unwrap()
+                                    .to_dynamic()
+                                    .expect("reflect clone during .bsn resolve"),
+                            ),
                         }
                     }
                     return Ok(Box::new(dynamic_tuple_struct));
@@ -706,11 +755,16 @@ impl BsnAst {
                     )?);
                 }
 
-                let dynamic_enum =
-                    DynamicEnum::new(named_tuple.0 .1.clone(), DynamicVariant::Tuple(dynamic_tuple));
+                let dynamic_enum = DynamicEnum::new(
+                    named_tuple.0 .1.clone(),
+                    DynamicVariant::Tuple(dynamic_tuple),
+                );
                 let ReflectMut::Enum(reflect_enum) = reflect.reflect_mut() else {
                     return Err(DynamicBsnLoaderError::UnknownType(
-                        template_type_registration.type_info().type_path().to_owned(),
+                        template_type_registration
+                            .type_info()
+                            .type_path()
+                            .to_owned(),
                     ));
                 };
                 reflect_enum.apply(&dynamic_enum);
@@ -753,7 +807,8 @@ impl BsnAst {
                     some_tuple.insert_boxed(converted.into_partial_reflect());
                     let mut dynamic_option =
                         DynamicEnum::new("Some", DynamicVariant::Tuple(some_tuple));
-                    dynamic_option.set_represented_type(Some(expected_type_registration.type_info()));
+                    dynamic_option
+                        .set_represented_type(Some(expected_type_registration.type_info()));
                     return Ok(Box::new(dynamic_option));
                 }
 
@@ -765,11 +820,9 @@ impl BsnAst {
                 // template for `Handle<T>`. We therefore convert into the field's *template* type
                 // (`HandleTemplate<T>` for a `Handle<T>` field), which the apply step later builds
                 // into the final `Handle<T>` using the `AssetServer`.
-                let target_registration = handle_template_registration(
-                    &type_registry,
-                    expected_type_registration,
-                )
-                .unwrap_or(expected_type_registration);
+                let target_registration =
+                    handle_template_registration(&type_registry, expected_type_registration)
+                        .unwrap_or(expected_type_registration);
 
                 if let Some(reflect_convert) = target_registration.data::<ReflectConvert>() {
                     if let Ok(converted) =
@@ -830,6 +883,36 @@ impl BsnAst {
                 Ok(Box::new(dynamic_list) as Box<dyn PartialReflect>)
             }
 
+            BsnExpr::Map(ref entries) => {
+                let type_registration =
+                    type_registry.get(expected_template_type).ok_or_else(|| {
+                        DynamicBsnLoaderError::UnknownType(format!(
+                            "TypeId {:?}",
+                            expected_template_type
+                        ))
+                    })?;
+                let map_info = type_registration
+                    .type_info()
+                    .as_map()
+                    .map_err(|_| DynamicBsnLoaderError::TypeMismatch)?;
+                let (key_type_id, value_type_id) =
+                    (map_info.key_ty().id(), map_info.value_ty().id());
+
+                let mut dynamic_map = DynamicMap::default();
+                for &(key_id, value_id) in entries {
+                    let key =
+                        self.convert_bsn_expr_to_reflect(key_id, app_type_registry, key_type_id)?;
+                    let value = self.convert_bsn_expr_to_reflect(
+                        value_id,
+                        app_type_registry,
+                        value_type_id,
+                    )?;
+                    dynamic_map.insert_boxed(key, value);
+                }
+                dynamic_map.set_represented_type(Some(type_registration.type_info()));
+                Ok(Box::new(dynamic_map) as Box<dyn PartialReflect>)
+            }
+
             BsnExpr::IntLit(int_lit) => {
                 let mut reflect = create_reflect_default(&type_registry, expected_template_type)?;
 
@@ -876,6 +959,155 @@ impl BsnAst {
                 Err(DynamicBsnLoaderError::IntLitTypeMismatch)
             }
         }
+    }
+
+    /// Build the loader's AST from a parsed [`bevy_bsn::SceneBsnAst`]: the one `.bsn` grammar
+    /// is `bevy_bsn`'s, and this is the bridge into scene resolution. A document with several
+    /// roots becomes one anonymous root holding them as children.
+    pub fn from_document(
+        document: &bevy_bsn::SceneBsnAst,
+    ) -> Result<(BsnAst, Entity), DynamicBsnLoaderError> {
+        let mut world = World::new();
+        world.init_resource::<BsnNameStore>();
+        let mut ast = BsnAst(world);
+        let roots = document
+            .roots
+            .iter()
+            .map(|&root| ast.translate_patches(document, root))
+            .collect::<Result<Vec<_>, _>>()?;
+        let top = match roots.as_slice() {
+            [root] => *root,
+            _ => {
+                let relation = BsnRelation(
+                    BsnSymbol::from_type_path("bevy_ecs::hierarchy::Children"),
+                    roots,
+                );
+                let patch = ast.create_patch(BsnPatch::Relation(relation));
+                ast.create_patches(vec![patch])
+            }
+        };
+        Ok((ast, top))
+    }
+
+    fn translate_patches(
+        &mut self,
+        document: &bevy_bsn::SceneBsnAst,
+        patches: Entity,
+    ) -> Result<Entity, DynamicBsnLoaderError> {
+        let ids = document
+            .world
+            .get::<bevy_bsn::BsnPatches>(patches)
+            .ok_or(DynamicBsnLoaderError::NoSuchAstNode)?
+            .0
+            .clone();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let patch = document
+                .world
+                .get::<bevy_bsn::BsnPatch>(id)
+                .ok_or(DynamicBsnLoaderError::NoSuchAstNode)?;
+            let translated = match patch {
+                bevy_bsn::BsnPatch::Name(name) => self.create_name_patch(name.clone()),
+                bevy_bsn::BsnPatch::Base(base) => self.create_patch(BsnPatch::Base(base.clone())),
+                bevy_bsn::BsnPatch::Type(path) => self.create_patch(BsnPatch::Var(BsnVar(
+                    BsnSymbol::from_type_path(path),
+                    false,
+                ))),
+                bevy_bsn::BsnPatch::Template(path, None) => {
+                    self.create_patch(BsnPatch::Var(BsnVar(BsnSymbol::from_type_path(path), true)))
+                }
+                bevy_bsn::BsnPatch::Template(path, Some(fields)) => {
+                    let fields = self.translate_fields(fields);
+                    self.create_patch(BsnPatch::Struct(BsnStruct(
+                        BsnSymbol::from_type_path(path),
+                        fields,
+                        true,
+                    )))
+                }
+                bevy_bsn::BsnPatch::Struct(data) => {
+                    let fields = self.translate_fields(&data.fields);
+                    self.create_patch(BsnPatch::Struct(BsnStruct(
+                        BsnSymbol::from_type_path(&data.type_path),
+                        fields,
+                        false,
+                    )))
+                }
+                bevy_bsn::BsnPatch::TupleStruct(data) => {
+                    let values = data
+                        .values
+                        .iter()
+                        .map(|v| self.translate_value(v))
+                        .collect();
+                    self.create_patch(BsnPatch::NamedTuple(BsnNamedTuple(
+                        BsnSymbol::from_type_path(&data.type_path),
+                        values,
+                        false,
+                    )))
+                }
+                bevy_bsn::BsnPatch::Children(children) => {
+                    let children = children
+                        .iter()
+                        .map(|&child| self.translate_patches(document, child))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.create_patch(BsnPatch::Relation(BsnRelation(
+                        BsnSymbol::from_type_path("bevy_ecs::hierarchy::Children"),
+                        children,
+                    )))
+                }
+            };
+            out.push(translated);
+        }
+        Ok(self.create_patches(out))
+    }
+
+    fn translate_fields(&mut self, fields: &bevy_bsn::BsnStructFields) -> Vec<BsnField> {
+        fields
+            .0
+            .iter()
+            .map(|field| BsnField(field.name.clone(), self.translate_value(&field.value)))
+            .collect()
+    }
+
+    fn translate_value(&mut self, value: &bevy_bsn::BsnValue) -> Entity {
+        let expr = match value {
+            bevy_bsn::BsnValue::Float(v) => BsnExpr::FloatLit(*v),
+            bevy_bsn::BsnValue::Int(v) => BsnExpr::IntLit(*v),
+            bevy_bsn::BsnValue::Bool(v) => BsnExpr::BoolLit(*v),
+            bevy_bsn::BsnValue::String(v) => BsnExpr::StringLit(v.clone()),
+            bevy_bsn::BsnValue::Type(path) => {
+                BsnExpr::Var(BsnVar(BsnSymbol::from_type_path(path), false))
+            }
+            bevy_bsn::BsnValue::Struct(data) => {
+                let fields = self.translate_fields(&data.fields);
+                BsnExpr::Struct(BsnStruct(
+                    BsnSymbol::from_type_path(&data.type_path),
+                    fields,
+                    false,
+                ))
+            }
+            bevy_bsn::BsnValue::TupleStruct(data) => {
+                let values = data
+                    .values
+                    .iter()
+                    .map(|v| self.translate_value(v))
+                    .collect();
+                BsnExpr::NamedTuple(BsnNamedTuple(
+                    BsnSymbol::from_type_path(&data.type_path),
+                    values,
+                    false,
+                ))
+            }
+            bevy_bsn::BsnValue::List(items) => {
+                BsnExpr::List(items.iter().map(|v| self.translate_value(v)).collect())
+            }
+            bevy_bsn::BsnValue::Map(entries) => BsnExpr::Map(
+                entries
+                    .iter()
+                    .map(|(k, v)| (self.translate_value(k), self.translate_value(v)))
+                    .collect(),
+            ),
+        };
+        self.create_expr(expr)
     }
 
     pub fn create_patches(&mut self, patches: Vec<Entity>) -> Entity {
@@ -944,9 +1176,7 @@ fn option_handle_inner_type_path(type_path: &str) -> Option<&str> {
     const OPTION_PREFIX: &str = "core::option::Option<";
     const HANDLE_PREFIX: &str = "bevy_asset::handle::Handle<";
 
-    let inner = type_path
-        .strip_prefix(OPTION_PREFIX)?
-        .strip_suffix('>')?;
+    let inner = type_path.strip_prefix(OPTION_PREFIX)?.strip_suffix('>')?;
     inner.starts_with(HANDLE_PREFIX).then_some(inner)
 }
 
@@ -1144,7 +1374,10 @@ where
                     let reflect_default = type_registration.data::<ReflectDefault>().unwrap();
                     // Seed with a dynamic representation of the default value, preserving the
                     // represented type so it can be materialized via `FromReflect` later.
-                    reflect_default.default().to_dynamic().expect("reflect clone during .bsn resolve")
+                    reflect_default
+                        .default()
+                        .to_dynamic()
+                        .expect("reflect clone during .bsn resolve")
                 };
                 Box::new(DefaultDynamicErasedTemplate {
                     value: reflect,
@@ -1153,7 +1386,8 @@ where
             });
         // The template was created (or cloned) by us as a `DefaultDynamicErasedTemplate`, so we can
         // recover mutable access to the underlying reflected value via `Any` downcasting.
-        let Some(template) = (template as &mut dyn Any).downcast_mut::<DefaultDynamicErasedTemplate>()
+        let Some(template) =
+            (template as &mut dyn Any).downcast_mut::<DefaultDynamicErasedTemplate>()
         else {
             return Err(ResolveSceneError::TypeNotReflectable);
         };
@@ -1178,11 +1412,18 @@ impl ErasedTemplate for DefaultDynamicErasedTemplate {
         let output = {
             let mut cache = self.resolved.lock().unwrap();
             if cache.is_none() {
-                let mut out = self.value.to_dynamic().expect("reflect clone during .bsn resolve");
+                let mut out = self
+                    .value
+                    .to_dynamic()
+                    .expect("reflect clone during .bsn resolve");
                 build_handle_template_fields(&mut out, context);
                 *cache = Some(out);
             }
-            cache.as_ref().unwrap().to_dynamic().expect("reflect clone during .bsn resolve")
+            cache
+                .as_ref()
+                .unwrap()
+                .to_dynamic()
+                .expect("reflect clone during .bsn resolve")
         };
 
         context.entity.insert_reflect(output);
@@ -1191,7 +1432,10 @@ impl ErasedTemplate for DefaultDynamicErasedTemplate {
 
     fn clone_template(&self) -> Box<dyn ErasedTemplate> {
         Box::new(DefaultDynamicErasedTemplate {
-            value: self.value.to_dynamic().expect("reflect clone during .bsn resolve"),
+            value: self
+                .value
+                .to_dynamic()
+                .expect("reflect clone during .bsn resolve"),
             resolved: Default::default(),
         })
     }
@@ -1254,7 +1498,11 @@ fn build_handle_template_fields(
                 let name = current.name_at(i).unwrap_or_default().to_owned();
                 let value = match replacements[i].take() {
                     Some(value) => value,
-                    None => current.field_at(i).unwrap().to_dynamic().expect("reflect clone during .bsn resolve"),
+                    None => current
+                        .field_at(i)
+                        .unwrap()
+                        .to_dynamic()
+                        .expect("reflect clone during .bsn resolve"),
                 };
                 rebuilt.insert_boxed(name, value);
             }
@@ -1266,7 +1514,11 @@ fn build_handle_template_fields(
             for i in 0..field_count {
                 let value = match replacements[i].take() {
                     Some(value) => value,
-                    None => current.field(i).unwrap().to_dynamic().expect("reflect clone during .bsn resolve"),
+                    None => current
+                        .field(i)
+                        .unwrap()
+                        .to_dynamic()
+                        .expect("reflect clone during .bsn resolve"),
                 };
                 rebuilt.insert_boxed(value);
             }
@@ -1335,8 +1587,13 @@ fn resolve_handle_field(
 
     // Bare `Handle<T>` field holding a `HandleTemplate::Path`.
     if let Some((asset_path, handle_type_path)) = handle_template_path(field) {
-        return load_typed_handle(&handle_type_path, asset_path, type_registry, context)
-            .map(|handle| handle.to_dynamic().expect("reflect clone during .bsn resolve"));
+        return load_typed_handle(&handle_type_path, asset_path, type_registry, context).map(
+            |handle| {
+                handle
+                    .to_dynamic()
+                    .expect("reflect clone during .bsn resolve")
+            },
+        );
     }
 
     let field_type_path = field.get_represented_type_info()?.type_path();
@@ -1375,7 +1632,9 @@ fn resolve_handle_field(
 
     // Recurse into a dynamic copy of the asset value to resolve its nested handle / option-handle
     // fields before adding it, so the stored asset holds concrete `Handle`s.
-    let mut asset_value = field.to_dynamic().expect("reflect clone during .bsn resolve");
+    let mut asset_value = field
+        .to_dynamic()
+        .expect("reflect clone during .bsn resolve");
     build_handle_template_fields(&mut asset_value, context);
 
     let reflect_asset = type_registry
@@ -1391,7 +1650,12 @@ fn resolve_handle_field(
     let untyped = context
         .entity
         .world_scope(|world| reflect_asset.add(world, asset_value.as_partial_reflect()));
-    Some(reflect_handle.typed(untyped).to_dynamic().expect("reflect clone during .bsn resolve"))
+    Some(
+        reflect_handle
+            .typed(untyped)
+            .to_dynamic()
+            .expect("reflect clone during .bsn resolve"),
+    )
 }
 
 #[derive(Clone)]

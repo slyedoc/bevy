@@ -901,7 +901,6 @@ pub mod macro_utils;
 extern crate alloc;
 
 pub mod dynamic_bsn;
-pub mod dynamic_bsn_lexer;
 mod resolved_scene;
 mod scene;
 mod scene_component;
@@ -923,12 +922,6 @@ use bevy_asset::AssetApp;
 use bevy_ecs::prelude::*;
 
 use crate::dynamic_bsn::DynamicBsnLoader;
-use lalrpop_util::lalrpop_mod;
-
-lalrpop_mod!(
-    #[allow(unused_qualifications, missing_docs)]
-    pub(crate) dynamic_bsn_grammar
-);
 
 /// Creates a `Scene` using BSN (Bevy Scene Notation) syntax.
 ///
@@ -1088,10 +1081,9 @@ impl Plugin for ScenePlugin {
         {
             let mut registry = registry.write();
             registry.register::<bevy_asset::HandleTemplate<ScenePatch>>();
-            registry
-                .register_type_conversion::<String, bevy_asset::HandleTemplate<ScenePatch>, _>(
-                    |s| Ok(s.into()),
-                );
+            registry.register_type_conversion::<String, bevy_asset::HandleTemplate<ScenePatch>, _>(
+                |s| Ok(s.into()),
+            );
         }
     }
 }
@@ -1606,7 +1598,11 @@ mod tests {
                 })
             }),
         );
-        app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default(), ScenePlugin));
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin::default(),
+            ScenePlugin,
+        ));
         app.register_type::<TestAlpha>()
             .register_type::<TestAlphaHolder>();
         app.finish();

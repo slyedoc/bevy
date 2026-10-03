@@ -235,6 +235,8 @@ bevy_extract = ["dep:bevy_extract"]
 bevy_curve = ["dep:bevy_curve"]
 bevy_shader = ["dep:bevy_shader"]
 bevy_image = ["dep:bevy_image", "bevy_color", "bevy_asset"]
+# The `.bsn` loader parses through `bevy_bsn`, which is also `bevy::bsn`.
+bevy_scene = ["dep:bevy_scene", "dep:bevy_bsn"]
 bevy_sprite = ["dep:bevy_sprite", "bevy_camera"]
 bevy_text = [
   "dep:bevy_text",
@@ -606,6 +608,7 @@ bevy_remote = { path = "../bevy_remote", optional = true, version = "0.20.0-dev"
 ] }
 bevy_render = { path = "../bevy_render", optional = true, version = "0.20.0-dev" }
 bevy_world_serialization = { path = "../bevy_world_serialization", optional = true, version = "0.20.0-dev" }
+bevy_bsn = { path = "../bevy_bsn", optional = true, version = "0.20.0-dev" }
 bevy_scene = { path = "../bevy_scene", optional = true, version = "0.20.0-dev" }
 bevy_solari = { path = "../bevy_solari", optional = true, version = "0.20.0-dev" }
 bevy_sprite = { path = "../bevy_sprite", optional = true, version = "0.20.0-dev" }

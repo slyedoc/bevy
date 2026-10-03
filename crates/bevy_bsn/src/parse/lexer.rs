@@ -1,8 +1,12 @@
-//! Hand-written lexer for the `.bsn` text format, used by the generated LALRPOP grammar.
+//! Tokens for the generated `.bsn` grammar; parser plumbing rather than API.
+#![allow(
+    missing_docs,
+    reason = "parser plumbing the generated grammar consumes"
+)]
+
+//! Token lexer for the BSN grammar, built on `nom`.
 //!
-//! The public token/lexer types are implementation details of the parser, so `missing_docs` is
-//! allowed here.
-#![allow(missing_docs)]
+//! Vendored from Bevy's dynamic BSN work.
 
 use nom::{IResult, Parser as _};
 
@@ -20,10 +24,17 @@ pub enum Token {
     LBrace,
     RBrace,
     Comma,
+    /// `<`, opening a type path's generic arguments.
+    Less,
+    /// `>`, closing them. Lexed one character at a time, so the `>>` that ends
+    /// a nested generic is two closers rather than a shift operator.
+    Greater,
     DoubleColon,
     Colon,
     Hash,
     At,
+    /// The `map` keyword, emitted only for the `map[...]` literal position.
+    Map,
 }
 
 #[derive(Debug)]
@@ -118,6 +129,12 @@ fn lex_colon(input: &str) -> IResult<&str, Token> {
 fn lex_comma(input: &str) -> IResult<&str, Token> {
     nom::combinator::value(Token::Comma, nom::character::complete::char(',')).parse(input)
 }
+fn lex_less(input: &str) -> IResult<&str, Token> {
+    nom::combinator::value(Token::Less, nom::character::complete::char('<')).parse(input)
+}
+fn lex_greater(input: &str) -> IResult<&str, Token> {
+    nom::combinator::value(Token::Greater, nom::character::complete::char('>')).parse(input)
+}
 fn lex_at(input: &str) -> IResult<&str, Token> {
     nom::combinator::value(Token::At, nom::character::complete::char('@')).parse(input)
 }
@@ -127,6 +144,77 @@ fn lex_false(input: &str) -> IResult<&str, Token> {
 }
 fn lex_true(input: &str) -> IResult<&str, Token> {
     nom::combinator::value(Token::BoolLit(true), nom::bytes::complete::tag("true")).parse(input)
+}
+
+/// Lex the `map` keyword that tags a `map[(k, v), ...]` literal.
+///
+/// The word `map` is only reserved in this one position: it must be a
+/// standalone identifier immediately followed (ignoring whitespace) by `[`.
+/// Anywhere else - a field named `map`, a component named `map`, a `map::`
+/// path segment - it stays a normal identifier via [`lex_ident`].
+fn lex_map_keyword(input: &str) -> IResult<&str, Token> {
+    let (rest, _) = nom::bytes::complete::tag("map")(input)?;
+
+    // Reject when `map` is only a prefix of a longer identifier (`maps`,
+    // `map_data`); those must lex as a single `Ident`.
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+
+    // Only treat `map` as the keyword when a `[` follows it.
+    if !rest.trim_start().starts_with('[') {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+
+    Ok((rest, Token::Map))
+}
+
+/// Lex a special float literal: `inf`, `-inf`, `NaN`, `-NaN` (and the
+/// `Infinity` / lowercase `nan` spellings the reflect serializer also emits).
+///
+/// These match only as standalone words so an identifier that merely begins
+/// with these letters (`information`, `nan_map`) stays a single [`Token::Ident`]
+/// via [`lex_ident`]. Must run before `lex_ident` (which would otherwise claim
+/// `inf` / `NaN`) and before the number lexers (which cannot parse them).
+fn lex_special_float(input: &str) -> IResult<&str, Token> {
+    const WORDS: &[(&str, f64)] = &[
+        ("Infinity", f64::INFINITY),
+        ("inf", f64::INFINITY),
+        ("NaN", f64::NAN),
+        ("nan", f64::NAN),
+    ];
+
+    let (body, negative) = match input.strip_prefix('-') {
+        Some(rest) => (rest, true),
+        None => (input, false),
+    };
+
+    for &(word, value) in WORDS {
+        if let Some(rest) = body.strip_prefix(word)
+            && !rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            let value = if negative { -value } else { value };
+            return Ok((rest, Token::FloatLit(value)));
+        }
+    }
+
+    Err(nom::Err::Error(nom::error::Error::new(
+        input,
+        nom::error::ErrorKind::Tag,
+    )))
 }
 
 fn lex_ident(ident: &str) -> IResult<&str, Token> {
@@ -272,11 +360,13 @@ fn lex_float(input: &str) -> IResult<&str, Token> {
 
 fn lex_token(input: &str) -> IResult<&str, Token> {
     nom::branch::alt((
-        lex_true,  // Must come before `lex_ident`.
-        lex_false, // Must come before `lex_ident`.
+        lex_true,          // Must come before `lex_ident`.
+        lex_false,         // Must come before `lex_ident`.
+        lex_map_keyword,   // Must come before `lex_ident`.
+        lex_special_float, // Must come before `lex_ident` and the number lexers.
         lex_ident,
         lex_string,
-        lex_float,  // Must come before `lex_int`.
+        lex_float, // Must come before `lex_int`.
         lex_int,
         lex_l_bracket,
         lex_r_bracket,
@@ -285,6 +375,8 @@ fn lex_token(input: &str) -> IResult<&str, Token> {
         lex_l_brace,
         lex_r_brace,
         lex_comma,
+        lex_less,
+        lex_greater,
         lex_double_colon, // Must come before `lex_colon`.
         lex_colon,
         lex_hash,
@@ -316,5 +408,66 @@ impl<'a> Iterator for Lexer<'a> {
                 self.input.chars().next().unwrap(),
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(input: &str) -> Vec<Token> {
+        Lexer::new(input).map(|r| r.unwrap().1).collect()
+    }
+
+    #[test]
+    fn lexes_special_floats() {
+        assert!(
+            matches!(tokens("inf").as_slice(), [Token::FloatLit(f)] if f.is_infinite() && *f > 0.0)
+        );
+        assert!(
+            matches!(tokens("-inf").as_slice(), [Token::FloatLit(f)] if f.is_infinite() && *f < 0.0)
+        );
+        assert!(
+            matches!(tokens("Infinity").as_slice(), [Token::FloatLit(f)] if f.is_infinite() && *f > 0.0)
+        );
+        assert!(matches!(tokens("NaN").as_slice(), [Token::FloatLit(f)] if f.is_nan()));
+        assert!(matches!(tokens("nan").as_slice(), [Token::FloatLit(f)] if f.is_nan()));
+        assert!(matches!(tokens("-NaN").as_slice(), [Token::FloatLit(f)] if f.is_nan()));
+    }
+
+    #[test]
+    fn identifiers_starting_with_special_words_stay_identifiers() {
+        // The guard keeps longer identifiers whole rather than splitting off a
+        // leading `inf` / `nan` float token.
+        for word in ["information", "infinite_health", "nanometers", "NaNny"] {
+            assert!(
+                matches!(tokens(word).as_slice(), [Token::Ident(s)] if s == word),
+                "{word} must lex as a single identifier",
+            );
+        }
+    }
+
+    #[test]
+    fn a_nested_generic_closes_with_two_separate_tokens() {
+        assert_eq!(
+            tokens("Vec<Vec<f32>>"),
+            vec![
+                Token::Ident("Vec".into()),
+                Token::Less,
+                Token::Ident("Vec".into()),
+                Token::Less,
+                Token::Ident("f32".into()),
+                Token::Greater,
+                Token::Greater,
+            ],
+        );
+    }
+
+    #[test]
+    fn negative_numbers_still_lex() {
+        assert!(matches!(tokens("-5").as_slice(), [Token::IntLit(-5)]));
+        assert!(
+            matches!(tokens("-5.0").as_slice(), [Token::FloatLit(f)] if (*f + 5.0).abs() < f64::EPSILON)
+        );
     }
 }

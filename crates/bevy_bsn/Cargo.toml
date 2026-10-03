@@ -1,0 +1,36 @@
+[package]
+name = "bevy_bsn"
+version = "0.20.0-dev"
+edition = "2024"
+description = "Reader, editable document and writer for the .bsn scene format"
+homepage = "https://bevy.org"
+repository = "https://github.com/bevyengine/bevy"
+license = "MIT OR Apache-2.0"
+keywords = ["bevy", "bsn", "scene"]
+
+[dependencies]
+bevy_app = { path = "../bevy_app", version = "0.20.0-dev" }
+bevy_asset = { path = "../bevy_asset", version = "0.20.0-dev" }
+bevy_ecs = { path = "../bevy_ecs", version = "0.20.0-dev" }
+bevy_platform = { path = "../bevy_platform", version = "0.20.0-dev" }
+# `smol_str` gives `SmolStr` its reflect impl; without it a `SmolStr` field round-trips as
+# its `Debug` form.
+bevy_reflect = { path = "../bevy_reflect", version = "0.20.0-dev", features = ["smol_str"] }
+lalrpop-util = "0.23"
+log = "0.4"
+nom = "8"
+pathdiff = "0.2"
+path-slash = "0.2"
+smol_str = "0.2"
+thiserror = "2"
+
+[dev-dependencies]
+bevy_math = { path = "../bevy_math", version = "0.20.0-dev" }
+bevy_transform = { path = "../bevy_transform", version = "0.20.0-dev" }
+tempfile = "3"
+
+[build-dependencies]
+lalrpop = "0.23"
+
+[lints]
+workspace = true
