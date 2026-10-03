@@ -115,6 +115,8 @@ pub enum TokenKind {
     Tilde,
     /// `-`
     Minus,
+    /// `--`, the separator between entities.
+    DashDash,
     /// `<`
     Lt,
     /// `>`
@@ -227,7 +229,14 @@ impl<'src> Lexer<'src> {
             '~' => TokenKind::Tilde,
             '<' => TokenKind::Lt,
             '>' => TokenKind::Gt,
-            '-' => TokenKind::Minus,
+            '-' => {
+                self.pos += 1;
+                if self.first() == Some('-') {
+                    self.pos += 1;
+                    return self.token(TokenKind::DashDash, start);
+                }
+                return self.token(TokenKind::Minus, start);
+            }
             '\'' => TokenKind::Error(LexError::CharLiteral),
             '|' => TokenKind::Error(LexError::Closure),
             '!' => TokenKind::Error(LexError::Macro),

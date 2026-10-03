@@ -458,7 +458,7 @@ fn spawns_children_and_names_from_bsn() {
     let dir = Dir::default();
     dir.insert_asset_text(
         Path::new("a.bsn"),
-        "Children [ (#X), (#Y Position { x: 3.0 }) ]",
+        "Children [ #X -- #Y Position { x: 3.0 } ]",
     );
     let mut app = test_app(&dir);
 
@@ -482,7 +482,7 @@ fn spawns_children_and_names_from_bsn() {
 #[test]
 fn bsn_macro_inherits_from_bsn_asset() {
     let dir = Dir::default();
-    dir.insert_asset_text(Path::new("a.bsn"), "Position { y: 2.0 }\nChildren [ (#X) ]");
+    dir.insert_asset_text(Path::new("a.bsn"), "Position { y: 2.0 }\nChildren [ #X ]");
     let mut app = test_app(&dir);
 
     let handle = load_and_settle(&mut app, "a.bsn");
@@ -608,7 +608,7 @@ fn multiple_roots_rejected() {
     let dir = Dir::default();
     dir.insert_asset_text(
         Path::new("a.bsn"),
-        "(Position { x: 1.0 }),\n(Position { y: 2.0 })",
+        "Position { x: 1.0 }\n--\nPosition { y: 2.0 }",
     );
     let mut app = test_app(&dir);
 
@@ -725,7 +725,7 @@ fn dyn_fully_qualified_component_paths() {
     // fully-qualified form is written without it. The rejection is asserted below.
     dir.insert_asset_text(
         Path::new("a.bsn"),
-        "bevy_ecs::hierarchy::Children [ (dynamic_bsn::Position { x: 1.0 }) ]",
+        "bevy_ecs::hierarchy::Children [ dynamic_bsn::Position { x: 1.0 } ]",
     );
     dir.insert_asset_text(
         Path::new("leading.bsn"),
@@ -833,7 +833,7 @@ fn dyn_hierarchy() {
     let dir = Dir::default();
     dir.insert_asset_text(
         Path::new("a.bsn"),
-        "#A Children [ (#B Children [ #X ]), (#C Children [ #Y ]) ]",
+        "#A Children [ #B Children [ #X ] -- #C Children [ #Y ] ]",
     );
     let mut app = test_app(&dir);
 
@@ -850,7 +850,7 @@ fn dyn_hierarchy() {
 #[test]
 fn dyn_name_references() {
     let dir = Dir::default();
-    dir.insert_asset_text(Path::new("a.bsn"), "#X Children [ (Reference(#X)) ]");
+    dir.insert_asset_text(Path::new("a.bsn"), "#X Children [ Reference(#X) ]");
     let mut app = test_app(&dir);
 
     let root = spawn_instance(&mut app, "a.bsn");
@@ -864,7 +864,7 @@ fn dyn_reverse_reference() {
     let dir = Dir::default();
     dir.insert_asset_text(
         Path::new("a.bsn"),
-        "Reference(#Last)\nChildren [ #First, #Second, #Last ]",
+        "Reference(#Last)\nChildren [ #First -- #Second -- #Last ]",
     );
     let mut app = test_app(&dir);
 
@@ -1035,7 +1035,7 @@ fn dyn_handle_template() {
 #[test]
 fn dyn_children_list() {
     let dir = Dir::default();
-    dir.insert_asset_text(Path::new("a.bsn"), "Children [ #A, #B, #C ]");
+    dir.insert_asset_text(Path::new("a.bsn"), "Children [ #A -- #B -- #C ]");
     let mut app = test_app(&dir);
 
     let root = spawn_instance(&mut app, "a.bsn");
@@ -1151,7 +1151,7 @@ fn dyn_nested_entity_references() {
     let dir = Dir::default();
     dir.insert_asset_text(
         Path::new("a.bsn"),
-        "#Root Children [ (#Middle Reference(#Root) Children [ (#Leaf Reference(#Middle)) ]) ]",
+        "#Root Children [ #Middle Reference(#Root) Children [ #Leaf Reference(#Middle) ] ]",
     );
     let mut app = test_app(&dir);
 
@@ -1172,7 +1172,7 @@ fn dyn_nested_entity_references() {
 #[test]
 fn dyn_two_instances_get_distinct_entities() {
     let dir = Dir::default();
-    dir.insert_asset_text(Path::new("a.bsn"), "#X Children [ (Reference(#X)) ]");
+    dir.insert_asset_text(Path::new("a.bsn"), "#X Children [ Reference(#X) ]");
     let mut app = test_app(&dir);
 
     let first = spawn_instance(&mut app, "a.bsn");
@@ -1443,7 +1443,7 @@ fn hot_reload_bsn_file_updates_instance() {
     let dir = Dir::default();
     dir.insert_asset_text(
         Path::new("a.bsn"),
-        "Position { x: 1.0 }\nChildren [ #A, #B ]",
+        "Position { x: 1.0 }\nChildren [ #A -- #B ]",
     );
     let mut app = test_app(&dir);
 
@@ -1544,14 +1544,14 @@ fn hot_reload_bsn_parse_error_keeps_previous_scene() {
 #[test]
 fn entity_references_across_reload() {
     let dir = Dir::default();
-    dir.insert_asset_text(Path::new("a.bsn"), "#X Children [ (Reference(#X)) ]");
+    dir.insert_asset_text(Path::new("a.bsn"), "#X Children [ Reference(#X) ]");
     let mut app = test_app(&dir);
 
     let root = spawn_instance(&mut app, "a.bsn");
     let held = app.world().get::<Children>(root).unwrap()[0];
     assert_eq!(app.world().get::<Reference>(held).unwrap().0, root);
 
-    edit_and_save(&app, &dir, "a.bsn", "#X Children [ (Reference(#X)) ]");
+    edit_and_save(&app, &dir, "a.bsn", "#X Children [ Reference(#X) ]");
     run_app_until(&mut app, |app| {
         app.world().get::<Children>(root).unwrap()[0] != held
     });
@@ -1661,7 +1661,7 @@ fn hot_reload_bsn_twice_in_one_frame_applies_once() {
 #[test]
 fn reinserting_scene_patch_instance_swaps_the_bsn_file() {
     let dir = Dir::default();
-    dir.insert_asset_text(Path::new("a.bsn"), "Children [ #A, #B ]");
+    dir.insert_asset_text(Path::new("a.bsn"), "Children [ #A -- #B ]");
     dir.insert_asset_text(Path::new("b.bsn"), "Children [ #C ]");
     let mut app = test_app(&dir);
 

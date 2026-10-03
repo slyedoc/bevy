@@ -188,6 +188,41 @@ impl<'src> Parser<'src> {
         result
     }
 
+    /// What follows `#`: an identifier, or a string for names that are not identifiers.
+    fn parse_name(&mut self) -> Result<(String, Span), BsnParseError> {
+        self.check_error_token()?;
+        let token = self.peek_token();
+        if token.kind == TokenKind::Str {
+            self.bump();
+            return Ok((decode_string(self.source, token.span)?, token.span));
+        }
+        let ident = self.expect(TokenKind::Ident, &["identifier", "string"])?;
+        Ok((ident.span.text(self.source).to_string(), ident.span))
+    }
+
+    /// `entity { "--" entity }`, up to (not including) `term`.
+    fn parse_entity_list(&mut self, term: TokenKind) -> Result<Vec<BsnNodeId>, BsnParseError> {
+        let mut entities = Vec::new();
+        loop {
+            self.check_error_token()?;
+            if self.peek() == term {
+                break;
+            }
+            entities.push(self.parse_entity()?);
+            let token = self.peek_token();
+            if token.kind == TokenKind::Comma {
+                return Err(BsnParseError::new(
+                    token.span,
+                    BsnParseErrorKind::CommaBetweenEntities,
+                ));
+            }
+            if !self.eat(TokenKind::DashDash) {
+                break;
+            }
+        }
+        Ok(entities)
+    }
+
     /// Comma-separated items with an optional trailing comma, up to (not including) `term`.
     fn parse_list<T>(
         &mut self,
@@ -268,13 +303,13 @@ impl<'src> Parser<'src> {
         let roots = if self.peek() == TokenKind::Eof {
             Vec::new()
         } else {
-            self.parse_list(TokenKind::Eof, Self::parse_entity)?
+            self.parse_entity_list(TokenKind::Eof)?
         };
-        self.expect(TokenKind::Eof, &["`,`", "end of file"])?;
+        self.expect(TokenKind::Eof, &["`--`", "end of file"])?;
         self.finish(roots)
     }
 
-    /// `entity = "(" entity_body ")" | entity_body`
+    /// `entity = "(" ")" | entity_body`
     fn parse_entity(&mut self) -> Result<BsnNodeId, BsnParseError> {
         self.nested(Self::parse_entity_inner)
     }
@@ -284,14 +319,17 @@ impl<'src> Parser<'src> {
         let id = self.alloc_node();
         let start = self.peek_token().span.start;
         let start_pos = self.pos;
-        let parenthesized = self.eat(TokenKind::LParen);
         let mut builder = EntityBuilder::default();
-        self.parse_entity_body(&mut builder, parenthesized)?;
-        if parenthesized {
-            self.expect(TokenKind::RParen, &["`)`", "type path"])?;
-        } else if self.pos == start_pos {
+        if self.peek() == TokenKind::LParen && self.peek_at(1) == TokenKind::RParen {
+            // `()`: an entity with no entries.
+            self.bump();
+            self.bump();
+        } else {
+            self.parse_entity_body(&mut builder)?;
+        }
+        if self.pos == start_pos {
             let token = self.peek_token();
-            return Err(self.unexpected(token, &["type path", "`#`", "`~`", "`@`", "`(`", "`:`"]));
+            return Err(self.unexpected(token, &["type path", "`#`", "`~`", "`@`", "`:`"]));
         }
         let span = Span::new(start, self.prev_end());
         self.finish_node(
@@ -310,11 +348,7 @@ impl<'src> Parser<'src> {
     }
 
     /// `entity_body = [ base ] { entry }`
-    fn parse_entity_body(
-        &mut self,
-        builder: &mut EntityBuilder,
-        parenthesized: bool,
-    ) -> Result<(), BsnParseError> {
+    fn parse_entity_body(&mut self, builder: &mut EntityBuilder) -> Result<(), BsnParseError> {
         if self.peek() == TokenKind::Colon {
             let colon = self.bump();
             self.check_error_token()?;
@@ -330,7 +364,7 @@ impl<'src> Parser<'src> {
             builder.base_span = Some(colon.span.join(token.span));
         }
         loop {
-            if is_entity_stop(self.peek(), parenthesized) {
+            if is_entity_stop(self.peek()) {
                 break;
             }
             self.parse_entry(builder)?;
@@ -354,15 +388,12 @@ impl<'src> Parser<'src> {
             TokenKind::LBrace => Err(self.unsupported(unsupported::EXPR, token.span)),
             TokenKind::Hash => {
                 self.bump();
-                let ident = self.expect(TokenKind::Ident, &["identifier"])?;
+                let (name, name_span) = self.parse_name()?;
                 if builder.name.is_some() {
-                    return Err(BsnParseError::new(
-                        ident.span,
-                        BsnParseErrorKind::DuplicateName,
-                    ));
+                    return Err(BsnParseError::new(name_span, BsnParseErrorKind::DuplicateName));
                 }
-                builder.name = Some(ident.span.text(self.source).to_string());
-                builder.name_span = Some(token.span.join(ident.span));
+                builder.name = Some(name);
+                builder.name_span = Some(token.span.join(name_span));
                 Ok(())
             }
             TokenKind::Tilde => {
@@ -407,8 +438,8 @@ impl<'src> Parser<'src> {
                 ));
             }
             self.bump();
-            let entities = self.parse_list(TokenKind::RBracket, Self::parse_entity)?;
-            self.expect(TokenKind::RBracket, &["`,`", "`]`"])?;
+            let entities = self.parse_entity_list(TokenKind::RBracket)?;
+            self.expect(TokenKind::RBracket, &["`--`", "`]`"])?;
             let span = Span::new(start.start, self.prev_end());
             self.finish_node(
                 id,
@@ -575,9 +606,8 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Hash => {
                 self.bump();
-                let ident = self.expect(TokenKind::Ident, &["identifier"])?;
-                let name = ident.span.text(self.source).to_string();
-                Ok(self.push_value(token.span.join(ident.span), BsnValue::EntityRef(name)))
+                let (name, name_span) = self.parse_name()?;
+                Ok(self.push_value(token.span.join(name_span), BsnValue::EntityRef(name)))
             }
             TokenKind::LBracket => {
                 let id = self.alloc_value();
@@ -781,12 +811,11 @@ fn first_duplicate_field(fields: &[(String, BsnValueId)]) -> Option<usize> {
 }
 
 /// Returns `true` if a flat entity body ends at `kind`.
-fn is_entity_stop(kind: TokenKind, parenthesized: bool) -> bool {
-    match kind {
-        TokenKind::Eof | TokenKind::RParen => true,
-        TokenKind::Comma | TokenKind::RBracket => !parenthesized,
-        _ => false,
-    }
+fn is_entity_stop(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Eof | TokenKind::RBracket | TokenKind::DashDash | TokenKind::Comma
+    )
 }
 
 /// The `bsn!` macro's constant heuristic: at least two characters and no lowercase letter.
@@ -807,6 +836,7 @@ fn token_desc(kind: TokenKind) -> &'static str {
         TokenKind::At => "`@`",
         TokenKind::Tilde => "`~`",
         TokenKind::Minus => "`-`",
+        TokenKind::DashDash => "`--`",
         TokenKind::Lt => "`<`",
         TokenKind::Gt => "`>`",
         TokenKind::LParen => "`(`",

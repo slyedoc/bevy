@@ -76,7 +76,7 @@ fn a1_sibling_base_does_not_leak_cached_context() {
     let b = scene(
         &app,
         "b.bsn",
-        "Children [ (:\"c.bsn\" Marker), (Position { x: 1.0 }) ]",
+        "Children [ :\"c.bsn\" Marker -- Position { x: 1.0 } ]",
     );
 
     let world = app.world_mut();
@@ -99,7 +99,7 @@ fn a1_control_no_sibling_base() {
     let b = scene(
         &app,
         "b.bsn",
-        "Children [ (Marker), (Position { x: 1.0 }) ]",
+        "Children [ Marker -- Position { x: 1.0 } ]",
     );
     let world = app.world_mut();
     let id = world.spawn_scene(b).unwrap().id();
@@ -115,7 +115,7 @@ fn a1_control_base_on_the_last_child() {
     let b = scene(
         &app,
         "b.bsn",
-        "Children [ (Position { x: 1.0 }), (:\"c.bsn\" Marker) ]",
+        "Children [ Position { x: 1.0 } -- :\"c.bsn\" Marker ]",
     );
     let world = app.world_mut();
     let id = world.spawn_scene(b).unwrap().id();
@@ -389,7 +389,7 @@ fn a7_duplicate_names_and_child_only_names() {
     let a = scene(
         &app,
         "a.bsn",
-        "#Dup Reference(#Deep) Children [ (#Dup), (#Deep) ]",
+        "#Dup Reference(#Deep) Children [ #Dup -- #Deep ]",
     );
     let world = app.world_mut();
     let id = world.spawn_scene(a).unwrap().id();
@@ -596,8 +596,8 @@ fn b7_base_of_unparsable_file() {
 #[test]
 fn b8_name_identity_is_per_asset() {
     let mut app = test_app();
-    let a = scene(&app, "a.bsn", "#Shared Children [ (#Kid Marker) ]");
-    let b = scene(&app, "b.bsn", "#Shared Children [ (#Kid Marker) ]");
+    let a = scene(&app, "a.bsn", "#Shared Children [ #Kid Marker ]");
+    let b = scene(&app, "b.bsn", "#Shared Children [ #Kid Marker ]");
     let world = app.world_mut();
     let first = world.spawn_scene(a).unwrap().id();
     let second = world.spawn_scene(b).unwrap().id();
@@ -611,7 +611,7 @@ fn b8_name_identity_is_per_asset() {
 #[test]
 fn b9_same_asset_two_spawns_do_not_alias() {
     let mut app = test_app();
-    let a = scene(&app, "a.bsn", "#Root Children [ (#Kid Reference(#Root)) ]");
+    let a = scene(&app, "a.bsn", "#Root Children [ #Kid Reference(#Root) ]");
     let world = app.world_mut();
     let first = world.spawn_scene(a.clone()).unwrap().id();
     let second = world.spawn_scene(a).unwrap().id();

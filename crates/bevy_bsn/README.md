@@ -24,18 +24,18 @@ bevy_ui::ui_node::Node {
 }
 bevy_ecs::hierarchy::Children [
     #Label
-    bevy_ui::widget::text::Text("hello"),
-    (
-        :"widgets/button.bsn"
-        my_game::Follower { target: #Root }
-    )
+    bevy_ui::widget::text::Text("hello")
+    --
+    :"widgets/button.bsn"
+    my_game::Follower { target: #Root }
 ]
 ```
 
 An entity is a list of *entries*: an optional `#Name`, an optional `:"other.bsn"` base to
 inherit from, any number of *patches* naming a type (`Transform { … }`, `Camera3d`,
 `Shape::Rect(1.0, 2.0)`) and any number of *relations* naming a relationship target
-(`Children [ … ]`). Patches are partial — fields you do not mention keep the value they had
+(`Children [ … ]`, its entities separated by `--`, as in `bsn!`). A name that is not an
+identifier is quoted: `#"Main Camera"`. Patches are partial — fields you do not mention keep the value they had
 from an earlier patch or from the type's default.
 
 ## Reading

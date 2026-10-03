@@ -651,10 +651,10 @@ fn render_entity(doc: &GenDoc, entity: &GenEntity, level: usize, out: &mut Strin
     for block in &entity.relations {
         let _ = writeln!(out, "{pad}Children [");
         for (index, child) in block.iter().enumerate() {
-            let _ = writeln!(out, "{pad}    (");
-            render_entity(doc, child, level + 2, out);
-            let separator = if index + 1 < block.len() { "," } else { "" };
-            let _ = writeln!(out, "{pad}    ){separator}");
+            render_entity(doc, child, level + 1, out);
+            if index + 1 < block.len() {
+                let _ = writeln!(out, "{pad}    --");
+            }
         }
         let _ = writeln!(out, "{pad}]");
     }

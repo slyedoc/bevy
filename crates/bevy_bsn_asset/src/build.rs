@@ -1109,7 +1109,7 @@ mod tests {
 
     #[test]
     fn nested_base_is_a_flat_dependency_and_the_root_base_is_not() {
-        let scene = build(":\"root.bsn\"\nChildren [ (:\"child.bsn\") ]");
+        let scene = build(":\"root.bsn\"\nChildren [ :\"child.bsn\" ]");
         let dependencies: Vec<_> = scene.dependencies().collect();
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0].1.path().to_string_lossy(), "child.bsn");

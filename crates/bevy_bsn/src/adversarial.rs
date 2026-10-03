@@ -629,7 +629,7 @@ fn gen_value(rng: &mut Rng, depth: u32) -> String {
     }
 }
 
-fn gen_entity(rng: &mut Rng, depth: u32, parenthesized: bool) -> String {
+fn gen_entity(rng: &mut Rng, depth: u32) -> String {
     let mut entries: Vec<String> = Vec::new();
     if rng.next() % 6 == 0 {
         entries.push("\"base.bsn\"".to_string());
@@ -648,10 +648,9 @@ fn gen_entity(rng: &mut Rng, depth: u32, parenthesized: bool) -> String {
                 let children = rng.index(3);
                 let mut list: Vec<String> = Vec::new();
                 for _ in 0..children {
-                    let paren = rng.next() % 2 == 0;
-                    list.push(gen_entity(rng, depth + 1, paren));
+                    list.push(gen_entity(rng, depth + 1));
                 }
-                body.push_str(&format!("{} [ {} ] ", gen_path(rng), list.join(", ")));
+                body.push_str(&format!("{} [ {} ] ", gen_path(rng), list.join(" -- ")));
             }
             1 => body.push_str(&format!("~{} ", gen_path(rng))),
             2 => body.push_str(&format!("@{} {{ f0: 1 }} ", gen_path(rng))),
@@ -667,11 +666,7 @@ fn gen_entity(rng: &mut Rng, depth: u32, parenthesized: bool) -> String {
     if body.trim().is_empty() {
         return "()".to_string();
     }
-    if parenthesized {
-        format!("({body})")
-    } else {
-        body
-    }
+    body
 }
 
 #[test]
@@ -683,10 +678,9 @@ fn fuzz_generated_valid_documents() {
         let mut source = String::new();
         for index in 0..roots {
             if index > 0 {
-                source.push_str(",\n");
+                source.push_str("\n--\n");
             }
-            let paren = roots > 1 || rng.next() % 2 == 0;
-            source.push_str(&gen_entity(&mut rng, 0, paren));
+            source.push_str(&gen_entity(&mut rng, 0));
         }
         if parse(&source).is_ok() {
             ok += 1;
@@ -779,10 +773,9 @@ fn ids_are_assigned_in_source_pre_order() {
         let mut source = String::new();
         for index in 0..roots {
             if index > 0 {
-                source.push_str(",\n");
+                source.push_str("\n--\n");
             }
-            let paren = roots > 1 || rng.next() % 2 == 0;
-            source.push_str(&gen_entity(&mut rng, 0, paren));
+            source.push_str(&gen_entity(&mut rng, 0));
         }
         let Ok(document) = parse(&source) else {
             continue;
@@ -893,10 +886,9 @@ fn non_default_print_options_still_re_parse() {
         let mut source = String::new();
         for index in 0..roots {
             if index > 0 {
-                source.push_str(",\n");
+                source.push_str("\n--\n");
             }
-            let paren = roots > 1 || rng.next() % 2 == 0;
-            source.push_str(&gen_entity(&mut rng, 0, paren));
+            source.push_str(&gen_entity(&mut rng, 0));
         }
         let Ok(document) = parse(&source) else {
             continue;

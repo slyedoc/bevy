@@ -122,6 +122,20 @@ pub fn write_document_with<W: core::fmt::Write>(
 ///
 /// Only `\\`, `\"`, `\n`, `\r`, `\t`, `\0` and other control characters are escaped; all
 /// other text, including non-ASCII characters, is emitted verbatim.
+/// A name as written after `#`: bare when it is an identifier, quoted otherwise.
+fn print_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let is_ident = chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_alphabetic())
+        && chars.all(|c| c == '_' || c.is_alphanumeric());
+    if is_ident {
+        name.to_string()
+    } else {
+        escape_string(name)
+    }
+}
+
 pub(crate) fn escape_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -201,9 +215,9 @@ impl Printer<'_> {
             return String::new();
         }
         let separator = if self.options.blank_line_between_roots {
-            ",\n\n"
+            "\n\n--\n\n"
         } else {
-            ",\n"
+            "\n--\n"
         };
         let mut out = parts.join(separator);
         out.push('\n');
@@ -247,7 +261,7 @@ impl Printer<'_> {
             let _ = writeln!(out, "{pad}:{}", escape_string(base));
         }
         if let Some(name) = name {
-            let _ = writeln!(out, "{pad}#{name}");
+            let _ = writeln!(out, "{pad}#{}", print_name(name));
         }
         for entry in merge_entries(document, patches, relations) {
             match document.node(entry).map(|node| &node.kind) {
@@ -286,9 +300,8 @@ impl Printer<'_> {
         let _ = writeln!(out, "{pad}{path} [");
         for (index, entity) in entities.iter().enumerate() {
             self.entity(out, *entity, level + 1);
-            if index + 1 < entities.len() && out.ends_with('\n') {
-                out.pop();
-                out.push_str(",\n");
+            if index + 1 < entities.len() {
+                let _ = writeln!(out, "{}--", self.indent(level + 1));
             }
         }
         let _ = writeln!(out, "{pad}]");
@@ -408,7 +421,7 @@ impl Printer<'_> {
             BsnValue::Int(value) => value.to_string(),
             BsnValue::Float(value) => format_float(*value),
             BsnValue::String(value) => escape_string(value),
-            BsnValue::EntityRef(name) => format!("#{name}"),
+            BsnValue::EntityRef(name) => format!("#{}", print_name(name)),
             BsnValue::Path(path) => path.to_type_path(),
             BsnValue::Tuple(values) => match self.inline_items(values, depth)?.as_slice() {
                 [] => "()".to_string(),

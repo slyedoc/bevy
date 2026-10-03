@@ -66,7 +66,8 @@ const CORPUS_3: &str = r#"#Root
 bevy_ui::ui_node::Node
 bevy_ecs::hierarchy::Children [
     #Label
-    bevy_ui::widget::text::Text("hello"),
+    bevy_ui::widget::text::Text("hello")
+    --
     my_game::Follower { target: #Root }
 ]
 "#;
@@ -196,12 +197,11 @@ $2 Struct(my_game::HealthBar)
 $3 Int(100)
 ";
 
-/// §12.8 Multi-root document, parentheses, comments, non-finite floats, literal forms.
-const CORPUS_8: &str = r##"// Two roots. The first is parenthesized, the second is flat.
-(
-    #Left
-    my_game::Link { other: #Right }
-),
+/// §12.8 Multi-root document, comments, non-finite floats, literal forms.
+const CORPUS_8: &str = r##"// Two roots, separated by `--`.
+#Left
+my_game::Link { other: #Right }
+--
 #Right
 my_game::Link { other: #Left }
 my_game::Sensor {
@@ -879,7 +879,8 @@ const PRINT_3: &str = "\
 bevy_ui::ui_node::Node
 bevy_ecs::hierarchy::Children [
     #Label
-    bevy_ui::widget::text::Text(\"hello\"),
+    bevy_ui::widget::text::Text(\"hello\")
+    --
     my_game::Follower { target: #Root }
 ]
 ";
@@ -913,7 +914,9 @@ const PRINT_7: &str = "\
 
 const PRINT_8: &str = "\
 #Left
-my_game::Link { other: #Right },
+my_game::Link { other: #Right }
+
+--
 
 #Right
 my_game::Link { other: #Left }
@@ -1145,8 +1148,8 @@ fn print_empty_document() {
 #[test]
 fn print_multi_root() {
     let text = print_document(&parse(CORPUS_8).unwrap());
-    assert!(text.contains("},\n\n#Right"), "{text}");
-    assert!(!text.trim_end().ends_with(','), "{text}");
+    assert!(text.contains("}\n\n--\n\n#Right"), "{text}");
+    assert!(!text.trim_end().ends_with("--"), "{text}");
 }
 
 #[test]
@@ -1789,17 +1792,35 @@ fn parse_edge_cases_table() {
     assert!(parse("A {}").is_ok());
     assert!(parse("A()").is_ok());
 
-    // Trailing commas at every list level.
+    // Trailing commas in value lists.
     assert!(parse("A(1, 2,)").is_ok());
     assert!(parse("A { x: [1, 2,], }").is_ok());
-    assert!(parse("A,\nB,").is_ok());
-    assert!(parse("A\nChildren [ B, ]").is_ok());
 
-    // A comma with nothing before it is not an entity.
+    // Entities are separated by `--`; a comma there names the fix.
+    assert!(parse("A\n--\nB").is_ok());
+    assert!(parse("A\nChildren [ B -- C ]").is_ok());
     assert!(matches!(
-        err(", A").kind,
+        err("A,\nB").kind,
+        BsnParseErrorKind::CommaBetweenEntities
+    ));
+    assert!(matches!(
+        err("A\nChildren [ B, C ]").kind,
+        BsnParseErrorKind::CommaBetweenEntities
+    ));
+    assert!(matches!(
+        err("(A)").kind,
         BsnParseErrorKind::UnexpectedToken { .. }
     ));
+
+    // A separator with nothing before it is not an entity.
+    assert!(matches!(
+        err("-- A").kind,
+        BsnParseErrorKind::UnexpectedToken { .. }
+    ));
+
+    // Names that are not identifiers are quoted, on entities and in entity references.
+    let quoted = parse("#\"Main Camera\"\nA(#\"Main Camera\")").unwrap();
+    assert_eq!(print_document(&quoted), "#\"Main Camera\"\nA(#\"Main Camera\")\n");
 
     // Unpaired closing delimiters.
     assert!(matches!(

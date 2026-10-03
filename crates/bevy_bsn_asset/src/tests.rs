@@ -488,7 +488,7 @@ fn dynamic_hierarchy() {
     let a = scene(
         &app,
         "a.bsn",
-        "#A Children [ (#B Children [ #X ]), (#C Children [ #Y ]) ]",
+        "#A Children [ #B Children [ #X ] -- #C Children [ #Y ] ]",
     );
 
     let world = app.world_mut();
@@ -516,7 +516,7 @@ fn dynamic_name_references() {
     let a = scene(
         &app,
         "a.bsn",
-        "#Root Children [ (#Child Reference(#Root)), Reference(#Child) ]",
+        "#Root Children [ #Child Reference(#Root) -- Reference(#Child) ]",
     );
 
     let world = app.world_mut();
@@ -534,7 +534,7 @@ fn dynamic_name_references() {
 #[test]
 fn dynamic_custom_relationship() {
     let mut app = test_app();
-    let a = scene(&app, "a.bsn", "#Root Items [ #First, #Second ]");
+    let a = scene(&app, "a.bsn", "#Root Items [ #First -- #Second ]");
 
     let world = app.world_mut();
     let id = world.spawn_scene(a).unwrap().id();
@@ -801,7 +801,7 @@ fn dynamic_child_with_a_missing_base_errors() {
     let b = scene(
         &app,
         "b.bsn",
-        "Children [ (:\"missing.bsn\" Marker), (Marker) ]",
+        "Children [ :\"missing.bsn\" Marker -- Marker ]",
     );
 
     let world = app.world_mut();

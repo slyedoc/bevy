@@ -11,8 +11,9 @@ Notation the `bsn!` macro compiles statically:
 Node { width: px(300.0), flex_direction: FlexDirection::Column }
 BackgroundColor(Color::Srgba(Srgba { red: 0.1, green: 0.1, blue: 0.1, alpha: 1.0 }))
 Children [
-    #Title Text("Hello from a file"),
-    #Logo ImageNode { image: "branding/icon.png" },
+    #Title Text("Hello from a file")
+    --
+    #Logo ImageNode { image: "branding/icon.png" }
 ]
 ```
 

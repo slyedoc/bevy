@@ -196,6 +196,9 @@ pub enum BsnParseErrorKind {
         "only scene assets can be included with `:`; expected a string literal, e.g. `:\"player.bsn\"`"
     )]
     BaseNotString,
+    /// Entities in a list were separated by `,` instead of `--`.
+    #[error("entities are separated by `--`, not `,`")]
+    CommaBetweenEntities,
     /// An entity carries more than one `#Name`.
     #[error("duplicate entity name; an entity may have at most one `#Name`")]
     DuplicateName,

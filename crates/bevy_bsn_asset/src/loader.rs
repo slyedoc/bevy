@@ -384,14 +384,14 @@ mod tests {
     fn multiple_roots_error_mentions_count() {
         // Multi-root documents are rejected by the builder; the loader is what turns the span into
         // a `path:line:column` prefix.
-        let message = load_errors("scenes/x.bsn", "(Foo),\n(Bar),\n(Baz)").to_string();
+        let message = load_errors("scenes/x.bsn", "Foo\n--\nBar\n--\nBaz").to_string();
         assert!(
             message.contains("exactly one root entity"),
             "unexpected message: {message}"
         );
         assert!(message.contains("found 3"), "unexpected message: {message}");
         assert!(
-            message.starts_with("scenes/x.bsn:2:"),
+            message.starts_with("scenes/x.bsn:3:"),
             "the message should locate the second root: {message}"
         );
     }
@@ -463,7 +463,7 @@ mod tests {
             "a single-root document must not be rejected for its root count: {error}"
         );
 
-        let error = load_errors("a.bsn", "(Foo),\n(Bar)");
+        let error = load_errors("a.bsn", "Foo\n--\nBar");
         assert!(
             matches!(
                 error,
