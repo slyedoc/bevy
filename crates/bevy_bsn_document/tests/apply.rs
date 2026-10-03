@@ -81,7 +81,7 @@ bevy_ecs::hierarchy::Children [
     let _ = SceneBsnAst::default();
 }
 
-/// A component with a `HashMap<String, i32>` field, applied from a `map[...]`
+/// A component with a `HashMap<String, i32>` field, applied from a `[(key, value), ...]` list
 /// literal. Proves the `DynamicMap` built by `map_value_to_reflect` converts
 /// into a concrete `HashMap` when applied onto the component (the concrete
 /// map's `FromReflect`-backed `insert_boxed` does the key/value conversion).
@@ -111,7 +111,7 @@ fn bsn_map_literal_materializes_into_concrete_hashmap() {
         .to_string();
     world.insert_resource(registry);
 
-    let text = format!("{type_path} {{\n    data: map[(\"a\", 1), (\"b\", 2)],\n}}\n");
+    let text = format!("{type_path} {{\n    data: [(\"a\", 1), (\"b\", 2)],\n}}\n");
 
     let ast = parse_bsn_text(&text).expect("bsn should parse");
     world.insert_resource(ast);
@@ -128,7 +128,7 @@ fn bsn_map_literal_materializes_into_concrete_hashmap() {
     assert_eq!(comp.data.get("b"), Some(&2));
 }
 
-/// A multiline `map[...]` whose values are nested struct instances. Proves the
+/// A multiline `[(key, value), ...]` map whose values are nested struct instances. Proves the
 /// map apply path recurses through `bsn_value_to_reflect` for non-scalar
 /// values, not just primitives, and materializes a concrete `HashMap` of
 /// structs.
@@ -179,7 +179,7 @@ fn bsn_map_with_struct_values_materializes() {
     world.insert_resource(registry);
 
     let text = format!(
-        "{props_path} {{\n    data: map[\n        (\"one\", {slot_path} {{ amount: 5, enabled: true }}),\n        (\"two\", {slot_path} {{ amount: 9, enabled: false }}),\n    ],\n}}\n"
+        "{props_path} {{\n    data: [\n        (\"one\", {slot_path} {{ amount: 5, enabled: true }}),\n        (\"two\", {slot_path} {{ amount: 9, enabled: false }}),\n    ],\n}}\n"
     );
 
     let ast = parse_bsn_text(&text).expect("bsn should parse");

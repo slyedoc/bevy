@@ -88,17 +88,15 @@ fn remove_component_patch_for_absent_type_is_a_noop() {
 /// Root, with children A (holding grandchild G) and B, plus a second root R2.
 fn reparent_fixture() -> SceneBsnAst {
     parse_bsn_text(
-        "bevy_ecs::hierarchy::Children [\n\
-             #Root\n\
-             bevy_ecs::hierarchy::Children [\n\
-                 #A\n\
-                 bevy_ecs::hierarchy::Children [ #G ]\n\
-                 ,\n\
-                 #B\n\
-             ]\n\
-             ,\n\
-             #R2\n\
-         ]\n",
+        "#Root\n\
+         bevy_ecs::hierarchy::Children [\n\
+             #A\n\
+             bevy_ecs::hierarchy::Children [ #G ]\n\
+             --\n\
+             #B\n\
+         ]\n\
+         --\n\
+         #R2\n",
     )
     .expect("fixture parses")
 }
@@ -192,18 +190,16 @@ fn move_to_parent_at_inserts_at_requested_root_position() {
 /// Two roots with component values, a nested child, and ECS links.
 fn clone_fixture() -> (SceneBsnAst, Entity, Entity) {
     let mut ast = parse_bsn_text(
-        "bevy_ecs::hierarchy::Children [\n\
-             #Root\n\
-             test_types::Transform { translation: glam::Vec3 { x: 1.0, y: 2.0, z: 3.0 } }\n\
-             test_types::Tag(7, \"label\")\n\
-             bevy_ecs::hierarchy::Children [\n\
-                 #Child\n\
-                 test_types::Material { base: \"#Mat0\", strength: 0.5 }\n\
-             ]\n\
-             ,\n\
-             #Sibling\n\
-             test_types::Transform { translation: glam::Vec3 { x: 9.0 } }\n\
-         ]\n",
+        "#Root\n\
+         test_types::Transform { translation: glam::Vec3 { x: 1.0, y: 2.0, z: 3.0 } }\n\
+         test_types::Tag(7, \"label\")\n\
+         bevy_ecs::hierarchy::Children [\n\
+             #Child\n\
+             test_types::Material { base: \"#Mat0\", strength: 0.5 }\n\
+         ]\n\
+         --\n\
+         #Sibling\n\
+         test_types::Transform { translation: glam::Vec3 { x: 9.0 } }\n",
     )
     .expect("fixture parses");
 
@@ -405,13 +401,11 @@ fn entity_for_stable_id_without_a_link_is_none() {
 #[test]
 fn duplicate_stable_ids_resolve_to_the_last_root_in_document_order() {
     let ast = parse_bsn_text(
-        "bevy_ecs::hierarchy::Children [\n\
-             #First\n\
-             jackdaw_scene_types::node_id::SceneNodeId(7)\n\
-             ,\n\
-             #Second\n\
-             jackdaw_scene_types::node_id::SceneNodeId(7)\n\
-         ]\n",
+        "#First\n\
+         jackdaw_scene_types::node_id::SceneNodeId(7)\n\
+         --\n\
+         #Second\n\
+         jackdaw_scene_types::node_id::SceneNodeId(7)\n",
     )
     .expect("fixture parses");
 

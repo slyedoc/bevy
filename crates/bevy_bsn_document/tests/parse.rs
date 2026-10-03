@@ -5,11 +5,10 @@
 use bevy_bsn_document::{parse_bsn, BsnPatch, BsnValue, SceneBsnAst};
 use bevy_ecs::entity::Entity;
 
-/// Parse text and return the document plus the top-level patch group's
-/// patch entities.
+/// Parse text and return the document plus its first root's patch entities.
 fn parse(text: &str) -> (SceneBsnAst, Vec<Entity>) {
-    let (ast, root) = parse_bsn(text).expect("text should parse");
-    let patches = ast.get_patches(root).expect("root patch group").0.clone();
+    let ast = parse_bsn(text).expect("text should parse");
+    let patches = ast.get_patches(ast.roots[0]).expect("root patch group").0.clone();
     (ast, patches)
 }
 
@@ -144,7 +143,7 @@ fn parses_list_literal() {
 
 #[test]
 fn parses_map_literal() {
-    let (ast, patches) = parse(r#"Comp { data: map[("a", 1), ("b", 2)] }"#);
+    let (ast, patches) = parse(r#"Comp { data: [("a", 1), ("b", 2)] }"#);
     let BsnPatch::Struct(data) = patch(&ast, patches[0]) else {
         panic!("expected Struct");
     };
@@ -159,32 +158,25 @@ fn parses_map_literal() {
 }
 
 #[test]
-fn parses_empty_map_literal() {
-    let (ast, patches) = parse("Comp { data: map[] }");
+fn an_empty_map_is_written_as_an_empty_list() {
+    // A map's type is only known at apply time, which builds an empty map from it.
+    let (ast, patches) = parse("Comp { data: [] }");
     let BsnPatch::Struct(data) = patch(&ast, patches[0]) else {
         panic!("expected Struct");
     };
-    let BsnValue::Map(entries) = &data.fields.0[0].value else {
-        panic!("expected Map value");
+    let BsnValue::List(items) = &data.fields.0[0].value else {
+        panic!("expected List value");
     };
-    assert!(entries.is_empty());
+    assert!(items.is_empty());
 }
 
 #[test]
-fn map_is_a_contextual_keyword() {
-    // `map` is only special immediately before `[`. As a field name, component
-    // name, or path segment it remains an ordinary identifier.
+fn map_is_an_ordinary_field_name() {
     let (ast, patches) = parse("Comp { map: 1 }");
     let BsnPatch::Struct(data) = patch(&ast, patches[0]) else {
         panic!("expected Struct");
     };
     assert_eq!(data.fields.0[0].name, "map");
-
-    let (ast, patches) = parse("map { x: 1 }");
-    let BsnPatch::Struct(data) = patch(&ast, patches[0]) else {
-        panic!("expected Struct named map");
-    };
-    assert_eq!(data.type_path, "map");
 }
 
 #[test]
@@ -219,7 +211,7 @@ fn parses_name_with_spaces() {
 
 #[test]
 fn parses_template_marker() {
-    let (ast, patches) = parse("@Foo { x: 1 }");
+    let (ast, patches) = parse("~Foo { x: 1 }");
     let BsnPatch::Template(path, fields) = patch(&ast, patches[0]) else {
         panic!("expected Template");
     };
@@ -259,7 +251,7 @@ fn malformed_input_errors_without_panic() {
 #[test]
 fn unterminated_containers_error_without_panic() {
     // A map literal whose bracket never closes.
-    assert!(parse_bsn(r#"Comp { data: map[("a", 1) }"#).is_err());
+    assert!(parse_bsn(r#"Comp { data: [("a", 1) }"#).is_err());
     // A struct body whose brace never closes.
     assert!(parse_bsn("Comp { a: 1").is_err());
     // A list literal whose bracket never closes.
@@ -291,7 +283,7 @@ fn duplicate_field_names_are_rejected() {
         Ok(_) => panic!("duplicate fields must be rejected"),
     };
     assert!(
-        message.contains("duplicate field 'a'"),
+        message.contains("duplicate field `a`"),
         "error names the duplicated field: {message}"
     );
 

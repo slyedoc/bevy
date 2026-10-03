@@ -17,7 +17,7 @@ use bevy_reflect::{
     list::DynamicList,
     map::{DynamicMap, Map},
     prelude::ReflectDefault,
-    PartialReflect, ReflectFromReflect, ReflectMut, TypeRegistry,
+    PartialReflect, ReflectFromReflect, ReflectMut, TypeInfo, TypeRegistration, TypeRegistry,
 };
 
 use crate::{
@@ -439,7 +439,7 @@ fn apply_enum_variant(target: &mut dyn Enum, dynamic: &DynamicEnum, type_path: &
         Ok(()) => true,
         Err(err) => {
             let variants = match target.get_represented_type_info() {
-                Some(bevy_reflect::TypeInfo::Enum(info)) => info.variant_names().join(", "),
+                Some(TypeInfo::Enum(info)) => info.variant_names().join(", "),
                 _ => String::new(),
             };
             log::warn!("cannot apply '{type_path}': {err} (the type has {variants})");
@@ -459,13 +459,13 @@ fn apply_enum_variant(target: &mut dyn Enum, dynamic: &DynamicEnum, type_path: &
 /// does not declare are ignored; fields the patch omits are left unset, which a
 /// strict `FromReflect` will reject for a type without a default.
 fn dynamic_struct_from_patch(
-    registration: &bevy_reflect::TypeRegistration,
+    registration: &TypeRegistration,
     data: &BsnStructData,
     reg: &TypeRegistry,
     assets_ctx: Option<&BsnApplyAssets>,
 ) -> bevy_reflect::structs::DynamicStruct {
     let field_types: std::collections::HashMap<String, TypeId> = match registration.type_info() {
-        bevy_reflect::TypeInfo::Struct(struct_info) => (0..struct_info.field_len())
+        TypeInfo::Struct(struct_info) => (0..struct_info.field_len())
             .filter_map(|i| struct_info.field_at(i))
             .map(|field_info| (field_info.name().to_string(), field_info.type_id()))
             .collect(),
@@ -606,7 +606,7 @@ fn apply_struct_patch(world: &mut World, entity: Entity, data: &BsnStructData) {
                 let variant_field_types: std::collections::HashMap<String, TypeId> = e
                     .get_represented_type_info()
                     .and_then(|info| {
-                        if let bevy_reflect::TypeInfo::Enum(enum_info) = info
+                        if let TypeInfo::Enum(enum_info) = info
                             && let Some(bevy_reflect::enums::VariantInfo::Struct(struct_info)) =
                                 enum_info.variant(variant_name)
                         {
@@ -705,7 +705,7 @@ fn apply_tuple_variant_patch(
     let Some(registration) = reg.get_with_type_path(&data.type_path[..separator]) else {
         return false;
     };
-    let bevy_reflect::TypeInfo::Enum(enum_info) = registration.type_info() else {
+    let TypeInfo::Enum(enum_info) = registration.type_info() else {
         return false;
     };
     let variant_name = variant_name_of(&data.type_path);
@@ -947,7 +947,7 @@ fn apply_authored_value(target: &mut dyn PartialReflect, value: &dyn PartialRefl
 fn type_path_of(value: &dyn PartialReflect) -> &str {
     value
         .get_represented_type_info()
-        .map_or("<dynamic>", bevy_reflect::TypeInfo::type_path)
+        .map_or("<dynamic>", TypeInfo::type_path)
 }
 
 /// Convert a [`BsnValue`] to a boxed reflected value given the expected type.
@@ -996,7 +996,7 @@ pub fn bsn_value_to_reflect(
     // If the expected type is `Option<Handle<T>>`, resolve a path string into
     // `Some(handle)` (or `None` for an empty string / missing value).
     if let Some(registration) = registry.get(expected)
-        && let bevy_reflect::TypeInfo::Enum(enum_info) = registration.type_info()
+        && let TypeInfo::Enum(enum_info) = registration.type_info()
         && enum_info.type_path().starts_with("core::option::Option<")
         && let Some(bevy_reflect::enums::VariantInfo::Tuple(some_var)) = enum_info.variant("Some")
         && let Some(inner_field) = some_var.field_at(0)
@@ -1027,7 +1027,7 @@ pub fn bsn_value_to_reflect(
     // registered type, so the plain struct/tuple-struct paths below would fail
     // to resolve it.
     if let Some(registration) = registry.get(expected)
-        && let bevy_reflect::TypeInfo::Enum(enum_info) = registration.type_info()
+        && let TypeInfo::Enum(enum_info) = registration.type_info()
         && let Some(result) =
             enum_variant_value_to_reflect(value, enum_info, registration, registry, assets)
     {
@@ -1052,6 +1052,16 @@ pub fn bsn_value_to_reflect(
         BsnValue::Type(type_path) => type_value_to_reflect(type_path, expected, registry),
         BsnValue::Struct(data) => struct_value_to_reflect(data, registry, assets),
         BsnValue::TupleStruct(data) => tuple_struct_value_to_reflect(data, registry, assets),
+        // `[]` is also how an empty map is written.
+        BsnValue::List(items)
+            if items.is_empty()
+                && matches!(
+                    registry.get(expected).map(TypeRegistration::type_info),
+                    Some(TypeInfo::Map(_))
+                ) =>
+        {
+            map_value_to_reflect(&[], expected, registry, assets)
+        }
         BsnValue::List(items) => list_value_to_reflect(items, expected, registry, assets),
         BsnValue::Map(entries) => map_value_to_reflect(entries, expected, registry, assets),
     }
@@ -1086,7 +1096,7 @@ fn variant_name_of(type_path: &str) -> &str {
 fn enum_variant_value_to_reflect(
     value: &BsnValue,
     enum_info: &bevy_reflect::enums::EnumInfo,
-    enum_registration: &bevy_reflect::TypeRegistration,
+    enum_registration: &TypeRegistration,
     registry: &TypeRegistry,
     assets: Option<&BsnApplyAssets>,
 ) -> Option<Box<dyn PartialReflect>> {
@@ -1412,7 +1422,7 @@ fn list_value_to_reflect(
     Some(Box::new(dynamic_list))
 }
 
-/// Build a [`DynamicMap`] for a `map[(k, v), ...]` value against the expected
+/// Build a [`DynamicMap`] for a `[(k, v), ...]` value against the expected
 /// concrete map type. The dynamic map carries the target type info, so applying
 /// it onto a concrete `HashMap<K, V>` field converts each key/value through that
 /// map's `FromReflect`-backed `insert_boxed`.
@@ -1888,9 +1898,9 @@ fn get_tuple_field_type_path(
 fn empty_component_patch_for_type(type_path: &str, registry: &TypeRegistry) -> BsnPatch {
     match registry
         .get_with_type_path(type_path)
-        .map(bevy_reflect::TypeRegistration::type_info)
+        .map(TypeRegistration::type_info)
     {
-        Some(bevy_reflect::TypeInfo::TupleStruct(_)) => BsnPatch::TupleStruct(BsnTupleStructData {
+        Some(TypeInfo::TupleStruct(_)) => BsnPatch::TupleStruct(BsnTupleStructData {
             type_path: type_path.to_string(),
             values: Vec::new(),
         }),
@@ -1905,14 +1915,14 @@ fn empty_component_patch_for_type(type_path: &str, registry: &TypeRegistry) -> B
 fn empty_container_value_for_type(type_path: &str, registry: &TypeRegistry) -> BsnValue {
     match registry
         .get_with_type_path(type_path)
-        .map(bevy_reflect::TypeRegistration::type_info)
+        .map(TypeRegistration::type_info)
     {
-        Some(bevy_reflect::TypeInfo::TupleStruct(_)) => BsnValue::TupleStruct(BsnTupleStructData {
+        Some(TypeInfo::TupleStruct(_)) => BsnValue::TupleStruct(BsnTupleStructData {
             type_path: type_path.to_string(),
             values: Vec::new(),
         }),
-        Some(bevy_reflect::TypeInfo::List(_)) => BsnValue::List(Vec::new()),
-        Some(bevy_reflect::TypeInfo::Map(_)) => BsnValue::Map(Vec::new()),
+        Some(TypeInfo::List(_)) => BsnValue::List(Vec::new()),
+        Some(TypeInfo::Map(_)) => BsnValue::Map(Vec::new()),
         _ => BsnValue::Struct(BsnStructData {
             type_path: type_path.to_string(),
             fields: BsnStructFields::default(),

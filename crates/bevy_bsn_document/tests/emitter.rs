@@ -297,7 +297,7 @@ fn emit_empty_map_roundtrips() {
 
     let text = emit_scene(&ast);
     assert!(
-        text.contains("data: map[]"),
+        text.contains("data: []"),
         "empty map emits as map[]:\n{text}"
     );
 

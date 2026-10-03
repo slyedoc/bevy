@@ -1,347 +1,183 @@
 //! BSN text emitter: document AST to `.bsn` text.
 //!
-//! Pretty-prints a [`SceneBsnAst`] to BSN text compatible with the parser in
-//! [`crate::parse`]. Emission order is fully determined by the document's
-//! `Vec<Entity>` fields (`SceneBsnAst::roots`, `BsnPatches`, `BsnStructFields`,
-//! `Children` lists): every emit function walks those vectors in their stored
-//! order and never consults `ecs_to_ast`/`ast_to_ecs`, so emitting the same
-//! document twice yields byte-identical text.
+//! The document is lowered to a `bevy_bsn` [`BsnDocument`] and printed by its printer, one
+//! field per line so an edit changes one line. Emission order is fully determined by the
+//! document's `Vec<Entity>` fields (`SceneBsnAst::roots`, `BsnPatches`, `BsnStructFields`,
+//! `Children` lists), so emitting the same document twice yields byte-identical text. A map is
+//! written as a list of `(key, value)` pairs, sorted by key.
 
-use std::fmt::Write;
-
+use bevy_bsn::{
+    BsnDocument, BsnNodeId, BsnNodeKind, BsnPatchPrefix, BsnPath, BsnValueId, PatchBody,
+    PrintOptions,
+};
 use bevy_ecs::entity::Entity;
 
-use crate::{BsnField, BsnPatch, BsnStructData, BsnTupleStructData, BsnValue, SceneBsnAst};
+use crate::{BsnField, BsnPatch, BsnValue, SceneBsnAst};
 
-/// Emits a complete `.bsn` file from the document AST.
-///
-/// One root emits its patches directly; multiple roots are wrapped in a
-/// `Children [...]` relation so the result re-parses as a single top-level
-/// entity.
+/// Emits a complete `.bsn` file from the document AST, one top-level entity per root.
 pub fn emit_scene(ast: &SceneBsnAst) -> String {
-    let mut out = String::new();
-
-    if ast.roots.len() <= 1 {
-        for &root in &ast.roots {
-            // A single root whose only patch is Children re-parses identically
-            // to the multi-root wrapper below and would be unwrapped, dropping
-            // this grouping entity. Tag it so the loader keeps it.
-            if root_has_only_children(ast, root) {
-                writeln!(out, "{}", crate::loader::SCENE_ROOT_GROUP_MARKER).unwrap();
-            }
-            emit_patches(ast, root, 0, &mut out);
-        }
-    } else {
-        writeln!(out, "bevy_ecs::hierarchy::Children [").unwrap();
-        for (i, &root) in ast.roots.iter().enumerate() {
-            emit_patches(ast, root, 1, &mut out);
-            if i + 1 < ast.roots.len() {
-                write_indent(1, &mut out);
-                out.push_str(",\n");
-            }
-        }
-        writeln!(out, "]").unwrap();
-    }
-
-    out
+    emit_entities(ast, &ast.roots)
 }
 
-/// True when `root`'s sole patch is a `Children` relation, the shape that
-/// collides with the synthetic multi-root wrapper on re-parse.
-fn root_has_only_children(ast: &SceneBsnAst, root: Entity) -> bool {
-    ast.get_patches(root).is_some_and(|p| {
-        p.0.len() == 1
-            && ast
-                .get_patch(p.0[0])
-                .is_some_and(|patch| matches!(patch, BsnPatch::Children(_)))
-    })
-}
-
-/// Emits BSN text for a single entity (and its children) from the AST. Used
-/// for clipboard copy: the output is valid `bsn!` macro input.
+/// Emits BSN text for a single entity (and its children) from the AST. Used for clipboard
+/// copy: the output is valid `bsn!` macro input.
 pub fn emit_entity(ast: &SceneBsnAst, patches_entity: Entity) -> String {
-    let mut out = String::new();
-    emit_patches(ast, patches_entity, 0, &mut out);
-    out
+    emit_entities(ast, &[patches_entity])
 }
 
-/// Emits BSN text for multiple entities. A single entity emits directly;
-/// multiple entities are wrapped in `Children [...]` like a multi-root scene.
+/// Emits BSN text for several entities, separated by `--` like a multi-root scene.
 pub fn emit_entities(ast: &SceneBsnAst, entities: &[Entity]) -> String {
-    let mut out = String::new();
-    if entities.len() <= 1 {
-        for &e in entities {
-            emit_patches(ast, e, 0, &mut out);
+    let mut doc = BsnDocument::new();
+    for &entity in entities {
+        if let Some(root) = lower_entity(ast, &mut doc, entity, 0) {
+            doc.push_root(root);
         }
-    } else {
-        writeln!(out, "bevy_ecs::hierarchy::Children [").unwrap();
-        for (i, &e) in entities.iter().enumerate() {
-            emit_patches(ast, e, 1, &mut out);
-            if i + 1 < entities.len() {
-                write_indent(1, &mut out);
-                out.push_str(",\n");
-            }
-        }
-        writeln!(out, "]").unwrap();
     }
+    let mut out = String::new();
+    bevy_bsn::write_document_with(
+        &doc,
+        &mut out,
+        &PrintOptions {
+            one_field_per_line: true,
+            blank_line_between_roots: false,
+            ..PrintOptions::default()
+        },
+    )
+    .expect("writing to a String does not fail");
     out
 }
 
-/// Emit all patches for one entity (one "block" in BSN), in the order they
-/// are stored in the entity's [`crate::BsnPatches`] list.
-fn emit_patches(ast: &SceneBsnAst, patches_entity: Entity, indent: usize, out: &mut String) {
-    // `indent` is the nesting depth, so this is the cap every document walk
-    // shares: a `Children` cycle stops here rather than writing text until
-    // memory runs out.
-    if indent >= crate::MAX_AST_DEPTH {
+fn lower_entity(
+    ast: &SceneBsnAst,
+    doc: &mut BsnDocument,
+    patches_entity: Entity,
+    depth: usize,
+) -> Option<BsnNodeId> {
+    // A `Children` cycle stops here rather than writing text until memory runs out.
+    if depth >= crate::MAX_AST_DEPTH {
         log::warn!(
             "document node {patches_entity} is deeper than {}; it was not emitted",
             crate::MAX_AST_DEPTH
         );
-        return;
+        return None;
     }
-    let Some(patches) = ast.get_patches(patches_entity) else {
-        return;
-    };
-
+    let patches = ast.get_patches(patches_entity)?;
+    let (mut name, mut base) = (None, None);
+    let (mut patch_nodes, mut relations) = (Vec::new(), Vec::new());
     for &patch_entity in &patches.0 {
         let Some(patch) = ast.get_patch(patch_entity) else {
             continue;
         };
-
         match patch {
-            BsnPatch::Name(name) => {
-                write_indent(indent, out);
-                if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.is_empty() {
-                    writeln!(out, "#{name}").unwrap();
-                } else {
-                    writeln!(out, "#\"{}\"", escape_string(name)).unwrap();
-                }
-            }
-
-            BsnPatch::Base(path) => {
-                write_indent(indent, out);
-                writeln!(out, ":\"{}\"", escape_string(path)).unwrap();
-            }
-
-            BsnPatch::Type(type_path) => {
-                write_indent(indent, out);
-                writeln!(out, "{type_path}").unwrap();
-            }
-
+            BsnPatch::Name(n) => name = Some(n.clone()),
+            BsnPatch::Base(b) => base = Some(b.clone()),
+            BsnPatch::Type(type_path) => patch_nodes.push(doc.push_patch(
+                BsnPatchPrefix::FromTemplate,
+                path(type_path),
+                PatchBody::Unit,
+            )),
             BsnPatch::Struct(data) => {
-                emit_struct_patch(data, indent, out);
+                let body = if data.fields.0.is_empty() {
+                    PatchBody::Unit
+                } else {
+                    PatchBody::Struct(lower_fields(doc, &data.fields.0))
+                };
+                patch_nodes.push(doc.push_patch(
+                    BsnPatchPrefix::FromTemplate,
+                    path(&data.type_path),
+                    body,
+                ));
             }
-
             BsnPatch::TupleStruct(data) => {
-                emit_tuple_struct_patch(data, indent, out);
+                let items = data.values.iter().map(|v| lower_value(doc, v)).collect();
+                patch_nodes.push(doc.push_patch(
+                    BsnPatchPrefix::FromTemplate,
+                    path(&data.type_path),
+                    PatchBody::Tuple(items),
+                ));
             }
-
             BsnPatch::Template(type_path, fields) => {
-                write_indent(indent, out);
-                if let Some(fields) = fields {
-                    if fields.0.is_empty() {
-                        writeln!(out, "@{type_path}").unwrap();
-                    } else {
-                        writeln!(out, "@{type_path} {{").unwrap();
-                        emit_fields(&fields.0, indent + 1, out);
-                        write_indent(indent, out);
-                        writeln!(out, "}}").unwrap();
-                    }
-                } else {
-                    writeln!(out, "@{type_path}").unwrap();
-                }
+                let body = match fields {
+                    Some(fields) => PatchBody::Struct(lower_fields(doc, &fields.0)),
+                    None => PatchBody::Unit,
+                };
+                patch_nodes.push(doc.push_patch(BsnPatchPrefix::Template, path(type_path), body));
             }
-
             BsnPatch::Children(children) => {
-                write_indent(indent, out);
-                if children.is_empty() {
-                    writeln!(out, "bevy_ecs::hierarchy::Children []").unwrap();
-                } else {
-                    writeln!(out, "bevy_ecs::hierarchy::Children [").unwrap();
-                    for (i, &child) in children.iter().enumerate() {
-                        emit_patches(ast, child, indent + 1, out);
-                        if i + 1 < children.len() {
-                            write_indent(indent + 1, out);
-                            out.push_str(",\n");
-                        }
-                    }
-                    write_indent(indent, out);
-                    writeln!(out, "]").unwrap();
-                }
+                let entities = children
+                    .iter()
+                    .filter_map(|&child| lower_entity(ast, doc, child, depth + 1))
+                    .collect();
+                relations.push(doc.push_node(BsnNodeKind::Relation {
+                    target_symbol: path("bevy_ecs::hierarchy::Children"),
+                    entities,
+                }));
             }
         }
     }
+    Some(doc.push_node(BsnNodeKind::Entity {
+        name,
+        name_span: None,
+        base,
+        base_span: None,
+        patches: patch_nodes,
+        relations,
+    }))
 }
 
-fn emit_struct_patch(data: &BsnStructData, indent: usize, out: &mut String) {
-    write_indent(indent, out);
-    if data.fields.0.is_empty() {
-        writeln!(out, "{}", data.type_path).unwrap();
-    } else {
-        writeln!(out, "{} {{", data.type_path).unwrap();
-        emit_fields(&data.fields.0, indent + 1, out);
-        write_indent(indent, out);
-        writeln!(out, "}}").unwrap();
-    }
+fn lower_fields(doc: &mut BsnDocument, fields: &[BsnField]) -> Vec<(String, BsnValueId)> {
+    fields
+        .iter()
+        .map(|field| (field.name.clone(), lower_value(doc, &field.value)))
+        .collect()
 }
 
-fn emit_tuple_struct_patch(data: &BsnTupleStructData, indent: usize, out: &mut String) {
-    write_indent(indent, out);
-    write!(out, "{}(", data.type_path).unwrap();
-    for (i, value) in data.values.iter().enumerate() {
-        if i > 0 {
-            write!(out, ", ").unwrap();
-        }
-        emit_value(value, out);
-    }
-    writeln!(out, ")").unwrap();
-}
-
-fn emit_fields(fields: &[BsnField], indent: usize, out: &mut String) {
-    for field in fields {
-        write_indent(indent, out);
-        write!(out, "{}: ", field.name).unwrap();
-        emit_value_maybe_multiline(&field.value, indent, out);
-        writeln!(out, ",").unwrap();
-    }
-}
-
-fn emit_value(value: &BsnValue, out: &mut String) {
-    match value {
-        BsnValue::Float(f) => {
-            // Always emit at least one decimal place so the value re-parses
-            // as a float rather than an int.
-            if f.fract() == 0.0 {
-                write!(out, "{f:.1}").unwrap();
-            } else {
-                write!(out, "{f}").unwrap();
-            }
-        }
-        BsnValue::Int(i) => write!(out, "{i}").unwrap(),
-        BsnValue::Bool(b) => write!(out, "{b}").unwrap(),
-        BsnValue::String(s) => write!(out, "\"{}\"", escape_string(s)).unwrap(),
-        BsnValue::Type(tp) => write!(out, "{tp}").unwrap(),
+fn lower_value(doc: &mut BsnDocument, value: &BsnValue) -> BsnValueId {
+    let value = match value {
+        BsnValue::Float(f) => bevy_bsn::BsnValue::Float(*f),
+        BsnValue::Int(i) => bevy_bsn::BsnValue::Int(*i),
+        BsnValue::Bool(b) => bevy_bsn::BsnValue::Bool(*b),
+        BsnValue::String(s) => bevy_bsn::BsnValue::String(s.clone()),
+        BsnValue::Type(type_path) => bevy_bsn::BsnValue::Path(path(type_path)),
         BsnValue::Struct(data) => {
-            if data.fields.0.is_empty() {
-                write!(out, "{}", data.type_path).unwrap();
-            } else {
-                write!(out, "{} {{ ", data.type_path).unwrap();
-                for (i, field) in data.fields.0.iter().enumerate() {
-                    if i > 0 {
-                        write!(out, ", ").unwrap();
-                    }
-                    write!(out, "{}: ", field.name).unwrap();
-                    emit_value(&field.value, out);
-                }
-                write!(out, " }}").unwrap();
-            }
+            bevy_bsn::BsnValue::Struct(path(&data.type_path), lower_fields(doc, &data.fields.0))
         }
-        BsnValue::TupleStruct(data) => {
-            write!(out, "{}(", data.type_path).unwrap();
-            for (i, v) in data.values.iter().enumerate() {
-                if i > 0 {
-                    write!(out, ", ").unwrap();
-                }
-                emit_value(v, out);
-            }
-            write!(out, ")").unwrap();
-        }
+        BsnValue::TupleStruct(data) => bevy_bsn::BsnValue::NamedTuple(
+            path(&data.type_path),
+            data.values.iter().map(|v| lower_value(doc, v)).collect(),
+        ),
         BsnValue::List(items) => {
-            write!(out, "[").unwrap();
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    write!(out, ", ").unwrap();
-                }
-                emit_value(item, out);
-            }
-            write!(out, "]").unwrap();
+            bevy_bsn::BsnValue::List(items.iter().map(|v| lower_value(doc, v)).collect())
         }
         BsnValue::Map(entries) => {
-            write!(out, "map[").unwrap();
-            for (i, (key, value)) in sorted_map_entries(entries).iter().enumerate() {
-                if i > 0 {
-                    write!(out, ", ").unwrap();
-                }
-                write!(out, "({key}, ").unwrap();
-                emit_value(value, out);
-                write!(out, ")").unwrap();
-            }
-            write!(out, "]").unwrap();
+            let mut sorted: Vec<_> = entries.iter().collect();
+            sorted.sort_by_cached_key(|(key, _)| format!("{key:?}"));
+            let pairs = sorted
+                .into_iter()
+                .map(|(key, value)| {
+                    let pair = vec![lower_value(doc, key), lower_value(doc, value)];
+                    doc.push_value(bevy_bsn::BsnValue::Tuple(pair))
+                })
+                .collect();
+            bevy_bsn::BsnValue::List(pairs)
         }
-    }
+    };
+    doc.push_value(value)
 }
 
-/// Render each map entry's key to text and return the entries sorted by that
-/// key text. Sorting on the emitted key makes map emission deterministic
-/// regardless of the source insertion order.
-fn sorted_map_entries(entries: &[(BsnValue, BsnValue)]) -> Vec<(String, &BsnValue)> {
-    let mut rendered: Vec<(String, &BsnValue)> = entries
-        .iter()
-        .map(|(key, value)| {
-            let mut key_text = String::new();
-            emit_value(key, &mut key_text);
-            (key_text, value)
-        })
-        .collect();
-    rendered.sort_by(|a, b| a.0.cmp(&b.0));
-    rendered
-}
-
-/// Emit a value, using multiline format for nested structs and lists.
-fn emit_value_maybe_multiline(value: &BsnValue, indent: usize, out: &mut String) {
-    match value {
-        BsnValue::Struct(data) if !data.fields.0.is_empty() => {
-            writeln!(out, "{} {{", data.type_path).unwrap();
-            emit_fields(&data.fields.0, indent + 1, out);
-            write_indent(indent, out);
-            write!(out, "}}").unwrap();
-        }
-        BsnValue::List(items) if !items.is_empty() => {
-            writeln!(out, "[").unwrap();
-            for item in items {
-                write_indent(indent + 1, out);
-                emit_value_maybe_multiline(item, indent + 1, out);
-                writeln!(out, ",").unwrap();
-            }
-            write_indent(indent, out);
-            write!(out, "]").unwrap();
-        }
-        BsnValue::Map(entries) if !entries.is_empty() => {
-            writeln!(out, "map[").unwrap();
-            let sorted = sorted_map_entries(entries);
-            for (i, (key, value)) in sorted.iter().enumerate() {
-                write_indent(indent + 1, out);
-                write!(out, "({key}, ").unwrap();
-                emit_value_maybe_multiline(value, indent + 1, out);
-                write!(out, ")").unwrap();
-                if i + 1 < sorted.len() {
-                    writeln!(out, ",").unwrap();
-                } else {
-                    writeln!(out).unwrap();
-                }
-            }
-            write_indent(indent, out);
-            write!(out, "]").unwrap();
-        }
-        _ => emit_value(value, out),
-    }
-}
-
-fn write_indent(indent: usize, out: &mut String) {
-    for _ in 0..indent {
-        out.push_str("    ");
-    }
-}
-
-fn escape_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+/// A document type path as a `bevy_bsn` path. One that does not parse is written as it is (and
+/// will not load back) rather than failing the whole save.
+fn path(type_path: &str) -> BsnPath {
+    BsnPath::from_type_path(type_path).unwrap_or_else(|| {
+        log::warn!("`{type_path}` is not a valid type path; it is written as it is");
+        BsnPath::from_segments([type_path])
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BsnPatches, BsnStructFields};
+    use crate::{BsnPatches, BsnStructData, BsnStructFields, BsnTupleStructData};
 
     #[test]
     fn emit_simple_entity() {

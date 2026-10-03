@@ -176,17 +176,15 @@ fn scene_load_routes_embedded_assets_and_resolves_references() {
     app.world_mut().init_resource::<SceneBsnAst>();
 
     let text = r##"
-bevy_ecs::hierarchy::Children [
-    #Shiny
-    scene_load_routes_embedded_assets_and_resolves_references::ProbeMaterial {
-        shininess: 9.5,
-    }
-    ,
-    #Thing
-    scene_load_routes_embedded_assets_and_resolves_references::UsesMaterial {
-        material: "#Shiny",
-    }
-]
+#Shiny
+scene_load_routes_embedded_assets_and_resolves_references::ProbeMaterial {
+    shininess: 9.5,
+}
+--
+#Thing
+scene_load_routes_embedded_assets_and_resolves_references::UsesMaterial {
+    material: "#Shiny",
+}
 "##;
     // The test types' reflected type paths are module-qualified; rewrite the
     // placeholder segment to each type's real reflect path.
@@ -273,22 +271,20 @@ fn scene_load_resolves_both_inline_and_catalog_reference_spellings() {
     app.world_mut().init_resource::<SceneBsnAst>();
 
     let text = r##"
-bevy_ecs::hierarchy::Children [
-    #Shiny
-    MATERIAL_TYPE {
-        shininess: 2.5,
-    }
-    ,
-    #InlineUser
-    USER_TYPE {
-        material: "#Shiny",
-    }
-    ,
-    #CatalogUser
-    USER_TYPE {
-        material: "@Shiny",
-    }
-]
+#Shiny
+MATERIAL_TYPE {
+    shininess: 2.5,
+}
+--
+#InlineUser
+USER_TYPE {
+    material: "#Shiny",
+}
+--
+#CatalogUser
+USER_TYPE {
+    material: "@Shiny",
+}
 "##;
     let text = text
         .replace("MATERIAL_TYPE", SpellingMaterial::type_path())
@@ -325,17 +321,15 @@ fn stable_node_id_lookup_finds_nested_nodes() {
     use bevy_bsn_document::{apply_dirty_ast_patches, parse_bsn_text, spawn_from_ast, SceneBsnAst};
 
     let text = r##"
+#Parent
+jackdaw_scene_types::node_id::SceneNodeId(11)
 bevy_ecs::hierarchy::Children [
-    #Parent
-    jackdaw_scene_types::node_id::SceneNodeId(11)
-    bevy_ecs::hierarchy::Children [
-        #Child
-        jackdaw_scene_types::node_id::SceneNodeId(22)
-    ]
-    ,
-    #Sibling
-    jackdaw_scene_types::node_id::SceneNodeId(33)
+    #Child
+    jackdaw_scene_types::node_id::SceneNodeId(22)
 ]
+--
+#Sibling
+jackdaw_scene_types::node_id::SceneNodeId(33)
 "##;
 
     let mut app = App::new();
@@ -362,9 +356,10 @@ bevy_ecs::hierarchy::Children [
 }
 
 #[test]
-fn comma_separated_top_level_groups_each_become_a_root() {
+fn separated_top_level_entities_each_become_a_root() {
     let ast = parse_bsn_text(
-        "#First bevy_transform::components::transform::Transform,\n\
+        "#First bevy_transform::components::transform::Transform\n\
+         --\n\
          #Second bevy_transform::components::transform::Transform\n",
     )
     .expect("two sibling roots should load");
@@ -383,7 +378,8 @@ fn a_sibling_root_keeps_its_own_children() {
     let ast = parse_bsn_text(
         "#First bevy_transform::components::transform::Transform bevy_ecs::hierarchy::Children [\n\
              #Nested bevy_transform::components::transform::Transform\n\
-         ],\n\
+         ]\n\
+         --\n\
          #Second bevy_transform::components::transform::Transform\n",
     )
     .expect("a nested sibling root should load");
