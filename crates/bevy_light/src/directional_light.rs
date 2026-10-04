@@ -264,7 +264,8 @@ pub fn update_directional_light_frusta(
 ///
 /// In order to cause the sun to "glow" and light up the surrounding sky, enable bloom
 /// in your post-processing pipeline by adding a `Bloom` component to your camera.
-#[derive(Component, Clone)]
+#[derive(Component, Clone, Reflect)]
+#[reflect(Component, Default, Clone)]
 #[require(DirectionalLight)]
 pub struct SunDisk {
     /// The angular size (diameter) of the sun disk in radians, as observed from the scene.
