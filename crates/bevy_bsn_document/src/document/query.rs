@@ -14,6 +14,13 @@ pub fn is_enum_variant_of(stored_path: &str, base_path: &str) -> bool {
         && !stored_path[base_path.len() + 2..].contains("::")
 }
 
+/// Whether a patch's stored path names `type_path`: the same path, or a short path (no `::`)
+/// equal to its last segment, which is how a hand-written document spells a type.
+pub fn names_type(stored: &str, type_path: &str) -> bool {
+    stored == type_path
+        || (!stored.contains("::") && type_path.rsplit("::").next() == Some(stored))
+}
+
 /// The component type path a patch names, for the patch forms that name one.
 /// `Children`, base inheritance and name references are not components and
 /// answer `None`.
@@ -31,7 +38,7 @@ pub fn patch_type_path(patch: &BsnPatch) -> Option<&str> {
 pub fn type_paths_include<'a>(paths: impl IntoIterator<Item = &'a str>, type_path: &str) -> bool {
     paths
         .into_iter()
-        .any(|path| path == type_path || is_enum_variant_of(path, type_path))
+        .any(|path| names_type(path, type_path) || is_enum_variant_of(path, type_path))
 }
 
 impl SceneBsnAst {
@@ -183,16 +190,18 @@ impl SceneBsnAst {
         for &patch_entity in &patches.0 {
             if let Some(patch) = self.get_patch(patch_entity) {
                 let matches = match patch {
-                    BsnPatch::Type(tp) => tp == type_path || is_enum_variant_of(tp, type_path),
+                    BsnPatch::Type(tp) => {
+                        names_type(tp, type_path) || is_enum_variant_of(tp, type_path)
+                    }
                     BsnPatch::Struct(data) => {
-                        data.type_path == type_path
+                        names_type(&data.type_path, type_path)
                             || is_enum_variant_of(&data.type_path, type_path)
                     }
                     BsnPatch::TupleStruct(data) => {
-                        data.type_path == type_path
+                        names_type(&data.type_path, type_path)
                             || is_enum_variant_of(&data.type_path, type_path)
                     }
-                    BsnPatch::Template(tp, _) => tp == type_path,
+                    BsnPatch::Template(tp, _) => names_type(tp, type_path),
                     _ => false,
                 };
                 if matches {
@@ -353,6 +362,18 @@ pub fn bsn_value_as_int(value: &BsnValue) -> Option<i128> {
 mod query_tests {
     use super::*;
     use crate::document::{clone_node_into, BsnTupleStructData};
+
+    #[test]
+    fn a_short_path_names_the_type_it_ends() {
+        assert!(names_type("Transform", "test::Transform"));
+        assert!(names_type("test::Transform", "test::Transform"));
+        assert!(!names_type("other::Transform", "test::Transform"));
+        assert!(!names_type("Trans", "test::Transform"));
+        let ast = crate::parse_bsn("#a\nNodePosition(1.0, 2.0)").unwrap();
+        assert!(ast
+            .find_patch_by_type_path(ast.roots[0], "graph::bsn::NodePosition")
+            .is_some());
+    }
 
     const TRANSFORM: &str = "test::Transform";
     const MESH: &str = "test::Mesh";

@@ -306,9 +306,7 @@ fn spawn_ast_node_to_depth(
 pub fn insert_relationship(world: &mut World, entity: Entity, owner: Entity, target: &str) -> bool {
     let data = {
         let registry = world.resource::<AppTypeRegistry>().read();
-        registry
-            .get_with_type_path(target)
-            .or_else(|| registry.get_with_short_type_path(target))
+        lookup_type(&registry, target)
             .and_then(|registration| registration.data::<ReflectRelationshipTarget>())
             .cloned()
     };
@@ -422,7 +420,7 @@ fn apply_type_patch(world: &mut World, entity: Entity, type_path: &str) {
     let reg = registry.read();
 
     // Try as a direct type first.
-    if let Some(registration) = reg.get_with_type_path(type_path) {
+    if let Some(registration) = lookup_type(&reg, type_path) {
         let Some(reflect_default) = registration.data::<ReflectDefault>() else {
             log::warn!("cannot apply '{type_path}': no ReflectDefault registered");
             return;
@@ -445,7 +443,7 @@ fn apply_type_patch(world: &mut World, entity: Entity, type_path: &str) {
         let enum_path = &type_path[..last_sep];
         let variant_name = &type_path[last_sep + 2..];
 
-        let Some(registration) = reg.get_with_type_path(enum_path) else {
+        let Some(registration) = lookup_type(&reg, enum_path) else {
             if !note_unapplied(world, type_path) {
                 log::warn!("cannot apply '{type_path}': type not in the registry");
             }
@@ -548,7 +546,7 @@ fn apply_struct_patch(world: &mut World, entity: Entity, data: &BsnStructData) {
     let reg = registry.read();
 
     // Direct lookup: the type_path is a struct component.
-    if let Some(registration) = reg.get_with_type_path(&data.type_path) {
+    if let Some(registration) = lookup_type(&reg, &data.type_path) {
         let Some(reflect_component) = registration.data::<ReflectComponent>() else {
             return;
         };
@@ -602,7 +600,7 @@ fn apply_struct_patch(world: &mut World, entity: Entity, data: &BsnStructData) {
         let enum_path = &data.type_path[..last_sep];
         let variant_name = &data.type_path[last_sep + 2..];
 
-        let Some(registration) = reg.get_with_type_path(enum_path) else {
+        let Some(registration) = lookup_type(&reg, enum_path) else {
             if !note_unapplied(world, &data.type_path) {
                 log::warn!(
                     "cannot apply '{}': type not in the registry",
@@ -751,7 +749,7 @@ fn apply_tuple_variant_patch(
     let Some(separator) = data.type_path.rfind("::") else {
         return false;
     };
-    let Some(registration) = reg.get_with_type_path(&data.type_path[..separator]) else {
+    let Some(registration) = lookup_type(reg, &data.type_path[..separator]) else {
         return false;
     };
     let TypeInfo::Enum(enum_info) = registration.type_info() else {
@@ -818,7 +816,7 @@ fn apply_tuple_struct_patch(world: &mut World, entity: Entity, data: &BsnTupleSt
     let registry = world.resource::<AppTypeRegistry>().clone();
     let reg = registry.read();
 
-    let Some(registration) = reg.get_with_type_path(&data.type_path) else {
+    let Some(registration) = lookup_type(&reg, &data.type_path) else {
         // `Enum::Variant(value)` is not itself a registered type, so without
         // this fallback it reads as an unknown type and is dropped on load.
         if apply_tuple_variant_patch(world, entity, data, &reg, assets_ctx.as_ref()) {
@@ -1313,7 +1311,7 @@ fn type_value_to_reflect(
     registry: &TypeRegistry,
 ) -> Option<Box<dyn PartialReflect>> {
     // Try as a direct type (unit struct).
-    if let Some(registration) = registry.get_with_type_path(type_path) {
+    if let Some(registration) = lookup_type(registry, type_path) {
         let reflect_default = registration.data::<ReflectDefault>()?;
         return Some(reflect_default.default().into_partial_reflect());
     }
@@ -1325,7 +1323,7 @@ fn type_value_to_reflect(
 
     let registration = registry
         .get(expected)
-        .or_else(|| registry.get_with_type_path(enum_path))?;
+        .or_else(|| lookup_type(registry, enum_path))?;
     let reflect_default = registration.data::<ReflectDefault>()?;
     let mut value = reflect_default.default();
     if let ReflectMut::Enum(e) = value.reflect_mut() {
@@ -1342,7 +1340,7 @@ fn struct_value_to_reflect(
     registry: &TypeRegistry,
     assets: Option<&BsnApplyAssets>,
 ) -> Option<Box<dyn PartialReflect>> {
-    let registration = registry.get_with_type_path(&data.type_path)?;
+    let registration = lookup_type(registry, &data.type_path)?;
     let struct_info = registration.type_info().as_struct().ok()?;
 
     // Without a default to seed, build a dynamic struct from the emitted
@@ -1380,7 +1378,7 @@ fn tuple_struct_value_to_reflect(
     registry: &TypeRegistry,
     assets: Option<&BsnApplyAssets>,
 ) -> Option<Box<dyn PartialReflect>> {
-    let registration = registry.get_with_type_path(&data.type_path)?;
+    let registration = lookup_type(registry, &data.type_path)?;
     let tuple_info = registration.type_info().as_tuple_struct().ok()?;
 
     let Some(reflect_default) = registration.data::<ReflectDefault>() else {
@@ -1519,7 +1517,7 @@ pub fn set_bsn_field(
 ) {
     // Refuse to write a field for a type the registry does not know about,
     // matching the JSON-path layer (which resolves the type before writing).
-    if registry.get_with_type_path(type_path).is_none() {
+    if lookup_type(registry, type_path).is_none() {
         return;
     }
 
@@ -1924,7 +1922,7 @@ fn get_field_type_path(
     field_name: &str,
     registry: &TypeRegistry,
 ) -> Option<String> {
-    let registration = registry.get_with_type_path(parent_type_path)?;
+    let registration = lookup_type(registry, parent_type_path)?;
     let struct_info = registration.type_info().as_struct().ok()?;
     let field_info = struct_info.field(field_name)?;
     let field_reg = registry.get(field_info.ty().id())?;
@@ -1936,7 +1934,7 @@ fn get_tuple_field_type_path(
     index: usize,
     registry: &TypeRegistry,
 ) -> Option<String> {
-    let registration = registry.get_with_type_path(parent_type_path)?;
+    let registration = lookup_type(registry, parent_type_path)?;
     let tuple_info = registration.type_info().as_tuple_struct().ok()?;
     let field_info = tuple_info.field_at(index)?;
     let field_reg = registry.get(field_info.ty().id())?;
@@ -1945,8 +1943,7 @@ fn get_tuple_field_type_path(
 
 /// Empty component patch shaped like the reflected type kind.
 fn empty_component_patch_for_type(type_path: &str, registry: &TypeRegistry) -> BsnPatch {
-    match registry
-        .get_with_type_path(type_path)
+    match lookup_type(registry, type_path)
         .map(TypeRegistration::type_info)
     {
         Some(TypeInfo::TupleStruct(_)) => BsnPatch::TupleStruct(BsnTupleStructData {
@@ -1962,8 +1959,7 @@ fn empty_component_patch_for_type(type_path: &str, registry: &TypeRegistry) -> B
 
 /// Empty nested value for a type, used when minting intermediate path segments.
 fn empty_container_value_for_type(type_path: &str, registry: &TypeRegistry) -> BsnValue {
-    match registry
-        .get_with_type_path(type_path)
+    match lookup_type(registry, type_path)
         .map(TypeRegistration::type_info)
     {
         Some(TypeInfo::TupleStruct(_)) => BsnValue::TupleStruct(BsnTupleStructData {
@@ -3086,4 +3082,11 @@ mod apply_value_tests {
         let sword = named(&mut world, "Sword");
         assert!(world.get::<ChildOf>(sword).is_none());
     }
+}
+
+/// A type by its full path, or by its short path when that names exactly one registered type.
+fn lookup_type<'a>(registry: &'a TypeRegistry, path: &str) -> Option<&'a TypeRegistration> {
+    registry
+        .get_with_type_path(path)
+        .or_else(|| registry.get_with_short_type_path(path))
 }

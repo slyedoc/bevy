@@ -472,6 +472,22 @@ fn spawns_scene_patch_instance_from_bsn() {
 }
 
 #[test]
+fn a_bsn_references_another_bsn_by_path() {
+    let dir = Dir::default();
+    dir.insert_asset_text(Path::new("inner.bsn"), "Position { x: 7.0 }");
+    dir.insert_asset_text(
+        Path::new("outer.bsn"),
+        "Children [\n    #Nested\n    bevy_scene::scene_patch::ScenePatchInstance(\"inner.bsn\")\n]",
+    );
+    let mut app = test_app(&dir);
+
+    let root = spawn_instance(&mut app, "outer.bsn");
+    let nested = app.world().get::<Children>(root).expect("outer spawned its child")[0];
+    run_app_until(&mut app, |app| app.world().get::<Position>(nested).is_some());
+    assert_eq!(app.world().get::<Position>(nested).unwrap().x, 7.0);
+}
+
+#[test]
 fn spawns_children_and_names_from_bsn() {
     let dir = Dir::default();
     dir.insert_asset_text(

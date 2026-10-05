@@ -1333,6 +1333,13 @@ fn reject_const_bare() {
 }
 
 #[test]
+fn a_letter_then_digits_is_a_variant_not_a_constant() {
+    for variant in ["F32", "U8", "I64"] {
+        parse(&format!("A {{ x: {variant}, y: Spec::{variant} }}")).expect(variant);
+    }
+}
+
+#[test]
 fn reject_const_assoc() {
     assert_unsupported("A { x: f32::MAX }", unsupported::CONST);
 }

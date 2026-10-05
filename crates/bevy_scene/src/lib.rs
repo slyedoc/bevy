@@ -999,6 +999,7 @@ impl Plugin for ScenePlugin {
             .init_asset::<SceneListPatch>()
             // Registered so a .bsn can reference another .bsn by path.
             .register_type::<ScenePatchInstance>()
+            .register_type::<<ScenePatchInstance as FromTemplate>::Template>()
             .add_systems(
                 SpawnScene,
                 (resolve_scene_patches, spawn_queued)
@@ -1017,6 +1018,14 @@ impl Plugin for ScenePlugin {
             registry.register::<bevy_ecs::name::HashedStr>();
             registry
                 .register_type_conversion::<String, bevy_ecs::name::HashedStr, _>(|s| Ok(s.into()));
+            // `ScenePatchInstance("trees/oak.bsn")`: a `.bsn` naming another `.bsn`. The loader
+            // turns a path string into a `HandleTemplate<T>` through a registered conversion;
+            // `register_asset_reflect` would add it, but `ScenePatch` holds a `Box<dyn Scene>` and
+            // cannot be `Reflect`, so only the conversion is registered.
+            registry.register::<bevy_asset::HandleTemplate<ScenePatch>>();
+            registry.register_type_conversion::<String, bevy_asset::HandleTemplate<ScenePatch>, _>(
+                |s| Ok(s.into()),
+            );
         }
     }
 }

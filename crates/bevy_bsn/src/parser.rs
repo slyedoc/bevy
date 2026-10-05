@@ -820,7 +820,8 @@ fn is_entity_stop(kind: TokenKind) -> bool {
 
 /// The `bsn!` macro's constant heuristic: at least two characters and no lowercase letter.
 fn is_const_ident(ident: &str) -> bool {
-    ident.chars().count() > 1 && !ident.chars().any(char::is_lowercase)
+    // `PI`, `MAX`, `MY_CONST`; not `F32` or `U8`, which are enum variants (one letter, then digits).
+    ident.chars().filter(|c| c.is_alphabetic()).count() > 1 && !ident.chars().any(char::is_lowercase)
 }
 
 /// A human-readable description of a token, used in "unexpected …" messages.
