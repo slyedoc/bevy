@@ -383,16 +383,10 @@ pub fn apply_ast_to_ecs(world: &mut World, entity: Entity) {
             BsnPatch::Name(name) => {
                 world.entity_mut(entity).insert(Name::new(name));
             }
-            BsnPatch::Type(ref type_path) => {
-                apply_type_patch(world, entity, type_path);
-            }
-            BsnPatch::Struct(ref data) => {
-                apply_struct_patch(world, entity, data);
-            }
-            BsnPatch::TupleStruct(ref data) => {
-                apply_tuple_struct_patch(world, entity, data);
-            }
             // Base, Template and relations handled elsewhere.
+            BsnPatch::Type(_) | BsnPatch::Struct(_) | BsnPatch::TupleStruct(_) => {
+                apply_component_patch(world, entity, &patch);
+            }
             _ => {}
         }
     }
@@ -402,6 +396,8 @@ pub fn apply_ast_to_ecs(world: &mut World, entity: Entity) {
 /// command uses this to mirror a document change onto the live entity through
 /// the same code paths as scene load.
 pub fn apply_component_patch(world: &mut World, entity: Entity, patch: &BsnPatch) {
+    let materialized = materialize_inline_assets(world, patch);
+    let patch = materialized.as_ref().unwrap_or(patch);
     match patch {
         BsnPatch::Type(type_path) => apply_type_patch(world, entity, type_path),
         BsnPatch::Struct(data) => apply_struct_patch(world, entity, data),
@@ -412,6 +408,82 @@ pub fn apply_component_patch(world: &mut World, entity: Entity, patch: &BsnPatch
         | BsnPatch::Children(_)
         | BsnPatch::Related(_) => {}
     }
+}
+
+/// An asset value written where a component's handle field goes, `AuroraMaterial3d(AuroraMaterial
+/// { .. })`: the asset is added to its store (once per distinct value) and the field reads it
+/// through [`BsnSceneAssets`] under a key standing for the value. The document keeps the value.
+/// `None` when the patch holds no such value.
+fn materialize_inline_assets(world: &mut World, patch: &BsnPatch) -> Option<BsnPatch> {
+    let type_path = crate::document::patch_type_path(patch)?.to_string();
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let reg = registry.read();
+    let registration = lookup_type(&reg, &type_path)?;
+    // Field types, by tuple index or by name.
+    let tuple_fields: Vec<TypeId> = registration
+        .type_info()
+        .as_tuple_struct()
+        .map(|info| info.iter().map(|f| f.type_id()).collect())
+        .unwrap_or_default();
+    let struct_fields = registration.type_info().as_struct().ok();
+
+    let mut out = patch.clone();
+    let mut changed = false;
+    let mut materialize = |world: &mut World, value: &mut BsnValue, field_type: TypeId| {
+        if matches!(value, BsnValue::String(_)) {
+            return;
+        }
+        let Some(reflect_handle) = reg.get_type_data::<ReflectHandle>(field_type) else {
+            return;
+        };
+        let asset_type = reflect_handle.asset_type_id();
+        let Some(reflect_asset) = reg.get_type_data::<bevy_asset::ReflectAsset>(asset_type) else {
+            return;
+        };
+        let key = format!(
+            "#inline:{}:{:x}",
+            reg.get(asset_type).map_or("?", |r| r.type_info().type_path()),
+            {
+                use core::hash::{BuildHasher, Hash, Hasher};
+                let mut hasher = bevy_platform::hash::FixedState::default().build_hasher();
+                format!("{value:?}").hash(&mut hasher);
+                hasher.finish()
+            }
+        );
+        let known = world
+            .get_resource::<BsnSceneAssets>()
+            .is_some_and(|assets| assets.0.contains_key(&key));
+        if !known {
+            let Some(asset) = bsn_value_to_reflect(value, asset_type, &reg, None) else {
+                return;
+            };
+            let handle = reflect_asset.add(world, asset.as_partial_reflect());
+            world
+                .get_resource_or_insert_with(BsnSceneAssets::default)
+                .0
+                .insert(key.clone(), handle);
+        }
+        *value = BsnValue::String(key);
+        changed = true;
+    };
+    match &mut out {
+        BsnPatch::TupleStruct(data) => {
+            for (value, &field_type) in data.values.iter_mut().zip(&tuple_fields) {
+                materialize(world, value, field_type);
+            }
+        }
+        BsnPatch::Struct(data) => {
+            if let Some(info) = struct_fields {
+                for field in &mut data.fields.0 {
+                    if let Some(field_info) = info.field(&field.name) {
+                        materialize(world, &mut field.value, field_info.type_id());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    changed.then_some(out)
 }
 
 /// Apply a bare type patch (unit struct or enum variant with all defaults).
@@ -1092,6 +1164,14 @@ pub fn bsn_value_to_reflect(
                 Some(Box::new(std::path::PathBuf::from(s.clone())))
             } else if expected == TypeId::of::<smol_str::SmolStr>() {
                 Some(Box::new(smol_str::SmolStr::new(s)))
+            } else if expected != TypeId::of::<String>()
+                && let Some(convert) =
+                    registry.get_type_data::<bevy_reflect::convert::ReflectConvert>(expected)
+                && let Ok(converted) = convert.try_convert_from(Box::new(s.clone()))
+            {
+                // A registered conversion from a string (`Name("x")` into its `HashedStr`),
+                // the reflection side of the `bsn!` macro's implicit `.into()`.
+                Some(converted.into_partial_reflect())
             } else {
                 Some(Box::new(s.clone()))
             }

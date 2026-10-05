@@ -207,3 +207,34 @@ fn bsn_map_with_struct_values_materializes() {
         })
     );
 }
+
+/// A `Name("x")` component patch (how baked rigs name their bones) applies through the
+/// registered `String -> HashedStr` conversion, as the scene loader's does.
+#[test]
+fn a_name_component_patch_applies_through_its_conversion() {
+    let text = "\
+#Rig
+bevy_ecs::hierarchy::Children [
+    bevy_ecs::name::Name(\"Armature\")
+]
+";
+    let mut world = World::new();
+    let registry = AppTypeRegistry::default();
+    {
+        let mut registry = registry.write();
+        registry.register::<Name>();
+        registry.register::<String>();
+        registry.register::<bevy_ecs::name::HashedStr>();
+        registry.register_type_conversion::<String, bevy_ecs::name::HashedStr, _>(|s| Ok(s.into()));
+    }
+    world.insert_resource(registry);
+    world.insert_resource(parse_bsn_text(text).expect("bsn should parse"));
+    let spawned = spawn_from_ast(&mut world);
+    apply_dirty_ast_patches(&mut world);
+    assert!(
+        spawned
+            .iter()
+            .any(|&e| world.get::<Name>(e).is_some_and(|n| n.as_str() == "Armature")),
+        "the bone is named"
+    );
+}
