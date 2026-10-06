@@ -11,7 +11,7 @@ use bevy_utils::default;
 use ktx2::SupercompressionScheme;
 use ktx2::{
     dfd::{Basic, Block, ChannelTypeQualifiers, SampleInformation},
-    ColorModel, Header,
+    ColorModel, Header, TransferFunction,
 };
 use wgpu_types::{
     AstcBlock, AstcChannel, Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor,
@@ -34,6 +34,10 @@ pub fn ktx2_buffer_to_image(
 ) -> Result<Image, TextureError> {
     let ktx2 = ktx2::Reader::new(buffer)
         .map_err(|err| TextureError::InvalidData(format!("Failed to parse ktx2 file: {err:?}")))?;
+    // The file states its own transfer function; the loader setting is only a fallback.
+    let is_srgb = ktx2
+        .transfer_function()
+        .map_or(is_srgb, |transfer| transfer == TransferFunction::SRGB);
     let Header {
         pixel_width: width,
         pixel_height: height,
@@ -1556,6 +1560,8 @@ pub fn ktx2_format_to_texture_format(
 
 #[cfg(test)]
 mod tests {
+    use wgpu_types::TextureFormat;
+
     use crate::CompressedImageFormats;
 
     use super::ktx2_buffer_to_image;
@@ -1584,5 +1590,46 @@ mod tests {
         let supported_compressed_formats = CompressedImageFormats::empty();
         let result = ktx2_buffer_to_image(&buffer, supported_compressed_formats, true);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn the_file_transfer_function_beats_the_setting() {
+        let srgb = test_ktx_bytes();
+        // The same file relabelled linear: vkFormat R8_UNORM, DFD transfer LINEAR.
+        let mut linear = srgb.clone();
+        linear[12] = 9;
+        let dfd = linear
+            .windows(8)
+            .position(|w| w == [2, 0, 0x28, 0, 1, 1, 2, 0])
+            .unwrap();
+        linear[dfd + 6] = 1;
+        let formats = CompressedImageFormats::empty();
+        let linear = ktx2_buffer_to_image(&linear, formats, true).unwrap();
+        assert_eq!(linear.texture_descriptor.format, TextureFormat::R8Unorm);
+        assert_eq!(linear.data.as_deref().unwrap()[0], 0x4a);
+        // R8 has no sRGB texture format, so an sRGB file is decoded on load.
+        let srgb = ktx2_buffer_to_image(&srgb, formats, false).unwrap();
+        assert_ne!(srgb.data.as_deref().unwrap()[0], 0x4a);
+    }
+
+    fn test_ktx_bytes() -> Vec<u8> {
+        vec![
+            0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb, 0x0d, 10, 0x1a, 10, 0x0f, 0, 0, 0, 1,
+            0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0,
+            0, 0, 0x98, 0, 0, 0, 0x2c, 0, 0, 0, 0xc4, 0, 0, 0, 0x5c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0x28, 1, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0x10,
+            0, 0, 0, 0, 0, 0, 0, 0x24, 1, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0,
+            0, 0, 0, 0x20, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+            0x2c, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0x28, 0, 1, 1, 2, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0, 0, 0, 0x12, 0, 0, 0, 0x4b, 0x54, 0x58,
+            0x6f, 0x72, 0x69, 0x65, 0x6e, 0x74, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0, 0x72, 0x64, 0, 0,
+            0, 0x10, 0, 0, 0, 0x4b, 0x54, 0x58, 0x73, 0x77, 0x69, 0x7a, 0x7a, 0x6c, 0x65, 0, 0x72,
+            0x72, 0x72, 0x31, 0, 0x2c, 0, 0, 0, 0x4b, 0x54, 0x58, 0x77, 0x72, 0x69, 0x74, 0x65,
+            0x72, 0, 0x74, 0x6f, 0x6b, 0x74, 0x78, 0x20, 0x76, 0x34, 0x2e, 0x33, 0x2e, 0x30, 0x7e,
+            0x32, 0x38, 0x20, 0x2f, 0x20, 0x6c, 0x69, 0x62, 0x6b, 0x74, 0x78, 0x20, 0x76, 0x34,
+            0x2e, 0x33, 0x2e, 0x30, 0x7e, 0x31, 0, 0x4a, 0, 0, 0, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a,
+            0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a,
+            0x4a,
+        ]
     }
 }
