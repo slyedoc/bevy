@@ -13,8 +13,8 @@ use bevy_reflect::{std_traits::ReflectDefault, PartialReflect, ReflectFromReflec
 
 use crate::template::DynamicComponentTemplate;
 use bevy_scene::{
-    erased_template_as_partial_reflect_mut, CachedSceneAsset, NameEntityReference, ResolveContext,
-    SceneBase,
+    erased_template_as_partial_reflect_mut, AuthoredComponents, CachedSceneAsset,
+    NameEntityReference, ResolveContext, SceneBase,
     ResolveSceneError, ResolvedScene, Scene, SceneDependencies, ScenePatch,
 };
 
@@ -100,6 +100,8 @@ pub(crate) struct DynamicPatch {
     pub(crate) template_type_id: TypeId,
     /// Type path of the template type. Errors only.
     pub(crate) template_type_path: &'static str,
+    /// The component the template builds: what [`AuthoredComponents`] records.
+    pub(crate) component_type_id: TypeId,
 
     /// Constructs a fresh template value. From the template type's registration.
     pub(crate) reflect_default: ReflectDefault,
@@ -181,6 +183,13 @@ fn resolve_entity(
         }
         .resolve_inline(context, scene);
     }
+
+    // What this file sets, on top of what a base already recorded.
+    let authored = &mut scene.get_or_insert_template::<AuthoredComponents>(context).0;
+    if entity.name.is_some() {
+        authored.insert(TypeId::of::<Name>());
+    }
+    authored.extend(entity.patches.iter().map(|patch| patch.component_type_id));
 
     // (3) Patches, in document order.
     for patch in &entity.patches {

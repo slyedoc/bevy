@@ -39,7 +39,7 @@ use bevy_reflect::{
     tuple_struct::TupleStruct, PartialReflect, ReflectRef,
     TypeRegistry,
 };
-use bevy_scene::{SceneBase, ScenePatch};
+use bevy_scene::{AuthoredComponents, SceneBase, ScenePatch};
 use thiserror::Error;
 
 /// Components [`write_scene`] never writes, by type path: values the engine derives at runtime.
@@ -352,6 +352,8 @@ impl<'a> Writer<'a> {
         let entity_ref = world.entity(entity);
         let components = world.components();
         let present: Vec<_> = entity_ref.archetype().components().to_vec();
+        // A recorded set is what the entity's author set; without one, everything reflected.
+        let authored = entity_ref.get::<AuthoredComponents>().map(|a| &a.0);
         let required: HashSet<_> = present
             .iter()
             .filter_map(|id| components.get_info(*id))
@@ -362,7 +364,7 @@ impl<'a> Writer<'a> {
             let Some(type_id) = components.get_info(id).and_then(|i| i.type_id()) else {
                 continue;
             };
-            if self.skipped(type_id) {
+            if self.skipped(type_id) || authored.is_some_and(|a| !a.contains(&type_id)) {
                 continue;
             }
             let Some(registration) = self.registry.get(type_id) else {
@@ -417,6 +419,7 @@ impl<'a> Writer<'a> {
             || type_id == TypeId::of::<Children>()
             || type_id == TypeId::of::<ChildOf>()
             || type_id == TypeId::of::<SceneBase>()
+            || type_id == TypeId::of::<AuthoredComponents>()
             || type_id == TypeId::of::<Disabled>()
             || self.derived.contains(&type_id)
             || self.settings.skip_components.contains(&type_id)

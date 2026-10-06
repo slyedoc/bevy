@@ -139,6 +139,12 @@ pub struct ScenePatchInstance(pub Handle<ScenePatch>);
 #[reflect(Component, Default, Clone, PartialEq)]
 pub struct SceneBase(pub String);
 
+/// The components a scene file sets on this entity, as opposed to those required components,
+/// hooks and systems add. Recorded by the `.bsn` loader (an instance holds its base's set and its
+/// own); a writer saving the entity writes only these.
+#[derive(Component, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthoredComponents(pub bevy_platform::collections::HashSet<core::any::TypeId>);
+
 /// Records what the most recent application of a [`ScenePatch`] created on this entity, so that
 /// the scene can be re-applied when its source asset changes (hot reload).
 ///

@@ -38,6 +38,28 @@ fn a_component_writes_only_the_fields_that_differ_from_its_default() {
 }
 
 #[test]
+fn only_what_the_file_set_is_written_back() {
+    let mut app = test_app();
+    register_fixtures(&mut app);
+    let source = scene(&app, "a.bsn", "Position { y: 2.0 }");
+    let root = app.world_mut().spawn_scene(source).unwrap().id();
+    // Added after loading, by something other than the file's author.
+    app.world_mut().entity_mut(root).insert(Marker);
+    let text = write(app.world_mut(), root);
+    assert!(text.contains("y: 2.0"), "{text}");
+    assert!(!text.contains("Marker"), "an unauthored component is not written:\n{text}");
+
+    // Marking it authored writes it.
+    app.world_mut()
+        .get_mut::<bevy_scene::AuthoredComponents>(root)
+        .unwrap()
+        .0
+        .insert(core::any::TypeId::of::<Marker>());
+    let text = write(app.world_mut(), root);
+    assert!(text.contains("Marker"), "{text}");
+}
+
+#[test]
 fn a_written_scene_loads_back_into_the_same_entities() {
     let mut app = test_app();
     register_fixtures(&mut app);

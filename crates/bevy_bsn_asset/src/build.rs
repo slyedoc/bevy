@@ -646,6 +646,7 @@ fn build_patch(
     Ok(DynamicPatch {
         template_type_id: template.type_id(),
         template_type_path,
+        component_type_id: output.type_id(),
         reflect_default,
         reflect_component,
         reflect_template,
