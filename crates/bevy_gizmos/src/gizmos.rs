@@ -10,6 +10,7 @@ use core::{
 use bevy_color::{Color, LinearRgba};
 use bevy_ecs::{
     change_detection::Tick,
+    entity::Entity,
     resource::Resource,
     system::{
         Deferred, ReadOnlySystemParam, Res, SystemAccess, SystemBuffer, SystemMeta, SystemParam,
@@ -33,9 +34,73 @@ use crate::{
 pub struct GizmoStorage<Config, Clear> {
     pub(crate) list_positions: Vec<Vec3>,
     pub(crate) list_colors: Vec<LinearRgba>,
+    pub(crate) list_owners: OwnerRuns,
     pub(crate) strip_positions: Vec<Vec3>,
     pub(crate) strip_colors: Vec<LinearRgba>,
+    pub(crate) strip_owners: OwnerRuns,
     marker: PhantomData<(Config, Clear)>,
+}
+
+/// The entity each stretch of a gizmo vertex stream is drawn for, as `(first vertex, owner)` in
+/// order. Vertices before the first run have no owner.
+///
+/// A renderer treats an owned line like anything else its owner renders: it shows in the owner's
+/// render layers and world, and not while the owner is hidden or gone. Unowned lines follow their
+/// config group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Reflect)]
+#[reflect(Default, Clone)]
+pub struct OwnerRuns(pub Vec<(u32, Option<Entity>)>);
+
+impl OwnerRuns {
+    /// From vertex `at` on, lines belong to `owner`.
+    pub fn mark(&mut self, at: usize, owner: Option<Entity>) {
+        let at = at as u32;
+        if let Some((start, last)) = self.0.last_mut()
+            && *start == at
+        {
+            *last = owner;
+            // Overwriting may make it repeat the run before it.
+            let len = self.0.len();
+            if (len >= 2 && self.0[len - 2].1 == owner) || (len == 1 && owner.is_none()) {
+                self.0.pop();
+            }
+            return;
+        }
+        if self.owner_at_end() != owner {
+            self.0.push((at, owner));
+        }
+    }
+
+    /// The owner the stream ends in.
+    pub fn owner_at_end(&self) -> Option<Entity> {
+        self.0.last().and_then(|(_, owner)| *owner)
+    }
+
+    /// Append `other`'s runs, for a stream appended at vertex `offset`.
+    pub fn append(&mut self, other: &OwnerRuns, offset: usize) {
+        self.mark(offset, None);
+        for &(start, owner) in &other.0 {
+            self.mark(offset + start as usize, owner);
+        }
+    }
+
+    /// Clear all runs.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// `(first vertex, end vertex, owner)` for a stream of `len` vertices, covering it all.
+    pub fn ranges(&self, len: usize) -> impl Iterator<Item = (usize, usize, Option<Entity>)> + '_ {
+        let first = self.0.first().map_or(len, |(start, _)| (*start as usize).min(len));
+        let lead = (first > 0).then_some((0, first, None));
+        let runs = self.0.iter().enumerate().map(move |(i, &(start, owner))| {
+            let end = self.0.get(i + 1).map_or(len, |(next, _)| *next as usize);
+            ((start as usize).min(len), end.min(len), owner)
+        });
+        lead.into_iter()
+            .chain(runs)
+            .filter(|(start, end, _)| start < end)
+    }
 }
 
 impl<Config, Clear> Default for GizmoStorage<Config, Clear> {
@@ -43,8 +108,10 @@ impl<Config, Clear> Default for GizmoStorage<Config, Clear> {
         Self {
             list_positions: default(),
             list_colors: default(),
+            list_owners: default(),
             strip_positions: default(),
             strip_colors: default(),
+            strip_owners: default(),
             marker: PhantomData,
         }
     }
@@ -60,6 +127,10 @@ where
         &mut self,
         other: &GizmoStorage<OtherConfig, OtherClear>,
     ) {
+        self.list_owners
+            .append(&other.list_owners, self.list_positions.len());
+        self.strip_owners
+            .append(&other.strip_owners, self.strip_positions.len());
         self.list_positions.extend(other.list_positions.iter());
         self.list_colors.extend(other.list_colors.iter());
         self.strip_positions.extend(other.strip_positions.iter());
@@ -74,14 +145,18 @@ where
         mem::swap(&mut self.list_colors, &mut other.list_colors);
         mem::swap(&mut self.strip_positions, &mut other.strip_positions);
         mem::swap(&mut self.strip_colors, &mut other.strip_colors);
+        mem::swap(&mut self.list_owners, &mut other.list_owners);
+        mem::swap(&mut self.strip_owners, &mut other.strip_owners);
     }
 
     /// Clear this gizmo storage of any requested gizmos.
     pub fn clear(&mut self) {
         self.list_positions.clear();
         self.list_colors.clear();
+        self.list_owners.clear();
         self.strip_positions.clear();
         self.strip_colors.clear();
+        self.strip_owners.clear();
     }
 }
 
@@ -150,6 +225,22 @@ where
     pub config: &'w GizmoConfig,
     /// The currently used [`GizmoConfigGroup`]
     pub config_ext: &'w Config,
+}
+
+impl<'w, 's, Config, Clear> Gizmos<'w, 's, Config, Clear>
+where
+    Config: GizmoConfigGroup,
+    Clear: 'static + Send + Sync,
+{
+    /// Draw with `draw` for `entity`, then go back to the owner before. See
+    /// [`GizmoBuffer::set_owner`].
+    pub fn for_entity<R>(&mut self, entity: Entity, draw: impl FnOnce(&mut Self) -> R) -> R {
+        let before = self.owner();
+        self.set_owner(Some(entity));
+        let out = draw(self);
+        self.set_owner(before);
+        out
+    }
 }
 
 impl<'w, 's, Config, Clear> Deref for Gizmos<'w, 's, Config, Clear>
@@ -291,6 +382,12 @@ where
     pub strip_positions: Vec<Vec3>,
     /// The colors of line strip vertices.
     pub strip_colors: Vec<LinearRgba>,
+    /// Who the line segments are drawn for.
+    pub list_owners: OwnerRuns,
+    /// Who the line strips are drawn for.
+    pub strip_owners: OwnerRuns,
+    /// Who lines drawn from now on are for.
+    pub(crate) owner: Option<Entity>,
     #[reflect(ignore, clone)]
     pub(crate) marker: PhantomData<(Config, Clear)>,
 }
@@ -318,8 +415,33 @@ where
             list_colors: Vec::new(),
             strip_positions: Vec::new(),
             strip_colors: Vec::new(),
+            list_owners: OwnerRuns(Vec::new()),
+            strip_owners: OwnerRuns(Vec::new()),
+            owner: None,
             marker: PhantomData,
         }
+    }
+
+    /// Draw what follows for `owner`: a renderer shows those lines in the owner's layers and
+    /// world, and hides them with it. `None` goes back to the config group's rules.
+    pub fn set_owner(&mut self, owner: Option<Entity>) {
+        self.owner = owner;
+        self.list_owners.mark(self.list_positions.len(), owner);
+        self.strip_owners.mark(self.strip_positions.len(), owner);
+    }
+
+    /// Who lines drawn now are for.
+    pub fn owner(&self) -> Option<Entity> {
+        self.owner
+    }
+
+    /// Draw with `draw` for `entity`, then go back to the owner before.
+    pub fn for_entity<R>(&mut self, entity: Entity, draw: impl FnOnce(&mut Self) -> R) -> R {
+        let before = self.owner;
+        self.set_owner(Some(entity));
+        let out = draw(self);
+        self.set_owner(before);
+        out
     }
 }
 
@@ -333,6 +455,10 @@ pub struct GizmoBufferView<'a> {
     pub strip_positions: &'a Vec<Vec3>,
     /// Vertex colors for line-strip topology.
     pub strip_colors: &'a Vec<LinearRgba>,
+    /// Who the line-list vertices are drawn for.
+    pub list_owners: &'a OwnerRuns,
+    /// Who the line-strip vertices are drawn for.
+    pub strip_owners: &'a OwnerRuns,
 }
 
 impl<Config, Clear> SystemBuffer for GizmoBuffer<Config, Clear>
@@ -342,6 +468,9 @@ where
 {
     fn queue(&mut self, _system_meta: &SystemMeta, mut world: DeferredWorld) {
         if let Some(mut storage) = world.get_resource_mut::<GizmoStorage<Config, Clear>>() {
+            let (list_at, strip_at) = (storage.list_positions.len(), storage.strip_positions.len());
+            storage.list_owners.append(&self.list_owners, list_at);
+            storage.strip_owners.append(&self.strip_owners, strip_at);
             storage.list_positions.append(&mut self.list_positions);
             storage.list_colors.append(&mut self.list_colors);
             storage.strip_positions.append(&mut self.strip_positions);
@@ -354,6 +483,10 @@ where
             self.strip_positions.clear();
             self.strip_colors.clear();
         }
+        // Next run starts unowned.
+        self.list_owners.clear();
+        self.strip_owners.clear();
+        self.owner = None;
     }
 }
 
@@ -362,12 +495,15 @@ where
     Config: GizmoConfigGroup,
     Clear: 'static + Send + Sync,
 {
-    /// Clear all data.
+    /// Clear all data. The owner stays, for what is drawn next.
     pub fn clear(&mut self) {
         self.list_positions.clear();
         self.list_colors.clear();
         self.strip_positions.clear();
         self.strip_colors.clear();
+        self.list_owners.clear();
+        self.strip_owners.clear();
+        self.set_owner(self.owner);
     }
 
     /// Read-only view into the buffers data.
@@ -377,6 +513,8 @@ where
             list_colors,
             strip_positions,
             strip_colors,
+            list_owners,
+            strip_owners,
             ..
         } = self;
         GizmoBufferView {
@@ -384,6 +522,8 @@ where
             list_colors,
             strip_positions,
             strip_colors,
+            list_owners,
+            strip_owners,
         }
     }
     /// Draw a line in 3D from `start` to `end`.
@@ -944,4 +1084,62 @@ fn rect_inner(size: Vec2) -> [Vec2; 4] {
     let bl = Vec2::new(-half_size.x, -half_size.y);
     let br = Vec2::new(half_size.x, -half_size.y);
     [tl, tr, br, bl]
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use crate::config::DefaultGizmoConfigGroup;
+    use bevy_color::palettes::basic::WHITE;
+
+    fn entity(index: u32) -> Entity {
+        Entity::from_raw_u32(index).unwrap()
+    }
+
+    #[test]
+    fn owners_mark_runs_and_restore() {
+        let mut buffer = GizmoBuffer::<DefaultGizmoConfigGroup, ()>::new();
+        buffer.line(Vec3::ZERO, Vec3::X, WHITE);
+        buffer.for_entity(entity(1), |g| {
+            g.line(Vec3::ZERO, Vec3::Y, WHITE);
+            g.for_entity(entity(2), |g| g.line(Vec3::ZERO, Vec3::Z, WHITE));
+            g.line(Vec3::ZERO, Vec3::Y, WHITE);
+        });
+        buffer.line(Vec3::ZERO, Vec3::X, WHITE);
+        let ranges: Vec<_> = buffer.list_owners.ranges(buffer.list_positions.len()).collect();
+        assert_eq!(
+            ranges,
+            vec![
+                (0, 2, None),
+                (2, 4, Some(entity(1))),
+                (4, 6, Some(entity(2))),
+                (6, 8, Some(entity(1))),
+                (8, 10, None),
+            ]
+        );
+        // An owner set and unset with nothing drawn leaves no run.
+        let mut empty = GizmoBuffer::<DefaultGizmoConfigGroup, ()>::new();
+        empty.for_entity(entity(3), |_| {});
+        assert!(empty.list_owners.0.is_empty());
+    }
+
+    #[test]
+    fn appended_runs_shift_and_do_not_inherit_the_tail_owner() {
+        let mut storage = GizmoStorage::<DefaultGizmoConfigGroup, ()>::default();
+        let mut owned = GizmoStorage::<DefaultGizmoConfigGroup, ()>::default();
+        owned.list_positions = vec![Vec3::ZERO; 2];
+        owned.list_colors = vec![LinearRgba::WHITE; 2];
+        owned.list_owners.mark(0, Some(entity(1)));
+        let mut unowned = GizmoStorage::<DefaultGizmoConfigGroup, ()>::default();
+        unowned.list_positions = vec![Vec3::ZERO; 4];
+        unowned.list_colors = vec![LinearRgba::WHITE; 4];
+        storage.append_storage(&owned);
+        storage.append_storage(&unowned);
+        storage.append_storage(&owned);
+        let ranges: Vec<_> = storage.list_owners.ranges(storage.list_positions.len()).collect();
+        assert_eq!(
+            ranges,
+            vec![(0, 2, Some(entity(1))), (2, 6, None), (6, 8, Some(entity(1)))]
+        );
+    }
 }

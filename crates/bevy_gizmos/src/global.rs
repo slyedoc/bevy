@@ -26,10 +26,15 @@ fn flush_global_gizmos(mut gizmos: Gizmos) {
     {
         core::mem::swap(&mut buffer, &mut GLOBAL_GIZMO.lock().unwrap());
     }
+    let (list_at, strip_at) = (gizmos.list_positions.len(), gizmos.strip_positions.len());
+    let owner = gizmos.owner();
+    gizmos.list_owners.append(&buffer.list_owners, list_at);
+    gizmos.strip_owners.append(&buffer.strip_owners, strip_at);
     gizmos.strip_positions.extend(buffer.strip_positions);
     gizmos.strip_colors.extend(buffer.strip_colors);
     gizmos.list_positions.extend(buffer.list_positions);
     gizmos.list_colors.extend(buffer.list_colors);
+    gizmos.set_owner(owner);
 }
 
 /// A global gizmo context for use outside of bevy systems.

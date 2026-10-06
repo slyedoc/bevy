@@ -301,6 +301,8 @@ fn update_gizmo_meshes<Config: GizmoConfigGroup>(
             gizmo.buffer.list_colors = mem::take(&mut storage.list_colors);
             gizmo.buffer.strip_positions = mem::take(&mut storage.strip_positions);
             gizmo.buffer.strip_colors = mem::take(&mut storage.strip_colors);
+            gizmo.buffer.list_owners = mem::take(&mut storage.list_owners);
+            gizmo.buffer.strip_owners = mem::take(&mut storage.strip_owners);
         } else {
             let gizmo = GizmoAsset {
                 config_ty: TypeId::of::<Config>(),
@@ -310,6 +312,9 @@ fn update_gizmo_meshes<Config: GizmoConfigGroup>(
                     list_colors: mem::take(&mut storage.list_colors),
                     strip_positions: mem::take(&mut storage.strip_positions),
                     strip_colors: mem::take(&mut storage.strip_colors),
+                    list_owners: mem::take(&mut storage.list_owners),
+                    strip_owners: mem::take(&mut storage.strip_owners),
+                    owner: None,
                     marker: PhantomData,
                 },
             };
