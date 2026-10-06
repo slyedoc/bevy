@@ -19,10 +19,13 @@ use bevy_platform::collections::HashSet;
 use bevy_reflect::{
     convert::ReflectConvert,
     enums::{DynamicEnum, DynamicVariant, VariantInfo},
+    array::DynamicArray,
     list::DynamicList,
+    map::{DynamicMap, Map},
+    set::{DynamicSet, Set},
     std_traits::ReflectDefault,
-    structs::DynamicStruct,
-    tuple::DynamicTuple,
+    structs::{DynamicStruct, Struct},
+    tuple::{DynamicTuple, Tuple},
     tuple_struct::DynamicTupleStruct,
     PartialReflect, Reflect, TypeInfo, TypeRegistration, TypeRegistry,
 };
@@ -354,7 +357,16 @@ fn build_named(
     }
 
     let symbol = resolve_symbol(cx.registry, path, span)?;
-    let named = symbol.registration;
+    let mut named = symbol.registration;
+    // `Link(…)` where a `LinkTemplate` is expected names that template (its fields hold
+    // templates, an `EntityTemplate` for a `#Name`, say): build it, as the `bsn!` macro does.
+    if named.type_id() != expected.type_id()
+        && expected
+            .data::<ReflectTemplate>()
+            .is_some_and(|template| template.output_type_id == named.type_id())
+    {
+        named = expected;
+    }
 
     let partial = match symbol.variant {
         // An enum variant. `full` — every field of the variant defaulted, then the supplied fields
@@ -389,6 +401,23 @@ fn build_named(
             })?;
     }
     coerce(value, expected, span)
+}
+
+/// The value a field left out of a variant takes: its type's default, or `None` for an `Option`
+/// (which needs no default of its payload).
+fn missing_field(
+    cx: &BuildCx,
+    registration: &TypeRegistration,
+    span: Span,
+) -> Result<Box<dyn PartialReflect>, DynamicSceneBuildError> {
+    if registration.data::<ReflectDefault>().is_none()
+        && optionish_payload(cx.registry, registration).is_some()
+    {
+        let mut none = DynamicEnum::new("None", DynamicVariant::Unit);
+        none.set_represented_type(Some(registration.type_info()));
+        return Ok(Box::new(none));
+    }
+    Ok(default_value(registration, span)?.into_partial_reflect())
 }
 
 /// Default-constructs a value of a registered type.
@@ -558,16 +587,26 @@ pub(crate) fn build_enum_forms(
                 partial.insert_boxed(name.clone(), value);
             }
 
+            // Only the fields not supplied are defaulted, so a fully written variant needs no
+            // default of its field types (a handle, say).
             let mut full = DynamicStruct::default();
             for field in variant_info.iter() {
-                let field_registration =
-                    cx.registration(field.ty().id(), field.type_path(), span)?;
-                full.insert_boxed(
-                    field.name(),
-                    default_value(field_registration, span)?.into_partial_reflect(),
-                );
+                let value = match partial.field(field.name()) {
+                    Some(supplied) => supplied.to_dynamic().map_err(|error| {
+                        DynamicSceneBuildError::ValueApplyFailed {
+                            type_path: format!("{type_path}::{variant_name}"),
+                            error: error.to_string(),
+                            span,
+                        }
+                    })?,
+                    None => {
+                        let field_registration =
+                            cx.registration(field.ty().id(), field.type_path(), span)?;
+                        missing_field(cx, field_registration, span)?
+                    }
+                };
+                full.insert_boxed(field.name(), value);
             }
-            apply_overlay(&mut full, &partial, type_path, variant_name, span)?;
 
             (
                 DynamicVariant::Struct(full),
@@ -604,12 +643,23 @@ pub(crate) fn build_enum_forms(
             }
 
             let mut full = DynamicTuple::default();
-            for field in variant_info.iter() {
-                let field_registration =
-                    cx.registration(field.ty().id(), field.type_path(), span)?;
-                full.insert_boxed(default_value(field_registration, span)?.into_partial_reflect());
+            for (index, field) in variant_info.iter().enumerate() {
+                let value = match partial.field(index) {
+                    Some(supplied) => supplied.to_dynamic().map_err(|error| {
+                        DynamicSceneBuildError::ValueApplyFailed {
+                            type_path: format!("{type_path}::{variant_name}"),
+                            error: error.to_string(),
+                            span,
+                        }
+                    })?,
+                    None => {
+                        let field_registration =
+                            cx.registration(field.ty().id(), field.type_path(), span)?;
+                        missing_field(cx, field_registration, span)?
+                    }
+                };
+                full.insert_boxed(value);
             }
-            apply_overlay(&mut full, &partial, type_path, variant_name, span)?;
 
             (DynamicVariant::Tuple(full), DynamicVariant::Tuple(partial))
         }
@@ -631,21 +681,6 @@ pub(crate) fn build_enum_forms(
     Ok((Box::new(full_enum), Box::new(partial_enum)))
 }
 
-/// Overlays the supplied fields of a variant onto the fully-defaulted form.
-fn apply_overlay(
-    full: &mut dyn PartialReflect,
-    partial: &dyn PartialReflect,
-    type_path: &str,
-    variant: &str,
-    span: Span,
-) -> Result<(), DynamicSceneBuildError> {
-    full.try_apply(partial)
-        .map_err(|error| DynamicSceneBuildError::ValueApplyFailed {
-            type_path: format!("{type_path}::{variant}"),
-            error: error.to_string(),
-            span,
-        })
-}
 
 /// Tuple values, such as `(1, 2)`.
 fn build_tuple(
@@ -700,8 +735,50 @@ fn build_list(
         return Ok(Box::new(dynamic));
     }
 
-    let TypeInfo::List(info) = expected.type_info() else {
-        return Err(mismatch("a list", expected, span));
+    let info = match expected.type_info() {
+        TypeInfo::List(info) => info,
+        TypeInfo::Array(info) => {
+            if items.len() != info.capacity() {
+                return Err(mismatch("a list of another length", expected, span));
+            }
+            let item = cx.registration(info.item_ty().id(), info.item_ty().path(), span)?;
+            let values = items
+                .iter()
+                .map(|value| build_value(cx, *value, item))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut dynamic = DynamicArray::new(values.into_boxed_slice());
+            dynamic.set_represented_type(Some(expected.type_info()));
+            return Ok(Box::new(dynamic));
+        }
+        TypeInfo::Set(info) => {
+            let item = cx.registration(info.value_ty().id(), info.value_ty().path(), span)?;
+            let mut dynamic = DynamicSet::default();
+            dynamic.set_represented_type(Some(expected.type_info()));
+            for value in items {
+                dynamic.insert_boxed(build_value(cx, *value, item)?);
+            }
+            return Ok(Box::new(dynamic));
+        }
+        TypeInfo::Map(info) => {
+            let key = cx.registration(info.key_ty().id(), info.key_ty().path(), span)?;
+            let val = cx.registration(info.value_ty().id(), info.value_ty().path(), span)?;
+            let mut dynamic = DynamicMap::default();
+            dynamic.set_represented_type(Some(expected.type_info()));
+            for entry in items {
+                let Some(BsnValue::Tuple(pair)) = cx.document.value(*entry).map(|v| &v.value)
+                else {
+                    return Err(mismatch("a list of (key, value) pairs", expected, span));
+                };
+                let &[k, v] = pair.as_slice() else {
+                    return Err(mismatch("a list of (key, value) pairs", expected, span));
+                };
+                let k = build_value(cx, k, key)?;
+                let v = build_value(cx, v, val)?;
+                dynamic.insert_boxed(k, v);
+            }
+            return Ok(Box::new(dynamic));
+        }
+        _ => return Err(mismatch("a list", expected, span)),
     };
     let item_registration = cx.registration(info.item_ty().id(), info.item_ty().path(), span)?;
 
@@ -1375,9 +1452,11 @@ mod tests {
             BsnPath::from_segments(["NoDefault"]),
             vec![one],
         ));
+        let _ = inner;
+        // The field is left out, so building the variant has to default it.
         let id = document.push_value(BsnValue::Struct(
             BsnPath::from_segments(["Tricky", "A"]),
-            vec![("field".to_string(), inner)],
+            Vec::new(),
         ));
         with_cx(&document, |cx| {
             let error = build_value(cx, id, reg::<Tricky>(cx)).unwrap_err();

@@ -830,7 +830,7 @@ fn dynamic_scene_is_clone_send_sync_and_scene() {
 }
 
 /// An [`App`] whose asset source contains an `a.bsn` that loads as a dynamic scene.
-fn base_asset_app(base_source: &'static str) -> App {
+pub(crate) fn base_asset_app(base_source: &'static str) -> App {
     let (mut app, dir) = memory_asset_app();
     app.init_asset::<Image>();
     app.register_asset_reflect::<Image>();

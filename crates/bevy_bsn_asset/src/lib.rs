@@ -29,16 +29,26 @@
 
 extern crate alloc;
 
+mod asset_value;
 mod build;
 mod loader;
 mod scene;
 mod template;
 mod value;
+mod write;
 
+pub use asset_value::{
+    asset_value_from_document, write_asset_value, write_asset_value_with, BsnAssetAppExt, BsnAssetValueError, BsnValueLoader,
+    BsnValueLoaderError,
+};
 pub use build::{DynamicSceneBuildError, HandleProvider};
 pub use loader::{report_scene_patch_load_failures, DynamicBsnLoader, DynamicBsnLoaderError};
 pub use scene::DynamicScene;
 pub use template::DynamicComponentTemplate;
+pub use write::{
+    write_scene, write_scene_roots, write_scene_roots_text, write_scene_text, BsnWriteError, SkipValue,
+    WriteSettings, DERIVED_COMPONENTS,
+};
 
 #[cfg(test)]
 mod attack;
@@ -46,6 +56,8 @@ mod attack;
 mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_tests;
 
 use bevy_app::{App, Plugin, SceneSpawnerSystems, SpawnScene};
 use bevy_asset::AssetApp;

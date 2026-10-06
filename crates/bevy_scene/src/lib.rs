@@ -999,6 +999,7 @@ impl Plugin for ScenePlugin {
             .init_asset::<SceneListPatch>()
             // Registered so a .bsn can reference another .bsn by path.
             .register_type::<ScenePatchInstance>()
+            .register_type::<SceneBase>()
             .register_type::<<ScenePatchInstance as FromTemplate>::Template>()
             .add_systems(
                 SpawnScene,

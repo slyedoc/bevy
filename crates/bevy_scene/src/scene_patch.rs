@@ -132,6 +132,13 @@ pub enum SpawnSceneError {
 #[require(SceneInstanceState)]
 pub struct ScenePatchInstance(pub Handle<ScenePatch>);
 
+/// The `:"base.bsn"` this entity inherits from, recorded by the `.bsn` loader when it resolves the
+/// include. A writer saving the entity compares it with a fresh copy of the base and writes only
+/// what differs.
+#[derive(Component, Clone, Debug, Default, Reflect, PartialEq, Eq)]
+#[reflect(Component, Default, Clone, PartialEq)]
+pub struct SceneBase(pub String);
+
 /// Records what the most recent application of a [`ScenePatch`] created on this entity, so that
 /// the scene can be re-applied when its source asset changes (hot reload).
 ///

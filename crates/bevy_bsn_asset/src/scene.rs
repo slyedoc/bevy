@@ -14,6 +14,7 @@ use bevy_reflect::{std_traits::ReflectDefault, PartialReflect, ReflectFromReflec
 use crate::template::DynamicComponentTemplate;
 use bevy_scene::{
     erased_template_as_partial_reflect_mut, CachedSceneAsset, NameEntityReference, ResolveContext,
+    SceneBase,
     ResolveSceneError, ResolvedScene, Scene, SceneDependencies, ScenePatch,
 };
 
@@ -167,6 +168,8 @@ fn resolve_entity(
     //     copy-on-write behavior of every template access below depends on `context.cached`.
     if let Some(base) = &entity.base {
         CachedSceneAsset(base.clone()).resolve(context, scene)?;
+        // Recorded so a writer can save only what differs from the base.
+        *scene.get_or_insert_template::<SceneBase>(context) = SceneBase(base.to_string());
     }
 
     // (2) The `#Name`, through the same inline path the `bsn!` macro uses, so that the `Name`
