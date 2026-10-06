@@ -120,11 +120,26 @@ pub fn write_scene_roots(
     roots: &[Entity],
     settings: &WriteSettings,
 ) -> Result<BsnDocument, BsnWriteError> {
+    write_scene_roots_under(world, None, roots, settings)
+}
+
+/// [`write_scene_roots`] with the root carrying `holder`'s components: an entity that stands for
+/// the file's root without the roots being its children in the world (an editor's environment).
+pub fn write_scene_roots_under(
+    world: &mut World,
+    holder: Option<Entity>,
+    roots: &[Entity],
+    settings: &WriteSettings,
+) -> Result<BsnDocument, BsnWriteError> {
     let registry = world.resource::<AppTypeRegistry>().clone();
     let registry = registry.read();
     let mut bases = Bases::default();
     let writer = Writer::new(&registry, settings);
     let result = (|| {
+        let patches = match holder {
+            Some(holder) => writer.patches(world, holder, None)?,
+            None => Vec::new(),
+        };
         let mut children = Vec::new();
         for &root in roots {
             if !settings.skip_entities.contains(&root) {
@@ -132,10 +147,10 @@ pub fn write_scene_roots(
             }
         }
         writer.finish(Node {
-            entity: Entity::PLACEHOLDER,
+            entity: holder.unwrap_or(Entity::PLACEHOLDER),
             name: None,
             base: None,
-            patches: Vec::new(),
+            patches,
             children,
         })
     })();
@@ -150,6 +165,16 @@ pub fn write_scene_roots_text(
     settings: &WriteSettings,
 ) -> Result<String, BsnWriteError> {
     write_scene_roots(world, roots, settings).map(|document| document.to_bsn_string())
+}
+
+/// [`write_scene_roots_under`], printed.
+pub fn write_scene_roots_under_text(
+    world: &mut World,
+    holder: Option<Entity>,
+    roots: &[Entity],
+    settings: &WriteSettings,
+) -> Result<String, BsnWriteError> {
+    write_scene_roots_under(world, holder, roots, settings).map(|document| document.to_bsn_string())
 }
 
 /// [`write_scene`], printed.

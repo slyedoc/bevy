@@ -60,6 +60,31 @@ fn only_what_the_file_set_is_written_back() {
 }
 
 #[test]
+fn a_holder_lends_the_root_its_components() {
+    let mut app = test_app();
+    register_fixtures(&mut app);
+    let holder = app
+        .world_mut()
+        .spawn((
+            Position { x: 0.0, y: 3.0, z: 0.0 },
+            Marker,
+            bevy_scene::AuthoredComponents(
+                [core::any::TypeId::of::<Position>()].into_iter().collect(),
+            ),
+        ))
+        .id();
+    let child = app.world_mut().spawn(Marker).id();
+    let settings = WriteSettings::default();
+    let text =
+        crate::write_scene_roots_under_text(app.world_mut(), Some(holder), &[child], &settings)
+            .unwrap();
+    let (root_part, children_part) = text.split_once("Children").expect(&text);
+    assert!(root_part.contains("y: 3.0"), "the holder's authored component is the root's:\n{text}");
+    assert!(!root_part.contains("Marker"), "an unauthored one is not:\n{text}");
+    assert!(children_part.contains("Marker"), "{text}");
+}
+
+#[test]
 fn a_written_scene_loads_back_into_the_same_entities() {
     let mut app = test_app();
     register_fixtures(&mut app);

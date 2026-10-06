@@ -46,7 +46,8 @@ pub use loader::{report_scene_patch_load_failures, DynamicBsnLoader, DynamicBsnL
 pub use scene::DynamicScene;
 pub use template::DynamicComponentTemplate;
 pub use write::{
-    write_scene, write_scene_roots, write_scene_roots_text, write_scene_text, BsnWriteError, SkipValue,
+    write_scene, write_scene_roots, write_scene_roots_text, write_scene_roots_under,
+    write_scene_roots_under_text, write_scene_text, BsnWriteError, SkipValue,
     WriteSettings, DERIVED_COMPONENTS,
 };
 
