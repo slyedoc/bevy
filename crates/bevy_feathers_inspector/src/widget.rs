@@ -72,8 +72,8 @@ impl_slider_scalar!(u32, 0, |v: f32| v.round().max(0.0) as u32);
 impl_slider_scalar!(u64, 0, |v: f32| v.round().max(0.0) as u64);
 impl_slider_scalar!(usize, 0, |v: f32| v.round().max(0.0) as usize);
 
-/// A feathers slider bound to a numeric field.
-fn build_numeric<T: SliderScalar>(
+/// A feathers slider bound to a numeric field with a declared range.
+pub(crate) fn build_slider<T: SliderScalar>(
     cx: &BuildCx,
     path: &str,
     value: &dyn PartialReflect,
@@ -143,26 +143,6 @@ fn build_bool(
         })
     }
 }
-
-macro_rules! impl_numeric_widget {
-    ($t:ty) => {
-        impl CreateTypeData<$t> for ReflectInspectorWidget {
-            fn create_type_data(_: ()) -> Self {
-                Self {
-                    build: build_numeric::<$t>,
-                }
-            }
-        }
-    };
-}
-
-impl_numeric_widget!(f32);
-impl_numeric_widget!(f64);
-impl_numeric_widget!(i32);
-impl_numeric_widget!(i64);
-impl_numeric_widget!(u32);
-impl_numeric_widget!(u64);
-impl_numeric_widget!(usize);
 
 impl CreateTypeData<bool> for ReflectInspectorWidget {
     fn create_type_data(_: ()) -> Self {
@@ -255,6 +235,12 @@ impl Plugin for DefaultInspectorWidgetsPlugin {
         register!(u64);
         register!(usize);
         register!(bool);
+        register!(String);
+        register!(bevy_math::Vec2);
+        register!(bevy_math::Vec3);
+        register!(bevy_math::Vec4);
+        register!(bevy_math::Quat);
+        register!(bevy_ui::Val);
         register!(bevy_color::Color);
         // Leaves that display rather than edit.
         register!(AssetPath<'static>);
@@ -264,7 +250,9 @@ impl Plugin for DefaultInspectorWidgetsPlugin {
 
         // Keep open widgets in sync when their source values change elsewhere.
         app.add_systems(Update, crate::sync::sync_inspector_widgets);
-        // Colour pickers fan a changed colour out to their sliders and swatch.
+        // String fields get their text once their input has spawned.
+        app.add_systems(Update, crate::text::seed_text_inputs);
+        // Colour pickers fan a changed colour out to their swatch, plane, sliders and hex.
         app.add_systems(Update, crate::color::refresh_color_pickers);
     }
 }

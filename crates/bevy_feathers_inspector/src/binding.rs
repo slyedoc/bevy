@@ -3,23 +3,98 @@
 //! Every leaf widget spawned by the inspector carries an [`InspectorBinding`] that records how to
 //! get from the widget back to the data it edits: an [`InspectorRoot`] (which component, on which
 //! entity) plus a reflection [`ParsedPath`] from that root down to the edited field. When a widget
-//! emits a [`ValueChange<T>`], a writeback observer resolves the binding and applies the new value
-//! through reflection, driving change detection on the target component.
+//! emits a [`ValueChange<T>`], a writeback observer resolves the binding and hands the new value to
+//! [`apply_edit`], which writes it through reflection (driving change detection on the target) or
+//! passes it to the app's [`InspectorEdits`] handler, an editor's undo history say.
 
 use core::any::TypeId;
 
 use bevy_asset::{ReflectAsset, UntypedAssetId};
 use bevy_ecs::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
-use bevy_reflect::{GetPath, ParsedPath, PartialReflect, Reflect};
+use bevy_reflect::{GetPath, ParsedPath, PartialReflect, Reflect, ReflectMut, ReflectRef};
 use bevy_ui_widgets::ValueChange;
 
 use crate::widget::SliderScalar;
 
+/// An app's handler for inspector edits, called with the root, the path to the edited value, the
+/// new value and whether the gesture is over (`is_final`: a released drag, a committed text, a
+/// click). It returns whether it took the edit; one it leaves is written straight through.
+///
+/// A drag sends many non-final edits and then one final one, so an undo history can record one
+/// entry per gesture.
+#[derive(Resource, Clone, Copy)]
+pub struct InspectorEdits(
+    pub fn(&mut World, &InspectorRoot, &ParsedPath, &dyn PartialReflect, bool) -> bool,
+);
+
+/// Apply an edit of the value at `root` / `path`: the [`InspectorEdits`] handler's to make if it
+/// takes it, else written through reflection.
+pub fn apply_edit(
+    world: &mut World,
+    root: &InspectorRoot,
+    path: &ParsedPath,
+    value: &dyn PartialReflect,
+    is_final: bool,
+) {
+    if let Some(InspectorEdits(handler)) = world.get_resource::<InspectorEdits>().copied()
+        && handler(world, root, path, value, is_final)
+    {
+        return;
+    }
+    with_field_reflect_mut(world, root, path, |target| {
+        if let Err(err) = assign(target, value) {
+            bevy_log::warn!("inspector: {path}: {err}");
+        }
+    });
+}
+
+/// `target.try_apply(value)`, except that a list ends up exactly as long as `value`: reflection's
+/// own list apply only overwrites and appends, so a removal would leave the old tail behind.
+pub fn assign(
+    target: &mut dyn PartialReflect,
+    value: &dyn PartialReflect,
+) -> Result<(), bevy_reflect::ApplyError> {
+    if let (ReflectMut::List(list), ReflectRef::List(new)) =
+        (target.reflect_mut(), value.reflect_ref())
+    {
+        while list.len() > new.len() {
+            list.pop();
+        }
+    }
+    target.try_apply(value)
+}
+
+/// The value at `root` / `path` as an owned copy, for an edit that rebuilds it (a list push, an
+/// enum variant switch) before handing it to [`apply_edit`].
+pub fn clone_field(
+    world: &World,
+    root: &InspectorRoot,
+    path: &ParsedPath,
+) -> Option<Box<dyn PartialReflect>> {
+    read_field(world, root, path, |value| value.to_dynamic().ok()).flatten()
+}
+
+/// Queue an edit of the field `binding` addresses; the observers' common tail.
+pub fn queue_edit(
+    commands: &mut Commands,
+    binding: &InspectorBinding,
+    value: Box<dyn PartialReflect>,
+    is_final: bool,
+) {
+    let Some(root) = binding.root.clone() else {
+        return;
+    };
+    let path = binding.path.clone();
+    commands.queue(move |world: &mut World| {
+        apply_edit(world, &root, &path, value.as_ref(), is_final);
+    });
+}
+
 /// Resolve `root` + `path` to an immutable reflected reference and hand it to `f`.
 ///
 /// Used by the external-sync systems to read the current source value back out.
-pub(crate) fn read_field<R>(
+pub fn read_field<R>(
     world: &World,
     root: &InspectorRoot,
     path: &ParsedPath,
@@ -119,7 +194,7 @@ pub type CustomWrite = fn(&mut World, &mut dyn FnMut(&mut dyn Reflect));
 /// a derive would compare its `fn` fields directly, which Rust warns about because a function's
 /// address is not a stable identity — the same function can have different addresses in different
 /// codegen units, and distinct functions can be merged to one address.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum InspectorRoot {
     /// A component on a specific entity.
     Component {
@@ -247,19 +322,9 @@ pub fn inspector_writeback_bool(
     bindings: Query<&InspectorBinding>,
     mut commands: Commands,
 ) {
-    let Ok(binding) = bindings.get(event.source) else {
-        return;
-    };
-    let Some(root) = binding.root.clone() else {
-        return;
-    };
-    let path = binding.path.clone();
-    let value = event.value;
-    commands.queue(move |world: &mut World| {
-        with_field_reflect_mut(world, &root, &path, |target| {
-            let _ = target.try_apply(value.as_partial_reflect());
-        });
-    });
+    if let Ok(binding) = bindings.get(event.source) {
+        queue_edit(&mut commands, binding, Box::new(event.value), true);
+    }
 }
 
 /// Writeback observer for any numeric field edited by a slider (`ValueChange<f32>`).
@@ -271,19 +336,10 @@ pub fn inspector_writeback_slider<T: SliderScalar>(
     bindings: Query<&InspectorBinding>,
     mut commands: Commands,
 ) {
-    let Ok(binding) = bindings.get(event.source) else {
-        return;
-    };
-    let Some(root) = binding.root.clone() else {
-        return;
-    };
-    let path = binding.path.clone();
-    let value = T::from_slider_f32(event.value);
-    commands.queue(move |world: &mut World| {
-        with_field_reflect_mut(world, &root, &path, |target| {
-            let _ = target.try_apply(value.as_partial_reflect());
-        });
-    });
+    if let Ok(binding) = bindings.get(event.source) {
+        let value = T::from_slider_f32(event.value);
+        queue_edit(&mut commands, binding, Box::new(value), event.is_final);
+    }
 }
 
 /// Resolve `root` + `path` to a mutable reflected reference and hand it to `f`.

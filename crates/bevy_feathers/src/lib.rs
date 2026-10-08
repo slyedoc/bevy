@@ -30,7 +30,8 @@
 //! (`bevy` feature `bevy_feathers_core` instead of `bevy_feathers`) and `bevy_render`,
 //! `bevy_shader` and `bevy_ui_render` leave the dependency graph entirely. Every control is still
 //! compiled, spawnable and interactive; what is lost is exactly those fills. Their markers
-//! ([`AlphaPattern`], [`ColorPlaneInner`](controls::ColorPlaneInner)) are public, so a project
+//! ([`AlphaPattern`], [`ColorPlaneInner`](controls::ColorPlaneInner),
+//! [`ColorWheelInner`](controls::ColorWheelInner)) are public, so a project
 //! driving `bevy_ui` with its own renderer can paint those surfaces itself.
 
 extern crate alloc;

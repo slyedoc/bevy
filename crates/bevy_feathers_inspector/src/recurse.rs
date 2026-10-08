@@ -5,6 +5,7 @@
 //! and otherwise recurses structurally. Scalar fields become a labeled row; compound fields
 //! (structs, enums, lists) become a titled feathers [`group`] "card".
 
+use bevy_ecs::component::Component;
 use bevy_ecs::hierarchy::Children;
 use bevy_reflect::structs::Struct;
 use bevy_reflect::tuple_struct::TupleStruct;
@@ -124,6 +125,16 @@ fn build_tuple_struct(cx: &BuildCx, path: &str, tuple_struct: &dyn TupleStruct) 
     Box::new(column(rows))
 }
 
+/// On every field row: the value it edits, for an app that decorates rows (a keyframe toggle,
+/// an override marker).
+#[derive(Component, Clone, Default)]
+pub struct InspectorField {
+    /// Where the value lives (`None` only on a default-constructed marker).
+    pub root: Option<InspectorRoot>,
+    /// The reflection path from the root to the field.
+    pub path: String,
+}
+
 /// Render one field: a labeled row for scalars, or a titled `group` card for compound values.
 pub(crate) fn field_entry(
     cx: &BuildCx,
@@ -137,7 +148,11 @@ pub(crate) fn field_entry(
     if compound {
         Box::new(group_card(cx, path, name, widget))
     } else {
-        Box::new(field_row(name, widget))
+        let marker = InspectorField {
+            root: Some(cx.root.clone()),
+            path: path.to_string(),
+        };
+        Box::new(field_row(name, widget, marker))
     }
 }
 
@@ -176,7 +191,7 @@ pub fn parse_path(path: &str) -> ParsedPath {
 }
 
 /// A labeled row that fills its width: a fixed-width name cell, then the editing widget.
-pub fn field_row(name: &str, widget: Box<dyn Scene>) -> impl Scene {
+pub fn field_row(name: &str, widget: Box<dyn Scene>, marker: InspectorField) -> impl Scene {
     let label_cell: Vec<Box<dyn Scene>> = vec![Box::new(label(name.to_string()))];
     let widget_cell: Vec<Box<dyn Scene>> = vec![widget];
     bsn! {
@@ -188,6 +203,7 @@ pub fn field_row(name: &str, widget: Box<dyn Scene>) -> impl Scene {
             column_gap: px(8),
             min_height: px(26),
         }
+        marker
         Children [
             Node { width: px(96), flex_shrink: 0.0 }
             Children [ {label_cell} ]

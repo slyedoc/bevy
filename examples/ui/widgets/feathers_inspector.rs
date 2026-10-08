@@ -1,15 +1,15 @@
 //! Reflection-driven property editing with Feathers widgets.
 //!
-//! Adds a turnkey [`WorldInspectorPlugin`]: press `F1` to toggle an overlay listing
-//! entities and resources in a collapsible tree — expand a row to edit its components/fields. Edits
-//! write straight back through reflection, so `Changed<T>` fires — watch the console.
-//!
-//! The plugin is filtered with `With<Name>` here (only named entities); use
-//! `WorldInspectorPlugin::new()` for every entity, or any other query filter.
+//! Builds an inspector for one entity's components and one for a resource, each under a panel
+//! node of its own. Edits write straight back through reflection, so `Changed<T>` fires — watch
+//! the console.
 
 use bevy::{
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
-    feathers_inspector::{FeathersInspectorPlugins, Hidden, ReadOnly, WorldInspectorPlugin},
+    feathers::{theme::ThemeBackgroundColor, tokens},
+    feathers_inspector::{
+        BuildEntityInspector, BuildResourceInspector, FeathersInspectorPlugins, Hidden, ReadOnly,
+    },
     prelude::*,
 };
 
@@ -68,12 +68,7 @@ struct DemoConfig {
 
 fn main() {
     App::new()
-        .add_plugins((
-            DefaultPlugins,
-            FeathersPlugins,
-            FeathersInspectorPlugins,
-            WorldInspectorPlugin::<With<Name>>::default().with_toggle_key(KeyCode::F1),
-        ))
+        .add_plugins((DefaultPlugins, FeathersPlugins, FeathersInspectorPlugins))
         .insert_resource(UiTheme(create_dark_theme()))
         .register_type::<DemoSettings>()
         .register_type::<NestedSettings>()
@@ -92,24 +87,26 @@ fn main() {
 fn setup(mut commands: Commands) {
     commands.spawn(Camera2d);
 
-    commands.spawn((
-        Name::new("Player"),
-        DemoSettings {
-            speed: 5.0,
-            enabled: true,
-            gain: 0.75,
-            count: 3,
-            offset: Vec3::new(1.0, 2.0, 3.0),
-            mode: DemoMode::Constant(4.0),
-            tags: vec![1.0, 2.0],
-            id: 42,
-            internal: 99.0,
-            nested: NestedSettings {
-                scale: 2.0,
-                active: false,
+    let player = commands
+        .spawn((
+            Name::new("Player"),
+            DemoSettings {
+                speed: 5.0,
+                enabled: true,
+                gain: 0.75,
+                count: 3,
+                offset: Vec3::new(1.0, 2.0, 3.0),
+                mode: DemoMode::Constant(4.0),
+                tags: vec![1.0, 2.0],
+                id: 42,
+                internal: 99.0,
+                nested: NestedSettings {
+                    scale: 2.0,
+                    active: false,
+                },
             },
-        },
-    ));
+        ))
+        .id();
     commands.spawn((
         Name::new("Enemy"),
         DemoSettings {
@@ -121,7 +118,37 @@ fn setup(mut commands: Commands) {
         },
     ));
 
-    info!("Press F1 to toggle the world inspector.");
+    let panel = |commands: &mut Commands| {
+        commands
+            .spawn((
+                Node {
+                    width: px(360),
+                    flex_direction: FlexDirection::Column,
+                    padding: UiRect::all(px(8)),
+                    overflow: Overflow::scroll_y(),
+                    ..default()
+                },
+                ThemeBackgroundColor(tokens::WINDOW_BG),
+            ))
+            .id()
+    };
+    let entity_panel = panel(&mut commands);
+    let resource_panel = panel(&mut commands);
+    commands
+        .spawn(Node {
+            height: percent(100),
+            column_gap: px(8),
+            ..default()
+        })
+        .add_children(&[entity_panel, resource_panel]);
+    commands.queue(BuildEntityInspector {
+        target: player,
+        panel: entity_panel,
+    });
+    commands.queue(BuildResourceInspector {
+        type_id: core::any::TypeId::of::<DemoConfig>(),
+        panel: resource_panel,
+    });
 }
 
 /// Prints components/resources whenever an inspector edit mutates them.

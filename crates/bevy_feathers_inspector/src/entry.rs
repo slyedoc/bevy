@@ -17,18 +17,23 @@ use bevy_scene::prelude::*;
 use bevy_scene::Scene;
 
 use crate::attributes::FieldCtx;
-use crate::binding::{CustomRead, CustomWrite, InspectorRoot};
+use crate::binding::{read_field, CustomRead, CustomWrite, InspectorRoot};
 use crate::collapse::InspectorCollapsed;
-use crate::recurse::{build_value, group_card, BuildCx};
+use crate::recurse::{build_value, field_entry, group_card, parse_path, BuildCx};
 
 /// Marks a panel entity built by the inspector, recording what it inspects so structural edits can
 /// [`rebuild_panel`] it.
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone)]
 pub enum InspectorPanel {
     /// Shows all components of an entity.
     Entity(Entity),
     /// Shows one component of an entity.
     Component(Entity, TypeId),
+    /// Shows the fields of the value at a path below a root, with no card around them, for a
+    /// host that draws its own.
+    Body(InspectorRoot, String),
+    /// Shows one labeled field: a root, the path below it, and the label.
+    Field(InspectorRoot, String, String),
     /// Shows a single resource.
     Resource(TypeId),
     /// Shows a single loaded asset.
@@ -53,9 +58,7 @@ pub fn build_entity_inspector(world: &mut World, target: Entity, panel: Entity) 
 
     drop(registry);
 
-    if let Ok(panel_mut) = world.get_entity_mut(panel) {
-        panel_mut.queue_spawn_related_scenes::<Children>(sections);
-    }
+    attach(world, panel, sections);
 }
 
 /// Build a titled section for each of an entity's reflectable components.
@@ -114,9 +117,7 @@ pub fn build_component_inspector(
     };
     drop(registry);
 
-    if let Ok(panel_mut) = world.get_entity_mut(panel) {
-        panel_mut.queue_spawn_related_scenes::<Children>(vec![section]);
-    }
+    attach(world, panel, vec![section]);
 }
 
 /// Build one component's titled section, or `None` if it isn't reflectable /
@@ -138,6 +139,80 @@ pub(crate) fn component_section(
     Some(section_for(world, registry, root, name, reflected))
 }
 
+/// (Re)build the fields of the value at `root`, with no card, as the sole child of `panel`: for
+/// an editor that frames each value itself.
+pub fn build_body(world: &mut World, root: InspectorRoot, panel: Entity) {
+    build_body_at(world, root, "", panel);
+}
+
+/// [`build_body`] for the value at `path` below `root` (one entry of a list, say).
+pub fn build_body_at(world: &mut World, root: InspectorRoot, path: &str, panel: Entity) {
+    clear_children(world, panel);
+    if let Ok(mut panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.insert(InspectorPanel::Body(root, path.to_string()));
+    }
+
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+    let body = read_field(world, &root, &parse_path(path), |value| {
+        let cx = BuildCx {
+            registry: &registry,
+            root,
+            collapsed: world.resource::<InspectorCollapsed>(),
+        };
+        build_value(&cx, path, value, &FieldCtx::default())
+    });
+    drop(registry);
+
+    if let Some(body) = body {
+        attach(world, panel, vec![body]);
+    }
+}
+
+/// Append one labeled field (a row, or a card for a compound value) for the value at `path` below
+/// `root` under `parent`, beside whatever `parent` already holds: for an editor that lays a value
+/// out by hand and wants the inspector's widget for one of its fields.
+pub fn build_field(
+    world: &mut World,
+    root: InspectorRoot,
+    path: &str,
+    label: &str,
+    parent: Entity,
+) -> Entity {
+    let panel = world
+        .spawn((
+            bevy_ui::Node {
+                width: bevy_ui::percent(100),
+                ..Default::default()
+            },
+            ChildOf(parent),
+        ))
+        .id();
+    rebuild_field(world, root, path, label, panel);
+    panel
+}
+
+fn rebuild_field(world: &mut World, root: InspectorRoot, path: &str, label: &str, panel: Entity) {
+    clear_children(world, panel);
+    if let Ok(mut panel_mut) = world.get_entity_mut(panel) {
+        panel_mut.insert(InspectorPanel::Field(root, path.to_string(), label.to_string()));
+    }
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+    let field = read_field(world, &root, &parse_path(path), |value| {
+        let cx = BuildCx {
+            registry: &registry,
+            root,
+            collapsed: world.resource::<InspectorCollapsed>(),
+        };
+        field_entry(&cx, label, path, value, &FieldCtx::default())
+    });
+    drop(registry);
+    if let Some(field) = field {
+        attach(world, panel, vec![field]);
+    }
+}
+
 /// (Re)build a single-resource inspector as the sole child of `panel`.
 pub fn build_resource_inspector(world: &mut World, type_id: TypeId, panel: Entity) {
     clear_children(world, panel);
@@ -153,9 +228,7 @@ pub fn build_resource_inspector(world: &mut World, type_id: TypeId, panel: Entit
     };
     drop(registry);
 
-    if let Ok(panel_mut) = world.get_entity_mut(panel) {
-        panel_mut.queue_spawn_related_scenes::<Children>(vec![section]);
-    }
+    attach(world, panel, vec![section]);
 }
 
 /// Enumerate one loaded asset's fields and (re)build an editing section under `panel`.
@@ -181,9 +254,7 @@ pub fn build_asset_inspector(
     };
     drop(registry);
 
-    if let Ok(panel_mut) = world.get_entity_mut(panel) {
-        panel_mut.queue_spawn_related_scenes::<Children>(vec![section]);
-    }
+    attach(world, panel, vec![section]);
 }
 
 /// Build a titled section for a loaded asset, or `None` if it isn't reflectable / loaded.
@@ -243,9 +314,7 @@ pub fn build_custom_inspector(
     let Some(section) = section else {
         return;
     };
-    if let Ok(panel_mut) = world.get_entity_mut(panel) {
-        panel_mut.queue_spawn_related_scenes::<Children>(vec![section]);
-    }
+    attach(world, panel, vec![section]);
 }
 
 /// Build a titled section for a resource, or `None` if it isn't reflectable / present.
@@ -295,13 +364,17 @@ pub(crate) fn section_for(
 
 /// Rebuild a panel according to what its [`InspectorPanel`] records.
 pub fn rebuild_panel(world: &mut World, panel: Entity) {
-    let Some(kind) = world.get::<InspectorPanel>(panel).copied() else {
+    let Some(kind) = world.get::<InspectorPanel>(panel).cloned() else {
         return;
     };
     match kind {
         InspectorPanel::Entity(target) => build_entity_inspector(world, target, panel),
         InspectorPanel::Component(target, type_id) => {
             build_component_inspector(world, target, type_id, panel);
+        }
+        InspectorPanel::Body(root, path) => build_body_at(world, root, &path, panel),
+        InspectorPanel::Field(root, path, label) => {
+            rebuild_field(world, root, &path, &label, panel);
         }
         InspectorPanel::Resource(type_id) => build_resource_inspector(world, type_id, panel),
         InspectorPanel::Asset(asset_id, type_id) => {
@@ -325,6 +398,23 @@ pub fn find_ancestor_panel(
         match parents.get(current) {
             Ok(child_of) => current = child_of.parent(),
             Err(_) => return None,
+        }
+    }
+}
+
+/// Spawn `scenes` as children of `panel` now, in order. Not queued: a host that rebuilds (an
+/// editor's inspector on a selection change) can despawn `panel` before a queued spawn lands,
+/// and the orphaned rows would become UI roots drawn across the window.
+fn attach(world: &mut World, panel: Entity, scenes: Vec<Box<dyn Scene>>) {
+    if world.get_entity(panel).is_err() {
+        return;
+    }
+    for scene in scenes {
+        match world.spawn_scene(scene) {
+            Ok(mut spawned) => {
+                spawned.insert(ChildOf(panel));
+            }
+            Err(err) => bevy_log::warn!("inspector: a section did not spawn: {err}"),
         }
     }
 }

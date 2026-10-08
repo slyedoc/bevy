@@ -30,25 +30,29 @@ pub mod color;
 pub mod entry;
 pub mod enums;
 pub mod lists;
+pub mod number;
 pub mod recurse;
 pub mod sync;
+pub mod text;
+pub mod val;
 pub mod widget;
-pub mod world_inspector;
 
 pub use attributes::{FieldCtx, Hidden, ReadOnly};
 pub use binding::{
-    inspector_writeback_bool, inspector_writeback_slider, CustomRead, CustomWrite,
-    InspectorBinding, InspectorRoot,
+    apply_edit, assign, clone_field, inspector_writeback_bool, inspector_writeback_slider,
+    queue_edit, read_field, CustomRead, CustomWrite, InspectorBinding, InspectorEdits,
+    InspectorRoot,
 };
 pub use collapse::InspectorCollapsed;
+pub use color::{color_picker, ColorPicker};
 pub use entry::{
-    build_asset_inspector, build_component_inspector, build_custom_inspector,
+    build_asset_inspector, build_body, build_body_at, build_component_inspector, build_field, build_custom_inspector,
     build_entity_inspector, build_resource_inspector, find_ancestor_panel, rebuild_panel,
     BuildAssetInspector, BuildComponentInspector, BuildCustomInspector, BuildEntityInspector,
     BuildResourceInspector, InspectorPanel,
 };
-pub use recurse::{build_value, BuildCx};
+pub use enums::set_variant;
+pub use recurse::{build_value, BuildCx, InspectorField};
 pub use widget::{
     DefaultInspectorWidgetsPlugin, FeathersInspectorPlugins, ReflectInspectorWidget, SliderScalar,
 };
-pub use world_inspector::{WorldInspectorPlugin, WorldInspectorState};

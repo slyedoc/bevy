@@ -1,7 +1,7 @@
 //! List/Array editing: a row per element plus add/remove buttons.
 //!
-//! Adding and removing elements changes structure, so (like enum variant switches) the edit is
-//! applied through reflection and the panel is rebuilt.
+//! Adding, removing and reordering elements changes structure, so (like enum variant switches) the
+//! whole edited list goes through [`apply_edit`] and the panel is rebuilt.
 
 use core::any::TypeId;
 
@@ -20,7 +20,7 @@ use bevy_feathers::controls::FeathersButton;
 use bevy_feathers::display::label;
 
 use crate::attributes::FieldCtx;
-use crate::binding::{with_field_reflect_mut, InspectorRoot};
+use crate::binding::{apply_edit, clone_field, InspectorRoot};
 use crate::entry::{find_ancestor_panel, rebuild_panel, InspectorPanel};
 use crate::recurse::{build_value, column, parse_path, BuildCx};
 
@@ -31,6 +31,8 @@ enum ListOp {
     Push,
     /// Remove the element at this index.
     Remove(usize),
+    /// Swap the element at this index with the one after it.
+    SwapNext(usize),
 }
 
 /// Records a pending list edit for a button.
@@ -62,9 +64,14 @@ pub fn build_list(cx: &BuildCx, path: &str, list: &dyn List) -> Box<dyn Scene> {
         if let Some(child) = list.get(i) {
             let child_path = format!("{path}[{i}]");
             let widget = build_value(cx, &child_path, child, &FieldCtx::default());
-            let remove = op_button(cx, path, ListOp::Remove(i), item_type_id, "x");
-            let children: Vec<Box<dyn Scene>> =
-                vec![Box::new(label(i.to_string())), widget, remove];
+            let mut children: Vec<Box<dyn Scene>> = vec![Box::new(label(i.to_string())), widget];
+            if i > 0 {
+                children.push(op_button(cx, path, ListOp::SwapNext(i - 1), item_type_id, "^"));
+            }
+            if i + 1 < list.len() {
+                children.push(op_button(cx, path, ListOp::SwapNext(i), item_type_id, "v"));
+            }
+            children.push(op_button(cx, path, ListOp::Remove(i), item_type_id, "x"));
             rows.push(Box::new(bsn! {
                 Node {
                     display: Display::Flex,
@@ -131,7 +138,7 @@ fn on_list_button_click(
     });
 }
 
-/// Apply a push/remove to the list at `root`/`path`.
+/// Apply a push / remove / swap to the list at `root`/`path`, as one edit of the whole list.
 fn apply_list_op(
     world: &mut World,
     root: &InspectorRoot,
@@ -139,36 +146,36 @@ fn apply_list_op(
     op: &ListOp,
     item_type_id: Option<TypeId>,
 ) {
-    match op {
-        ListOp::Remove(index) => {
-            let index = *index;
-            with_field_reflect_mut(world, root, path, move |field| {
-                if let ReflectMut::List(list) = field.reflect_mut()
-                    && index < list.len()
-                {
-                    list.remove(index);
-                }
-            });
+    let Some(mut edited) = clone_field(world, root, path) else {
+        return;
+    };
+    let ReflectMut::List(list) = edited.reflect_mut() else {
+        return;
+    };
+    match *op {
+        ListOp::Remove(index) if index < list.len() => {
+            list.remove(index);
+        }
+        ListOp::SwapNext(index) if index + 1 < list.len() => {
+            let next = list.remove(index + 1);
+            list.insert(index, next);
         }
         ListOp::Push => {
             let registry = world.resource::<AppTypeRegistry>().clone();
-            let default = {
-                let registry = registry.read();
-                item_type_id
-                    .and_then(|id| registry.get(id))
-                    .and_then(|reg| reg.data::<ReflectDefault>())
-                    .map(ReflectDefault::default)
-            };
-            let Some(default) = default else {
+            let registry = registry.read();
+            let Some(default) = item_type_id
+                .and_then(|id| registry.get(id))
+                .and_then(|reg| reg.data::<ReflectDefault>())
+                .map(ReflectDefault::default)
+            else {
+                bevy_log::warn!("inspector: {path}: the item type has no ReflectDefault to add");
                 return;
             };
-            with_field_reflect_mut(world, root, path, move |field| {
-                if let ReflectMut::List(list) = field.reflect_mut() {
-                    list.push(default.into_partial_reflect());
-                }
-            });
+            list.push(default.into_partial_reflect());
         }
+        _ => return,
     }
+    apply_edit(world, root, path, edited.as_ref(), true);
 }
 
 /// Determine the element type of a list (from an existing element, else its list metadata).

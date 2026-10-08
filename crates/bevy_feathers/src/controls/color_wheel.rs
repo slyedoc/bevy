@@ -122,10 +122,14 @@ impl ColorWheelValue {
     }
 }
 
-/// Marker identifying the inner element of the color wheel.
+/// Marker identifying the inner element of the color wheel: the square the ring and triangle fill.
+///
+/// With the `render_materials` feature the fill is a `UiMaterial` on this entity. Without it the
+/// square stays transparent, and a custom render backend paints it from this entity's
+/// `ComputedNode` and the parent's [`ColorWheelValue`] (whose `hue` places the triangle).
 #[derive(Component, Default, Clone, Reflect)]
 #[reflect(Component, Clone, Default)]
-struct ColorWheelInner;
+pub struct ColorWheelInner;
 
 /// Marker identifying the thumb element of the triangle.
 #[derive(Component, Default, Clone, Reflect)]

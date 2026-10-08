@@ -22,7 +22,7 @@ use bevy_feathers::controls::{ButtonVariant, FeathersButton};
 use bevy_feathers::display::label;
 
 use crate::attributes::FieldCtx;
-use crate::binding::{with_field_reflect_mut, InspectorRoot};
+use crate::binding::{apply_edit, read_field, InspectorRoot};
 use crate::entry::{find_ancestor_panel, rebuild_panel, InspectorPanel};
 use crate::recurse::{column, field_entry, parse_path, BuildCx};
 
@@ -156,6 +156,20 @@ fn on_enum_variant_click(
     });
 }
 
+/// Switch the enum at `root`/`path` to `variant_name` (its fields default-constructed), as one
+/// edit through [`apply_edit`].
+pub fn set_variant(world: &mut World, root: &InspectorRoot, path: &ParsedPath, variant_name: &str) {
+    let enum_type_id = read_field(world, root, path, |value| {
+        value
+            .get_represented_type_info()
+            .map(bevy_reflect::TypeInfo::type_id)
+    })
+    .flatten();
+    if let Some(enum_type_id) = enum_type_id {
+        switch_enum_variant(world, root, path, enum_type_id, variant_name);
+    }
+}
+
 /// Apply a [`DynamicEnum`] for `variant_name` to the enum at `root`/`path`.
 fn switch_enum_variant(
     world: &mut World,
@@ -176,9 +190,7 @@ fn switch_enum_variant(
         );
         return;
     };
-    with_field_reflect_mut(world, root, path, |enum_field| {
-        let _ = enum_field.try_apply(dynamic.as_partial_reflect());
-    });
+    apply_edit(world, root, path, dynamic.as_partial_reflect(), true);
 }
 
 /// Construct a [`DynamicEnum`] for `variant_name`, default-constructing any variant fields.
