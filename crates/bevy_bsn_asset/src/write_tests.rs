@@ -233,3 +233,42 @@ mod asset_values {
         let _: &dyn Reflect = read.as_ref();
     }
 }
+
+use bevy_ecs::reflect::ReflectComponent;
+use bevy_reflect::std_traits::ReflectDefault;
+
+#[derive(bevy_ecs::component::Component, bevy_reflect::Reflect, Default)]
+#[reflect(Component, Default)]
+struct Slot(#[reflect(skip_serializing)] Option<u8>);
+
+#[derive(bevy_ecs::component::Component, bevy_reflect::Reflect, Default)]
+#[reflect(Component, Default)]
+struct Tagged {
+    label: u32,
+    #[reflect(skip_serializing)]
+    runtime: u32,
+}
+
+#[test]
+fn a_skip_serializing_field_is_never_written() {
+    let mut app = test_app();
+    register_fixtures(&mut app);
+    app.register_type::<Slot>().register_type::<Tagged>();
+    let root = app
+        .world_mut()
+        .spawn((Slot(Some(4)), Tagged { label: 7, runtime: 9 }))
+        .id();
+    for type_id in [core::any::TypeId::of::<Slot>(), core::any::TypeId::of::<Tagged>()] {
+        app.world_mut()
+            .entity_mut(root)
+            .entry::<bevy_scene::AuthoredComponents>()
+            .or_default()
+            .get_mut()
+            .0
+            .insert(type_id);
+    }
+    let text = write(app.world_mut(), root);
+    assert!(!text.contains('4'), "the skipped tuple field is left out:\n{text}");
+    assert!(text.contains("label: 7"), "{text}");
+    assert!(!text.contains("runtime"), "the skipped struct field is left out:\n{text}");
+}

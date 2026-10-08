@@ -35,9 +35,8 @@ use bevy_ecs::{
 };
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_reflect::{
-    enums::{Enum, VariantType}, std_traits::ReflectDefault, structs::Struct,
-    tuple_struct::TupleStruct, PartialReflect, ReflectRef,
-    TypeRegistry,
+    enums::{Enum, VariantType}, serde::SerializationData, std_traits::ReflectDefault,
+    structs::Struct, tuple_struct::TupleStruct, PartialReflect, ReflectRef, TypeRegistry,
 };
 use bevy_scene::{AuthoredComponents, SceneBase, ScenePatch};
 use thiserror::Error;
@@ -543,8 +542,12 @@ impl<'a> Writer<'a> {
         value: &dyn Struct,
         baseline: Option<&dyn Struct>,
     ) -> Result<Vec<(String, W)>, BsnWriteError> {
+        let skipped = self.serialization(value);
         let mut fields = Vec::new();
-        for (name, field) in value.iter_fields() {
+        for (index, (name, field)) in value.iter_fields().enumerate() {
+            if skipped.is_some_and(|s| s.is_field_skipped(index)) {
+                continue;
+            }
             let before = baseline.and_then(|b| b.field(name));
             if before.is_some_and(|b| equal(b, field)) {
                 continue;
@@ -556,25 +559,47 @@ impl<'a> Writer<'a> {
 
     /// The leading fields of `value` up to the last that differs from `baseline`: a tuple patch
     /// sets fields `0..n`.
+    ///
+    /// A `#[reflect(skip_serializing)]` field is never the reason to write: trailing, it is left
+    /// out; before a field that is written, it is written as its default, since a tuple patch is
+    /// positional.
     fn leading_fields(
         &self,
         cx: &Cx,
         value: &dyn TupleStruct,
         baseline: Option<&dyn TupleStruct>,
     ) -> Result<Vec<W>, BsnWriteError> {
+        let skipped = self.serialization(value);
+        let is_skipped = |i: usize| skipped.is_some_and(|s| s.is_field_skipped(i));
         let last = (0..value.field_len()).rev().find(|&i| {
-            !baseline
-                .and_then(|b| b.field(i))
-                .zip(value.field(i))
-                .is_some_and(|(b, v)| equal(b, v))
+            !is_skipped(i)
+                && !baseline
+                    .and_then(|b| b.field(i))
+                    .zip(value.field(i))
+                    .is_some_and(|(b, v)| equal(b, v))
         });
         let Some(last) = last else {
             return Ok(Vec::new());
         };
-        (0..=last)
-            .filter_map(|i| value.field(i).map(|f| (f, baseline.and_then(|b| b.field(i)))))
-            .map(|(f, before)| self.value(cx, f, before))
-            .collect()
+        let mut items = Vec::new();
+        for i in 0..=last {
+            if is_skipped(i)
+                && let Some(default) = skipped.and_then(|s| s.generate_default(i))
+            {
+                items.push(self.value(cx, default.as_partial_reflect(), None)?);
+                continue;
+            }
+            if let Some(field) = value.field(i) {
+                items.push(self.value(cx, field, baseline.and_then(|b| b.field(i)))?);
+            }
+        }
+        Ok(items)
+    }
+
+    /// The `#[reflect(skip_serializing)]` fields of `value`'s type, if it declares any.
+    fn serialization(&self, value: &dyn PartialReflect) -> Option<&SerializationData> {
+        let info = value.get_represented_type_info()?;
+        self.registry.get_type_data::<SerializationData>(info.type_id())
     }
 
     /// `value` as a `.bsn` value. A struct or tuple struct writes only what differs from
@@ -633,7 +658,7 @@ impl<'a> Writer<'a> {
             ),
             ReflectRef::TupleStruct(t) => {
                 let mut items = self.leading_fields(cx, t, baseline.and_then(as_tuple_struct))?;
-                if items.is_empty() {
+                if items.is_empty() && baseline.is_some() {
                     items = self.leading_fields(cx, t, None)?;
                 }
                 W::Named(t.reflect_type_path().to_string(), items)
