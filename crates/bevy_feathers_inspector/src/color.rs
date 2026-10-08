@@ -364,16 +364,16 @@ pub(crate) fn refresh_color_pickers(
             };
             match *part {
                 ColorPart::Swatch => {
-                    commands.entity(entity).insert(ColorSwatchValue(color));
+                    commands.entity(entity).try_insert(ColorSwatchValue(color));
                 }
                 ColorPart::Plane => {
-                    commands.entity(entity).insert(ColorPlaneValue(plane_value(rgba)));
+                    commands.entity(entity).try_insert(ColorPlaneValue(plane_value(rgba)));
                 }
                 ColorPart::Channel(channel) => {
                     let value = [rgba.red, rgba.green, rgba.blue, rgba.alpha][channel];
                     commands
                         .entity(entity)
-                        .insert((SliderValue(value), SliderBaseColor(color)));
+                        .try_insert((SliderValue(value), SliderBaseColor(color)));
                 }
                 ColorPart::Hex => {
                     if focus.get() != Some(entity)
