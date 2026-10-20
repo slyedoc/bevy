@@ -4,7 +4,9 @@
 //! A field with a `#[reflect(@min..=max)]` range keeps the slider (see [`crate::widget`]).
 
 use bevy_ecs::prelude::*;
-use bevy_feathers::controls::{FeathersNumberInput, HardLimit, NumberInputPrecision};
+use bevy_feathers::controls::{
+    FeathersNumberInput, HardLimit, NumberInputPrecision, NumberInputStep,
+};
 use bevy_feathers::tokens;
 use bevy_math::{EulerRot, Quat, Vec2, Vec3, Vec4};
 use bevy_reflect::{CreateTypeData, ParsedPath, PartialReflect, ReflectRef};
@@ -83,15 +85,19 @@ pub(crate) fn build_number<T: NumberField>(
         path: parse_path(path),
     };
     let limit = T::hard_limit();
-    Box::new(bsn! {
-        @FeathersNumberInput
-        NumberInputPrecision({T::DECIMALS})
-        limit
-        numeric
-        binding
-        Node { flex_grow: 1.0 }
-        on(writeback_number::<T>)
-    })
+    let step = field.step.map(|s| bsn! { NumberInputStep({s as f64}) });
+    Box::new((
+        bsn! {
+            @FeathersNumberInput
+            NumberInputPrecision({T::DECIMALS})
+            limit
+            numeric
+            binding
+            Node { flex_grow: 1.0 }
+            on(writeback_number::<T>)
+        },
+        step,
+    ))
 }
 
 /// Writeback for a number input: show the new value (the input does not update itself), then
@@ -123,17 +129,26 @@ macro_rules! number_widget {
 number_widget!(f32, f64, i32, i64, u32, u64, usize);
 
 /// One axis input of a vector or rotation row.
-fn axis_input(axis: usize, numeric: NumericValue, binding: InspectorBinding) -> Box<dyn Scene> {
+fn axis_input(
+    axis: usize,
+    numeric: NumericValue,
+    binding: InspectorBinding,
+    step: Option<f32>,
+) -> Box<dyn Scene> {
+    let step = step.map(|s| bsn! { NumberInputStep({s as f64}) });
     macro_rules! input {
         ($token:expr, $label:expr) => {
-            Box::new(bsn! {
-                @FeathersNumberInput { @sigil_color: $token, @label_text: $label }
-                NumberInputPrecision(3)
-                numeric
-                binding
-                Node { flex_grow: 1.0, min_width: px(0) }
-                on(writeback_number::<f32>)
-            })
+            Box::new((
+                bsn! {
+                    @FeathersNumberInput { @sigil_color: $token, @label_text: $label }
+                    NumberInputPrecision(3)
+                    numeric
+                    binding
+                    Node { flex_grow: 1.0, min_width: px(0) }
+                    on(writeback_number::<f32>)
+                },
+                step,
+            ))
         };
     }
     match axis {
@@ -157,7 +172,12 @@ fn axis_row(inputs: Vec<Box<dyn Scene>>) -> Box<dyn Scene> {
 }
 
 /// A vector: one `f32` input per named component, each bound to `path.x`, `path.y`, ...
-fn build_vector(cx: &BuildCx, path: &str, value: &dyn PartialReflect) -> Box<dyn Scene> {
+fn build_vector(
+    cx: &BuildCx,
+    path: &str,
+    value: &dyn PartialReflect,
+    step: Option<f32>,
+) -> Box<dyn Scene> {
     let ReflectRef::Struct(components) = value.reflect_ref() else {
         return Box::new(bevy_feathers::display::label_dim(format!("{value:?}")));
     };
@@ -173,7 +193,7 @@ fn build_vector(cx: &BuildCx, path: &str, value: &dyn PartialReflect) -> Box<dyn
                 root: Some(cx.root.clone()),
                 path: parse_path(&format!("{path}.{name}")),
             };
-            Some(axis_input(i, NumericValue::F32(current), binding))
+            Some(axis_input(i, NumericValue::F32(current), binding, step))
         })
         .collect();
     axis_row(inputs)
@@ -183,9 +203,9 @@ fn build_vec(
     cx: &BuildCx,
     path: &str,
     value: &dyn PartialReflect,
-    _field: &FieldCtx,
+    field: &FieldCtx,
 ) -> Box<dyn Scene> {
-    build_vector(cx, path, value)
+    build_vector(cx, path, value, field.step)
 }
 
 macro_rules! vector_widget {

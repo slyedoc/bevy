@@ -11,7 +11,9 @@ use bevy_reflect::{CreateTypeData, PartialReflect};
 use bevy_scene::prelude::*;
 use bevy_scene::Scene;
 use bevy_ui::Checked;
-use bevy_ui_widgets::{checkbox_self_update, slider_self_update, SliderPrecision, SliderValue};
+use bevy_ui_widgets::{
+    checkbox_self_update, slider_self_update, SliderPrecision, SliderStep, SliderValue,
+};
 
 use crate::attributes::FieldCtx;
 use crate::binding::{inspector_writeback_bool, inspector_writeback_slider, InspectorBinding};
@@ -85,17 +87,21 @@ pub(crate) fn build_slider<T: SliderScalar>(
         root: Some(cx.root.clone()),
         path: parse_path(path),
     };
-    Box::new(bsn! {
-        @FeathersSlider { @min: {min}, @max: {max} }
-        // The initial value is a component on main, not a prop.
-        SliderValue({current})
-        // `update_slider_pos` requires `SliderPrecision`; without it the bar/text never update.
-        SliderPrecision({T::PRECISION})
-        binding
-        // `slider_self_update` moves the thumb; our observer writes the data back.
-        on(slider_self_update)
-        on(inspector_writeback_slider::<T>)
-    })
+    let step = field.step.map(|s| bsn! { SliderStep({s}) });
+    Box::new((
+        bsn! {
+            @FeathersSlider { @min: {min}, @max: {max} }
+            // The initial value is a component on main, not a prop.
+            SliderValue({current})
+            // `update_slider_pos` requires `SliderPrecision`; without it the bar/text never update.
+            SliderPrecision({T::PRECISION})
+            binding
+            // `slider_self_update` moves the thumb; our observer writes the data back.
+            on(slider_self_update)
+            on(inspector_writeback_slider::<T>)
+        },
+        step,
+    ))
 }
 
 /// When a field has no explicit range, derive one that keeps the value visible mid-track.
