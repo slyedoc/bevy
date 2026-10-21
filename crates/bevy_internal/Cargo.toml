@@ -105,6 +105,7 @@ force_disable_dlss = [
 ]
 
 # Audio format support (vorbis is enabled by default)
+bevy_audio = ["dep:bevy_audio", "bevy_dev_tools?/bevy_audio"]
 flac = ["bevy_audio/flac"]
 mp3 = ["bevy_audio/mp3"]
 mp4 = ["bevy_audio/mp4"]

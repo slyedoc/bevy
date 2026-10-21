@@ -32,7 +32,7 @@ serialize = [
 # bevy
 bevy_animation = { path = "../bevy_animation", version = "0.20.0-dev" }
 bevy_app = { path = "../bevy_app", version = "0.20.0-dev" }
-bevy_audio = { path = "../bevy_audio", version = "0.20.0-dev" }
+bevy_audio = { path = "../bevy_audio", version = "0.20.0-dev", optional = true }
 bevy_asset = { path = "../bevy_asset", version = "0.20.0-dev" }
 bevy_camera = { path = "../bevy_camera", version = "0.20.0-dev" }
 bevy_color = { path = "../bevy_color", version = "0.20.0-dev" }
