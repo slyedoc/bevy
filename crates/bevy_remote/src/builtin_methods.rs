@@ -1254,7 +1254,11 @@ pub fn process_remote_mutate_components_request(
         .ok_or_else(|| {
             BrpError::component_error(anyhow!("Component `{}` isn't registered", component))
         })?
-        .reflect_mut(world.entity_mut(entity))
+        .reflect_mut(
+            world
+                .get_entity_mut(entity)
+                .map_err(|_| BrpError::entity_not_found(entity))?,
+        )
         .ok_or_else(|| {
             BrpError::component_error(anyhow!("Cannot reflect component `{}`", component))
         })?;

@@ -38,6 +38,8 @@ pub enum ButtonVariant {
     Primary,
     /// Don't display the button background unless hovering or pressed.
     Plain,
+    /// A red button for destructive actions (delete, discard).
+    Danger,
 }
 
 impl ButtonVariant {
@@ -239,6 +241,10 @@ fn set_button_styles(
         (ButtonVariant::Primary, false, true, _) => tokens::BUTTON_PRIMARY_BG_PRESSED,
         (ButtonVariant::Primary, false, false, true) => tokens::BUTTON_PRIMARY_BG_HOVER,
         (ButtonVariant::Primary, false, false, false) => tokens::BUTTON_PRIMARY_BG,
+        (ButtonVariant::Danger, true, _, _) => tokens::BUTTON_DANGER_BG_DISABLED,
+        (ButtonVariant::Danger, false, true, _) => tokens::BUTTON_DANGER_BG_PRESSED,
+        (ButtonVariant::Danger, false, false, true) => tokens::BUTTON_DANGER_BG_HOVER,
+        (ButtonVariant::Danger, false, false, false) => tokens::BUTTON_DANGER_BG,
         (ButtonVariant::Plain, true, _, _) => tokens::BUTTON_PLAIN_BG_DISABLED,
         (ButtonVariant::Plain, false, true, _) => tokens::BUTTON_PLAIN_BG_PRESSED,
         (ButtonVariant::Plain, false, false, true) => tokens::BUTTON_PLAIN_BG_HOVER,
@@ -248,8 +254,8 @@ fn set_button_styles(
     let font_color_token = match (variant, disabled) {
         (ButtonVariant::Primary, true) => tokens::BUTTON_PRIMARY_TEXT_DISABLED,
         (ButtonVariant::Primary, false) => tokens::BUTTON_PRIMARY_TEXT,
-        (ButtonVariant::Normal | ButtonVariant::Plain, true) => tokens::BUTTON_TEXT_DISABLED,
-        (ButtonVariant::Normal | ButtonVariant::Plain, false) => tokens::BUTTON_TEXT,
+        (ButtonVariant::Normal | ButtonVariant::Plain | ButtonVariant::Danger, true) => tokens::BUTTON_TEXT_DISABLED,
+        (ButtonVariant::Normal | ButtonVariant::Plain | ButtonVariant::Danger, false) => tokens::BUTTON_TEXT,
     };
 
     let cursor_shape = match disabled {

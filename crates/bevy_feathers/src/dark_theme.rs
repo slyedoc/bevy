@@ -36,6 +36,13 @@ pub fn create_dark_theme() -> ThemeProps {
                 semantic::FILL_ACCENT_DISABLED,
                 palette::GRAY_3.with_alpha(0.7),
             ),
+            (semantic::FILL_DANGER_DEFAULT, palette::DANGER),
+            (semantic::FILL_DANGER_HOVER, palette::DANGER.lighter(0.05)),
+            (semantic::FILL_DANGER_PRESSED, palette::DANGER.lighter(0.1)),
+            (
+                semantic::FILL_DANGER_DISABLED,
+                palette::GRAY_3.with_alpha(0.7),
+            ),
             (semantic::FILL_SOLID_DEFAULT, palette::GRAY_3),
             (semantic::FILL_SOLID_HOVER, palette::GRAY_3.lighter(0.05)),
             (semantic::FILL_SOLID_PRESSED, palette::GRAY_3.lighter(0.1)),
@@ -116,6 +123,11 @@ pub fn create_dark_theme() -> ThemeProps {
                 tokens::BUTTON_PRIMARY_BG_DISABLED,
                 semantic::FILL_ACCENT_DISABLED,
             ),
+            // Button (danger)
+            (tokens::BUTTON_DANGER_BG, semantic::FILL_DANGER_DEFAULT),
+            (tokens::BUTTON_DANGER_BG_HOVER, semantic::FILL_DANGER_HOVER),
+            (tokens::BUTTON_DANGER_BG_PRESSED, semantic::FILL_DANGER_PRESSED),
+            (tokens::BUTTON_DANGER_BG_DISABLED, semantic::FILL_DANGER_DISABLED),
             // Button (plain)
             (tokens::BUTTON_PLAIN_BG, semantic::FILL_NONE),
             (tokens::BUTTON_PLAIN_BG_HOVER, semantic::FILL_ITEM_HOVER),

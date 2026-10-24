@@ -51,6 +51,20 @@ pub const BUTTON_PRIMARY_TEXT: ThemeToken = ThemeToken::new_static("feathers.but
 pub const BUTTON_PRIMARY_TEXT_DISABLED: ThemeToken =
     ThemeToken::new_static("feathers.button.primary.txt.disabled");
 
+// Danger (destructive) buttons
+
+/// Danger button background
+pub const BUTTON_DANGER_BG: ThemeToken = ThemeToken::new_static("feathers.button.danger.bg");
+/// Danger button background (hovered)
+pub const BUTTON_DANGER_BG_HOVER: ThemeToken =
+    ThemeToken::new_static("feathers.button.danger.bg.hover");
+/// Danger button background (disabled)
+pub const BUTTON_DANGER_BG_DISABLED: ThemeToken =
+    ThemeToken::new_static("feathers.button.danger.bg.disabled");
+/// Danger button background (pressed)
+pub const BUTTON_DANGER_BG_PRESSED: ThemeToken =
+    ThemeToken::new_static("feathers.button.danger.bg.pressed");
+
 // Plain buttons (transparent background)
 
 /// Plain button background
@@ -486,6 +500,16 @@ pub mod semantic {
     /// Accent when disabled
     pub const FILL_ACCENT_DISABLED: SemanticToken =
         SemanticToken::new_static("fill.accent.disabled");
+
+    /// Danger fill - used for destructive buttons
+    pub const FILL_DANGER_DEFAULT: SemanticToken = SemanticToken::new_static("fill.danger.default");
+    /// Danger when hovered
+    pub const FILL_DANGER_HOVER: SemanticToken = SemanticToken::new_static("fill.danger.hover");
+    /// Danger when pressed
+    pub const FILL_DANGER_PRESSED: SemanticToken = SemanticToken::new_static("fill.danger.pressed");
+    /// Danger when disabled
+    pub const FILL_DANGER_DISABLED: SemanticToken =
+        SemanticToken::new_static("fill.danger.disabled");
 
     /// Default fill - buttons
     pub const FILL_SOLID_DEFAULT: SemanticToken = SemanticToken::new_static("fill.solid.default");
