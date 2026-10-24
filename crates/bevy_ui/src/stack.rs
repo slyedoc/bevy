@@ -2,7 +2,7 @@
 
 use crate::{
     experimental::{UiChildren, UiRootNodes},
-    GlobalZIndex, ZIndex,
+    GlobalZIndex, Node, ZIndex,
 };
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
@@ -49,7 +49,29 @@ pub(crate) struct StackRoot {
 /// Create a list of `StackRoot`s from parentless entities and entities with a `GlobalZIndex` component.
 /// Then build the `UiStack` from a walk of the existing layout trees starting from each stack root,
 /// filtering branches by `Without<GlobalZIndex>`so that we don't revisit nodes.
+///
+/// The stack depends only on the hierarchy and the z indices: while neither changed, the last
+/// one stands.
+#[expect(clippy::too_many_arguments, reason = "the hierarchy and z changes it watches")]
 pub fn ui_stack_system(
+    mut built: Local<bool>,
+    changes: Query<
+        (),
+        Or<(
+            Added<Node>,
+            Changed<Children>,
+            Changed<ChildOf>,
+            Changed<ZIndex>,
+            Changed<GlobalZIndex>,
+        )>,
+    >,
+    mut removals: (
+        RemovedComponents<Node>,
+        RemovedComponents<Children>,
+        RemovedComponents<ChildOf>,
+        RemovedComponents<ZIndex>,
+        RemovedComponents<GlobalZIndex>,
+    ),
     mut cache: Local<Vec<(Entity, i32)>>,
     mut stack_roots: Local<Vec<(Entity, StackRoot)>>,
     mut stack_root_order: Local<EntityHashMap<usize>>,
@@ -65,6 +87,15 @@ pub fn ui_stack_system(
     zindex_query: Query<Option<&ZIndex>, (With<ComputedStackIndex>, Without<GlobalZIndex>)>,
     mut update_query: Query<&mut ComputedStackIndex>,
 ) {
+    let removed = removals.0.read().count()
+        + removals.1.read().count()
+        + removals.2.read().count()
+        + removals.3.read().count()
+        + removals.4.read().count();
+    if *built && removed == 0 && changes.is_empty() {
+        return;
+    }
+    *built = true;
     stack_root_order.clear();
     for (order, partition) in ui_stack.partition.iter().enumerate() {
         stack_root_order.insert(ui_stack.uinodes[partition.start], order);
