@@ -1,5 +1,7 @@
 //! This module contains the systems that update the stored UI nodes stack
 
+#[cfg(feature = "ghost_nodes")]
+use crate::experimental::GhostNode;
 use crate::{
     experimental::{UiChildren, UiRootNodes},
     GlobalZIndex, Node, ZIndex,
@@ -52,7 +54,10 @@ pub(crate) struct StackRoot {
 ///
 /// The stack depends only on the hierarchy and the z indices: while neither changed, the last
 /// one stands.
-#[expect(clippy::too_many_arguments, reason = "the hierarchy and z changes it watches")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the hierarchy and z changes it watches"
+)]
 pub fn ui_stack_system(
     mut built: Local<bool>,
     changes: Query<
@@ -71,6 +76,11 @@ pub fn ui_stack_system(
         RemovedComponents<ChildOf>,
         RemovedComponents<ZIndex>,
         RemovedComponents<GlobalZIndex>,
+    ),
+    // A ghost node added to or removed from an entity reshapes the UI hierarchy on its own.
+    #[cfg(feature = "ghost_nodes")] (added_ghost_nodes, mut removed_ghost_nodes): (
+        Query<(), Added<GhostNode>>,
+        RemovedComponents<GhostNode>,
     ),
     mut cache: Local<Vec<(Entity, i32)>>,
     mut stack_roots: Local<Vec<(Entity, StackRoot)>>,
@@ -92,7 +102,11 @@ pub fn ui_stack_system(
         + removals.2.read().count()
         + removals.3.read().count()
         + removals.4.read().count();
-    if *built && removed == 0 && changes.is_empty() {
+    let changed = removed > 0 || !changes.is_empty();
+    #[cfg(feature = "ghost_nodes")]
+    let changed =
+        removed_ghost_nodes.read().count() > 0 || !added_ghost_nodes.is_empty() || changed;
+    if *built && !changed {
         return;
     }
     *built = true;
