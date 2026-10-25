@@ -1,8 +1,10 @@
 //! This module contains the systems that update the stored UI nodes stack
 
+#[cfg(feature = "ghost_nodes")]
+use crate::experimental::GhostNode;
 use crate::{
     experimental::{UiChildren, UiRootNodes},
-    GlobalZIndex, ZIndex,
+    GlobalZIndex, Node, ZIndex,
 };
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
@@ -34,6 +36,14 @@ pub struct UiStack {
     pub uinodes: Vec<Entity>,
 }
 
+/// The entities whose hierarchy shapes the stack: UI nodes, and with `ghost_nodes` ghost nodes
+/// too (a ghost root has no [`Node`]). A non-UI entity gaining, losing or changing a parent or
+/// children (an animated character's bones, say) leaves the stack as it was.
+#[cfg(not(feature = "ghost_nodes"))]
+type UiHierarchyEntity = With<Node>;
+#[cfg(feature = "ghost_nodes")]
+type UiHierarchyEntity = Or<(With<Node>, With<GhostNode>)>;
+
 /// A `StackRoot` can be either a root UI node, or a parented UI node with a `GlobalZIndex` component.
 /// The stack root and its descendants, up to any nested `StackRoots`, occupy a contiguous range in the render stack.
 #[derive(Ord, PartialOrd, PartialEq, Eq)]
@@ -49,7 +59,34 @@ pub(crate) struct StackRoot {
 /// Create a list of `StackRoot`s from parentless entities and entities with a `GlobalZIndex` component.
 /// Then build the `UiStack` from a walk of the existing layout trees starting from each stack root,
 /// filtering branches by `Without<GlobalZIndex>`so that we don't revisit nodes.
+///
+/// The stack depends only on the hierarchy and the z indices: while neither changed, the last
+/// one stands.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the hierarchy and z changes it watches"
+)]
 pub fn ui_stack_system(
+    mut built: Local<bool>,
+    changes: Query<(), Or<(Added<Node>, Changed<ZIndex>, Changed<GlobalZIndex>)>>,
+    // UI entities whose parent or children changed, and every UI entity (to tell which hierarchy
+    // removals were on one).
+    (hierarchy_changes, ui_hierarchy_entities): (
+        Query<(), (Or<(Changed<Children>, Changed<ChildOf>)>, UiHierarchyEntity)>,
+        Query<(), UiHierarchyEntity>,
+    ),
+    mut removals: (
+        RemovedComponents<Node>,
+        RemovedComponents<Children>,
+        RemovedComponents<ChildOf>,
+        RemovedComponents<ZIndex>,
+        RemovedComponents<GlobalZIndex>,
+    ),
+    // A ghost node added to or removed from an entity reshapes the UI hierarchy on its own.
+    #[cfg(feature = "ghost_nodes")] (added_ghost_nodes, mut removed_ghost_nodes): (
+        Query<(), Added<GhostNode>>,
+        RemovedComponents<GhostNode>,
+    ),
     mut cache: Local<Vec<(Entity, i32)>>,
     mut stack_roots: Local<Vec<(Entity, StackRoot)>>,
     mut stack_root_order: Local<EntityHashMap<usize>>,
@@ -65,6 +102,29 @@ pub fn ui_stack_system(
     zindex_query: Query<Option<&ZIndex>, (With<ComputedStackIndex>, Without<GlobalZIndex>)>,
     mut update_query: Query<&mut ComputedStackIndex>,
 ) {
+    // A despawned UI entity is caught by its `Node` (or `GhostNode`) removal, so a hierarchy
+    // removal counts only on an entity that is still part of the UI.
+    let removed = removals.0.read().count()
+        + removals
+            .1
+            .read()
+            .filter(|&entity| ui_hierarchy_entities.contains(entity))
+            .count()
+        + removals
+            .2
+            .read()
+            .filter(|&entity| ui_hierarchy_entities.contains(entity))
+            .count()
+        + removals.3.read().count()
+        + removals.4.read().count();
+    let changed = removed > 0 || !changes.is_empty() || !hierarchy_changes.is_empty();
+    #[cfg(feature = "ghost_nodes")]
+    let changed =
+        removed_ghost_nodes.read().count() > 0 || !added_ghost_nodes.is_empty() || changed;
+    if *built && !changed {
+        return;
+    }
+    *built = true;
     stack_root_order.clear();
     for (order, partition) in ui_stack.partition.iter().enumerate() {
         stack_root_order.insert(ui_stack.uinodes[partition.start], order);
@@ -466,5 +526,68 @@ mod tests {
         schedule.run(&mut world);
 
         assert_eq!(uinodes, world.resource::<UiStack>().uinodes);
+    }
+
+    #[test]
+    fn only_ui_hierarchy_changes_rebuild_the_stack() {
+        let mut world = World::default();
+        world.init_resource::<UiStack>();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(ui_stack_system);
+
+        let root = world.spawn(Node::default()).id();
+        let child = world.spawn((Node::default(), ChildOf(root))).id();
+        let other_root = world.spawn(Node::default()).id();
+        let bone = world.spawn_empty().id();
+        let other_bone = world.spawn(ChildOf(bone)).id();
+
+        schedule.run(&mut world);
+        world.clear_trackers();
+
+        // A non-UI entity reparented, detached, or gaining children leaves the stack alone.
+        let third_bone = world.spawn_empty().id();
+        world.entity_mut(other_bone).insert(ChildOf(third_bone));
+        world.entity_mut(bone).insert(ChildOf(third_bone));
+        schedule.run(&mut world);
+        world.entity_mut(bone).remove::<ChildOf>();
+        schedule.run(&mut world);
+        assert!(!world.is_resource_changed::<UiStack>());
+
+        // A UI node reparented does not.
+        world.entity_mut(child).insert(ChildOf(other_root));
+        schedule.run(&mut world);
+        assert!(world.is_resource_changed::<UiStack>());
+        world.clear_trackers();
+
+        // Nor does one detached into a root of its own.
+        world.entity_mut(child).remove::<ChildOf>();
+        schedule.run(&mut world);
+        assert!(world.is_resource_changed::<UiStack>());
+        assert!(world.resource::<UiStack>().uinodes.contains(&child));
+    }
+
+    #[cfg(feature = "ghost_nodes")]
+    #[test]
+    fn a_ghost_root_detached_from_a_non_ui_parent_rebuilds_the_stack() {
+        use crate::experimental::GhostNode;
+
+        let mut world = World::default();
+        world.init_resource::<UiStack>();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(ui_stack_system);
+
+        let holder = world.spawn_empty().id();
+        let ghost = world.spawn((GhostNode, ChildOf(holder))).id();
+        let node = world.spawn((Node::default(), ChildOf(ghost))).id();
+
+        schedule.run(&mut world);
+        assert!(!world.resource::<UiStack>().uinodes.contains(&node));
+        world.clear_trackers();
+
+        world.entity_mut(ghost).remove::<ChildOf>();
+        schedule.run(&mut world);
+        assert!(world.resource::<UiStack>().uinodes.contains(&node));
     }
 }

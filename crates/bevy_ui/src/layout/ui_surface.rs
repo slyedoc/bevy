@@ -188,6 +188,14 @@ impl UiSurface {
         }
     }
 
+    /// Whether anything under `ui_root_entity` changed since its last [`Self::compute_layout`]
+    /// (taffy marks a changed node's ancestors dirty, up to the root's implicit viewport).
+    pub fn needs_layout(&self, ui_root_entity: Entity) -> bool {
+        self.root_entity_to_viewport_node
+            .get(&ui_root_entity)
+            .is_none_or(|viewport| self.taffy.dirty(*viewport).unwrap_or(true))
+    }
+
     /// Gets or inserts an implicit taffy viewport node corresponding to the given UI root entity
     pub fn get_or_insert_taffy_viewport_node(&mut self, ui_root_entity: Entity) -> NodeId {
         *self

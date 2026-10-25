@@ -11,7 +11,7 @@ use bevy_ecs::{
     entity::{Entity, EntityHashSet},
     hierarchy::{ChildOf, Children},
     lifecycle::RemovedComponents,
-    query::{Added, Has, With},
+    query::{Added, Changed, Has, Or, With},
     system::{Query, Res, ResMut},
     world::Ref,
 };
@@ -128,6 +128,24 @@ pub fn ui_layout_system(
         Has<FixedNode>,
     )>,
     mut buffer_query: Query<&mut ComputedTextBlock>,
+    geometry_changes: Query<
+        (),
+        Or<(
+            Changed<Node>,
+            Changed<UiTransform>,
+            Changed<ScrollPosition>,
+            Changed<Outline>,
+            Changed<IgnoreScroll>,
+            Changed<LayoutConfig>,
+            Changed<EmSize>,
+        )>,
+    >,
+    mut geometry_removals: (
+        RemovedComponents<Outline>,
+        RemovedComponents<IgnoreScroll>,
+        RemovedComponents<LayoutConfig>,
+        RemovedComponents<ScrollPosition>,
+    ),
     mut font_system: ResMut<FontCx>,
     (mut removed_children, mut removed_nodes, mut removed_fixed_nodes): (
         RemovedComponents<Children>,
@@ -212,6 +230,19 @@ pub fn ui_layout_system(
         .chain(removed_fixed_nodes.read())
         .collect::<EntityHashSet>();
 
+    // Geometry also reads what taffy does not lay out (transforms, scroll, outlines): while none
+    // of that changed anywhere, a root whose tree taffy has clean is skipped whole. In a world
+    // full of still panels this is most of the system's cost: every root's rounding pass and
+    // geometry walk, every frame.
+    let removed_geometry = geometry_removals.0.read().count()
+        + geometry_removals.1.read().count()
+        + geometry_removals.2.read().count()
+        + geometry_removals.3.read().count();
+    let geometry_changed = rem_size_changed
+        || !fixed_node_changes.is_empty()
+        || !geometry_changes.is_empty()
+        || removed_geometry > 0;
+
     for ui_root_entity in ui_root_node_query.iter().chain(fixed_nodes_query.iter()) {
         fn update_children_recursively(
             ui_surface: &mut UiSurface,
@@ -268,6 +299,12 @@ pub fn ui_layout_system(
             warn!("UI root {ui_root_entity} not found");
             continue;
         };
+        if !geometry_changed
+            && !computed_target.is_changed()
+            && !ui_surface.needs_layout(ui_root_entity)
+        {
+            continue;
+        }
 
         ui_surface.compute_layout(
             ui_root_entity,
