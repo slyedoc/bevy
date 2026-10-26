@@ -129,23 +129,38 @@ impl EmbeddedAssetRegistry {
             let processed_dir = self.dir.clone();
             source = source
                 .with_watcher(move |sender| {
-                    Some(Box::new(EmbeddedWatcher::new(
+                    watch_embedded(EmbeddedWatcher::new(
                         dir.clone(),
                         root_paths.clone(),
                         sender,
                         core::time::Duration::from_millis(300),
-                    )))
+                    ))
                 })
                 .with_processed_watcher(move |sender| {
-                    Some(Box::new(EmbeddedWatcher::new(
+                    watch_embedded(EmbeddedWatcher::new(
                         processed_dir.clone(),
                         processed_root_paths.clone(),
                         sender,
                         core::time::Duration::from_millis(300),
-                    )))
+                    ))
                 });
         }
         sources.insert(EMBEDDED, source);
+    }
+}
+
+/// An embedded watcher that could not start leaves the embedded assets as built: hot reloading
+/// them is a convenience, never a reason to stop the app.
+#[cfg(feature = "embedded_watcher")]
+fn watch_embedded(
+    watcher: Result<EmbeddedWatcher, notify_debouncer_full::notify::Error>,
+) -> Option<Box<dyn crate::io::AssetWatcher>> {
+    match watcher {
+        Ok(watcher) => Some(Box::new(watcher)),
+        Err(error) => {
+            tracing::warn!("Embedded assets will not hot reload: {error}");
+            None
+        }
     }
 }
 
@@ -437,6 +452,15 @@ macro_rules! load_internal_binary_asset {
 #[cfg(test)]
 mod tests {
     use super::{_embedded_asset_path, EmbeddedAssetRegistry};
+
+    #[cfg(feature = "embedded_watcher")]
+    #[test]
+    fn a_watcher_that_cannot_start_leaves_no_watcher() {
+        let error = notify_debouncer_full::notify::Error::new(
+            notify_debouncer_full::notify::ErrorKind::MaxFilesWatch,
+        );
+        assert!(super::watch_embedded(Err(error)).is_none());
+    }
     use std::path::Path;
 
     // Relative paths show up if this macro is being invoked by a local crate.

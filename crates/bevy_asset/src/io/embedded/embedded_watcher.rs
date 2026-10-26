@@ -25,12 +25,13 @@ pub struct EmbeddedWatcher {
 
 impl EmbeddedWatcher {
     /// Creates a new `EmbeddedWatcher` that watches for changes to the embedded assets in the given `dir`.
+    /// Fails when the system will not watch the crate (out of inotify watches, for one).
     pub fn new(
         dir: Dir,
         root_paths: Arc<RwLock<HashMap<Box<Path>, PathBuf>>>,
         sender: async_channel::Sender<AssetSourceEvent>,
         debounce_wait_time: Duration,
-    ) -> Self {
+    ) -> Result<Self, notify_debouncer_full::notify::Error> {
         let root = get_base_path();
         let handler = EmbeddedEventHandler {
             dir,
@@ -39,8 +40,8 @@ impl EmbeddedWatcher {
             root_paths,
             last_event: None,
         };
-        let watcher = new_asset_event_debouncer(root, debounce_wait_time, handler).unwrap();
-        Self { _watcher: watcher }
+        let watcher = new_asset_event_debouncer(root, debounce_wait_time, handler)?;
+        Ok(Self { _watcher: watcher })
     }
 }
 

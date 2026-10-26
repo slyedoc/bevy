@@ -551,16 +551,19 @@ impl AssetSource {
             {
                 let path = super::file::get_base_path().join(path.clone());
                 if path.exists() {
-                    Some(Box::new(
-                        super::file::FileWatcher::new(
-                            path.clone(),
-                            sender,
-                            file_debounce_wait_time,
-                        )
-                        .unwrap_or_else(|e| {
-                            panic!("Failed to create file watcher from path {path:?}, {e:?}")
-                        }),
-                    ))
+                    // Hot reloading is a convenience: a watcher the system will not give (out of
+                    // inotify watches, for one) leaves the source unwatched, not the app down.
+                    match super::file::FileWatcher::new(
+                        path.clone(),
+                        sender,
+                        file_debounce_wait_time,
+                    ) {
+                        Ok(watcher) => Some(Box::new(watcher)),
+                        Err(e) => {
+                            warn!("Assets in {path:?} will not hot reload: {e:?}");
+                            None
+                        }
+                    }
                 } else {
                     warn!("Skip creating file watcher because path {path:?} does not exist.");
                     None
