@@ -528,6 +528,7 @@ impl WinitAppRunnerState {
         let focused = windows.iter().any(|(_, window)| window.focused);
 
         let mut update_mode = config.update_mode(focused);
+        let wait_for_redraw = config.wait_for_redraw;
         let mut should_update = self.should_update(update_mode);
 
         if self.startup_forced_updates > 0 {
@@ -623,7 +624,7 @@ impl WinitAppRunnerState {
             // Additional condition for Windows OS.
             // If no windows are visible, redraw calls will never succeed, which results in no app update calls being performed.
             // This is a temporary solution, full solution is mentioned here: https://github.com/bevyengine/bevy/issues/1343#issuecomment-770091684
-            if !self.ran_update_since_last_redraw || all_invisible {
+            if !self.ran_update_since_last_redraw || all_invisible || !wait_for_redraw {
                 self.run_app_update();
                 #[cfg(feature = "custom_cursor")]
                 self.update_cursors(event_loop);

@@ -20,6 +20,7 @@ fn main() {
         .insert_resource(WinitSettings {
             focused_mode: bevy::winit::UpdateMode::Continuous,
             unfocused_mode: bevy::winit::UpdateMode::reactive_low_power(Duration::from_millis(10)),
+            wait_for_redraw: true,
         })
         .insert_resource(ExampleMode::Game)
         .add_plugins(DefaultPlugins.set(WindowPlugin {

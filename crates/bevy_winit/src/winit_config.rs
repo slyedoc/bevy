@@ -8,6 +8,11 @@ pub struct WinitSettings {
     pub focused_mode: UpdateMode,
     /// Determines how frequently the application can update when it's out of focus.
     pub unfocused_mode: UpdateMode,
+    /// Each update waits for the windows' next redraw request, so the app updates no faster
+    /// than its windows draw (the default). An app something else paces, such as an XR
+    /// headset's frame loop, turns this off: on Wayland a window the compositor is not drawing
+    /// (hidden, minimized, on another workspace) gets its redraw requests about once a second.
+    pub wait_for_redraw: bool,
 }
 
 impl WinitSettings {
@@ -19,6 +24,7 @@ impl WinitSettings {
         WinitSettings {
             focused_mode: UpdateMode::Continuous,
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs_f64(1.0 / 60.0)), /* 60Hz, */
+            wait_for_redraw: true,
         }
     }
 
@@ -32,6 +38,7 @@ impl WinitSettings {
         WinitSettings {
             focused_mode: UpdateMode::reactive(Duration::from_secs(5)),
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs(60)),
+            wait_for_redraw: true,
         }
     }
 
@@ -45,6 +52,7 @@ impl WinitSettings {
         WinitSettings {
             focused_mode: UpdateMode::reactive(Duration::from_secs_f32(1.0 / 60.0)),
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs(1)),
+            wait_for_redraw: true,
         }
     }
 
@@ -55,6 +63,7 @@ impl WinitSettings {
         WinitSettings {
             focused_mode: UpdateMode::Continuous,
             unfocused_mode: UpdateMode::Continuous,
+            wait_for_redraw: true,
         }
     }
 
