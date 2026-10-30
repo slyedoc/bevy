@@ -19,7 +19,9 @@ use bevy_feathers::display::{label, label_dim};
 
 use crate::attributes::FieldCtx;
 use crate::binding::InspectorRoot;
-use crate::collapse::{collapse_toggle, CollapseBody, CollapseGroup, InspectorCollapsed};
+use crate::collapse::{
+    collapse_toggle, on_header_click, CollapseBody, CollapseGroup, InspectorCollapsed,
+};
 use crate::enums::build_enum;
 use crate::lists::build_list;
 use crate::widget::ReflectInspectorWidget;
@@ -257,6 +259,7 @@ pub(crate) fn group_card(
             // The chevron and the title read as one unit, so override the header's
             // space-between default.
             Node { justify_content: JustifyContent::Start, column_gap: px(6) }
+            on(on_header_click)
             Children [ {header} ]
             --
             @group_body()
