@@ -1,4 +1,4 @@
-use bevy_log::{debug, error, warn};
+use bevy_log::{debug, error, warn, warn_once};
 use bevy_platform::dirs::preferences_dir;
 use bevy_tasks::IoTaskPool;
 use std::{fs, path::PathBuf};
@@ -96,6 +96,9 @@ impl SettingsStore {
     /// * `filename` - The name of the settings file, without the file extension.
     pub(crate) fn load(&self, filename: &str) -> Option<toml::Table> {
         let Some(base_path) = &self.base_path else {
+            // No preferences directory: nothing can load or be saved, unlike a missing file
+            // (the first run), which is routine.
+            warn_once!("no preferences directory: settings cannot be loaded or saved");
             return None;
         };
 

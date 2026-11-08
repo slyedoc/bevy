@@ -29,7 +29,7 @@ use bevy_ecs::{
     world::World,
 };
 pub use bevy_ecs_macros::SettingsGroup;
-use bevy_log::warn;
+use bevy_log::{debug, warn};
 use bevy_reflect::{
     enums::DynamicEnum,
     prelude::ReflectDefault,
@@ -554,7 +554,8 @@ fn load_settings_file(
     let store = SettingsStore::new(app_name);
     let toml = store.load(filename);
     if toml.is_none() {
-        warn!("Filename {filename}.toml not found");
+        // A missing file is the first run, not a problem: every group takes its defaults.
+        debug!("Filename {filename}.toml not found; its settings take their defaults");
     }
 
     apply_settings_to_world(world, toml.as_ref(), manifest, types);
